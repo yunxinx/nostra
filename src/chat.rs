@@ -5,21 +5,22 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
     ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _,
-    button::{Button, ButtonRounded, ButtonVariants as _},
+    button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, RopeExt as _},
     scroll::ScrollableElement as _,
     text::{TextView, TextViewState},
     v_flex,
 };
 
 use crate::assistant;
+use crate::fonts;
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 
-/// While streaming, keep pinning to the bottom only when the viewport is within
-/// this distance of the end — roughly one line of slack so tiny layout jitter
-/// doesn't disengage the auto-follow.
+/// While streaming, the view re-pins to the bottom only when it is already
+/// within this distance of the end — used both as the pin guard and as the
+/// "scrolled back down" re-arm threshold for [`ChatView::follow`].
 const STICK_THRESHOLD: Pixels = px(48.);
 
 /// Bottom inset reserved for the floating composer so the last message stays
@@ -27,6 +28,11 @@ const STICK_THRESHOLD: Pixels = px(48.);
 /// single-line auto-grow height plus outer padding; taller multi-line input may
 /// briefly overlap until the user scrolls.
 const COMPOSER_RESERVE: Pixels = px(120.);
+
+/// Deliberately over-scrolled deferred target for the composer viewport.
+/// `InputState::set_scroll_offset` applies it after the next layout pass and
+/// clamps it to the fresh content size, so this lands exactly at the bottom.
+const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -45,6 +51,12 @@ pub struct ChatView {
     messages: Vec<Message>,
     input: Entity<InputState>,
     scroll_handle: ScrollHandle,
+    /// Whether streaming updates may pin the view to the bottom.  A single
+    /// upward wheel tick clears it — distance alone isn't enough, because
+    /// during fast streaming the next token re-pins before the user can
+    /// scroll past [`STICK_THRESHOLD`].  Scrolling back near the bottom, or
+    /// sending a message, re-arms it.
+    follow: bool,
     pending: bool,
     _reply_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -76,6 +88,28 @@ impl ChatView {
                         input.update(cx, |state, cx| state.set_value("", window, cx));
                         this.submit(text, cx);
                     }
+                    InputEvent::Change => {
+                        // After an edit that lands the caret on the last line
+                        // (typing at the end, or pasting a block of text), snap
+                        // the composer viewport to the bottom.  The component's
+                        // own paste follow-scroll computes against the previous
+                        // frame's layout, so pasting many lines into a shorter
+                        // document clamps its scroll target to zero and the view
+                        // stays stuck at the top.
+                        let (cursor_line, lines_len, x) = {
+                            let state = input.read(cx);
+                            (
+                                state.cursor_position().line as usize,
+                                state.text().lines_len(),
+                                state.scroll_offset().x,
+                            )
+                        };
+                        if lines_len > 1 && cursor_line + 1 == lines_len {
+                            input.update(cx, |state, cx| {
+                                state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
+                            });
+                        }
+                    }
                     _ => {}
                 },
             );
@@ -85,6 +119,7 @@ impl ChatView {
             messages: Vec::new(),
             input,
             scroll_handle: ScrollHandle::new(),
+            follow: true,
             pending: false,
             _reply_task: None,
             _subscriptions: vec![subscription],
@@ -102,10 +137,12 @@ impl ChatView {
     }
 
     /// Called on every streaming update.  Keeps the latest tokens in view, but
-    /// only while the user is already reading the bottom of the transcript —
-    /// so scrolling up to re-read earlier turns isn't interrupted.
+    /// only while auto-follow is armed and the user is actually reading the
+    /// bottom of the transcript — an upward wheel tick disarms it (see
+    /// [`ChatView::follow`]), so scrolling up to re-read earlier turns is never
+    /// interrupted, no matter how small the scroll was.
     pub fn follow_stream(&self) {
-        if self.is_near_bottom() {
+        if self.follow && self.is_near_bottom() {
             self.scroll_handle.scroll_to_bottom();
         }
     }
@@ -142,6 +179,7 @@ impl ChatView {
 
         self.pending = true;
         self._reply_task = Some(assistant::stream_reply(&text, assistant_body, cx));
+        self.follow = true;
         self.scroll_to_bottom();
         cx.notify();
     }
@@ -205,6 +243,19 @@ impl ChatView {
                     .size_full()
                     .track_scroll(&self.scroll_handle)
                     .overflow_y_scroll()
+                    // Wheel intent drives auto-follow: any upward tick disarms
+                    // it immediately (no minimum distance), scrolling back to
+                    // near the bottom re-arms it.  `delta.y > 0` scrolls toward
+                    // earlier content (gpui applies `offset.y += delta.y` with
+                    // 0 = top).
+                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, _| {
+                        let dy = ev.delta.pixel_delta(window.line_height()).y;
+                        if dy > px(0.) {
+                            this.follow = false;
+                        } else if dy < px(0.) && this.is_near_bottom() {
+                            this.follow = true;
+                        }
+                    }))
                     .child(
                         v_flex()
                             .w_full()
@@ -239,13 +290,39 @@ impl ChatView {
                     .border_color(theme.border)
                     .rounded(theme.radius_lg)
                     .shadow_md()
-                    .px_1p5()
                     .py_1()
-                    // Input defaults to Medium (12px) horizontal padding; override so the
-                    // outer card padding alone sets the inset (avoids ~20px double-pad).
-                    .child(Input::new(&self.input).appearance(false).px_1())
+                    // The multi-line Input places its overlay scrollbar inside its
+                    // own horizontal padding and soft-wraps text 10px short of the
+                    // text area (RIGHT_MARGIN, fixed upstream).  The thumb's left
+                    // edge sits at `text_right + padding.right − 12px`, so the
+                    // glyph→thumb gap works out to `padding.right − 2px`: the
+                    // default 12px padding reads as a too-wide 10px gap, 8px
+                    // brings it to 6px.  Don't go much lower — the gap is only
+                    // guaranteed because the bundled fonts wrap with zero
+                    // estimate drift (see the font note below).  The card adds
+                    // no horizontal padding of its own around the input; the
+                    // toolbar row below carries its own inset.
+                    //
+                    // The bundled font is load-bearing, not cosmetic: upstream
+                    // gpui-component (bc174a7) computes soft-wrap points from
+                    // per-char isolated measurements.  Under a proportional
+                    // system font, fullwidth punctuation (，。) measures ~0.5em
+                    // alone but paints at 1em inside a CJK run, so wrapped lines
+                    // overflow and the rightmost glyph clips.  Both bundled
+                    // choices avoid that: Maple Mono CN covers Latin + CJK +
+                    // fullwidth forms itself (no fallback at all), and JetBrains
+                    // Mono carries no fullwidth glyphs whatsoever, so both
+                    // measurement paths fall back identically.  Verify with
+                    // `cargo run --example wrap_probe`.
+                    .child(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .font_family(fonts::active(cx).family())
+                            .pr(px(8.)),
+                    )
                     .child(
                         h_flex()
+                            .px_1p5()
                             .items_center()
                             .gap_1()
                             .child(
@@ -268,7 +345,6 @@ impl ChatView {
                                 Button::new("send")
                                     .primary()
                                     .icon(IconName::ArrowUp)
-                                    .rounded(ButtonRounded::Large)
                                     .small()
                                     .disabled(send_disabled)
                                     .tooltip("Send (Enter)")
