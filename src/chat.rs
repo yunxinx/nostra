@@ -4,7 +4,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
+    ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonRounded, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -27,9 +27,6 @@ const STICK_THRESHOLD: Pixels = px(48.);
 /// single-line auto-grow height plus outer padding; taller multi-line input may
 /// briefly overlap until the user scrolls.
 const COMPOSER_RESERVE: Pixels = px(120.);
-
-/// Extra top content padding below the floating title-bar controls (model pill).
-const CONTENT_TOP_PAD: Pixels = px(20.);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -211,8 +208,9 @@ impl ChatView {
                     .child(
                         v_flex()
                             .w_full()
-                            // Clear the floating title bar; scrollbar still runs under it.
-                            .pt(TITLE_BAR_HEIGHT + CONTENT_TOP_PAD)
+                            // Match the scrollbar thumb's 4px top inset so the
+                            // first message aligns with the top of the thumb.
+                            .pt(px(4.))
                             // Leave room so the last message clears the floating composer.
                             .pb(COMPOSER_RESERVE)
                             .gap_5()
@@ -323,8 +321,6 @@ fn render_empty_state(cx: &App) -> impl IntoElement {
         .size_full()
         .items_center()
         .justify_center()
-        // Keep greeting centered in the area between title bar and composer.
-        .pt(TITLE_BAR_HEIGHT)
         .pb(COMPOSER_RESERVE)
         .gap_2()
         .child(
