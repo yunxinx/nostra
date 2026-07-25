@@ -41,6 +41,14 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 # gpui-component (and its assets crate) live in the same upstream repo.  Pin
 # to a specific rev so the app builds against the exact API surface it was
 # written against; bump this when adopting new component features.
+#
+# Known upstream issue at bc174a7: the input's soft-wrap points come from
+# per-char isolated width estimates, which under-measure CJK fullwidth
+# punctuation under proportional fonts (rightmost glyph clips).  The composer
+# works around it by rendering with a bundled full-coverage CJK-mono font
+# (see chat.rs / fonts.rs); a root fix exists on the local gpui-component
+# branch `fix/input-soft-wrap-shaped-width` should it ever be needed
+# (upstream PR material).
 gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7" }
 gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7" }
 

@@ -11,6 +11,7 @@ mod app;
 mod assets;
 mod assistant;
 mod chat;
+mod fonts;
 pub mod preferences;
 mod theme;
 mod window;
@@ -18,7 +19,7 @@ mod window;
 use gpui::App;
 use gpui_component::{ActiveTheme, Theme, ThemeMode};
 
-use crate::actions::{Quit, ToggleTheme};
+use crate::actions::{Quit, ToggleComposerFont, ToggleTheme};
 use crate::assets::NostraAssets;
 
 /// Entry point used by `main.rs`.
@@ -34,6 +35,7 @@ pub fn run() {
 /// One-time application setup: initialise components, theme, keys, menus.
 fn init(prefs: &preferences::Preferences, cx: &mut App) {
     gpui_component::init(cx);
+    fonts::init(prefs.composer_font, cx);
 
     // Start from the system appearance, then honour the saved override if any.
     Theme::sync_system_appearance(None, cx);
@@ -76,4 +78,6 @@ fn install_action_handlers(cx: &mut App) {
         theme::apply_dark_palette(cx);
         cx.refresh_windows();
     });
+
+    cx.on_action(|_: &ToggleComposerFont, cx: &mut App| fonts::toggle(cx));
 }

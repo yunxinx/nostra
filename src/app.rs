@@ -14,8 +14,9 @@ use gpui_component::{
     v_flex,
 };
 
-use crate::actions::{NewChat, ToggleSidebar, ToggleTheme};
+use crate::actions::{NewChat, ToggleComposerFont, ToggleSidebar, ToggleTheme};
 use crate::chat::ChatView;
+use crate::fonts;
 use crate::preferences::{self, Preferences};
 
 /// Minimum sidebar width when the user drags the right edge inward.
@@ -106,6 +107,7 @@ impl ChatApp {
             sidebar_width: self.sidebar_width.as_f32(),
             sidebar_collapsed: self.collapsed,
             theme_mode: Some(theme_mode),
+            composer_font: fonts::active(cx),
         }
     }
 
@@ -250,6 +252,7 @@ impl ChatApp {
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dark = cx.theme().mode.is_dark();
+        let next_font = fonts::active(cx).toggled();
 
         let account = Button::new("account")
             .ghost()
@@ -286,7 +289,10 @@ impl ChatApp {
                 } else {
                     "Switch to dark mode"
                 };
-                menu.menu(label, Box::new(ToggleTheme))
+                menu.menu(label, Box::new(ToggleTheme)).menu(
+                    format!("Composer font: {}", next_font.label()),
+                    Box::new(ToggleComposerFont),
+                )
             });
 
         h_flex()

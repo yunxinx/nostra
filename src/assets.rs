@@ -14,7 +14,14 @@ use gpui_component_assets::Assets as ComponentAssets;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "assets"]
 #[include = "icons/**/*.svg"]
+#[include = "fonts/**/*.ttf"]
 struct AppEmbed;
+
+/// Raw bytes of an app-embedded asset (e.g. a bundled font), by path
+/// relative to the `assets/` folder.
+pub fn embedded(path: &str) -> Option<Cow<'static, [u8]>> {
+    AppEmbed::get(path).map(|file| file.data)
+}
 
 /// Combined asset source: app-embedded first, gpui-component-assets second.
 pub struct NostraAssets;

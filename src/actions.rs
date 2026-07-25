@@ -5,7 +5,16 @@
 
 use gpui::{App, KeyBinding, actions};
 
-actions!(nostra, [NewChat, Quit, ToggleSidebar, ToggleTheme]);
+actions!(
+    nostra,
+    [
+        NewChat,
+        Quit,
+        ToggleSidebar,
+        ToggleTheme,
+        ToggleComposerFont
+    ]
+);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
