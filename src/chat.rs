@@ -4,7 +4,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
     button::{Button, ButtonRounded, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -21,6 +21,15 @@ const CONTENT_MAX_WIDTH: Pixels = px(760.);
 /// this distance of the end — roughly one line of slack so tiny layout jitter
 /// doesn't disengage the auto-follow.
 const STICK_THRESHOLD: Pixels = px(48.);
+
+/// Bottom inset reserved for the floating composer so the last message stays
+/// readable and scroll-to-bottom lands above the input.  Sized for the default
+/// single-line auto-grow height plus outer padding; taller multi-line input may
+/// briefly overlap until the user scrolls.
+const COMPOSER_RESERVE: Pixels = px(120.);
+
+/// Extra top content padding below the floating title-bar controls (model pill).
+const CONTENT_TOP_PAD: Pixels = px(20.);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -162,24 +171,34 @@ impl Render for ChatView {
         let has_messages = !self.messages.is_empty();
         let send_disabled = self.pending || self.input.read(cx).value().trim().is_empty();
 
-        v_flex()
+        // Full-height message viewport with a floating composer stacked on top
+        // (gpui-component absolute overlay pattern).  Scrollbar tracks the right
+        // edge all the way to the panel bottom; content padding keeps the last
+        // turn clear of the input.
+        div()
+            .relative()
             .size_full()
             .bg(cx.theme().background)
-            .child(div().flex_1().min_h_0().map(|this| {
-                if has_messages {
-                    this.child(self.render_message_list(cx))
-                } else {
-                    this.child(render_empty_state(cx))
-                }
-            }))
-            .child(self.render_input_area(send_disabled, cx))
+            .child(if has_messages {
+                self.render_message_list(cx).into_any_element()
+            } else {
+                render_empty_state(cx).into_any_element()
+            })
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(self.render_input_area(send_disabled, cx)),
+            )
     }
 }
 
 impl ChatView {
     fn render_message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // Relative, non-scrolling wrapper so the overlay scrollbar anchors to
-        // the viewport instead of scrolling away with the content.
+        // the full panel height (including under the floating composer).
         div()
             .relative()
             .size_full()
@@ -192,7 +211,10 @@ impl ChatView {
                     .child(
                         v_flex()
                             .w_full()
-                            .py_5()
+                            // Clear the floating title bar; scrollbar still runs under it.
+                            .pt(TITLE_BAR_HEIGHT + CONTENT_TOP_PAD)
+                            // Leave room so the last message clears the floating composer.
+                            .pb(COMPOSER_RESERVE)
                             .gap_5()
                             .children(self.messages.iter().map(|m| render_message(m, cx))),
                     ),
@@ -208,19 +230,22 @@ impl ChatView {
             .justify_center()
             .px_6()
             .pt_2()
-            .pb_5()
+            .pb_3()
             .child(
                 v_flex()
                     .w_full()
                     .max_w(CONTENT_MAX_WIDTH)
-                    .gap_1()
-                    .bg(theme.input_background())
+                    .gap_0p5()
+                    .bg(theme.background)
                     .border_1()
                     .border_color(theme.border)
                     .rounded(theme.radius_lg)
-                    .px_3()
-                    .py_2()
-                    .child(Input::new(&self.input).appearance(false))
+                    .shadow_md()
+                    .px_1p5()
+                    .py_1()
+                    // Input defaults to Medium (12px) horizontal padding; override so the
+                    // outer card padding alone sets the inset (avoids ~20px double-pad).
+                    .child(Input::new(&self.input).appearance(false).px_1())
                     .child(
                         h_flex()
                             .items_center()
@@ -298,6 +323,9 @@ fn render_empty_state(cx: &App) -> impl IntoElement {
         .size_full()
         .items_center()
         .justify_center()
+        // Keep greeting centered in the area between title bar and composer.
+        .pt(TITLE_BAR_HEIGHT)
+        .pb(COMPOSER_RESERVE)
         .gap_2()
         .child(
             div()

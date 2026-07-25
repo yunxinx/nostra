@@ -369,21 +369,15 @@ impl Render for ChatApp {
 
         // ---------- Main column ----------
         //
-        // Just a top-bar spacer and the chat body.  The floating widgets on
-        // top of the window (overlay buttons, model pill) are rendered
-        // separately as absolute elements so they don't shift with the layout.
-        let main_column = v_flex()
+        // Chat body fills the full height so its scrollbar runs edge-to-edge
+        // under the floating title widgets (model pill, etc.).  Content top
+        // padding inside ChatView keeps messages clear of those overlays.
+        let main_column = div()
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(cx.theme().background)
-            .child(div().h(TITLE_BAR_HEIGHT).flex_shrink_0())
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when_some(active_view, |this, view| this.child(view)),
-            );
+            .when_some(active_view, |this, view| this.child(view));
 
         // ---------- Fixed top-left overlay: never moves ----------
         //
