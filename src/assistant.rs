@@ -28,7 +28,7 @@ pub fn stream_reply(
                 .timer(Duration::from_millis(28))
                 .await;
             target.update(cx, |state, cx| state.push_str(&chunk, cx));
-            view.update(cx, |chat, _| chat.scroll_to_bottom());
+            view.update(cx, |chat, _| chat.follow_stream());
         }
 
         view.update(cx, |chat, cx| chat.finish_reply(cx));

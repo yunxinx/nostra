@@ -8,6 +8,7 @@ use gpui_component::{
     button::{Button, ButtonRounded, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    scroll::ScrollableElement as _,
     text::{TextView, TextViewState},
     v_flex,
 };
@@ -15,6 +16,11 @@ use gpui_component::{
 use crate::assistant;
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
+
+/// While streaming, keep pinning to the bottom only when the viewport is within
+/// this distance of the end — roughly one line of slack so tiny layout jitter
+/// doesn't disengage the auto-follow.
+const STICK_THRESHOLD: Pixels = px(48.);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -83,8 +89,28 @@ impl ChatView {
         &self.title
     }
 
+    /// Force the newest message into view.  Used right after the user sends a
+    /// message, where jumping to the bottom is always the desired behavior.
     pub fn scroll_to_bottom(&self) {
         self.scroll_handle.scroll_to_bottom();
+    }
+
+    /// Called on every streaming update.  Keeps the latest tokens in view, but
+    /// only while the user is already reading the bottom of the transcript —
+    /// so scrolling up to re-read earlier turns isn't interrupted.
+    pub fn follow_stream(&self) {
+        if self.is_near_bottom() {
+            self.scroll_handle.scroll_to_bottom();
+        }
+    }
+
+    /// True when the viewport sits at (or within `STICK_THRESHOLD` of) the
+    /// bottom.  `offset.y` is `<= 0` and reaches `-max_offset.y` at the bottom,
+    /// so their sum is the remaining distance to the end of the content.
+    fn is_near_bottom(&self) -> bool {
+        let offset = self.scroll_handle.offset().y;
+        let max = self.scroll_handle.max_offset().y;
+        max + offset <= STICK_THRESHOLD
     }
 
     fn submit(&mut self, text: String, cx: &mut Context<Self>) {
@@ -110,7 +136,7 @@ impl ChatView {
 
         self.pending = true;
         self._reply_task = Some(assistant::stream_reply(&text, assistant_body, cx));
-        self.scroll_handle.scroll_to_bottom();
+        self.scroll_to_bottom();
         cx.notify();
     }
 
@@ -152,19 +178,26 @@ impl Render for ChatView {
 
 impl ChatView {
     fn render_message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Relative, non-scrolling wrapper so the overlay scrollbar anchors to
+        // the viewport instead of scrolling away with the content.
         div()
-            .id("messages")
-            .flex_1()
-            .min_h_0()
-            .track_scroll(&self.scroll_handle)
-            .overflow_y_scroll()
+            .relative()
+            .size_full()
             .child(
-                v_flex()
-                    .w_full()
-                    .py_5()
-                    .gap_5()
-                    .children(self.messages.iter().cloned().map(|m| render_message(m, cx))),
+                div()
+                    .id("messages")
+                    .size_full()
+                    .track_scroll(&self.scroll_handle)
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .py_5()
+                            .gap_5()
+                            .children(self.messages.iter().map(|m| render_message(m, cx))),
+                    ),
             )
+            .vertical_scrollbar(&self.scroll_handle)
     }
 
     fn render_input_area(&self, send_disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -223,7 +256,7 @@ impl ChatView {
     }
 }
 
-fn render_message(msg: Message, cx: &App) -> impl IntoElement {
+fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let is_user = msg.role == Role::User;
 
