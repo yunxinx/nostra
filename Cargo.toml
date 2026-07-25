@@ -1,0 +1,72 @@
+[package]
+name = "nostra"
+description = "Nostra — a desktop chat client."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["yuewei"]
+license = "Apache-2.0"
+readme = "README.md"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nostra"
+path = "src/main.rs"
+
+# All external dependencies resolve to git or crates.io — no filesystem paths.
+# Cargo.lock pins the exact commits so every contributor gets the same build.
+[dependencies]
+anyhow = "1"
+rust-embed = { version = "8.7", features = [
+    "interpolate-folder-path",
+    "include-exclude",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Zed's gpui runtime.  Kept unpinned (branch = main) here to match the version
+# gpui-component itself declares in its workspace; Cargo.lock captures the
+# exact commit for reproducibility.
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+    "font-kit",
+    "x11",
+    "wayland",
+    "runtime_shaders",
+] }
+
+# gpui-component (and its assets crate) live in the same upstream repo.  Pin
+# to a specific rev so the app builds against the exact API surface it was
+# written against; bump this when adopting new component features.
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7" }
+
+# Build tweaks copied from the gpui-component workspace to keep dev builds
+# usable; without these the dev binary is very slow.
+[profile.dev]
+codegen-units = 16
+debug = "limited"
+split-debuginfo = "unpacked"
+
+[profile.dev.package]
+gpui = { opt-level = 3 }
+gpui_platform = { opt-level = 3 }
+gpui_macros = { opt-level = 3 }
+resvg = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
+smol = { opt-level = 3 }
+sum_tree = { opt-level = 3 }
+ropey = { opt-level = 3 }
+lsp-types = { opt-level = 3 }
+markdown = { opt-level = 3 }
+xml5ever = { opt-level = 3 }
+
+# WASM-friendly psm fork; inherited from the gpui-component workspace so
+# transitive resolution stays consistent.
+[patch.crates-io]
+psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }

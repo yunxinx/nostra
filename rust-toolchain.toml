@@ -1,0 +1,5 @@
+# Pin the Rust toolchain so every contributor builds against the same
+# compiler.  Rust 2024 edition (used by this crate) requires 1.85 or newer.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
