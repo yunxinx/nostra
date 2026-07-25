@@ -3897,6 +3897,7 @@ dependencies = [
  "gpui-component-assets",
  "gpui_platform",
  "rust-embed",
+ "rust-i18n",
  "serde",
  "serde_json",
 ]

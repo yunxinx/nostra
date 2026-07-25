@@ -7,13 +7,7 @@ use gpui::{App, KeyBinding, actions};
 
 actions!(
     nostra,
-    [
-        NewChat,
-        Quit,
-        ToggleSidebar,
-        ToggleTheme,
-        ToggleComposerFont
-    ]
+    [NewChat, Quit, ToggleSidebar, ToggleTheme, OpenSettings]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -30,6 +24,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-l", ToggleTheme, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-l", ToggleTheme, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-,", OpenSettings, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-q", Quit, None),
         #[cfg(not(target_os = "macos"))]

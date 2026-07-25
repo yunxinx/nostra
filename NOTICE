@@ -5,3 +5,8 @@ This product includes software developed by yuewei.
 
 Licensed under the Apache License, Version 2.0 (the "License").
 You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0.
+
+Bundled theme files under assets/themes/ (except nostra.json) are copied from
+the gpui-component project (https://github.com/longbridge/gpui-component),
+licensed under the Apache License, Version 2.0.
+

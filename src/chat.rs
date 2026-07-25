@@ -12,6 +12,7 @@ use gpui_component::{
     text::{TextView, TextViewState},
     v_flex,
 };
+use rust_i18n::t;
 
 use crate::assistant;
 use crate::fonts;
@@ -50,6 +51,10 @@ pub struct ChatView {
     title: SharedString,
     messages: Vec<Message>,
     input: Entity<InputState>,
+    /// Placeholder text currently installed in the input state.  Compared
+    /// against the live translation each frame so a language switch updates
+    /// the composer without rebuilding it (and without notify loops).
+    placeholder: SharedString,
     scroll_handle: ScrollHandle,
     /// Whether streaming updates may pin the view to the bottom.  A single
     /// upward wheel tick clears it — distance alone isn't enough, because
@@ -68,11 +73,12 @@ impl ChatView {
     }
 
     fn new(title: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let placeholder: SharedString = t!("chat.placeholder").to_string().into();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
-                .placeholder("Send a message.  Enter to send, Shift+Enter for newline.")
+                .placeholder(placeholder.clone())
         });
 
         let subscription =
@@ -118,6 +124,7 @@ impl ChatView {
             title: title.into(),
             messages: Vec::new(),
             input,
+            placeholder,
             scroll_handle: ScrollHandle::new(),
             follow: true,
             pending: false,
@@ -202,7 +209,17 @@ impl ChatView {
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Re-resolve the placeholder so a language switch reaches the
+        // already-built input; guarded to avoid a notify cycle.
+        let placeholder: SharedString = t!("chat.placeholder").to_string().into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder.clone();
+            self.input.update(cx, |state, cx| {
+                state.set_placeholder(placeholder, window, cx);
+            });
+        }
+
         let has_messages = !self.messages.is_empty();
         let send_disabled = self.pending || self.input.read(cx).value().trim().is_empty();
 
@@ -330,7 +347,7 @@ impl ChatView {
                                     .ghost()
                                     .small()
                                     .icon(IconName::Plus)
-                                    .tooltip("Attach"),
+                                    .tooltip(t!("chat.attach").to_string()),
                             )
                             .child(div().flex_1())
                             .when(self.pending, |this| {
@@ -338,7 +355,7 @@ impl ChatView {
                                     div()
                                         .text_xs()
                                         .text_color(theme.muted_foreground)
-                                        .child("Generating..."),
+                                        .child(t!("chat.generating").to_string()),
                                 )
                             })
                             .child(
@@ -347,7 +364,7 @@ impl ChatView {
                                     .icon(IconName::ArrowUp)
                                     .small()
                                     .disabled(send_disabled)
-                                    .tooltip("Send (Enter)")
+                                    .tooltip(t!("chat.send_tooltip").to_string())
                                     .on_click(cx.listener(Self::on_send_click)),
                             ),
                     ),
@@ -404,13 +421,13 @@ fn render_empty_state(cx: &App) -> impl IntoElement {
                 .text_2xl()
                 .font_semibold()
                 .text_color(theme.foreground)
-                .child("How can I help you today?"),
+                .child(t!("chat.empty_title").to_string()),
         )
         .child(
             div()
                 .text_sm()
                 .text_color(theme.muted_foreground)
-                .child("Ask me anything.  Enter to send, Shift+Enter for newline."),
+                .child(t!("chat.empty_hint").to_string()),
         )
 }
 
@@ -420,7 +437,7 @@ fn derive_title(text: &str) -> SharedString {
         cleaned = cleaned.chars().take(37).collect::<String>() + "...";
     }
     if cleaned.trim().is_empty() {
-        "New chat".into()
+        t!("chat.default_title").to_string().into()
     } else {
         cleaned.into()
     }

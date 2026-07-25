@@ -2,15 +2,17 @@
 //!
 //! Owns everything that a mature gpui-component app is expected to configure
 //! around the top-level window: display-clamped bounds, immersive titlebar,
-//! native menu bar (macOS), startup activation/focus, and quit-on-last-window.
+//! native menu bar (macOS), startup activation/focus, quit-on-last-window,
+//! and restoring the previous session's window geometry.
 
 use anyhow::{Context as _, Result};
 use gpui::*;
 use gpui_component::{ActiveTheme, Root, TitleBar};
+use rust_i18n::t;
 
-use crate::actions::{NewChat, Quit, ToggleSidebar, ToggleTheme};
+use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::app::ChatApp;
-use crate::preferences::Preferences;
+use crate::preferences::{Preferences, WindowGeometry};
 
 /// Preferred initial window size; clamped to 85% of the primary display.
 const PREFERRED_SIZE: Size<Pixels> = Size {
@@ -26,7 +28,7 @@ const MIN_SIZE: Size<Pixels> = Size {
 
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
-    let bounds = clamped_bounds(cx);
+    let bounds = initial_bounds(prefs.window, cx);
 
     cx.spawn(async move |cx| -> Result<()> {
         let options = WindowOptions {
@@ -61,7 +63,7 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
         window.update(cx, |_, window, cx| {
             window.activate_window();
             window.set_window_title("Nostra");
-            // Quit the process when the last window closes.
+            // Quit the process when the main window closes.
             cx.on_release(|_, cx| cx.quit()).detach();
         })?;
 
@@ -70,7 +72,8 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     .detach_and_log_err(cx);
 }
 
-/// Install the macOS native menu bar.  No-op on other platforms.
+/// Install (or re-install after a language change) the macOS native menu
+/// bar.  No-op on other platforms.
 pub fn install_menus(_cx: &mut App) {
     #[cfg(target_os = "macos")]
     {
@@ -78,24 +81,62 @@ pub fn install_menus(_cx: &mut App) {
             Menu {
                 name: "Nostra".into(),
                 items: vec![
-                    MenuItem::action("Toggle Theme", ToggleTheme),
+                    MenuItem::action(t!("menu.settings").to_string(), OpenSettings),
+                    MenuItem::action(t!("menu.toggle_theme").to_string(), ToggleTheme),
                     MenuItem::separator(),
-                    MenuItem::action("Quit", Quit),
+                    MenuItem::action(t!("menu.quit").to_string(), Quit),
                 ],
                 disabled: false,
             },
             Menu {
-                name: "File".into(),
-                items: vec![MenuItem::action("New Chat", NewChat)],
+                name: t!("menu.file").to_string().into(),
+                items: vec![MenuItem::action(t!("menu.new_chat").to_string(), NewChat)],
                 disabled: false,
             },
             Menu {
-                name: "View".into(),
-                items: vec![MenuItem::action("Toggle Sidebar", ToggleSidebar)],
+                name: t!("menu.view").to_string().into(),
+                items: vec![MenuItem::action(
+                    t!("menu.toggle_sidebar").to_string(),
+                    ToggleSidebar,
+                )],
                 disabled: false,
             },
         ]);
     }
+}
+
+/// Bounds for the main window: the saved geometry when it is still sane and
+/// visible on some connected display, the default centered rect otherwise.
+/// The restored size is clamped to the display it lands on, so a saved
+/// geometry from a larger (since disconnected) monitor never produces an
+/// oversized window.
+fn initial_bounds(saved: Option<WindowGeometry>, cx: &App) -> Bounds<Pixels> {
+    if let Some(g) = saved {
+        let finite = [g.x, g.y, g.width, g.height].iter().all(|v| v.is_finite());
+        if finite {
+            let mut bounds = Bounds {
+                origin: point(px(g.x), px(g.y)),
+                size: size(
+                    px(g.width).max(MIN_SIZE.width),
+                    px(g.height).max(MIN_SIZE.height),
+                ),
+            };
+            // A monitor may have been unplugged since the last run; only
+            // restore geometry that still lands on a connected display.
+            if let Some(display) = cx
+                .displays()
+                .into_iter()
+                .find(|d| d.bounds().intersects(&bounds))
+            {
+                let ds = display.bounds().size;
+                bounds.size.width = bounds.size.width.min(ds.width);
+                bounds.size.height = bounds.size.height.min(ds.height);
+                return bounds;
+            }
+        }
+    }
+
+    clamped_bounds(cx)
 }
 
 fn clamped_bounds(cx: &App) -> Bounds<Pixels> {

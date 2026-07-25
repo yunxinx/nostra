@@ -1,12 +1,15 @@
-//! Persistent user preferences (sidebar width, collapse state, theme mode).
+//! Persistent user preferences (sidebar, theme, language, window geometry).
 //!
-//! Prefs are written to a platform-specific config directory on app quit
-//! and read back on startup.  Any deserialize failure falls back to
-//! `Preferences::default`, so users never see a startup error just because
-//! the on-disk format has drifted.
+//! Prefs are written to a platform-specific config directory and read back on
+//! startup.  Any deserialize failure falls back to `Preferences::default`, so
+//! users never see a startup error just because the on-disk format has
+//! drifted.  At runtime the current values live in the [`Prefs`] app-global;
+//! mutations go through [`update`], which persists asynchronously so settings
+//! survive even if the app never quits cleanly.
 
 use std::path::PathBuf;
 
+use gpui::{App, Global};
 use serde::{Deserialize, Serialize};
 
 /// Directory name inside the platform config root.
@@ -30,6 +33,20 @@ pub struct Preferences {
     /// instead of invalidating the whole file).
     #[serde(default, deserialize_with = "composer_font_or_default")]
     pub composer_font: ComposerFont,
+    /// UI language.  Unknown values fall back to the default (zh-CN).
+    #[serde(default, deserialize_with = "language_or_default")]
+    pub language: Language,
+    /// Theme name applied while in light mode.  `None` or an unregistered
+    /// name falls back to the built-in default at startup.
+    #[serde(default)]
+    pub light_theme: Option<String>,
+    /// Theme name applied while in dark mode.  Same fallback rules.
+    #[serde(default)]
+    pub dark_theme: Option<String>,
+    /// Last known main-window geometry (restore bounds).  `None` on first
+    /// run; invalid values are clamped or discarded at restore time.
+    #[serde(default)]
+    pub window: Option<WindowGeometry>,
 }
 
 /// Deserialize a [`ComposerFont`] via its derived impl, mapping unknown
@@ -43,6 +60,16 @@ where
     Ok(ComposerFont::deserialize(value).unwrap_or_default())
 }
 
+/// Same tolerance for [`Language`]: an unrecognized language tag reverts to
+/// the default instead of invalidating the whole preferences file.
+fn language_or_default<'de, D>(d: D) -> Result<Language, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(Language::deserialize(value).unwrap_or_default())
+}
+
 fn default_sidebar_width() -> f32 {
     272.0
 }
@@ -54,8 +81,73 @@ impl Default for Preferences {
             sidebar_collapsed: false,
             theme_mode: None,
             composer_font: ComposerFont::default(),
+            language: Language::default(),
+            light_theme: None,
+            dark_theme: None,
+            window: None,
         }
     }
+}
+
+/// UI languages the app can render in.  The serialized form doubles as the
+/// stable identifier used by the settings dropdown.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Language {
+    /// 简体中文 (default).
+    #[default]
+    ZhCn,
+    /// English.
+    En,
+}
+
+impl Language {
+    /// BCP 47 tag understood by rust-i18n's locale lookup; must match the
+    /// locale keys used in `locales/nostra.yml` and gpui-component's `ui.yml`.
+    pub fn locale(self) -> &'static str {
+        match self {
+            Language::ZhCn => "zh-CN",
+            Language::En => "en",
+        }
+    }
+
+    /// Native-script label shown in the language dropdown.  Deliberately not
+    /// translated: each language names itself.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::ZhCn => "简体中文",
+            Language::En => "English",
+        }
+    }
+
+    /// Stable identifier for dropdown values (the serde kebab-case form).
+    pub fn key(self) -> &'static str {
+        match self {
+            Language::ZhCn => "zh-cn",
+            Language::En => "en",
+        }
+    }
+
+    /// Inverse of [`Language::key`]; unknown keys fall back to the default.
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "en" => Language::En,
+            _ => Language::default(),
+        }
+    }
+
+    pub fn all() -> [Language; 2] {
+        [Language::ZhCn, Language::En]
+    }
+}
+
+/// Main-window restore bounds in global screen coordinates.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct WindowGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 /// Fonts the composer can render with.  The default bundles Latin + CJK +
@@ -84,7 +176,8 @@ impl ComposerFont {
         }
     }
 
-    /// Human-readable label for menus.
+    /// Human-readable label for menus.  Font names are proper nouns, so the
+    /// label is not routed through i18n.
     pub fn label(self) -> &'static str {
         match self {
             ComposerFont::MapleMonoCn => "Maple Mono 圆体",
@@ -92,12 +185,25 @@ impl ComposerFont {
         }
     }
 
-    /// The other choice, for a toggle-style menu item.
-    pub fn toggled(self) -> Self {
+    /// Stable identifier for dropdown values (the serde kebab-case form,
+    /// which splits on every capital: `jet-brains-mono`).
+    pub fn key(self) -> &'static str {
         match self {
-            ComposerFont::MapleMonoCn => ComposerFont::JetBrainsMono,
-            ComposerFont::JetBrainsMono => ComposerFont::MapleMonoCn,
+            ComposerFont::MapleMonoCn => "maple-mono-cn",
+            ComposerFont::JetBrainsMono => "jet-brains-mono",
         }
+    }
+
+    /// Inverse of [`ComposerFont::key`]; unknown keys fall back to default.
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "jet-brains-mono" => ComposerFont::JetBrainsMono,
+            _ => ComposerFont::default(),
+        }
+    }
+
+    pub fn all() -> [ComposerFont; 2] {
+        [ComposerFont::MapleMonoCn, ComposerFont::JetBrainsMono]
     }
 }
 
@@ -115,6 +221,49 @@ impl ThemeMode {
     pub fn is_dark(self) -> bool {
         matches!(self, ThemeMode::Dark)
     }
+}
+
+/// App-global holding the live preferences: the single source of truth
+/// between startup and quit.  UI state that only matters at exit (sidebar
+/// geometry, window bounds) is written back by `ChatApp` on quit; settings
+/// changes go through [`update`] and persist immediately.
+pub struct Prefs(pub Preferences);
+
+impl Global for Prefs {}
+
+/// Seed the [`Prefs`] global from the loaded preferences.  Must run during
+/// app init, before any UI reads settings.
+pub fn init_global(prefs: Preferences, cx: &mut App) {
+    cx.set_global(Prefs(prefs));
+}
+
+/// The live preferences.
+pub fn get(cx: &App) -> &Preferences {
+    &cx.global::<Prefs>().0
+}
+
+/// Mutate the live preferences and persist the result.  The write happens
+/// synchronously on purpose: the file is a few hundred bytes, and spawning
+/// each save onto the background pool would let two rapid changes race on
+/// the same path (fs::write is not atomic — last-spawned is not guaranteed
+/// last-written).  Save errors are logged and otherwise ignored — a failed
+/// write never breaks the running app.
+pub fn update(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
+    let prefs = &mut cx.global_mut::<Prefs>().0;
+    f(prefs);
+    let snapshot = prefs.clone();
+    if let Err(e) = save(&snapshot) {
+        eprintln!("failed to save preferences: {e:?}");
+    }
+}
+
+/// Fold exit-time state into the live preferences and return the merged
+/// snapshot.  Unlike [`update`] this does not spawn a save — quit hooks run
+/// the flush themselves so gpui can await it before the process exits.
+pub fn snapshot_with(cx: &mut App, f: impl FnOnce(&mut Preferences)) -> Preferences {
+    let prefs = &mut cx.global_mut::<Prefs>().0;
+    f(prefs);
+    prefs.clone()
 }
 
 /// Full path where preferences are stored.  `None` on platforms where no
@@ -164,5 +313,73 @@ fn config_dir() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preference files written before the settings-window feature carry
+    /// none of the new fields; they must load cleanly with defaults.
+    #[test]
+    fn legacy_file_gets_defaults_for_new_fields() {
+        let legacy = r#"{
+            "sidebar_width": 300.0,
+            "sidebar_collapsed": true,
+            "theme_mode": "dark",
+            "composer_font": "jet-brains-mono"
+        }"#;
+        let prefs: Preferences = serde_json::from_str(legacy).expect("legacy file must parse");
+        assert_eq!(prefs.sidebar_width, 300.0);
+        assert!(prefs.sidebar_collapsed);
+        assert_eq!(prefs.theme_mode, Some(ThemeMode::Dark));
+        assert_eq!(prefs.composer_font, ComposerFont::JetBrainsMono);
+        assert_eq!(prefs.language, Language::ZhCn);
+        assert_eq!(prefs.light_theme, None);
+        assert_eq!(prefs.dark_theme, None);
+        assert_eq!(prefs.window, None);
+    }
+
+    /// Unknown enum tags (from newer or older builds) degrade to defaults
+    /// instead of poisoning the whole file.
+    #[test]
+    fn unknown_language_and_font_fall_back_to_default() {
+        let json = r#"{
+            "language": "klingon",
+            "composer_font": "comic-sans"
+        }"#;
+        let prefs: Preferences = serde_json::from_str(json).expect("must parse");
+        assert_eq!(prefs.language, Language::ZhCn);
+        assert_eq!(prefs.composer_font, ComposerFont::MapleMonoCn);
+    }
+
+    #[test]
+    fn window_geometry_round_trips() {
+        let prefs = Preferences {
+            window: Some(WindowGeometry {
+                x: -12.5,
+                y: 40.0,
+                width: 1180.0,
+                height: 760.0,
+            }),
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize");
+        let back: Preferences = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.window, prefs.window);
+    }
+
+    /// Language keys are the stable dropdown identifiers; the round trip
+    /// must hold and unknown keys must land on the default.
+    #[test]
+    fn language_key_round_trip() {
+        for lang in Language::all() {
+            assert_eq!(Language::from_key(lang.key()), lang);
+        }
+        assert_eq!(Language::from_key("nope"), Language::ZhCn);
+        for font in ComposerFont::all() {
+            assert_eq!(ComposerFont::from_key(font.key()), font);
+        }
     }
 }

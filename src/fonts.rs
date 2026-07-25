@@ -44,10 +44,13 @@ pub fn active(cx: &App) -> ComposerFont {
     cx.global::<ActiveComposerFont>().0
 }
 
-/// Switch to the other bundled font and repaint.
-pub fn toggle(cx: &mut App) {
-    let next = active(cx).toggled();
-    cx.set_global(ActiveComposerFont(next));
+/// Switch the composer font, persist the choice, and repaint everywhere.
+pub fn set(font: ComposerFont, cx: &mut App) {
+    if active(cx) == font {
+        return;
+    }
+    cx.set_global(ActiveComposerFont(font));
+    crate::preferences::update(cx, |prefs| prefs.composer_font = font);
     cx.refresh_windows();
 }
 

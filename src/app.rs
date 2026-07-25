@@ -13,11 +13,11 @@ use gpui_component::{
     sidebar::SidebarToggleButton,
     v_flex,
 };
+use rust_i18n::t;
 
-use crate::actions::{NewChat, ToggleComposerFont, ToggleSidebar, ToggleTheme};
+use crate::actions::{NewChat, OpenSettings, ToggleSidebar, ToggleTheme};
 use crate::chat::ChatView;
-use crate::fonts;
-use crate::preferences::{self, Preferences};
+use crate::preferences::{self, Preferences, WindowGeometry};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -55,6 +55,9 @@ pub struct ChatApp {
     /// (mouse_x, sidebar_width) captured on `mouse_down` on the resize handle.
     /// While `Some`, window-level mouse move events adjust `sidebar_width`.
     resize_start: Option<(Pixels, Pixels)>,
+    /// Latest main-window restore bounds, kept fresh by a window-bounds
+    /// observer and persisted on quit.
+    window_geometry: Option<WindowGeometry>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -75,19 +78,40 @@ impl ChatApp {
             has_toggled: false,
             sidebar_width,
             resize_start: None,
+            window_geometry: Some(geometry_of(window)),
             _subscriptions: Vec::new(),
         };
+        this.track_window_geometry(window, cx);
         this.spawn_conversation(window, cx);
         this.register_save_on_quit(cx);
         this
     }
 
-    /// Persist current preferences (sidebar width, collapse state, theme mode)
-    /// when the app quits.  File I/O happens on the background executor so it
-    /// doesn't stall shutdown.
+    /// Keep `window_geometry` current across moves and resizes.  The
+    /// observer fires for both, because the platform window reports either
+    /// as a bounds change.
+    fn track_window_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.observe_window_bounds(window, |this, window, _| {
+            this.window_geometry = Some(geometry_of(window));
+        });
+        self._subscriptions.push(sub);
+    }
+
+    /// Persist current preferences (sidebar state, window geometry) when the
+    /// app quits.  Settings-window changes are already live in the `Prefs`
+    /// global, so folding in the exit-only state completes the snapshot.
+    /// File I/O happens on the background executor so it doesn't stall
+    /// shutdown; gpui awaits the returned task before exiting.
     fn register_save_on_quit(&self, cx: &mut Context<Self>) {
         cx.on_app_quit(|this, cx| {
-            let snapshot = this.snapshot_preferences(cx);
+            let sidebar_width = this.sidebar_width.as_f32();
+            let sidebar_collapsed = this.collapsed;
+            let window = this.window_geometry;
+            let snapshot = preferences::snapshot_with(cx, |prefs| {
+                prefs.sidebar_width = sidebar_width;
+                prefs.sidebar_collapsed = sidebar_collapsed;
+                prefs.window = window;
+            });
             cx.background_executor().spawn(async move {
                 if let Err(e) = preferences::save(&snapshot) {
                     eprintln!("failed to save preferences: {e:?}");
@@ -97,22 +121,8 @@ impl ChatApp {
         .detach();
     }
 
-    fn snapshot_preferences(&self, cx: &App) -> Preferences {
-        let theme_mode = if cx.theme().mode.is_dark() {
-            preferences::ThemeMode::Dark
-        } else {
-            preferences::ThemeMode::Light
-        };
-        Preferences {
-            sidebar_width: self.sidebar_width.as_f32(),
-            sidebar_collapsed: self.collapsed,
-            theme_mode: Some(theme_mode),
-            composer_font: fonts::active(cx),
-        }
-    }
-
     fn spawn_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = ChatView::view("New chat", window, cx);
+        let view = ChatView::view(t!("chat.default_title").to_string(), window, cx);
         let sub = cx.observe(&view, |_, _, cx| cx.notify());
         self.conversations.push(view);
         self._subscriptions.push(sub);
@@ -245,14 +255,13 @@ impl ChatApp {
                     .items_center()
                     .text_xs()
                     .text_color(cx.theme().sidebar_foreground.opacity(0.6))
-                    .child("Chats"),
+                    .child(t!("sidebar.chats").to_string()),
             )
             .children(items)
     }
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dark = cx.theme().mode.is_dark();
-        let next_font = fonts::active(cx).toggled();
 
         let account = Button::new("account")
             .ghost()
@@ -284,14 +293,20 @@ impl ChatApp {
                     ),
             )
             .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
-                let label = if is_dark {
-                    "Switch to light mode"
+                let (theme_label, theme_icon) = if is_dark {
+                    (t!("account.switch_to_light"), IconName::Sun)
                 } else {
-                    "Switch to dark mode"
+                    (t!("account.switch_to_dark"), IconName::Moon)
                 };
-                menu.menu(label, Box::new(ToggleTheme)).menu(
-                    format!("Composer font: {}", next_font.label()),
-                    Box::new(ToggleComposerFont),
+                menu.menu_with_icon(
+                    t!("account.settings").to_string(),
+                    IconName::Settings,
+                    Box::new(OpenSettings),
+                )
+                .menu_with_icon(
+                    theme_label.to_string(),
+                    theme_icon,
+                    Box::new(ToggleTheme),
                 )
             });
 
@@ -308,7 +323,7 @@ impl ChatApp {
                     .ghost()
                     .small()
                     .icon(IconName::Search)
-                    .tooltip("Search chats"),
+                    .tooltip(t!("sidebar.search").to_string()),
             )
     }
 }
@@ -326,7 +341,7 @@ impl Render for ChatApp {
         let active_title = active_view
             .as_ref()
             .map(|v| v.read(cx).title().clone())
-            .unwrap_or_else(|| "Chat".into());
+            .unwrap_or_else(|| t!("chat.fallback_title").to_string().into());
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
         // inside the top-level view of the window.
@@ -419,7 +434,7 @@ impl Render for ChatApp {
                     .ghost()
                     .small()
                     .icon(Icon::default().path("icons/square-pen.svg"))
-                    .tooltip("New chat")
+                    .tooltip(t!("sidebar.new_chat").to_string())
                     .on_click(
                         cx.listener(|this, _, window, cx| this.spawn_conversation(window, cx)),
                     ),
@@ -508,3 +523,15 @@ fn model_pill(title: SharedString, cx: &App) -> impl IntoElement {
 /// handler that this drag is ours.
 #[derive(Clone)]
 struct SidebarResize;
+
+/// Restore bounds of the window (excludes transient maximized/fullscreen
+/// size, which is exactly what we want to persist).
+fn geometry_of(window: &Window) -> WindowGeometry {
+    let bounds = window.window_bounds().get_bounds();
+    WindowGeometry {
+        x: bounds.origin.x.as_f32(),
+        y: bounds.origin.y.as_f32(),
+        width: bounds.size.width.as_f32(),
+        height: bounds.size.height.as_f32(),
+    }
+}

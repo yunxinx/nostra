@@ -1,0 +1,132 @@
+_version: 2
+sidebar:
+  chats:
+    en: Chats
+    zh-CN: 聊天
+  new_chat:
+    en: New chat
+    zh-CN: 新建聊天
+  search:
+    en: Search chats
+    zh-CN: 搜索聊天
+account:
+  settings:
+    en: Settings…
+    zh-CN: 设置…
+  switch_to_light:
+    en: Switch to light mode
+    zh-CN: 切换到浅色模式
+  switch_to_dark:
+    en: Switch to dark mode
+    zh-CN: 切换到深色模式
+chat:
+  default_title:
+    en: New chat
+    zh-CN: 新的聊天
+  fallback_title:
+    en: Chat
+    zh-CN: 聊天
+  placeholder:
+    en: "Send a message.  Enter to send, Shift+Enter for newline."
+    zh-CN: "发送消息。Enter 发送，Shift+Enter 换行。"
+  attach:
+    en: Attach
+    zh-CN: 添加附件
+  generating:
+    en: Generating...
+    zh-CN: 正在生成…
+  send_tooltip:
+    en: Send (Enter)
+    zh-CN: 发送（Enter）
+  empty_title:
+    en: How can I help you today?
+    zh-CN: 今天我能帮你做点什么？
+  empty_hint:
+    en: "Ask me anything.  Enter to send, Shift+Enter for newline."
+    zh-CN: "随便问点什么。Enter 发送，Shift+Enter 换行。"
+menu:
+  file:
+    en: File
+    zh-CN: 文件
+  view:
+    en: View
+    zh-CN: 显示
+  new_chat:
+    en: New Chat
+    zh-CN: 新建聊天
+  toggle_sidebar:
+    en: Toggle Sidebar
+    zh-CN: 切换侧边栏
+  toggle_theme:
+    en: Toggle Theme
+    zh-CN: 切换主题
+  settings:
+    en: "Settings…"
+    zh-CN: "设置…"
+  quit:
+    en: Quit
+    zh-CN: 退出
+settings:
+  title:
+    en: Settings
+    zh-CN: 设置
+  page:
+    general:
+      en: General
+      zh-CN: 通用
+    appearance:
+      en: Appearance
+      zh-CN: 外观
+    about:
+      en: About
+      zh-CN: 关于
+  language:
+    en: Interface language
+    zh-CN: 界面语言
+  language_desc:
+    en: Language used across the app UI.
+    zh-CN: 应用界面所使用的语言。
+  theme_mode:
+    en: Theme mode
+    zh-CN: 主题模式
+  theme_mode_desc:
+    en: Follow the system appearance, or always use light / dark.
+    zh-CN: 跟随系统外观，或固定使用浅色/深色。
+  mode:
+    system:
+      en: System
+      zh-CN: 跟随系统
+    light:
+      en: Light
+      zh-CN: 浅色
+    dark:
+      en: Dark
+      zh-CN: 深色
+  light_theme:
+    en: Light theme
+    zh-CN: 浅色主题
+  light_theme_desc:
+    en: Theme used while in light mode.
+    zh-CN: 浅色模式下使用的主题。
+  dark_theme:
+    en: Dark theme
+    zh-CN: 深色主题
+  dark_theme_desc:
+    en: Theme used while in dark mode.
+    zh-CN: 深色模式下使用的主题。
+  composer_font:
+    en: Composer font
+    zh-CN: 输入框字体
+  composer_font_desc:
+    en: Bundled font used by the message input; both options keep soft-wrap positions exact.
+    zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  about:
+    version:
+      en: Version
+      zh-CN: 版本
+    description:
+      en: A desktop chat client built with GPUI.
+      zh-CN: 基于 GPUI 构建的桌面聊天客户端。
+    license:
+      en: Released under the Apache License 2.0.
+      zh-CN: 基于 Apache License 2.0 许可发布。

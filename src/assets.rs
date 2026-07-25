@@ -15,6 +15,7 @@ use gpui_component_assets::Assets as ComponentAssets;
 #[folder = "assets"]
 #[include = "icons/**/*.svg"]
 #[include = "fonts/**/*.ttf"]
+#[include = "themes/**/*.json"]
 struct AppEmbed;
 
 /// Raw bytes of an app-embedded asset (e.g. a bundled font), by path

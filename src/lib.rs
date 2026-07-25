@@ -2,9 +2,10 @@
 //!
 //! The crate is organised as a library plus a thin binary so both `cargo
 //! run` and downstream consumers get a clean surface.  All platform wiring
-//! lives in `window`, all keyboard actions in `actions`, the palette
-//! overrides in `theme`, and persisted user preferences in `preferences`.
-//! The UI itself is the `ChatApp` view inside `app.rs`.
+//! lives in `window`, all keyboard actions in `actions`, theme management in
+//! `theme`, locale management in `i18n`, the settings window in `settings`,
+//! and persisted user preferences in `preferences`.  The UI itself is the
+//! `ChatApp` view inside `app.rs`.
 
 mod actions;
 mod app;
@@ -12,14 +13,20 @@ mod assets;
 mod assistant;
 mod chat;
 mod fonts;
+mod i18n;
 pub mod preferences;
+mod settings;
 mod theme;
 mod window;
 
-use gpui::App;
-use gpui_component::{ActiveTheme, Theme, ThemeMode};
+// Locale files live in `locales/`; English is the fallback for any key a
+// locale is missing.  The active locale defaults to zh-CN via preferences.
+rust_i18n::i18n!("locales", fallback = "en");
 
-use crate::actions::{Quit, ToggleComposerFont, ToggleTheme};
+use gpui::App;
+use gpui_component::ActiveTheme;
+
+use crate::actions::{OpenSettings, Quit, ToggleTheme};
 use crate::assets::NostraAssets;
 
 /// Entry point used by `main.rs`.
@@ -27,20 +34,22 @@ pub fn run() {
     let app = gpui_platform::application().with_assets(NostraAssets);
     app.run(|cx| {
         let prefs = preferences::load();
-        init(&prefs, cx);
+        init(prefs.clone(), cx);
         window::open_main_window(prefs, cx);
     });
 }
 
-/// One-time application setup: initialise components, theme, keys, menus.
-fn init(prefs: &preferences::Preferences, cx: &mut App) {
+/// One-time application setup: initialise components, prefs, locale, theme,
+/// fonts, keys, menus.
+fn init(prefs: preferences::Preferences, cx: &mut App) {
     gpui_component::init(cx);
-    fonts::init(prefs.composer_font, cx);
 
-    // Start from the system appearance, then honour the saved override if any.
-    Theme::sync_system_appearance(None, cx);
-    apply_saved_theme_mode(prefs, cx);
-    theme::apply_dark_palette(cx);
+    // The Prefs global is the single source of truth at runtime; seed it
+    // before any subsystem reads or writes settings.
+    i18n::init(prefs.language);
+    fonts::init(prefs.composer_font, cx);
+    preferences::init_global(prefs.clone(), cx);
+    theme::init(&prefs, cx);
 
     actions::bind_keys(cx);
     window::install_menus(cx);
@@ -50,34 +59,18 @@ fn init(prefs: &preferences::Preferences, cx: &mut App) {
     cx.activate(true);
 }
 
-fn apply_saved_theme_mode(prefs: &preferences::Preferences, cx: &mut App) {
-    let Some(saved) = prefs.theme_mode else {
-        return;
-    };
-    let target = if saved.is_dark() {
-        ThemeMode::Dark
-    } else {
-        ThemeMode::Light
-    };
-    if cx.theme().mode != target {
-        Theme::change(target, None, cx);
-    }
-}
-
 /// Application-scoped action handlers (per-view actions live in `app.rs`).
 fn install_action_handlers(cx: &mut App) {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 
     cx.on_action(|_: &ToggleTheme, cx: &mut App| {
         let next = if cx.theme().mode.is_dark() {
-            ThemeMode::Light
+            preferences::ThemeMode::Light
         } else {
-            ThemeMode::Dark
+            preferences::ThemeMode::Dark
         };
-        Theme::change(next, None, cx);
-        theme::apply_dark_palette(cx);
-        cx.refresh_windows();
+        theme::set_mode(Some(next), cx);
     });
 
-    cx.on_action(|_: &ToggleComposerFont, cx: &mut App| fonts::toggle(cx));
+    cx.on_action(|_: &OpenSettings, cx: &mut App| settings::open(cx));
 }
