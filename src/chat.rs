@@ -4,7 +4,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _},
@@ -24,11 +24,8 @@ const CONTENT_MAX_WIDTH: Pixels = px(760.);
 /// "scrolled back down" re-arm threshold for [`ChatView::follow`].
 const STICK_THRESHOLD: Pixels = px(48.);
 
-/// Bottom inset reserved for the floating composer so the last message stays
-/// readable and scroll-to-bottom lands above the input.  Sized for the default
-/// single-line auto-grow height plus outer padding; taller multi-line input may
-/// briefly overlap until the user scrolls.
-const COMPOSER_RESERVE: Pixels = px(120.);
+/// First-frame fallback until the floating composer reports its actual height.
+const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 
 /// Deliberately over-scrolled deferred target for the composer viewport.
 /// `InputState::set_scroll_offset` applies it after the next layout pass and
@@ -47,14 +44,21 @@ pub struct Message {
     pub body: Entity<TextViewState>,
 }
 
+#[derive(Clone)]
+pub enum ChatEvent {
+    TitleChanged(SharedString),
+}
+
 pub struct ChatView {
-    title: SharedString,
     messages: Vec<Message>,
     input: Entity<InputState>,
     /// Placeholder text currently installed in the input state.  Compared
     /// against the live translation each frame so a language switch updates
     /// the composer without rebuilding it (and without notify loops).
     placeholder: SharedString,
+    /// Last measured height of the complete floating composer, including its
+    /// outer padding. Used as the transcript's bottom inset.
+    composer_height: Pixels,
     scroll_handle: ScrollHandle,
     /// Whether streaming updates may pin the view to the bottom.  A single
     /// upward wheel tick clears it — distance alone isn't enough, because
@@ -68,11 +72,11 @@ pub struct ChatView {
 }
 
 impl ChatView {
-    pub fn view(title: impl Into<SharedString>, window: &mut Window, cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| Self::new(title, window, cx))
+    pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
+        cx.new(|cx| Self::new(window, cx))
     }
 
-    fn new(title: impl Into<SharedString>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let placeholder: SharedString = t!("chat.placeholder").to_string().into();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -88,11 +92,9 @@ impl ChatView {
                 |this, input, event, window, cx| match event {
                     InputEvent::PressEnter { shift, .. } if !shift => {
                         let text = input.read(cx).value().trim().to_string();
-                        if text.is_empty() {
-                            return;
+                        if this.submit(text, cx) {
+                            input.update(cx, |state, cx| state.set_value("", window, cx));
                         }
-                        input.update(cx, |state, cx| state.set_value("", window, cx));
-                        this.submit(text, cx);
                     }
                     InputEvent::Change => {
                         // After an edit that lands the caret on the last line
@@ -121,20 +123,16 @@ impl ChatView {
             );
 
         Self {
-            title: title.into(),
             messages: Vec::new(),
             input,
             placeholder,
+            composer_height: DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
             follow: true,
             pending: false,
             _reply_task: None,
             _subscriptions: vec![subscription],
         }
-    }
-
-    pub fn title(&self) -> &SharedString {
-        &self.title
     }
 
     /// Force the newest message into view.  Used right after the user sends a
@@ -163,13 +161,16 @@ impl ChatView {
         max + offset <= STICK_THRESHOLD
     }
 
-    fn submit(&mut self, text: String, cx: &mut Context<Self>) {
-        if self.pending {
-            return;
+    /// Submit a non-empty message when no reply is already in flight.
+    /// Returns whether the message was accepted so callers only clear the
+    /// composer after a successful submission.
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+        if self.pending || text.is_empty() {
+            return false;
         }
 
         if self.messages.is_empty() {
-            self.title = derive_title(&text);
+            cx.emit(ChatEvent::TitleChanged(derive_title(&text)));
         }
 
         let user_body = cx.new(|cx| TextViewState::markdown(&text, cx));
@@ -189,6 +190,7 @@ impl ChatView {
         self.follow = true;
         self.scroll_to_bottom();
         cx.notify();
+        true
     }
 
     pub fn finish_reply(&mut self, cx: &mut Context<Self>) {
@@ -199,14 +201,14 @@ impl ChatView {
 
     fn on_send_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return;
+        if self.submit(text, cx) {
+            self.input
+                .update(cx, |state, cx| state.set_value("", window, cx));
         }
-        self.input
-            .update(cx, |state, cx| state.set_value("", window, cx));
-        self.submit(text, cx);
     }
 }
+
+impl EventEmitter<ChatEvent> for ChatView {}
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -222,6 +224,8 @@ impl Render for ChatView {
 
         let has_messages = !self.messages.is_empty();
         let send_disabled = self.pending || self.input.read(cx).value().trim().is_empty();
+        let composer_height = self.composer_height;
+        let view = cx.weak_entity();
 
         // Full-height message viewport with a floating composer stacked on top
         // (gpui-component absolute overlay pattern).  Scrollbar tracks the right
@@ -232,9 +236,10 @@ impl Render for ChatView {
             .size_full()
             .bg(cx.theme().background)
             .child(if has_messages {
-                self.render_message_list(cx).into_any_element()
+                self.render_message_list(composer_height, cx)
+                    .into_any_element()
             } else {
-                render_empty_state(cx).into_any_element()
+                render_empty_state(composer_height, cx).into_any_element()
             })
             .child(
                 div()
@@ -242,13 +247,27 @@ impl Render for ChatView {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .child(self.render_input_area(send_disabled, cx)),
+                    .child(self.render_input_area(send_disabled, cx))
+                    .on_prepaint(move |bounds, _, cx| {
+                        view.update(cx, |this, cx| {
+                            let height = bounds.size.height;
+                            if this.composer_height != height {
+                                this.composer_height = height;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }),
             )
     }
 }
 
 impl ChatView {
-    fn render_message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_message_list(
+        &self,
+        composer_height: Pixels,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         // Relative, non-scrolling wrapper so the overlay scrollbar anchors to
         // the full panel height (including under the floating composer).
         div()
@@ -279,8 +298,8 @@ impl ChatView {
                             // Match the scrollbar thumb's 4px top inset so the
                             // first message aligns with the top of the thumb.
                             .pt(px(4.))
-                            // Leave room so the last message clears the floating composer.
-                            .pb(COMPOSER_RESERVE)
+                            // Leave exactly enough room for the measured floating composer.
+                            .pb(composer_height)
                             .gap_5()
                             .children(self.messages.iter().map(|m| render_message(m, cx))),
                     ),
@@ -308,6 +327,11 @@ impl ChatView {
                     .rounded(theme.radius_lg)
                     .shadow_md()
                     .py_1()
+                    // Input consumes wheel events while its viewport moves, but
+                    // deliberately propagates them at the top/bottom boundary.
+                    // Contain that remainder inside the floating composer so it
+                    // cannot scroll the transcript underneath.
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     // The multi-line Input places its overlay scrollbar inside its
                     // own horizontal padding and soft-wraps text 10px short of the
                     // text area (RIGHT_MARGIN, fixed upstream).  The thumb's left
@@ -408,13 +432,13 @@ fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
         .child(div().w_full().max_w(CONTENT_MAX_WIDTH).child(inner))
 }
 
-fn render_empty_state(cx: &App) -> impl IntoElement {
+fn render_empty_state(composer_height: Pixels, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     v_flex()
         .size_full()
         .items_center()
         .justify_center()
-        .pb(COMPOSER_RESERVE)
+        .pb(composer_height)
         .gap_2()
         .child(
             div()

@@ -14,6 +14,36 @@ use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::app::ChatApp;
 use crate::preferences::{Preferences, WindowGeometry};
 
+/// Weak handle used by application-level commands to reach the main view
+/// regardless of which window currently owns focus.
+#[derive(Default)]
+struct MainView(Option<WeakEntity<ChatApp>>);
+
+impl Global for MainView {}
+
+/// Route New Chat to the main window.
+pub fn new_chat(cx: &mut App) {
+    update_main(cx, |app, window, cx| app.new_chat(window, cx));
+}
+
+/// Route Toggle Sidebar to the main window.
+pub fn toggle_sidebar(cx: &mut App) {
+    update_main(cx, |app, _, cx| app.toggle_sidebar(cx));
+}
+
+fn update_main(
+    cx: &mut App,
+    update: impl FnOnce(&mut ChatApp, &mut Window, &mut Context<ChatApp>),
+) {
+    let Some(view) = cx
+        .try_global::<MainView>()
+        .and_then(|state| state.0.clone())
+    else {
+        return;
+    };
+    view.update_in(cx, update).ok();
+}
+
 /// Preferred initial window size; clamped to 85% of the primary display.
 const PREFERRED_SIZE: Size<Pixels> = Size {
     width: px(1180.),
@@ -28,7 +58,7 @@ const MIN_SIZE: Size<Pixels> = Size {
 
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
-    let bounds = initial_bounds(prefs.window, cx);
+    let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
 
     cx.spawn(async move |cx| -> Result<()> {
         let options = WindowOptions {
@@ -46,6 +76,7 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
         let window = cx
             .open_window(options, |window, cx| {
                 let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+                cx.set_global(MainView(Some(app_view.downgrade())));
 
                 // Default focus to the app root so global keybindings dispatch to it
                 // before any input steals focus.
@@ -110,15 +141,20 @@ pub fn install_menus(_cx: &mut App) {
 /// The restored size is clamped to the display it lands on, so a saved
 /// geometry from a larger (since disconnected) monitor never produces an
 /// oversized window.
-fn initial_bounds(saved: Option<WindowGeometry>, cx: &App) -> Bounds<Pixels> {
+pub(crate) fn restored_bounds(
+    saved: Option<WindowGeometry>,
+    preferred_size: Size<Pixels>,
+    minimum_size: Size<Pixels>,
+    cx: &App,
+) -> Bounds<Pixels> {
     if let Some(g) = saved {
         let finite = [g.x, g.y, g.width, g.height].iter().all(|v| v.is_finite());
         if finite {
             let mut bounds = Bounds {
                 origin: point(px(g.x), px(g.y)),
                 size: size(
-                    px(g.width).max(MIN_SIZE.width),
-                    px(g.height).max(MIN_SIZE.height),
+                    px(g.width).max(minimum_size.width),
+                    px(g.height).max(minimum_size.height),
                 ),
             };
             // A monitor may have been unplugged since the last run; only
@@ -136,11 +172,7 @@ fn initial_bounds(saved: Option<WindowGeometry>, cx: &App) -> Bounds<Pixels> {
         }
     }
 
-    clamped_bounds(cx)
-}
-
-fn clamped_bounds(cx: &App) -> Bounds<Pixels> {
-    let mut size = PREFERRED_SIZE;
+    let mut size = preferred_size;
     if let Some(display) = cx.primary_display() {
         let ds = display.bounds().size;
         size.width = size.width.min(ds.width * 0.85);

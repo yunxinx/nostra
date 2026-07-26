@@ -17,6 +17,7 @@ mod i18n;
 pub mod preferences;
 mod settings;
 mod theme;
+mod ui;
 mod window;
 
 // Locale files live in `locales/`; English is the fallback for any key a
@@ -26,7 +27,7 @@ rust_i18n::i18n!("locales", fallback = "en");
 use gpui::App;
 use gpui_component::ActiveTheme;
 
-use crate::actions::{OpenSettings, Quit, ToggleTheme};
+use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::assets::NostraAssets;
 
 /// Entry point used by `main.rs`.
@@ -73,4 +74,6 @@ fn install_action_handlers(cx: &mut App) {
     });
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| settings::open(cx));
+    cx.on_action(|_: &NewChat, cx: &mut App| window::new_chat(cx));
+    cx.on_action(|_: &ToggleSidebar, cx: &mut App| window::toggle_sidebar(cx));
 }

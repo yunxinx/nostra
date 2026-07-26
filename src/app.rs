@@ -15,9 +15,10 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::actions::{NewChat, OpenSettings, ToggleSidebar, ToggleTheme};
-use crate::chat::ChatView;
+use crate::actions::{OpenSettings, ToggleTheme};
+use crate::chat::{ChatEvent, ChatView};
 use crate::preferences::{self, Preferences, WindowGeometry};
+use crate::{theme, ui};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -42,7 +43,7 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
 pub struct ChatApp {
     focus_handle: FocusHandle,
-    conversations: Vec<Entity<ChatView>>,
+    conversations: Vec<Conversation>,
     active: usize,
     collapsed: bool,
     /// True once the user has toggled the sidebar at least once.  Prevents an
@@ -59,6 +60,11 @@ pub struct ChatApp {
     /// observer and persisted on quit.
     window_geometry: Option<WindowGeometry>,
     _subscriptions: Vec<Subscription>,
+}
+
+struct Conversation {
+    view: Entity<ChatView>,
+    title: SharedString,
 }
 
 impl ChatApp {
@@ -78,10 +84,11 @@ impl ChatApp {
             has_toggled: false,
             sidebar_width,
             resize_start: None,
-            window_geometry: Some(geometry_of(window)),
+            window_geometry: Some(WindowGeometry::from_window(window)),
             _subscriptions: Vec::new(),
         };
         this.track_window_geometry(window, cx);
+        this.track_system_appearance(window, cx);
         this.spawn_conversation(window, cx);
         this.register_save_on_quit(cx);
         this
@@ -92,7 +99,16 @@ impl ChatApp {
     /// as a bounds change.
     fn track_window_geometry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let sub = cx.observe_window_bounds(window, |this, window, _| {
-            this.window_geometry = Some(geometry_of(window));
+            this.window_geometry = Some(WindowGeometry::from_window(window));
+        });
+        self._subscriptions.push(sub);
+    }
+
+    /// Keep a "follow system" theme live after startup. The subscription is
+    /// window-scoped and drops with the root view.
+    fn track_system_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.observe_window_appearance(window, |_, window, cx| {
+            theme::sync_system_appearance(window, cx);
         });
         self._subscriptions.push(sub);
     }
@@ -122,9 +138,23 @@ impl ChatApp {
     }
 
     fn spawn_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = ChatView::view(t!("chat.default_title").to_string(), window, cx);
-        let sub = cx.observe(&view, |_, _, cx| cx.notify());
-        self.conversations.push(view);
+        let title: SharedString = t!("chat.default_title").to_string().into();
+        let view = ChatView::view(window, cx);
+        let sub = cx.subscribe(&view, |this, view, event, cx| {
+            let ChatEvent::TitleChanged(title) = event;
+            let Some(conversation) = this
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation.view.entity_id() == view.entity_id())
+            else {
+                return;
+            };
+            if conversation.title != *title {
+                conversation.title = title.clone();
+                cx.notify();
+            }
+        });
+        self.conversations.push(Conversation { view, title });
         self._subscriptions.push(sub);
         self.active = self.conversations.len() - 1;
         cx.notify();
@@ -137,18 +167,14 @@ impl ChatApp {
         }
     }
 
-    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.collapsed = !self.collapsed;
         self.has_toggled = true;
         cx.notify();
     }
 
-    fn on_new_chat(&mut self, _: &NewChat, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.spawn_conversation(window, cx);
-    }
-
-    fn on_toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_sidebar(cx);
     }
 
     /// Vertical drag hit-area at the sidebar's right edge.  Uses gpui's
@@ -191,13 +217,18 @@ impl ChatApp {
 
     // ---------- Sidebar rendering ----------
 
-    fn render_sidebar_panel(&self, active: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar_panel(
+        &self,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         v_flex()
             .size_full()
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().sidebar_foreground)
             .child(self.render_sidebar_top_row(cx))
-            .child(self.render_sidebar_content(active, cx))
+            .child(self.render_sidebar_content(active, window, cx))
             .child(self.render_sidebar_footer(cx))
             .into_any_element()
     }
@@ -210,34 +241,61 @@ impl ChatApp {
         div().h(TITLE_BAR_HEIGHT).flex_shrink_0()
     }
 
-    fn render_sidebar_content(&self, active: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let items = self.conversations.iter().enumerate().map(|(i, view)| {
-            let title = view.read(cx).title().clone();
-            let is_active = i == active;
-            div()
-                .id(("conv", i))
-                .flex_shrink_0()
-                .h(px(32.))
-                .px_2()
-                .flex()
-                .items_center()
-                .rounded(cx.theme().radius)
-                .text_sm()
-                .text_color(cx.theme().sidebar_foreground)
-                .cursor_pointer()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .when(is_active, |this| {
-                    this.bg(cx.theme().sidebar_accent)
-                        .text_color(cx.theme().sidebar_accent_foreground)
-                })
-                .hover(|this| {
-                    this.bg(cx.theme().sidebar_accent)
-                        .text_color(cx.theme().sidebar_accent_foreground)
-                })
-                .on_click(cx.listener(move |this, _, _, cx| this.select(i, cx)))
-                .child(div().overflow_hidden().text_ellipsis().child(title))
-        });
+    fn render_sidebar_content(
+        &self,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let items = self
+            .conversations
+            .iter()
+            .enumerate()
+            .map(|(i, conversation)| {
+                let title = conversation.title.clone();
+                let is_active = i == active;
+                let id = ElementId::NamedInteger("conv".into(), i as u64);
+                let focus_handle = window
+                    .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+                    .read(cx)
+                    .clone();
+                let focus_ring = cx.theme().ring.opacity(0.2);
+
+                div()
+                    .id(id)
+                    .role(Role::Button)
+                    .aria_label(title.clone())
+                    .aria_selected(is_active)
+                    .track_focus(&focus_handle.tab_stop(true))
+                    .focus_visible(|this| this.border_1().border_color(focus_ring))
+                    .flex_shrink_0()
+                    .h(px(32.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .text_sm()
+                    .text_color(cx.theme().sidebar_foreground)
+                    .cursor_default()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when(is_active, |this| {
+                        this.bg(cx.theme().sidebar_accent)
+                            .text_color(cx.theme().sidebar_accent_foreground)
+                    })
+                    .hover(|this| {
+                        this.bg(cx.theme().sidebar_accent)
+                            .text_color(cx.theme().sidebar_accent_foreground)
+                    })
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if ui::consume_button_key(event, window, cx) {
+                            this.select(i, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(i, cx)))
+                    .child(div().overflow_hidden().text_ellipsis().child(title))
+            })
+            .collect::<Vec<_>>();
 
         v_flex()
             .id("chats")
@@ -337,10 +395,14 @@ impl Focusable for ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active;
-        let active_view = self.conversations.get(active).cloned();
-        let active_title = active_view
-            .as_ref()
-            .map(|v| v.read(cx).title().clone())
+        let active_view = self
+            .conversations
+            .get(active)
+            .map(|conversation| conversation.view.clone());
+        let active_title = self
+            .conversations
+            .get(active)
+            .map(|conversation| conversation.title.clone())
             .unwrap_or_else(|| t!("chat.fallback_title").to_string().into());
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
@@ -360,7 +422,7 @@ impl Render for ChatApp {
             .w(sidebar_width)
             .h_full()
             .relative()
-            .child(self.render_sidebar_panel(active, cx))
+            .child(self.render_sidebar_panel(active, window, cx))
             .child(self.render_resize_handle(cx));
 
         let (from_w, to_w) = if self.collapsed {
@@ -484,8 +546,6 @@ impl Render for ChatApp {
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
-            .on_action(cx.listener(Self::on_new_chat))
-            .on_action(cx.listener(Self::on_toggle_sidebar))
             .child(
                 h_flex()
                     .size_full()
@@ -523,15 +583,3 @@ fn model_pill(title: SharedString, cx: &App) -> impl IntoElement {
 /// handler that this drag is ours.
 #[derive(Clone)]
 struct SidebarResize;
-
-/// Restore bounds of the window (excludes transient maximized/fullscreen
-/// size, which is exactly what we want to persist).
-fn geometry_of(window: &Window) -> WindowGeometry {
-    let bounds = window.window_bounds().get_bounds();
-    WindowGeometry {
-        x: bounds.origin.x.as_f32(),
-        y: bounds.origin.y.as_f32(),
-        width: bounds.size.width.as_f32(),
-        height: bounds.size.height.as_f32(),
-    }
-}

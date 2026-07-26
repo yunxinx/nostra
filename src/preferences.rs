@@ -4,12 +4,15 @@
 //! startup.  Any deserialize failure falls back to `Preferences::default`, so
 //! users never see a startup error just because the on-disk format has
 //! drifted.  At runtime the current values live in the [`Prefs`] app-global;
-//! mutations go through [`update`], which persists asynchronously so settings
-//! survive even if the app never quits cleanly.
+//! mutations go through [`update`], which persists synchronously and atomically
+//! so settings survive even if the app never quits cleanly.
 
-use std::path::PathBuf;
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+};
 
-use gpui::{App, Global};
+use gpui::{App, Global, Window};
 use serde::{Deserialize, Serialize};
 
 /// Directory name inside the platform config root.
@@ -26,7 +29,7 @@ pub struct Preferences {
     #[serde(default)]
     pub sidebar_collapsed: bool,
     /// Explicit theme mode override.  `None` means "follow system".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "theme_mode_or_default")]
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.  Tolerant of values from
     /// older preference files (unknown names fall back to the default font
@@ -47,6 +50,10 @@ pub struct Preferences {
     /// run; invalid values are clamped or discarded at restore time.
     #[serde(default)]
     pub window: Option<WindowGeometry>,
+    /// Last known settings-window geometry. `None` until that window has
+    /// been opened; invalid values are discarded at restore time.
+    #[serde(default)]
+    pub settings_window: Option<WindowGeometry>,
 }
 
 /// Deserialize a [`ComposerFont`] via its derived impl, mapping unknown
@@ -70,6 +77,16 @@ where
     Ok(Language::deserialize(value).unwrap_or_default())
 }
 
+/// Unknown theme modes degrade to "follow system" without invalidating the
+/// rest of the preferences file.
+fn theme_mode_or_default<'de, D>(d: D) -> Result<Option<ThemeMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|value| ThemeMode::deserialize(value).ok()))
+}
+
 fn default_sidebar_width() -> f32 {
     272.0
 }
@@ -85,6 +102,7 @@ impl Default for Preferences {
             light_theme: None,
             dark_theme: None,
             window: None,
+            settings_window: None,
         }
     }
 }
@@ -148,6 +166,19 @@ pub struct WindowGeometry {
     pub y: f32,
     pub width: f32,
     pub height: f32,
+}
+
+impl WindowGeometry {
+    /// Capture normal restore bounds (not transient maximized/fullscreen size).
+    pub fn from_window(window: &Window) -> Self {
+        let bounds = window.window_bounds().get_bounds();
+        Self {
+            x: bounds.origin.x.as_f32(),
+            y: bounds.origin.y.as_f32(),
+            width: bounds.size.width.as_f32(),
+            height: bounds.size.height.as_f32(),
+        }
+    }
 }
 
 /// Fonts the composer can render with.  The default bundles Latin + CJK +
@@ -289,11 +320,28 @@ pub fn save(prefs: &Preferences) -> anyhow::Result<()> {
     let Some(p) = path() else {
         anyhow::bail!("no config directory available on this platform");
     };
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(prefs)?;
-    std::fs::write(&p, json)?;
+    save_to_path(&p, prefs)
+}
+
+/// Persist preferences by atomically replacing the target with a fully
+/// written temporary file from the same directory.
+fn save_to_path(path: &Path, prefs: &Preferences) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(prefs)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&json)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+
+    // Persist the directory entry as well as the file contents on Unix.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+
     Ok(())
 }
 
@@ -339,6 +387,7 @@ mod tests {
         assert_eq!(prefs.light_theme, None);
         assert_eq!(prefs.dark_theme, None);
         assert_eq!(prefs.window, None);
+        assert_eq!(prefs.settings_window, None);
     }
 
     /// Unknown enum tags (from newer or older builds) degrade to defaults
@@ -355,6 +404,42 @@ mod tests {
     }
 
     #[test]
+    fn unknown_theme_mode_falls_back_without_discarding_other_preferences() {
+        let json = r#"{
+            "sidebar_width": 336.0,
+            "sidebar_collapsed": true,
+            "theme_mode": "sepia",
+            "language": "en"
+        }"#;
+
+        let prefs: Preferences = serde_json::from_str(json).expect("preferences must parse");
+
+        assert_eq!(prefs.sidebar_width, 336.0);
+        assert!(prefs.sidebar_collapsed);
+        assert_eq!(prefs.theme_mode, None);
+        assert_eq!(prefs.language, Language::En);
+    }
+
+    #[test]
+    fn atomic_save_replaces_an_existing_preferences_file() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "truncated old contents").expect("seed old file");
+        let prefs = Preferences {
+            sidebar_width: 336.0,
+            language: Language::En,
+            ..Preferences::default()
+        };
+
+        save_to_path(&path, &prefs).expect("save preferences atomically");
+
+        let saved = std::fs::read_to_string(path).expect("read saved preferences");
+        let parsed: Preferences = serde_json::from_str(&saved).expect("saved JSON must parse");
+        assert_eq!(parsed.sidebar_width, 336.0);
+        assert_eq!(parsed.language, Language::En);
+    }
+
+    #[test]
     fn window_geometry_round_trips() {
         let prefs = Preferences {
             window: Some(WindowGeometry {
@@ -363,11 +448,18 @@ mod tests {
                 width: 1180.0,
                 height: 760.0,
             }),
+            settings_window: Some(WindowGeometry {
+                x: 120.0,
+                y: 80.0,
+                width: 820.0,
+                height: 560.0,
+            }),
             ..Preferences::default()
         };
         let json = serde_json::to_string(&prefs).expect("serialize");
         let back: Preferences = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.window, prefs.window);
+        assert_eq!(back.settings_window, prefs.settings_window);
     }
 
     /// Language keys are the stable dropdown identifiers; the round trip

@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use gpui::App;
+use gpui::{App, Window};
 use gpui_component::{ActiveTheme as _, Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 
 use crate::assets;
@@ -59,6 +59,17 @@ pub fn set_mode(mode: Option<preferences::ThemeMode>, cx: &mut App) {
 /// The persisted mode preference (`None` = follow system).
 pub fn mode_preference(cx: &App) -> Option<preferences::ThemeMode> {
     preferences::get(cx).theme_mode
+}
+
+/// Apply a system appearance change when the user has chosen to follow the
+/// system. Explicit light/dark preferences deliberately ignore the event.
+pub fn sync_system_appearance(window: &mut Window, cx: &mut App) {
+    if mode_preference(cx).is_some() {
+        return;
+    }
+
+    Theme::sync_system_appearance(Some(window), cx);
+    cx.refresh_windows();
 }
 
 /// Select a registered theme by name.  The theme lands in the slot matching

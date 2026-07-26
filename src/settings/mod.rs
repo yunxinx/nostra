@@ -18,6 +18,12 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
+use crate::{
+    preferences::{self, WindowGeometry},
+    ui::consume_button_key,
+    window,
+};
+
 /// Preferred size of the settings window; clamped to 85% of the display.
 const PREFERRED_SIZE: Size<Pixels> = Size {
     width: px(820.),
@@ -61,7 +67,12 @@ pub fn open(cx: &mut App) {
         }
     }
 
-    let bounds = Bounds::centered(None, clamped_size(cx), cx);
+    let bounds = window::restored_bounds(
+        preferences::get(cx).settings_window,
+        PREFERRED_SIZE,
+        MIN_SIZE,
+        cx,
+    );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitleBar::title_bar_options()),
@@ -124,16 +135,6 @@ pub fn refresh_native_title(cx: &mut App) {
     }
 }
 
-fn clamped_size(cx: &App) -> Size<Pixels> {
-    let mut size = PREFERRED_SIZE;
-    if let Some(display) = cx.primary_display() {
-        let ds = display.bounds().size;
-        size.width = size.width.min(ds.width * 0.85);
-        size.height = size.height.min(ds.height * 0.85);
-    }
-    size
-}
-
 /// The settings pages reachable from the left nav.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -174,21 +175,47 @@ impl Page {
 struct SettingsWindow {
     focus_handle: FocusHandle,
     active: Page,
+    window_geometry: WindowGeometry,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsWindow {
-    fn new(_: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let bounds_subscription = cx.observe_window_bounds(window, |this, window, _| {
+            this.window_geometry = WindowGeometry::from_window(window);
+        });
+        cx.on_release(|this, cx| {
+            let geometry = this.window_geometry;
+            preferences::update(cx, |prefs| prefs.settings_window = Some(geometry));
+        })
+        .detach();
+
         Self {
             focus_handle: cx.focus_handle(),
             active: Page::General,
+            window_geometry: WindowGeometry::from_window(window),
+            _subscriptions: vec![bounds_subscription],
         }
     }
 
-    fn render_nav(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let items = Page::ALL.map(|page| {
             let is_active = page == self.active;
+            let title = page.title();
+            let id: ElementId = page.id().into();
+            let focus_handle = window
+                .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
+                .read(cx)
+                .clone();
+            let focus_ring = cx.theme().ring.opacity(0.2);
+
             h_flex()
-                .id(page.id())
+                .id(id)
+                .role(Role::Button)
+                .aria_label(title.clone())
+                .aria_selected(is_active)
+                .track_focus(&focus_handle.tab_stop(true))
+                .focus_visible(|this| this.border_1().border_color(focus_ring))
                 .h(px(30.))
                 .px_2()
                 .gap_2()
@@ -196,7 +223,7 @@ impl SettingsWindow {
                 .rounded(cx.theme().radius)
                 .text_sm()
                 .text_color(cx.theme().sidebar_foreground)
-                .cursor_pointer()
+                .cursor_default()
                 .when(is_active, |this| {
                     this.bg(cx.theme().sidebar_accent)
                         .text_color(cx.theme().sidebar_accent_foreground)
@@ -205,6 +232,12 @@ impl SettingsWindow {
                     this.bg(cx.theme().sidebar_accent)
                         .text_color(cx.theme().sidebar_accent_foreground)
                 })
+                .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                    if consume_button_key(event, window, cx) && this.active != page {
+                        this.active = page;
+                        cx.notify();
+                    }
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.active != page {
                         this.active = page;
@@ -216,7 +249,7 @@ impl SettingsWindow {
                         .size_4()
                         .text_color(cx.theme().sidebar_foreground.opacity(0.8)),
                 )
-                .child(page.title())
+                .child(title)
         });
 
         v_flex()
@@ -294,7 +327,7 @@ impl Render for SettingsWindow {
                 h_flex()
                     .size_full()
                     .items_stretch()
-                    .child(self.render_nav(cx))
+                    .child(self.render_nav(window, cx))
                     .child(self.render_content(cx)),
             )
             .children(sheet_layer)

@@ -20,18 +20,19 @@ pub fn stream_reply(
     cx: &mut Context<ChatView>,
 ) -> Task<()> {
     let chunks = mock_chunks(prompt);
-    let view = cx.entity();
 
-    cx.spawn(async move |_, cx| {
+    cx.spawn(async move |view, cx| {
         for chunk in chunks {
             cx.background_executor()
                 .timer(Duration::from_millis(28))
                 .await;
             target.update(cx, |state, cx| state.push_str(&chunk, cx));
-            view.update(cx, |chat, _| chat.follow_stream());
+            if view.update(cx, |chat, _| chat.follow_stream()).is_err() {
+                return;
+            }
         }
 
-        view.update(cx, |chat, cx| chat.finish_reply(cx));
+        view.update(cx, |chat, cx| chat.finish_reply(cx)).ok();
     })
 }
 
