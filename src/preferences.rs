@@ -20,6 +20,7 @@ use crate::llm::{ModelSelection, ProviderProfile};
 /// Directory name inside the platform config root.
 const APP_DIRNAME: &str = "nostra";
 const FILE_NAME: &str = "preferences.json";
+pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.85;
 
 /// Snapshot of user preferences that survives across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +34,10 @@ pub struct Preferences {
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.
     pub composer_font: ComposerFont,
+    /// Whether supported windows use the native macOS blurred backdrop.
+    pub glass_effect: bool,
+    /// Opacity of the theme tint drawn above the native blurred backdrop.
+    pub glass_tint_opacity: f32,
     /// UI language.
     pub language: Language,
     /// Theme name applied while in light mode.  `None` or an unregistered
@@ -63,6 +68,8 @@ impl Default for Preferences {
             sidebar_collapsed: false,
             theme_mode: None,
             composer_font: ComposerFont::default(),
+            glass_effect: false,
+            glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             language: Language::default(),
             light_theme: None,
             dark_theme: None,
@@ -360,6 +367,13 @@ mod tests {
         .expect("serialize");
         unknown_geometry["window"]["legacy_scale"] = serde_json::Value::from(2);
         assert!(serde_json::from_value::<Preferences>(unknown_geometry).is_err());
+    }
+
+    #[test]
+    fn glass_effect_is_disabled_by_default() {
+        let prefs = Preferences::default();
+        assert!(!prefs.glass_effect);
+        assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
     }
 
     #[test]

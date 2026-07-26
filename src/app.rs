@@ -20,7 +20,7 @@ use crate::actions::{OpenSettings, ToggleTheme};
 use crate::chat::{ChatEvent, ChatView};
 use crate::llm::ModelSelection;
 use crate::preferences::{self, Preferences, WindowGeometry};
-use crate::{providers, theme, ui};
+use crate::{glass, providers, theme, ui};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -245,7 +245,7 @@ impl ChatApp {
     ) -> AnyElement {
         v_flex()
             .size_full()
-            .bg(cx.theme().sidebar)
+            .bg(glass::background(cx.theme().sidebar, cx))
             .text_color(cx.theme().sidebar_foreground)
             .child(self.render_sidebar_top_row(cx))
             .child(self.render_sidebar_content(active, window, cx))

@@ -14,10 +14,13 @@ mod ui;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
+#[cfg(target_os = "macos")]
+use gpui_component::slider::{SliderEvent, SliderState};
 use gpui_component::{ActiveTheme, Icon, IconName, Root, TITLE_BAR_HEIGHT, h_flex, v_flex};
 use rust_i18n::t;
 
 use crate::{
+    glass,
     preferences::{self, WindowGeometry},
     ui::consume_button_key,
     window,
@@ -77,6 +80,8 @@ pub fn open(cx: &mut App) {
         titlebar: Some(window::title_bar_options()),
         window_min_size: Some(MIN_SIZE),
         kind: WindowKind::Normal,
+        #[cfg(target_os = "macos")]
+        window_background: glass::window_background(preferences::get(cx).glass_effect),
         #[cfg(target_os = "linux")]
         window_background: WindowBackgroundAppearance::Transparent,
         #[cfg(target_os = "linux")]
@@ -97,7 +102,7 @@ pub fn open(cx: &mut App) {
             }
         });
 
-        cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
+        cx.new(|cx| Root::new(view, window, cx).bg(glass::root_background(cx.theme().background)))
     }) {
         Ok(handle) => {
             handle
@@ -184,27 +189,59 @@ struct SettingsWindow {
     focus_handle: FocusHandle,
     active: Page,
     providers: Entity<providers::ProvidersPage>,
+    #[cfg(target_os = "macos")]
+    glass_opacity: Entity<SliderState>,
     window_geometry: WindowGeometry,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsWindow {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        #[cfg(target_os = "macos")]
+        let glass_opacity = {
+            let initial_opacity = glass::tint_opacity(cx) * 100.;
+            cx.new(|_| {
+                SliderState::new()
+                    .min(glass::MIN_TINT_PERCENT)
+                    .max(glass::MAX_TINT_PERCENT)
+                    .step(1.)
+                    .default_value(initial_opacity)
+            })
+        };
         let bounds_subscription = cx.observe_window_bounds(window, |this, window, _| {
             this.window_geometry = WindowGeometry::from_window(window);
         });
         cx.on_release(|this, cx| {
             let geometry = this.window_geometry;
             preferences::update(cx, |prefs| prefs.settings_window = Some(geometry));
+            #[cfg(target_os = "macos")]
+            glass::commit_tint_preview(cx);
         })
         .detach();
+
+        let mut subscriptions = vec![bounds_subscription];
+        #[cfg(target_os = "macos")]
+        subscriptions.push(cx.subscribe_in(
+            &glass_opacity,
+            window,
+            |_, _, event: &SliderEvent, _, cx| match event {
+                SliderEvent::Change(value) => {
+                    glass::preview_tint_opacity(value.start() / 100., cx);
+                }
+                SliderEvent::Release(value) => {
+                    glass::persist_tint_opacity(value.start() / 100., cx);
+                }
+            },
+        ));
 
         Self {
             focus_handle: cx.focus_handle(),
             active: Page::General,
             providers: cx.new(|cx| providers::ProvidersPage::new(window, cx)),
+            #[cfg(target_os = "macos")]
+            glass_opacity,
             window_geometry: WindowGeometry::from_window(window),
-            _subscriptions: vec![bounds_subscription],
+            _subscriptions: subscriptions,
         }
     }
 
@@ -266,7 +303,7 @@ impl SettingsWindow {
             .w(NAV_WIDTH)
             .h_full()
             .flex_shrink_0()
-            .bg(cx.theme().sidebar)
+            .bg(glass::background(cx.theme().sidebar, cx))
             .text_color(cx.theme().sidebar_foreground)
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
@@ -284,7 +321,11 @@ impl SettingsWindow {
     fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.active {
             Page::General => general::render(cx),
-            Page::Appearance => appearance::render(cx),
+            Page::Appearance => appearance::render(
+                cx,
+                #[cfg(target_os = "macos")]
+                &self.glass_opacity,
+            ),
             Page::Providers => self.providers.clone().into_any_element(),
             Page::About => about::render(cx),
         };
@@ -332,7 +373,6 @@ impl Render for SettingsWindow {
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
-            .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
                 h_flex()

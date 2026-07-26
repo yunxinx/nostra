@@ -12,6 +12,7 @@ use rust_i18n::t;
 
 use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::app::ChatApp;
+use crate::glass;
 use crate::preferences::{Preferences, WindowGeometry};
 
 /// Weak handle used by application-level commands to reach the main view
@@ -77,6 +78,8 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
             titlebar: Some(title_bar_options()),
             window_min_size: Some(MIN_SIZE),
             kind: WindowKind::Normal,
+            #[cfg(target_os = "macos")]
+            window_background: glass::window_background(prefs.glass_effect),
             #[cfg(target_os = "linux")]
             window_background: WindowBackgroundAppearance::Transparent,
             #[cfg(target_os = "linux")]
@@ -98,7 +101,10 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
                     }
                 });
 
-                cx.new(|cx| Root::new(app_view, window, cx).bg(cx.theme().background))
+                cx.new(|cx| {
+                    Root::new(app_view, window, cx)
+                        .bg(glass::root_background(cx.theme().background))
+                })
             })
             .context("failed to open main window")?;
 

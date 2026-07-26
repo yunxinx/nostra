@@ -387,7 +387,6 @@ impl Render for ChatView {
         div()
             .relative()
             .size_full()
-            .bg(cx.theme().background)
             .child(if has_messages {
                 self.render_message_list(composer_height, cx)
                     .into_any_element()

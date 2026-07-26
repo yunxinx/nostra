@@ -1,9 +1,19 @@
 //! "Appearance" settings page: theme mode, light/dark theme, composer font.
 
-use gpui::{AnyElement, App, SharedString};
+use gpui::{AnyElement, App, IntoElement as _, SharedString};
+#[cfg(target_os = "macos")]
+use gpui::{Entity, ParentElement as _, Styled as _, px};
+#[cfg(target_os = "macos")]
+use gpui_component::{
+    Sizable as _, h_flex,
+    slider::{Slider, SliderState},
+    switch::Switch,
+};
 use rust_i18n::t;
 
 use super::ui;
+#[cfg(target_os = "macos")]
+use crate::glass;
 use crate::preferences::{ComposerFont, ThemeMode};
 use crate::{fonts, theme};
 
@@ -12,14 +22,54 @@ const MODE_SYSTEM: &str = "system";
 const MODE_LIGHT: &str = "light";
 const MODE_DARK: &str = "dark";
 
-pub(super) fn render(cx: &App) -> AnyElement {
-    ui::section(
-        vec![
-            theme_mode_row(cx),
-            theme_row(false, cx),
-            theme_row(true, cx),
-            composer_font_row(cx),
-        ],
+pub(super) fn render(
+    cx: &App,
+    #[cfg(target_os = "macos")] glass_opacity: &Entity<SliderState>,
+) -> AnyElement {
+    let mut rows = vec![
+        theme_mode_row(cx),
+        theme_row(false, cx),
+        theme_row(true, cx),
+        composer_font_row(cx),
+    ];
+    #[cfg(target_os = "macos")]
+    {
+        rows.push(glass_effect_row(cx));
+        rows.push(glass_opacity_row(glass_opacity, cx));
+    }
+
+    ui::section(rows, cx)
+}
+
+#[cfg(target_os = "macos")]
+fn glass_opacity_row(slider: &Entity<SliderState>, cx: &App) -> AnyElement {
+    let percent = slider.read(cx).value().start().round() as i32;
+    ui::row(
+        "glass-opacity",
+        t!("settings.glass_opacity").to_string(),
+        Some(t!("settings.glass_opacity_desc").to_string()),
+        h_flex()
+            .w(px(220.))
+            .gap_3()
+            .items_center()
+            .child(Slider::new(slider).flex_1().disabled(!glass::enabled(cx)))
+            .child(format!("{percent}%"))
+            .into_any_element(),
+        cx,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn glass_effect_row(cx: &App) -> AnyElement {
+    ui::row(
+        "glass-effect",
+        t!("settings.glass_effect").to_string(),
+        Some(t!("settings.glass_effect_desc").to_string()),
+        Switch::new("glass-effect-switch")
+            .small()
+            .checked(glass::enabled(cx))
+            .on_click(|checked, window, cx| glass::set_enabled(*checked, window, cx))
+            .into_any_element(),
         cx,
     )
 }

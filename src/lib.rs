@@ -13,6 +13,7 @@ mod assets;
 mod assistant;
 mod chat;
 mod fonts;
+mod glass;
 mod i18n;
 pub mod llm;
 pub mod preferences;
@@ -55,6 +56,7 @@ fn init(prefs: preferences::Preferences, cx: &mut App) {
     i18n::init(prefs.language);
     fonts::init(prefs.composer_font, cx);
     preferences::init_global(prefs.clone(), cx);
+    glass::init(cx);
     theme::init(&prefs, cx);
 
     actions::bind_keys(cx);

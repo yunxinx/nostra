@@ -157,6 +157,18 @@ settings:
   composer_font_desc:
     en: Bundled font used by the message input; both options keep soft-wrap positions exact.
     zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  glass_effect:
+    en: Glass effect
+    zh-CN: 毛玻璃效果
+  glass_effect_desc:
+    en: Use the native macOS blurred backdrop with a translucent theme tint.
+    zh-CN: 使用 macOS 原生背景模糊，并叠加半透明主题色。
+  glass_opacity:
+    en: Glass opacity
+    zh-CN: 毛玻璃不透明度
+  glass_opacity_desc:
+    en: Adjust the opacity of the theme tint above the native blurred backdrop.
+    zh-CN: 调整原生模糊背景上方主题色遮罩的不透明度。
   providers:
     new_profile:
       en: New provider
