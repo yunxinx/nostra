@@ -13,9 +13,7 @@ mod ui;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{
-    ActiveTheme, Icon, IconName, Root, TITLE_BAR_HEIGHT, TitleBar, h_flex, v_flex,
-};
+use gpui_component::{ActiveTheme, Icon, IconName, Root, TITLE_BAR_HEIGHT, h_flex, v_flex};
 use rust_i18n::t;
 
 use crate::{
@@ -75,7 +73,7 @@ pub fn open(cx: &mut App) {
     );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitleBar::title_bar_options()),
+        titlebar: Some(window::title_bar_options()),
         window_min_size: Some(MIN_SIZE),
         kind: WindowKind::Normal,
         #[cfg(target_os = "linux")]

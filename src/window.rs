@@ -56,6 +56,17 @@ const MIN_SIZE: Size<Pixels> = Size {
     height: px(480.),
 };
 
+/// gpui-component centers app content in a 34px title bar, while its default
+/// macOS traffic-light inset places the native controls 1px above that center.
+pub(crate) fn title_bar_options() -> TitlebarOptions {
+    let mut options = TitleBar::title_bar_options();
+    #[cfg(target_os = "macos")]
+    {
+        options.traffic_light_position = Some(point(px(9.), px(10.)));
+    }
+    options
+}
+
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
@@ -63,7 +74,7 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     cx.spawn(async move |cx| -> Result<()> {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitleBar::title_bar_options()),
+            titlebar: Some(title_bar_options()),
             window_min_size: Some(MIN_SIZE),
             kind: WindowKind::Normal,
             #[cfg(target_os = "linux")]
@@ -179,4 +190,17 @@ pub(crate) fn restored_bounds(
         size.height = size.height.min(ds.height * 0.85);
     }
     Bounds::centered(None, size, cx)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use gpui::{point, px};
+
+    #[test]
+    fn title_bar_centers_native_traffic_lights() {
+        assert_eq!(
+            super::title_bar_options().traffic_light_position,
+            Some(point(px(9.), px(10.)))
+        );
+    }
 }
