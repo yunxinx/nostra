@@ -1,9 +1,9 @@
 //! Persistent user preferences (sidebar, theme, language, window geometry).
 //!
 //! Prefs are written to a platform-specific config directory and read back on
-//! startup.  Any deserialize failure falls back to `Preferences::default`, so
-//! users never see a startup error just because the on-disk format has
-//! drifted.  At runtime the current values live in the [`Prefs`] app-global;
+//! startup. Any invalid current-schema document falls back to
+//! `Preferences::default`. At runtime the current values live in the [`Prefs`]
+//! app-global;
 //! mutations go through [`update`], which persists synchronously and atomically
 //! so settings survive even if the app never quits cleanly.
 
@@ -15,76 +15,41 @@ use std::{
 use gpui::{App, Global, Window};
 use serde::{Deserialize, Serialize};
 
+use crate::llm::{ModelSelection, ProviderProfile};
+
 /// Directory name inside the platform config root.
 const APP_DIRNAME: &str = "nostra";
 const FILE_NAME: &str = "preferences.json";
 
 /// Snapshot of user preferences that survives across restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Preferences {
     /// Sidebar width in the expanded state.
-    #[serde(default = "default_sidebar_width")]
     pub sidebar_width: f32,
     /// Whether the sidebar is collapsed.
-    #[serde(default)]
     pub sidebar_collapsed: bool,
     /// Explicit theme mode override.  `None` means "follow system".
-    #[serde(default, deserialize_with = "theme_mode_or_default")]
     pub theme_mode: Option<ThemeMode>,
-    /// Which bundled font the composer input uses.  Tolerant of values from
-    /// older preference files (unknown names fall back to the default font
-    /// instead of invalidating the whole file).
-    #[serde(default, deserialize_with = "composer_font_or_default")]
+    /// Which bundled font the composer input uses.
     pub composer_font: ComposerFont,
-    /// UI language.  Unknown values fall back to the default (zh-CN).
-    #[serde(default, deserialize_with = "language_or_default")]
+    /// UI language.
     pub language: Language,
     /// Theme name applied while in light mode.  `None` or an unregistered
     /// name falls back to the built-in default at startup.
-    #[serde(default)]
     pub light_theme: Option<String>,
     /// Theme name applied while in dark mode.  Same fallback rules.
-    #[serde(default)]
     pub dark_theme: Option<String>,
     /// Last known main-window geometry (restore bounds).  `None` on first
     /// run; invalid values are clamped or discarded at restore time.
-    #[serde(default)]
     pub window: Option<WindowGeometry>,
     /// Last known settings-window geometry. `None` until that window has
     /// been opened; invalid values are discarded at restore time.
-    #[serde(default)]
     pub settings_window: Option<WindowGeometry>,
-}
-
-/// Deserialize a [`ComposerFont`] via its derived impl, mapping unknown
-/// values (e.g. fonts that have since been removed) to the default instead
-/// of failing the whole preferences file.
-fn composer_font_or_default<'de, D>(d: D) -> Result<ComposerFont, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(d)?;
-    Ok(ComposerFont::deserialize(value).unwrap_or_default())
-}
-
-/// Same tolerance for [`Language`]: an unrecognized language tag reverts to
-/// the default instead of invalidating the whole preferences file.
-fn language_or_default<'de, D>(d: D) -> Result<Language, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(d)?;
-    Ok(Language::deserialize(value).unwrap_or_default())
-}
-
-/// Unknown theme modes degrade to "follow system" without invalidating the
-/// rest of the preferences file.
-fn theme_mode_or_default<'de, D>(d: D) -> Result<Option<ThemeMode>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(d)?;
-    Ok(value.and_then(|value| ThemeMode::deserialize(value).ok()))
+    /// User-managed OpenAI-compatible endpoints and their model catalogs.
+    pub provider_profiles: Vec<ProviderProfile>,
+    /// Selection inherited by newly-created conversations.
+    pub last_model_selection: Option<ModelSelection>,
 }
 
 fn default_sidebar_width() -> f32 {
@@ -103,6 +68,8 @@ impl Default for Preferences {
             dark_theme: None,
             window: None,
             settings_window: None,
+            provider_profiles: Vec::new(),
+            last_model_selection: None,
         }
     }
 }
@@ -161,6 +128,7 @@ impl Language {
 
 /// Main-window restore bounds in global screen coordinates.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WindowGeometry {
     pub x: f32,
     pub y: f32,
@@ -368,56 +336,30 @@ fn config_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Preference files written before the settings-window feature carry
-    /// none of the new fields; they must load cleanly with defaults.
     #[test]
-    fn legacy_file_gets_defaults_for_new_fields() {
-        let legacy = r#"{
-            "sidebar_width": 300.0,
-            "sidebar_collapsed": true,
-            "theme_mode": "dark",
-            "composer_font": "jet-brains-mono"
-        }"#;
-        let prefs: Preferences = serde_json::from_str(legacy).expect("legacy file must parse");
-        assert_eq!(prefs.sidebar_width, 300.0);
-        assert!(prefs.sidebar_collapsed);
-        assert_eq!(prefs.theme_mode, Some(ThemeMode::Dark));
-        assert_eq!(prefs.composer_font, ComposerFont::JetBrainsMono);
-        assert_eq!(prefs.language, Language::ZhCn);
-        assert_eq!(prefs.light_theme, None);
-        assert_eq!(prefs.dark_theme, None);
-        assert_eq!(prefs.window, None);
-        assert_eq!(prefs.settings_window, None);
-    }
+    fn incomplete_or_unknown_schema_is_rejected() {
+        assert!(serde_json::from_str::<Preferences>(r#"{"language":"en"}"#).is_err());
+        let mut value = serde_json::to_value(Preferences::default()).expect("serialize");
+        value["language"] = serde_json::Value::String("unknown".into());
+        assert!(serde_json::from_value::<Preferences>(value).is_err());
 
-    /// Unknown enum tags (from newer or older builds) degrade to defaults
-    /// instead of poisoning the whole file.
-    #[test]
-    fn unknown_language_and_font_fall_back_to_default() {
-        let json = r#"{
-            "language": "klingon",
-            "composer_font": "comic-sans"
-        }"#;
-        let prefs: Preferences = serde_json::from_str(json).expect("must parse");
-        assert_eq!(prefs.language, Language::ZhCn);
-        assert_eq!(prefs.composer_font, ComposerFont::MapleMonoCn);
-    }
+        let mut unknown_top_level =
+            serde_json::to_value(Preferences::default()).expect("serialize");
+        unknown_top_level["legacy_provider"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Preferences>(unknown_top_level).is_err());
 
-    #[test]
-    fn unknown_theme_mode_falls_back_without_discarding_other_preferences() {
-        let json = r#"{
-            "sidebar_width": 336.0,
-            "sidebar_collapsed": true,
-            "theme_mode": "sepia",
-            "language": "en"
-        }"#;
-
-        let prefs: Preferences = serde_json::from_str(json).expect("preferences must parse");
-
-        assert_eq!(prefs.sidebar_width, 336.0);
-        assert!(prefs.sidebar_collapsed);
-        assert_eq!(prefs.theme_mode, None);
-        assert_eq!(prefs.language, Language::En);
+        let mut unknown_geometry = serde_json::to_value(Preferences {
+            window: Some(WindowGeometry {
+                x: 0.,
+                y: 0.,
+                width: 800.,
+                height: 600.,
+            }),
+            ..Preferences::default()
+        })
+        .expect("serialize");
+        unknown_geometry["window"]["legacy_scale"] = serde_json::Value::from(2);
+        assert!(serde_json::from_value::<Preferences>(unknown_geometry).is_err());
     }
 
     #[test]
@@ -472,6 +414,78 @@ mod tests {
         assert_eq!(Language::from_key("nope"), Language::ZhCn);
         for font in ComposerFont::all() {
             assert_eq!(ComposerFont::from_key(font.key()), font);
+        }
+    }
+
+    #[test]
+    fn provider_profiles_and_plaintext_secret_round_trip() {
+        let prefs = Preferences {
+            provider_profiles: vec![ProviderProfile {
+                id: "profile-1".into(),
+                name: "Local gateway".into(),
+                base_url: "http://localhost:8080/v1".into(),
+                api_key: crate::llm::SecretString::new("plain-text-key"),
+                protocol: crate::llm::Protocol::Responses,
+                compatibility: crate::llm::CompatibilityProfile::default(),
+                models: vec![crate::llm::ModelConfig {
+                    id: "model-1".into(),
+                    model_id: "gpt-compatible".into(),
+                    display_name: Some("Local model".into()),
+                }],
+            }],
+            last_model_selection: Some(ModelSelection {
+                profile_id: "profile-1".into(),
+                model_id: "model-1".into(),
+            }),
+            ..Preferences::default()
+        };
+
+        let json = serde_json::to_string(&prefs).expect("serialize provider settings");
+        assert!(json.contains("plain-text-key"));
+        let back: Preferences = serde_json::from_str(&json).expect("deserialize provider settings");
+        assert_eq!(back.provider_profiles, prefs.provider_profiles);
+        assert_eq!(back.last_model_selection, prefs.last_model_selection);
+    }
+
+    #[test]
+    fn provider_preferences_reject_unknown_nested_fields() {
+        let prefs = Preferences {
+            provider_profiles: vec![ProviderProfile {
+                id: "profile-1".into(),
+                name: "Provider".into(),
+                base_url: "https://example.com/v1".into(),
+                api_key: crate::llm::SecretString::default(),
+                protocol: crate::llm::Protocol::Responses,
+                compatibility: crate::llm::CompatibilityProfile::default(),
+                models: vec![crate::llm::ModelConfig {
+                    id: "model-1".into(),
+                    model_id: "gpt".into(),
+                    display_name: None,
+                }],
+            }],
+            last_model_selection: Some(ModelSelection {
+                profile_id: "profile-1".into(),
+                model_id: "model-1".into(),
+            }),
+            ..Preferences::default()
+        };
+
+        for path in [
+            "/provider_profiles/0/legacy",
+            "/provider_profiles/0/models/0/legacy",
+            "/provider_profiles/0/compatibility/legacy",
+            "/last_model_selection/legacy",
+        ] {
+            let mut value = serde_json::to_value(&prefs).expect("serialize");
+            value
+                .pointer_mut(path.rsplit_once('/').map_or("", |(parent, _)| parent))
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("object")
+                .insert("legacy".into(), serde_json::Value::Bool(true));
+            assert!(
+                serde_json::from_value::<Preferences>(value).is_err(),
+                "{path}"
+            );
         }
     }
 }

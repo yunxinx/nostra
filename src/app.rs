@@ -5,11 +5,12 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Root, Sizable as _, StyledExt as _, TITLE_BAR_HEIGHT,
+    ActiveTheme, Disableable as _, Icon, IconName, Root, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT,
     animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
-    menu::DropdownMenu as _,
+    menu::{DropdownMenu as _, PopupMenuItem},
     sidebar::SidebarToggleButton,
     v_flex,
 };
@@ -17,8 +18,9 @@ use rust_i18n::t;
 
 use crate::actions::{OpenSettings, ToggleTheme};
 use crate::chat::{ChatEvent, ChatView};
+use crate::llm::ModelSelection;
 use crate::preferences::{self, Preferences, WindowGeometry};
-use crate::{theme, ui};
+use crate::{providers, theme, ui};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -65,6 +67,8 @@ pub struct ChatApp {
 struct Conversation {
     view: Entity<ChatView>,
     title: SharedString,
+    selection: Option<ModelSelection>,
+    pending: bool,
 }
 
 impl ChatApp {
@@ -141,7 +145,6 @@ impl ChatApp {
         let title: SharedString = t!("chat.default_title").to_string().into();
         let view = ChatView::view(window, cx);
         let sub = cx.subscribe(&view, |this, view, event, cx| {
-            let ChatEvent::TitleChanged(title) = event;
             let Some(conversation) = this
                 .conversations
                 .iter_mut()
@@ -149,12 +152,29 @@ impl ChatApp {
             else {
                 return;
             };
-            if conversation.title != *title {
-                conversation.title = title.clone();
-                cx.notify();
+            match event {
+                ChatEvent::TitleChanged(title) => {
+                    if conversation.title != *title {
+                        conversation.title = title.clone();
+                        cx.notify();
+                    }
+                }
+                ChatEvent::StateChanged { selection, pending } => {
+                    if conversation.selection != *selection || conversation.pending != *pending {
+                        conversation.selection = selection.clone();
+                        conversation.pending = *pending;
+                        cx.notify();
+                    }
+                }
             }
         });
-        self.conversations.push(Conversation { view, title });
+        let selection = view.read(cx).selection();
+        self.conversations.push(Conversation {
+            view,
+            title,
+            selection,
+            pending: false,
+        });
         self._subscriptions.push(sub);
         self.active = self.conversations.len() - 1;
         cx.notify();
@@ -399,11 +419,13 @@ impl Render for ChatApp {
             .conversations
             .get(active)
             .map(|conversation| conversation.view.clone());
-        let active_title = self
-            .conversations
-            .get(active)
-            .map(|conversation| conversation.title.clone())
-            .unwrap_or_else(|| t!("chat.fallback_title").to_string().into());
+        let active_state = self.conversations.get(active).map(|conversation| {
+            (
+                conversation.view.clone(),
+                conversation.selection.clone(),
+                conversation.pending,
+            )
+        });
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
         // inside the top-level view of the window.
@@ -526,7 +548,9 @@ impl Render for ChatApp {
             .h(TITLE_BAR_HEIGHT)
             .flex()
             .items_center()
-            .child(model_pill(active_title, cx));
+            .when_some(active_state, |this, (view, selection, pending)| {
+                this.child(model_pill(view, selection, pending, cx))
+            });
 
         let pill_element: AnyElement = if self.has_toggled {
             Transition::new(SIDEBAR_ANIM)
@@ -560,22 +584,64 @@ impl Render for ChatApp {
     }
 }
 
-fn model_pill(title: SharedString, cx: &App) -> impl IntoElement {
-    h_flex()
-        .id("model-pill")
-        .items_center()
-        .gap_1()
-        .px_2()
-        .h(px(26.))
-        .rounded(cx.theme().radius)
-        .cursor_pointer()
-        .hover(|this| this.bg(cx.theme().accent))
-        .child(div().text_sm().font_medium().child(title))
-        .child(
-            Icon::new(IconName::ChevronDown)
-                .size_3()
-                .text_color(cx.theme().muted_foreground),
-        )
+fn model_pill(
+    view: Entity<ChatView>,
+    selection: Option<ModelSelection>,
+    pending: bool,
+    cx: &App,
+) -> impl IntoElement {
+    let models = providers::selectable_models(cx);
+    let selected_label = selection
+        .as_ref()
+        .and_then(|selection| models.iter().find(|model| &model.selection == selection))
+        .map(|model| format!("{} / {}", model.profile_name, model.model_name))
+        .unwrap_or_else(|| {
+            if selection.is_some() {
+                t!("chat.unavailable_model").to_string()
+            } else {
+                t!("chat.select_model").to_string()
+            }
+        });
+
+    Button::new("model-pill")
+        .ghost()
+        .small()
+        .label(selected_label)
+        .icon(IconName::ChevronDown)
+        .disabled(pending)
+        .dropdown_menu(move |menu, window, _| {
+            let mut menu = menu.scrollable(true).max_h(px(480.));
+            let mut model_count = 0;
+            let mut current_profile = None;
+            for model in &models {
+                if current_profile.as_deref() != Some(model.selection.profile_id.as_str()) {
+                    current_profile = Some(model.selection.profile_id.clone());
+                    menu = menu.label(model.profile_name.clone());
+                }
+                model_count += 1;
+                let item_selection = model.selection.clone();
+                let checked = selection.as_ref() == Some(&item_selection);
+                let view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(model.model_name.clone())
+                        .checked(checked)
+                        .on_click(window.listener_for(&view, move |chat, _, _, cx| {
+                            chat.select_model(item_selection.clone(), cx);
+                        })),
+                );
+            }
+            if model_count == 0 {
+                menu = menu
+                    .item(PopupMenuItem::new(t!("chat.no_models").to_string()).disabled(true))
+                    .separator()
+                    .menu_with_icon(
+                        t!("account.settings").to_string(),
+                        IconName::Settings,
+                        Box::new(OpenSettings),
+                    );
+            }
+            menu
+        })
 }
 
 /// Zero-sized marker used as the payload type of the sidebar-resize drag

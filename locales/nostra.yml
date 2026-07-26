@@ -38,6 +38,40 @@ chat:
   send_tooltip:
     en: Send (Enter)
     zh-CN: 发送（Enter）
+  stop_tooltip:
+    en: Stop generating
+    zh-CN: 停止生成
+  select_model:
+    en: Select model
+    zh-CN: 选择模型
+  unavailable_model:
+    en: Model unavailable
+    zh-CN: 模型不可用
+  no_models:
+    en: Configure a provider and model in Settings
+    zh-CN: 请先在设置中配置提供商和模型
+  tool_requested:
+    en: "Tool requested: %{name}"
+    zh-CN: "请求调用工具：%{name}"
+  error:
+    configuration:
+      en: Select an available provider and model in Settings.
+      zh-CN: 请在设置中选择可用的提供商和模型。
+    connection:
+      en: Unable to connect to the provider.
+      zh-CN: 无法连接到提供商。
+    interrupted:
+      en: The provider stream was interrupted.
+      zh-CN: 提供商响应流意外中断。
+    http:
+      en: "The provider returned HTTP %{status}."
+      zh-CN: "提供商返回了 HTTP %{status}。"
+    provider:
+      en: The provider request failed.
+      zh-CN: 提供商请求失败。
+    request_id:
+      en: Request ID
+      zh-CN: 请求 ID
   empty_title:
     en: How can I help you today?
     zh-CN: 今天我能帮你做点什么？
@@ -77,6 +111,9 @@ settings:
     appearance:
       en: Appearance
       zh-CN: 外观
+    providers:
+      en: Providers
+      zh-CN: 提供商
     about:
       en: About
       zh-CN: 关于
@@ -120,6 +157,104 @@ settings:
   composer_font_desc:
     en: Bundled font used by the message input; both options keep soft-wrap positions exact.
     zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  providers:
+    new_profile:
+      en: New provider
+      zh-CN: 新提供商
+    unnamed:
+      en: Unnamed provider
+      zh-CN: 未命名提供商
+    add_profile:
+      en: Add provider
+      zh-CN: 添加提供商
+    delete_profile:
+      en: Delete provider
+      zh-CN: 删除提供商
+    delete_profile_title:
+      en: Delete this provider?
+      zh-CN: 删除此提供商？
+    delete_profile_desc:
+      en: Its models and credentials will also be removed. Existing chats will require another model selection.
+      zh-CN: 其模型和凭据也会被删除，已有聊天需要重新选择模型。
+    delete:
+      en: Delete
+      zh-CN: 删除
+    cancel:
+      en: Cancel
+      zh-CN: 取消
+    empty:
+      en: Add a provider to start configuring models.
+      zh-CN: 添加提供商以开始配置模型。
+    name:
+      en: Provider name
+      zh-CN: 提供商名称
+    base_url:
+      en: API Base URL
+      zh-CN: API Base URL
+    wire_api:
+      en: Wire API
+      zh-CN: 接口协议
+    api_key:
+      en: API Key
+      zh-CN: API Key
+    compatibility:
+      en: Compatibility
+      zh-CN: 兼容选项
+    max_tokens_field:
+      en: Token limit field
+      zh-CN: Token 上限字段
+    system_role:
+      en: System instruction role
+      zh-CN: 系统指令角色
+    reasoning_field:
+      en: Reasoning field
+      zh-CN: 推理字段
+    responses_instructions:
+      en: Responses instructions
+      zh-CN: Responses 指令位置
+    option:
+      preserve:
+        en: Preserve
+        zh-CN: 保持原样
+      auto:
+        en: Auto
+        zh-CN: 自动
+      top_level:
+        en: Top level
+        zh-CN: 顶层字段
+      input_items:
+        en: Input items
+        zh-CN: 输入项
+    stream_usage:
+      en: Request stream usage
+      zh-CN: 请求流式用量
+    nullable_tool_fields:
+      en: Accept nullable tool fields
+      zh-CN: 接受可空工具字段
+    object_tool_arguments:
+      en: Accept object tool arguments
+      zh-CN: 接受对象形式工具参数
+    models:
+      en: Models
+      zh-CN: 模型
+    add_model:
+      en: Add model
+      zh-CN: 添加模型
+    delete_model:
+      en: Delete model
+      zh-CN: 删除模型
+    delete_model_title:
+      en: Delete this model?
+      zh-CN: 删除此模型？
+    delete_model_desc:
+      en: Existing chats using this model will require another model selection.
+      zh-CN: 使用此模型的已有聊天将需要重新选择模型。
+    model_name_placeholder:
+      en: Optional name
+      zh-CN: 可选名称
+    model_id_placeholder:
+      en: Model ID
+      zh-CN: 模型 ID
   about:
     version:
       en: Version

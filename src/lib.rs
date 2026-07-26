@@ -14,7 +14,9 @@ mod assistant;
 mod chat;
 mod fonts;
 mod i18n;
+pub mod llm;
 pub mod preferences;
+mod providers;
 mod settings;
 mod theme;
 mod ui;
@@ -26,13 +28,16 @@ rust_i18n::i18n!("locales", fallback = "en");
 
 use gpui::App;
 use gpui_component::ActiveTheme;
+use reqwest_client::ReqwestClient;
 
 use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::assets::NostraAssets;
 
 /// Entry point used by `main.rs`.
 pub fn run() {
-    let app = gpui_platform::application().with_assets(NostraAssets);
+    let app = gpui_platform::application()
+        .with_assets(NostraAssets)
+        .with_http_client(std::sync::Arc::new(ReqwestClient::new()));
     app.run(|cx| {
         let prefs = preferences::load();
         init(prefs.clone(), cx);

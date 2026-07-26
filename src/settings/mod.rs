@@ -9,6 +9,7 @@
 mod about;
 mod appearance;
 mod general;
+mod providers;
 mod ui;
 
 use gpui::prelude::FluentBuilder as _;
@@ -24,8 +25,8 @@ use crate::{
 
 /// Preferred size of the settings window; clamped to 85% of the display.
 const PREFERRED_SIZE: Size<Pixels> = Size {
-    width: px(820.),
-    height: px(560.),
+    width: px(1040.),
+    height: px(680.),
 };
 
 /// Minimum size that still fits the nav plus a readable content column.
@@ -138,16 +139,23 @@ pub fn refresh_native_title(cx: &mut App) {
 enum Page {
     General,
     Appearance,
+    Providers,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 3] = [Page::General, Page::Appearance, Page::About];
+    const ALL: [Page; 4] = [
+        Page::General,
+        Page::Appearance,
+        Page::Providers,
+        Page::About,
+    ];
 
     fn title(self) -> String {
         match self {
             Page::General => t!("settings.page.general").to_string(),
             Page::Appearance => t!("settings.page.appearance").to_string(),
+            Page::Providers => t!("settings.page.providers").to_string(),
             Page::About => t!("settings.page.about").to_string(),
         }
     }
@@ -156,6 +164,7 @@ impl Page {
         match self {
             Page::General => IconName::Settings2,
             Page::Appearance => IconName::Palette,
+            Page::Providers => IconName::Globe,
             Page::About => IconName::Info,
         }
     }
@@ -164,6 +173,7 @@ impl Page {
         match self {
             Page::General => "nav-general",
             Page::Appearance => "nav-appearance",
+            Page::Providers => "nav-providers",
             Page::About => "nav-about",
         }
     }
@@ -173,6 +183,7 @@ impl Page {
 struct SettingsWindow {
     focus_handle: FocusHandle,
     active: Page,
+    providers: Entity<providers::ProvidersPage>,
     window_geometry: WindowGeometry,
     _subscriptions: Vec<Subscription>,
 }
@@ -191,6 +202,7 @@ impl SettingsWindow {
         Self {
             focus_handle: cx.focus_handle(),
             active: Page::General,
+            providers: cx.new(|cx| providers::ProvidersPage::new(window, cx)),
             window_geometry: WindowGeometry::from_window(window),
             _subscriptions: vec![bounds_subscription],
         }
@@ -273,6 +285,7 @@ impl SettingsWindow {
         let body = match self.active {
             Page::General => general::render(cx),
             Page::Appearance => appearance::render(cx),
+            Page::Providers => self.providers.clone().into_any_element(),
             Page::About => about::render(cx),
         };
 

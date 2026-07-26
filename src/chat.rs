@@ -16,6 +16,13 @@ use rust_i18n::t;
 
 use crate::assistant;
 use crate::fonts;
+use crate::llm::{
+    ContentBlock, Message as LlmMessage, ModelSelection, ProviderMetadata, ReasoningContent,
+    ToolCall,
+};
+use crate::providers;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 
@@ -32,6 +39,8 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 /// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
+static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
@@ -42,11 +51,16 @@ pub enum Role {
 pub struct Message {
     pub role: Role,
     pub body: Entity<TextViewState>,
+    pub canonical: LlmMessage,
 }
 
 #[derive(Clone)]
 pub enum ChatEvent {
     TitleChanged(SharedString),
+    StateChanged {
+        selection: Option<ModelSelection>,
+        pending: bool,
+    },
 }
 
 pub struct ChatView {
@@ -66,8 +80,13 @@ pub struct ChatView {
     /// scroll past [`STICK_THRESHOLD`].  Scrolling back near the bottom, or
     /// sending a message, re-arms it.
     follow: bool,
+    selection: Option<ModelSelection>,
+    selection_available: bool,
+    provider_catalog_revision: u64,
     pending: bool,
-    _reply_task: Option<Task<()>>,
+    reply_task: Option<assistant::ReplyTask>,
+    conversation_id: String,
+    next_turn_id: u64,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -122,6 +141,8 @@ impl ChatView {
                 },
             );
 
+        let selection = providers::last_selection(cx);
+        let selection_available = providers::selection_is_available(selection.as_ref(), cx);
         Self {
             messages: Vec::new(),
             input,
@@ -129,8 +150,16 @@ impl ChatView {
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             scroll_handle: ScrollHandle::new(),
             follow: true,
+            selection,
+            selection_available,
+            provider_catalog_revision: providers::catalog_revision(),
             pending: false,
-            _reply_task: None,
+            reply_task: None,
+            conversation_id: format!(
+                "conversation-{}",
+                NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
+            ),
+            next_turn_id: 1,
             _subscriptions: vec![subscription],
         }
     }
@@ -165,7 +194,8 @@ impl ChatView {
     /// Returns whether the message was accepted so callers only clear the
     /// composer after a successful submission.
     fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
-        if self.pending || text.is_empty() {
+        self.sync_selection_availability(cx);
+        if self.pending || text.is_empty() || !self.selection_available {
             return false;
         }
 
@@ -177,26 +207,142 @@ impl ChatView {
         self.messages.push(Message {
             role: Role::User,
             body: user_body,
+            canonical: LlmMessage {
+                role: crate::llm::Role::User,
+                content: vec![ContentBlock::Text {
+                    text: text.clone(),
+                    provider_metadata: ProviderMetadata::default(),
+                }],
+                provider_metadata: ProviderMetadata::default(),
+            },
         });
 
         let assistant_body = cx.new(|cx| TextViewState::markdown("", cx));
         self.messages.push(Message {
             role: Role::Assistant,
             body: assistant_body.clone(),
+            canonical: LlmMessage {
+                role: crate::llm::Role::Assistant,
+                content: Vec::new(),
+                provider_metadata: ProviderMetadata::default(),
+            },
         });
 
         self.pending = true;
-        self._reply_task = Some(assistant::stream_reply(&text, assistant_body, cx));
+        let history = self
+            .messages
+            .iter()
+            .take(self.messages.len().saturating_sub(1))
+            .filter(|message| is_replayable(&message.canonical))
+            .map(|message| message.canonical.clone())
+            .collect();
+        let turn_id = format!("turn-{}", self.next_turn_id);
+        self.next_turn_id = self.next_turn_id.saturating_add(1);
+        self.reply_task = Some(assistant::stream_reply(
+            history,
+            self.selection.clone(),
+            self.conversation_id.clone(),
+            turn_id,
+            assistant_body,
+            cx,
+        ));
         self.follow = true;
         self.scroll_to_bottom();
+        self.emit_state(cx);
         cx.notify();
         true
     }
 
-    pub fn finish_reply(&mut self, cx: &mut Context<Self>) {
+    pub fn finish_reply(&mut self, message: Option<LlmMessage>, cx: &mut Context<Self>) {
+        if let (Some(message), Some(last)) = (message, self.messages.last_mut()) {
+            last.canonical = message;
+        }
         self.pending = false;
-        self._reply_task = None;
+        self.reply_task = None;
+        self.emit_state(cx);
         cx.notify();
+    }
+
+    pub fn append_stream_text(&mut self, delta: &str) {
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        match last.canonical.content.last_mut() {
+            Some(ContentBlock::Text { text, .. }) => text.push_str(delta),
+            _ => last.canonical.content.push(ContentBlock::Text {
+                text: delta.to_string(),
+                provider_metadata: ProviderMetadata::default(),
+            }),
+        }
+    }
+
+    pub fn append_stream_reasoning(&mut self, delta: &str) {
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        match last.canonical.content.last_mut() {
+            Some(ContentBlock::Reasoning { reasoning }) => reasoning.display.push_str(delta),
+            _ => last.canonical.content.push(ContentBlock::Reasoning {
+                reasoning: ReasoningContent {
+                    display: delta.to_string(),
+                    replay: None,
+                },
+            }),
+        }
+    }
+
+    pub fn append_stream_tool_call(&mut self, tool_call: ToolCall) {
+        if let Some(last) = self.messages.last_mut() {
+            last.canonical
+                .content
+                .push(ContentBlock::ToolCall { tool_call });
+        }
+    }
+
+    pub fn finish_stream_batch(&mut self, cx: &mut Context<Self>) {
+        self.follow_stream();
+        cx.notify();
+    }
+
+    pub fn cancel_reply(&mut self) {
+        if !self.pending {
+            return;
+        }
+        if let Some(reply) = &self.reply_task {
+            reply.cancel();
+        }
+    }
+
+    pub fn select_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+        if self.pending || self.selection.as_ref() == Some(&selection) {
+            return;
+        }
+        self.selection = Some(selection.clone());
+        self.selection_available = true;
+        self.provider_catalog_revision = providers::catalog_revision();
+        providers::select_model(selection, cx);
+        self.emit_state(cx);
+        cx.notify();
+    }
+
+    pub fn selection(&self) -> Option<ModelSelection> {
+        self.selection.clone()
+    }
+
+    fn emit_state(&self, cx: &mut Context<Self>) {
+        cx.emit(ChatEvent::StateChanged {
+            selection: self.selection.clone(),
+            pending: self.pending,
+        });
+    }
+
+    fn sync_selection_availability(&mut self, cx: &App) {
+        let revision = providers::catalog_revision();
+        if self.provider_catalog_revision == revision {
+            return;
+        }
+        self.selection_available = providers::selection_is_available(self.selection.as_ref(), cx);
+        self.provider_catalog_revision = revision;
     }
 
     fn on_send_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -206,12 +352,17 @@ impl ChatView {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
     }
+
+    fn on_stop_click(&mut self, _: &ClickEvent, _: &mut Window, _: &mut Context<Self>) {
+        self.cancel_reply();
+    }
 }
 
 impl EventEmitter<ChatEvent> for ChatView {}
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_selection_availability(cx);
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
         let placeholder: SharedString = t!("chat.placeholder").to_string().into();
@@ -223,7 +374,9 @@ impl Render for ChatView {
         }
 
         let has_messages = !self.messages.is_empty();
-        let send_disabled = self.pending || self.input.read(cx).value().trim().is_empty();
+        let send_disabled = self.pending
+            || self.input.read(cx).value().trim().is_empty()
+            || !self.selection_available;
         let composer_height = self.composer_height;
         let view = cx.weak_entity();
 
@@ -260,6 +413,10 @@ impl Render for ChatView {
                     }),
             )
     }
+}
+
+fn is_replayable(message: &LlmMessage) -> bool {
+    message.role != crate::llm::Role::Assistant || !message.content.is_empty()
 }
 
 impl ChatView {
@@ -382,15 +539,22 @@ impl ChatView {
                                         .child(t!("chat.generating").to_string()),
                                 )
                             })
-                            .child(
+                            .child(if self.pending {
+                                Button::new("stop")
+                                    .primary()
+                                    .icon(IconName::Close)
+                                    .small()
+                                    .tooltip(t!("chat.stop_tooltip").to_string())
+                                    .on_click(cx.listener(Self::on_stop_click))
+                            } else {
                                 Button::new("send")
                                     .primary()
                                     .icon(IconName::ArrowUp)
                                     .small()
                                     .disabled(send_disabled)
                                     .tooltip(t!("chat.send_tooltip").to_string())
-                                    .on_click(cx.listener(Self::on_send_click)),
-                            ),
+                                    .on_click(cx.listener(Self::on_send_click))
+                            }),
                     ),
             )
     }
@@ -464,5 +628,32 @@ fn derive_title(text: &str) -> SharedString {
         t!("chat.default_title").to_string().into()
     } else {
         cleaned.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
+
+    use super::is_replayable;
+
+    #[test]
+    fn empty_assistant_placeholders_are_not_replayed() {
+        let empty_assistant = LlmMessage {
+            role: crate::llm::Role::Assistant,
+            content: Vec::new(),
+            provider_metadata: ProviderMetadata::default(),
+        };
+        let user = LlmMessage {
+            role: crate::llm::Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hi".into(),
+                provider_metadata: ProviderMetadata::default(),
+            }],
+            provider_metadata: ProviderMetadata::default(),
+        };
+
+        assert!(!is_replayable(&empty_assistant));
+        assert!(is_replayable(&user));
     }
 }

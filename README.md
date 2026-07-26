@@ -24,6 +24,18 @@ Preferences are persisted to:
 | Toggle theme     | ⌘⇧L         | Ctrl+Shift+L   |
 | Quit             | ⌘Q          | Alt+F4         |
 
+## Acknowledgements
+
+Nostra has benefited from the architecture, compatibility work, and examples
+in these open-source projects:
+
+- [Zed](https://github.com/zed-industries/zed) and its GPUI framework
+- [gpui-component](https://github.com/longbridge/gpui-component)
+- [pi](https://github.com/earendil-works/pi)
+- [Rig](https://github.com/0xPlaygrounds/rig)
+- [one-api](https://github.com/songquanpeng/one-api)
+- [Vercel AI SDK](https://github.com/vercel/ai)
+
 ## License
 
 Licensed under the Apache License, Version 2.0 (the "License"); you may
