@@ -25,6 +25,10 @@ use crate::{preferences, ui::consume_button_key};
 type ActivateHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 const INFO_BUTTON_SIZE: gpui::Pixels = px(18.);
 const INFO_ICON_SIZE: gpui::Pixels = px(14.);
+const DROPDOWN_MENU_MAX_HEIGHT: gpui::Pixels = px(190.);
+// PopupMenu uses 26px medium items by default; six items plus gaps and padding
+// fit below the cap, while a seventh item overflows it.
+const DROPDOWN_MENU_MAX_VISIBLE_ITEMS: usize = 6;
 
 /// Compact icon-only command with an explicit accessible name. The upstream
 /// `Button` derives its accessible name only from a visible label, so settings
@@ -396,11 +400,14 @@ pub(super) fn labelled(
 
 /// Compact dropdown control: an outline button whose popup menu lists the
 /// options with a check mark on the current one.
+///
+/// Scrolling is enabled automatically only when the option count would
+/// overflow the menu's max height — callers never decide this, so a short
+/// list can never end up with a spurious scrollbar.
 pub(super) fn dropdown(
     id: &'static str,
     options: Vec<(SharedString, SharedString)>,
     current: SharedString,
-    scrollable: bool,
     on_select: impl Fn(SharedString, &mut App) + 'static,
 ) -> AnyElement {
     let current_label = options
@@ -409,6 +416,7 @@ pub(super) fn dropdown(
         .map(|(_, label)| label.clone())
         .unwrap_or_else(|| current.clone());
     let on_select = Rc::new(on_select);
+    let scrollable = options.len() > DROPDOWN_MENU_MAX_VISIBLE_ITEMS;
 
     Button::new(id)
         .outline()
@@ -428,7 +436,7 @@ pub(super) fn dropdown(
                         }),
                 )
             });
-            menu.scrollable(scrollable)
+            menu.scrollable(scrollable).max_h(DROPDOWN_MENU_MAX_HEIGHT)
         })
         .into_any_element()
 }

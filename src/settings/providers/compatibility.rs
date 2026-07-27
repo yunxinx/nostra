@@ -96,7 +96,6 @@ impl ProvidersPage {
                         ("max_tokens".into(), "max_tokens".into()),
                     ],
                     max_tokens.into(),
-                    false,
                     {
                         let weak = cx.weak_entity();
                         move |value, cx| {
@@ -130,7 +129,6 @@ impl ProvidersPage {
                         ("developer".into(), "developer".into()),
                     ],
                     system_role.into(),
-                    false,
                     {
                         let weak = cx.weak_entity();
                         move |value, cx| {
@@ -165,7 +163,6 @@ impl ProvidersPage {
                         ("reasoning_text".into(), "reasoning_text".into()),
                     ],
                     reasoning.into(),
-                    false,
                     {
                         let weak = cx.weak_entity();
                         move |value, cx| {
@@ -203,7 +200,6 @@ impl ProvidersPage {
                         ),
                     ],
                     instructions.into(),
-                    false,
                     {
                         let weak = cx.weak_entity();
                         move |value, cx| {

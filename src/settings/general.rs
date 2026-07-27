@@ -22,7 +22,6 @@ pub(super) fn render(cx: &App) -> AnyElement {
                 "language-dd",
                 language_options,
                 i18n::current(cx).key().into(),
-                false,
                 |value, cx| i18n::change(Language::from_key(&value), cx),
             ),
             cx,

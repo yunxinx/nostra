@@ -558,7 +558,6 @@ impl ProvidersPage {
                             ("responses".into(), "Responses".into()),
                         ],
                         protocol.as_str().into(),
-                        false,
                         move |value, cx| {
                             let Some(protocol) = Protocol::from_key(value.as_ref()) else {
                                 return;
