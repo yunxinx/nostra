@@ -5,8 +5,8 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, Root, Sizable as _, StyledExt as _,
-    TITLE_BAR_HEIGHT,
+    ActiveTheme, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _,
+    StyledExt as _, TITLE_BAR_HEIGHT,
     animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
@@ -58,6 +58,9 @@ pub struct ChatApp {
     /// (mouse_x, sidebar_width) captured on `mouse_down` on the resize handle.
     /// While `Some`, window-level mouse move events adjust `sidebar_width`.
     resize_start: Option<(Pixels, Pixels)>,
+    /// Set on pointer-down in the empty titlebar layer. The first move hands
+    /// the gesture to the platform and clears this flag.
+    titlebar_move_pending: bool,
     /// Latest main-window restore bounds, kept fresh by a window-bounds
     /// observer and persisted on quit.
     window_geometry: Option<WindowGeometry>,
@@ -88,6 +91,7 @@ impl ChatApp {
             has_toggled: false,
             sidebar_width,
             resize_start: None,
+            titlebar_move_pending: false,
             window_geometry: Some(WindowGeometry::from_window(window)),
             _subscriptions: Vec::new(),
         };
@@ -504,6 +508,7 @@ impl Render for ChatApp {
             .top_0()
             .left_0()
             .h(TITLE_BAR_HEIGHT)
+            .occlude()
             .pl(TRAFFIC_LIGHT_PAD)
             .pr(px(6.))
             .items_center()
@@ -548,8 +553,44 @@ impl Render for ChatApp {
             .h(TITLE_BAR_HEIGHT)
             .flex()
             .items_center()
+            .occlude()
             .when_some(active_state, |this, (view, selection, pending)| {
                 this.child(model_pill(view, selection, pending, cx))
+            });
+
+        // AppKit otherwise treats every point in a transparent native
+        // titlebar as draggable, including controls. This layer sits behind
+        // the controls, so only genuinely empty titlebar space starts a move.
+        let titlebar_drag_area = div()
+            .id("main-titlebar-drag-area")
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(TITLE_BAR_HEIGHT)
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.titlebar_move_pending = true),
+            )
+            .on_mouse_down_out(cx.listener(|this, _, _, _| {
+                this.titlebar_move_pending = false;
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.titlebar_move_pending = false),
+            )
+            .on_mouse_move(cx.listener(|this, _, window, _| {
+                if this.titlebar_move_pending {
+                    this.titlebar_move_pending = false;
+                    window.start_window_move();
+                }
+            }))
+            .when(cfg!(target_os = "macos"), |this| {
+                this.on_double_click(|_, window, _| window.titlebar_double_click())
+            })
+            .when(cfg!(target_os = "linux"), |this| {
+                this.on_double_click(|_, window, _| window.zoom_window())
             });
 
         let pill_element: AnyElement = if self.has_toggled {
@@ -576,6 +617,7 @@ impl Render for ChatApp {
                     .child(sidebar_column)
                     .child(main_column),
             )
+            .child(titlebar_drag_area)
             .child(pill_element)
             .child(overlay)
             .children(sheet_layer)

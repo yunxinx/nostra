@@ -1,13 +1,13 @@
-//! "Appearance" settings page: theme mode, light/dark theme, composer font.
+//! "Appearance" settings page: theme, font, effects, and settings hints.
 
 use gpui::{AnyElement, App, IntoElement as _, SharedString};
 #[cfg(target_os = "macos")]
 use gpui::{Entity, ParentElement as _, Styled as _, px};
+use gpui_component::{Sizable as _, switch::Switch};
 #[cfg(target_os = "macos")]
 use gpui_component::{
-    Sizable as _, h_flex,
+    h_flex,
     slider::{Slider, SliderState},
-    switch::Switch,
 };
 use rust_i18n::t;
 
@@ -37,8 +37,23 @@ pub(super) fn render(
         rows.push(glass_effect_row(cx));
         rows.push(glass_opacity_row(glass_opacity, cx));
     }
+    rows.push(info_buttons_row(cx));
 
     ui::section(rows, cx)
+}
+
+fn info_buttons_row(cx: &App) -> AnyElement {
+    ui::row(
+        "hide-info-buttons",
+        t!("settings.hide_info_buttons").to_string(),
+        Some(t!("settings.hide_info_buttons_desc").to_string()),
+        Switch::new("hide-info-buttons-switch")
+            .small()
+            .checked(ui::info_buttons_hidden(cx))
+            .on_click(|checked, _, cx| ui::set_info_buttons_hidden(*checked, cx))
+            .into_any_element(),
+        cx,
+    )
 }
 
 #[cfg(target_os = "macos")]

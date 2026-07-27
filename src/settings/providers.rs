@@ -4,29 +4,45 @@
 //! changes. All writes go through `providers`, which owns persistence, catalog
 //! revision updates, and window refreshes.
 
+mod compatibility;
+mod profile_list;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Selectable as _, Sizable as _, StyledExt as _,
-    WindowExt as _,
-    button::{Button, ButtonVariant, ButtonVariants as _},
-    dialog::DialogButtonProps,
-    h_flex,
-    input::{Input, InputEvent, InputState},
-    switch::Switch,
+    ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, h_flex,
+    input::{Input, InputContentType, InputEvent, InputState},
+    resizable::{ResizableState, h_resizable, resizable_panel},
+    scroll::ScrollableElement as _,
     v_flex,
 };
 use rust_i18n::t;
 
+use super::{ROW_HEIGHT, ui::IconButton};
 use crate::{
-    llm::{
-        CompatibilityProfile, MaxTokensField, ModelConfig, Protocol, ProviderProfile,
-        ReasoningField, ResponsesInstructionsPolicy, SecretString, SystemRolePolicy,
-    },
+    llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString},
     providers,
 };
+
+/// Shown as the Base URL placeholder rather than pre-filled, so the field
+/// reads as a hint instead of a value the user has to notice and correct.
+const BASE_URL_HINT: &str = "https://api.openai.com/v1";
+
+/// Initial width of the profile list column.
+const LIST_WIDTH: Pixels = px(220.);
+
+/// Travel limits of the divider: narrow enough to stay compact, wide enough
+/// to still show a long provider name without truncating everything.
+const LIST_MIN_WIDTH: Pixels = px(160.);
+const LIST_MAX_WIDTH: Pixels = px(320.);
+
+/// Keeps the detail form readable however far the divider is dragged left.
+/// Both floors together must fit the narrowest content box the window allows
+/// (640px window − 200px nav − 40px inset = 400px), or the form would spill
+/// past the window edge instead of the divider stopping.
+const DETAIL_MIN_WIDTH: Pixels = px(220.);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -47,12 +63,45 @@ struct ModelEditor {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct ProviderPlaceholders {
+    name: SharedString,
+    model_name: SharedString,
+    model_id: SharedString,
+}
+
+impl ProviderPlaceholders {
+    fn resolve() -> Self {
+        Self {
+            name: t!("settings.providers.name_placeholder").to_string().into(),
+            model_name: t!("settings.providers.model_name_placeholder")
+                .to_string()
+                .into(),
+            model_id: t!("settings.providers.model_id_placeholder")
+                .to_string()
+                .into(),
+        }
+    }
+}
+
 pub(super) struct ProvidersPage {
     selected: Option<String>,
     name: Entity<InputState>,
     base_url: Entity<InputState>,
     api_key: Entity<InputState>,
     models: Vec<ModelEditor>,
+    placeholders: ProviderPlaceholders,
+    /// Divider position of the list / detail split.  Owned here (not by the
+    /// element) so the width survives re-renders and page switches.
+    layout: Entity<ResizableState>,
+    /// Wire-format switches stay folded away until asked for.
+    compatibility_open: bool,
+    /// Row the pointer is over, so its remove button can appear.
+    hovered: Option<String>,
+    /// Mirrors the API key input's mask state.  Tracked here because the
+    /// component's own toggle picks the opposite icon convention and its
+    /// `masked` flag is not readable from outside the crate.
+    api_key_masked: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -65,11 +114,18 @@ impl ProvidersPage {
             .as_deref()
             .and_then(|id| providers::find(id, cx))
             .cloned();
-        let name = input(window, cx, profile.as_ref().map_or("", |p| p.name.as_str()));
-        let base_url = input(
+        let placeholders = ProviderPlaceholders::resolve();
+        let name = input_with_placeholder(
+            window,
+            cx,
+            profile.as_ref().map_or("", |p| p.name.as_str()),
+            placeholders.name.clone(),
+        );
+        let base_url = input_with_placeholder(
             window,
             cx,
             profile.as_ref().map_or("", |p| p.base_url.as_str()),
+            BASE_URL_HINT.into(),
         );
         let api_key = cx.new(|cx| {
             InputState::new(window, cx)
@@ -83,6 +139,11 @@ impl ProvidersPage {
             base_url,
             api_key,
             models: Vec::new(),
+            placeholders,
+            layout: cx.new(|_| ResizableState::default()),
+            compatibility_open: false,
+            hovered: None,
+            api_key_masked: true,
             _subscriptions: Vec::new(),
         };
         this.subscribe_profile_fields(window, cx);
@@ -142,13 +203,13 @@ impl ProvidersPage {
             window,
             cx,
             model.display_name.as_deref().unwrap_or_default(),
-            &t!("settings.providers.model_name_placeholder"),
+            self.placeholders.model_name.clone(),
         );
         let model_id = input_with_placeholder(
             window,
             cx,
             &model.model_id,
-            &t!("settings.providers.model_id_placeholder"),
+            self.placeholders.model_id.clone(),
         );
         let mut subscriptions = Vec::new();
         for (state, field) in [
@@ -201,12 +262,16 @@ impl ProvidersPage {
                 cx,
             )
         });
+        // Re-mask on every switch: a key revealed for one provider must not
+        // stay on screen once a different provider's key loads into the field.
+        self.api_key_masked = true;
         self.api_key.update(cx, |state, cx| {
             state.set_value(
                 profile.as_ref().map_or("", |p| p.api_key.expose()),
                 window,
                 cx,
-            )
+            );
+            state.set_masked(true, window, cx);
         });
         self.rebuild_models(profile.as_ref(), window, cx);
         cx.notify();
@@ -215,8 +280,12 @@ impl ProvidersPage {
     fn add_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let profile = ProviderProfile {
             id: next_id("profile"),
-            name: t!("settings.providers.new_profile").to_string(),
-            base_url: "https://api.openai.com/v1".into(),
+            // Both fields start empty and rely on their placeholders.  A
+            // stored default would be frozen in whichever language was active
+            // when the row was created; the list falls back to a localized
+            // "unnamed" label instead, which follows the current locale.
+            name: String::new(),
+            base_url: String::new(),
             api_key: SecretString::default(),
             protocol: Protocol::ChatCompletions,
             compatibility: CompatibilityProfile::default(),
@@ -227,48 +296,34 @@ impl ProvidersPage {
         self.select(id, window, cx);
     }
 
-    fn request_delete_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.selected.clone() else {
+    /// Drops a profile and moves the selection to whatever is left.  The row
+    /// menu is the intentional direct-delete surface, so this runs unguarded.
+    fn delete_profile(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        providers::remove(id, cx);
+        if self.hovered.as_deref() == Some(id) {
+            self.hovered = None;
+        }
+        if self.selected.as_deref() != Some(id) {
+            cx.notify();
             return;
-        };
-        let weak = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let id = id.clone();
-            let weak = weak.clone();
-            alert
-                .title(t!("settings.providers.delete_profile_title").to_string())
-                .description(t!("settings.providers.delete_profile_desc").to_string())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_variant(ButtonVariant::Danger)
-                        .ok_text(t!("settings.providers.delete").to_string())
-                        .cancel_text(t!("settings.providers.cancel").to_string())
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    providers::remove(&id, cx);
-                    weak.update(cx, |this, cx| {
-                        let next = providers::profiles(cx)
-                            .first()
-                            .map(|profile| profile.id.clone());
-                        this.selected = None;
-                        if let Some(next) = next {
-                            this.select(next, window, cx);
-                        } else {
-                            this.name
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            this.base_url
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            this.api_key
-                                .update(cx, |state, cx| state.set_value("", window, cx));
-                            this.models.clear();
-                            cx.notify();
-                        }
-                    })
-                    .ok();
-                    true
-                })
-        });
+        }
+
+        let next = providers::profiles(cx)
+            .first()
+            .map(|profile| profile.id.clone());
+        self.selected = None;
+        if let Some(next) = next {
+            self.select(next, window, cx);
+        } else {
+            self.name
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.base_url
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.api_key
+                .update(cx, |state, cx| state.set_value("", window, cx));
+            self.models.clear();
+            cx.notify();
+        }
     }
 
     fn add_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -294,28 +349,6 @@ impl ProvidersPage {
         cx.notify();
     }
 
-    fn request_delete_model(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        let weak = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let id = id.clone();
-            let weak = weak.clone();
-            alert
-                .title(t!("settings.providers.delete_model_title").to_string())
-                .description(t!("settings.providers.delete_model_desc").to_string())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_variant(ButtonVariant::Danger)
-                        .ok_text(t!("settings.providers.delete").to_string())
-                        .cancel_text(t!("settings.providers.cancel").to_string())
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, _, cx| {
-                    weak.update(cx, |this, cx| this.delete_model(&id, cx)).ok();
-                    true
-                })
-        });
-    }
-
     fn set_protocol(&mut self, protocol: Protocol, cx: &mut Context<Self>) {
         let Some(id) = self.selected.clone() else {
             return;
@@ -335,6 +368,32 @@ impl ProvidersPage {
         providers::update(&id, cx, |profile| update(&mut profile.compatibility));
         cx.notify();
     }
+
+    fn sync_placeholders(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = ProviderPlaceholders::resolve();
+
+        if self.placeholders.name != next.name {
+            self.name.update(cx, |state, cx| {
+                state.set_placeholder(next.name.clone(), window, cx)
+            });
+        }
+        if self.placeholders.model_name != next.model_name {
+            for model in &self.models {
+                model.name.update(cx, |state, cx| {
+                    state.set_placeholder(next.model_name.clone(), window, cx)
+                });
+            }
+        }
+        if self.placeholders.model_id != next.model_id {
+            for model in &self.models {
+                model.model_id.update(cx, |state, cx| {
+                    state.set_placeholder(next.model_id.clone(), window, cx)
+                });
+            }
+        }
+
+        self.placeholders = next;
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -350,393 +409,242 @@ enum ModelField {
     UpstreamId,
 }
 
-fn input(window: &mut Window, cx: &mut App, value: &str) -> Entity<InputState> {
-    cx.new(|cx| InputState::new(window, cx).default_value(value))
-}
-
 fn input_with_placeholder(
     window: &mut Window,
     cx: &mut App,
     value: &str,
-    placeholder: &str,
+    placeholder: SharedString,
 ) -> Entity<InputState> {
     cx.new(|cx| {
         InputState::new(window, cx)
             .default_value(value)
-            .placeholder(placeholder.to_string())
+            .placeholder(placeholder)
     })
 }
 
 impl Render for ProvidersPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let profiles = providers::profiles(cx).to_vec();
-        let selected = self.selected.clone();
-        let protocol = selected
-            .as_deref()
-            .and_then(|id| providers::find(id, cx))
-            .map(|profile| profile.protocol);
-        let compatibility = selected
-            .as_deref()
-            .and_then(|id| providers::find(id, cx))
-            .map(|profile| profile.compatibility.clone());
+        self.sync_placeholders(window, cx);
 
-        h_flex()
-            .size_full()
-            .items_stretch()
+        // Two independently scrolling columns with a draggable divider.  The
+        // group fills the content area, so neither column relies on the
+        // settings window's own scroll view.
+        h_resizable("providers-split")
+            .with_state(&self.layout)
             .child(
-                v_flex()
-                    .w(px(210.))
-                    .flex_shrink_0()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .gap_1()
-                            .pr_3()
-                            .children(profiles.into_iter().map(|profile| {
-                                let id = profile.id.clone();
-                                let active = selected.as_deref() == Some(id.as_str());
-                                Button::new(ElementId::Name(format!("provider-{id}").into()))
-                                    .ghost()
-                                    .label(if profile.name.trim().is_empty() {
-                                        t!("settings.providers.unnamed").to_string()
-                                    } else {
-                                        profile.name
-                                    })
-                                    .selected(active)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select(id.clone(), window, cx)
-                                    }))
-                            })),
-                    )
-                    .child(
-                        h_flex()
-                            .pt_3()
-                            .pr_3()
-                            .gap_1()
-                            .child(
-                                Button::new("add-provider")
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .tooltip(t!("settings.providers.add_profile").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.add_profile(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("delete-provider")
-                                    .ghost()
-                                    .danger()
-                                    .small()
-                                    .icon(IconName::Close)
-                                    .disabled(self.selected.is_none())
-                                    .tooltip(t!("settings.providers.delete_profile").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.request_delete_profile(window, cx)
-                                    })),
-                            ),
-                    ),
+                resizable_panel()
+                    .size(LIST_WIDTH)
+                    .size_range(LIST_MIN_WIDTH..LIST_MAX_WIDTH)
+                    // Sized panel next to a growing sibling: opt out of the
+                    // panel's internal `flex_grow: 1` so the detail column
+                    // absorbs every extra pixel.
+                    .flex_none()
+                    .child(self.render_profile_list(window, cx)),
             )
             .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .pl_7()
-                    .gap_5()
-                    .when(self.selected.is_none(), |this| {
-                        this.child(
-                            div()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(t!("settings.providers.empty").to_string()),
-                        )
-                    })
-                    .when(self.selected.is_some(), |this| {
-                        this.child(field(
-                            t!("settings.providers.name").to_string(),
-                            Input::new(&self.name),
-                        ))
-                        .child(field(
-                            t!("settings.providers.base_url").to_string(),
-                            Input::new(&self.base_url),
-                        ))
-                        .child(
-                            v_flex()
-                                .gap_2()
-                                .child(label(t!("settings.providers.wire_api").to_string(), cx))
-                                .child({
-                                    let weak = cx.weak_entity();
-                                    super::ui::dropdown(
-                                        "provider-protocol",
-                                        vec![
-                                            ("chat-completions".into(), "Chat Completions".into()),
-                                            ("responses".into(), "Responses".into()),
-                                        ],
-                                        protocol.unwrap_or_default().as_str().into(),
-                                        false,
-                                        move |value, cx| {
-                                            let Some(protocol) = Protocol::from_key(value.as_ref())
-                                            else {
-                                                return;
-                                            };
-                                            weak.update(cx, |this, cx| {
-                                                this.set_protocol(protocol, cx)
-                                            })
-                                            .ok();
-                                        },
-                                    )
-                                }),
-                        )
-                        .child(field(
-                            t!("settings.providers.api_key").to_string(),
-                            Input::new(&self.api_key).mask_toggle(),
-                        ))
-                        .when_some(compatibility, |this, compatibility| {
-                            this.child(self.render_compatibility(compatibility, cx))
-                        })
-                        .child(self.render_models(window, cx))
-                    }),
+                resizable_panel()
+                    .size_range(DETAIL_MIN_WIDTH..Pixels::MAX)
+                    .child(self.render_detail(cx)),
             )
     }
 }
 
 impl ProvidersPage {
-    fn render_compatibility(
-        &self,
-        compatibility: CompatibilityProfile,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let max_tokens = compatibility.max_tokens_field.as_str();
-        let system_role = compatibility.system_role.as_str();
-        let reasoning = compatibility.reasoning_field.as_str();
-        let instructions = compatibility.responses_instructions.as_str();
+    /// Reveal toggle for the API key.  Replaces the component's built-in one so
+    /// the icon reports the current state — struck-through eye while the key is
+    /// hidden — rather than the action the click would perform.
+    fn render_mask_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let masked = self.api_key_masked;
+        let tooltip = if masked {
+            t!("settings.providers.show_api_key").to_string()
+        } else {
+            t!("settings.providers.hide_api_key").to_string()
+        };
+        let weak = cx.weak_entity();
+
+        IconButton::new(
+            "toggle-api-key-mask",
+            if masked {
+                IconName::EyeOff
+            } else {
+                IconName::Eye
+            },
+            tooltip,
+        )
+        .on_activate(move |window, cx| {
+            weak.update(cx, |this, cx| {
+                this.api_key_masked = !this.api_key_masked;
+                let masked = this.api_key_masked;
+                this.api_key
+                    .update(cx, |state, cx| state.set_masked(masked, window, cx));
+                cx.notify();
+            })
+            .ok();
+        })
+    }
+
+    /// Right column: the selected profile's form, scrolling on its own, below
+    /// the same reserved drag strip the list column keeps.
+    fn render_detail(&self, cx: &mut Context<Self>) -> AnyElement {
+        // With nothing selected there is no form to keep clear of the drag
+        // strip, so the prompt centres on the whole column instead of the
+        // area below it.
+        if self.selected.is_none() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .px_6()
+                .text_sm()
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t!("settings.providers.empty").to_string()),
+                )
+                .into_any_element();
+        }
 
         v_flex()
-            .gap_2()
-            .child(label(
-                t!("settings.providers.compatibility").to_string(),
-                cx,
-            ))
-            .child(compatibility_dropdown_row(
-                t!("settings.providers.max_tokens_field").to_string(),
-                super::ui::dropdown(
-                    "compat-max-tokens",
-                    vec![
-                        (
-                            "max_completion_tokens".into(),
-                            "max_completion_tokens".into(),
-                        ),
-                        ("max_tokens".into(), "max_tokens".into()),
-                    ],
-                    max_tokens.into(),
-                    false,
-                    {
-                        let weak = cx.weak_entity();
-                        move |value, cx| {
-                            let Some(value) = MaxTokensField::from_key(value.as_ref()) else {
-                                return;
-                            };
-                            weak.update(cx, |this, cx| {
-                                this.update_compatibility(
-                                    |compatibility| {
-                                        compatibility.max_tokens_field = value;
-                                    },
-                                    cx,
-                                )
-                            })
-                            .ok();
-                        }
-                    },
-                ),
-            ))
-            .child(compatibility_dropdown_row(
-                t!("settings.providers.system_role").to_string(),
-                super::ui::dropdown(
-                    "compat-system-role",
-                    vec![
-                        (
-                            "preserve".into(),
-                            t!("settings.providers.option.preserve").to_string().into(),
-                        ),
-                        ("system".into(), "system".into()),
-                        ("developer".into(), "developer".into()),
-                    ],
-                    system_role.into(),
-                    false,
-                    {
-                        let weak = cx.weak_entity();
-                        move |value, cx| {
-                            let Some(value) = SystemRolePolicy::from_key(value.as_ref()) else {
-                                return;
-                            };
-                            weak.update(cx, |this, cx| {
-                                this.update_compatibility(
-                                    |compatibility| {
-                                        compatibility.system_role = value;
-                                    },
-                                    cx,
-                                )
-                            })
-                            .ok();
-                        }
-                    },
-                ),
-            ))
-            .child(compatibility_dropdown_row(
-                t!("settings.providers.reasoning_field").to_string(),
-                super::ui::dropdown(
-                    "compat-reasoning-field",
-                    vec![
-                        (
-                            "auto".into(),
-                            t!("settings.providers.option.auto").to_string().into(),
-                        ),
-                        ("reasoning_content".into(), "reasoning_content".into()),
-                        ("reasoning".into(), "reasoning".into()),
-                        ("reasoning_text".into(), "reasoning_text".into()),
-                    ],
-                    reasoning.into(),
-                    false,
-                    {
-                        let weak = cx.weak_entity();
-                        move |value, cx| {
-                            let Some(value) = ReasoningField::from_key(value.as_ref()) else {
-                                return;
-                            };
-                            weak.update(cx, |this, cx| {
-                                this.update_compatibility(
-                                    |compatibility| {
-                                        compatibility.reasoning_field = value;
-                                    },
-                                    cx,
-                                )
-                            })
-                            .ok();
-                        }
-                    },
-                ),
-            ))
-            .child(compatibility_dropdown_row(
-                t!("settings.providers.responses_instructions").to_string(),
-                super::ui::dropdown(
-                    "compat-responses-instructions",
-                    vec![
-                        (
-                            "top_level".into(),
-                            t!("settings.providers.option.top_level").to_string().into(),
-                        ),
-                        (
-                            "input_items".into(),
-                            t!("settings.providers.option.input_items")
-                                .to_string()
-                                .into(),
-                        ),
-                    ],
-                    instructions.into(),
-                    false,
-                    {
-                        let weak = cx.weak_entity();
-                        move |value, cx| {
-                            let Some(value) = ResponsesInstructionsPolicy::from_key(value.as_ref())
-                            else {
-                                return;
-                            };
-                            weak.update(cx, |this, cx| {
-                                this.update_compatibility(
-                                    |compatibility| {
-                                        compatibility.responses_instructions = value;
-                                    },
-                                    cx,
-                                )
-                            })
-                            .ok();
-                        }
-                    },
-                ),
-            ))
-            .child(self.compatibility_switch(
-                "compat-stream-usage",
-                t!("settings.providers.stream_usage").to_string(),
-                compatibility.include_stream_usage,
-                |compatibility, checked| compatibility.include_stream_usage = checked,
-                cx,
-            ))
-            .child(self.compatibility_switch(
-                "compat-nullable-tools",
-                t!("settings.providers.nullable_tool_fields").to_string(),
-                compatibility.allow_nullable_tool_fields,
-                |compatibility, checked| compatibility.allow_nullable_tool_fields = checked,
-                cx,
-            ))
-            .child(self.compatibility_switch(
-                "compat-object-arguments",
-                t!("settings.providers.object_tool_arguments").to_string(),
-                compatibility.allow_object_tool_arguments,
-                |compatibility, checked| compatibility.allow_object_tool_arguments = checked,
-                cx,
-            ))
+            .size_full()
+            .child(div().h(TITLE_BAR_HEIGHT).flex_shrink_0())
+            .child(self.render_detail_body(cx))
+            .into_any_element()
     }
 
-    fn compatibility_switch(
-        &self,
-        id: &'static str,
-        text: String,
-        checked: bool,
-        update: fn(&mut CompatibilityProfile, bool),
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let weak = cx.weak_entity();
-        h_flex().justify_between().child(text).child(
-            Switch::new(id)
-                .small()
-                .checked(checked)
-                .on_click(move |checked, _, cx| {
-                    weak.update(cx, |this, cx| {
-                        this.update_compatibility(
-                            |compatibility| update(compatibility, *checked),
-                            cx,
-                        )
-                    })
-                    .ok();
-                }),
-        )
-    }
+    fn render_detail_body(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(selected) = self.selected.clone() else {
+            return div().into_any_element();
+        };
 
-    fn render_models(&self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let profile = providers::find(&selected, cx);
+        let protocol = profile.map(|profile| profile.protocol).unwrap_or_default();
+        let compatibility = profile.map(|profile| profile.compatibility.clone());
+
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .pt_2()
+            .pl_6()
+            .pr_10()
+            .pb_6()
+            .gap_5()
+            .text_sm()
+            .child(field(
+                "provider-name",
+                t!("settings.providers.name").to_string(),
+                t!("settings.providers.name_desc").to_string(),
+                Input::new(&self.name),
+                cx,
+            ))
+            .child(field(
+                "provider-base-url",
+                t!("settings.providers.base_url").to_string(),
+                t!("settings.providers.base_url_desc").to_string(),
+                Input::new(&self.base_url),
+                cx,
+            ))
+            // A two-option dropdown needs no column of its own: label left,
+            // control right, same single-line shape as the compatibility rows.
+            .child(dropdown_row(
+                "provider-wire-api",
+                t!("settings.providers.wire_api").to_string(),
+                t!("settings.providers.wire_api_desc").to_string(),
+                {
+                    let weak = cx.weak_entity();
+                    super::ui::dropdown(
+                        "provider-protocol",
+                        vec![
+                            ("chat-completions".into(), "Chat Completions".into()),
+                            ("responses".into(), "Responses".into()),
+                        ],
+                        protocol.as_str().into(),
+                        false,
+                        move |value, cx| {
+                            let Some(protocol) = Protocol::from_key(value.as_ref()) else {
+                                return;
+                            };
+                            weak.update(cx, |this, cx| this.set_protocol(protocol, cx))
+                                .ok();
+                        },
+                    )
+                },
+                cx,
+            ))
+            .child(field(
+                "provider-api-key",
+                t!("settings.providers.api_key").to_string(),
+                t!("settings.providers.api_key_desc").to_string(),
+                Input::new(&self.api_key)
+                    .content_type(InputContentType::Password)
+                    .suffix(self.render_mask_toggle(cx)),
+                cx,
+            ))
+            .child(self.render_models(cx))
+            .when_some(compatibility, |this, compatibility| {
+                this.child(self.render_compatibility(compatibility, cx))
+            })
+            .overflow_y_scrollbar()
+            .into_any_element()
+    }
+}
+
+impl ProvidersPage {
+    /// One row per model: upstream id on the left, optional alias on the
+    /// right.  Both inputs share the row's free width evenly (`flex_1` +
+    /// `min_w_0`), so they stay equal at any divider position; the remove
+    /// button matches their height and is centred against them.
+    fn render_models(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .justify_between()
-                    .child(label(t!("settings.providers.models").to_string(), cx))
+                    .items_center()
+                    .child(super::ui::labelled(
+                        label(t!("settings.providers.models").to_string(), cx),
+                        "provider-models",
+                        t!("settings.providers.models_desc").to_string(),
+                        cx,
+                    ))
                     .child(
-                        Button::new("add-model")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .tooltip(t!("settings.providers.add_model").to_string())
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.add_model(window, cx)),
-                            ),
+                        IconButton::new(
+                            "add-model",
+                            IconName::Plus,
+                            t!("settings.providers.add_model").to_string(),
+                        )
+                        .outline()
+                        .size(px(24.))
+                        .on_activate({
+                            let weak = cx.weak_entity();
+                            move |window, cx| {
+                                weak.update(cx, |this, cx| this.add_model(window, cx)).ok();
+                            }
+                        }),
                     ),
             )
             .children(self.models.iter().map(|model| {
                 let id = model.id.clone();
                 h_flex()
                     .gap_2()
-                    .child(Input::new(&model.name))
-                    .child(Input::new(&model.model_id).flex_1())
+                    .items_center()
+                    .child(Input::new(&model.model_id).flex_1().min_w_0())
+                    .child(Input::new(&model.name).flex_1().min_w_0())
                     .child(
-                        Button::new(ElementId::Name(format!("delete-model-{id}").into()))
-                            .ghost()
-                            .danger()
-                            .small()
-                            .icon(IconName::Close)
-                            .tooltip(t!("settings.providers.delete_model").to_string())
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.request_delete_model(id.clone(), window, cx)
-                            })),
+                        IconButton::new(
+                            ElementId::Name(format!("delete-model-{id}").into()),
+                            IconName::Close,
+                            t!("settings.providers.delete_model").to_string(),
+                        )
+                        .danger()
+                        .size(px(32.))
+                        // A row of two text fields is cheap to retype, so
+                        // this removes straight away — no confirmation.
+                        .on_activate({
+                            let weak = cx.weak_entity();
+                            move |_, cx| {
+                                weak.update(cx, |this, cx| this.delete_model(&id, cx)).ok();
+                            }
+                        }),
                     )
             }))
     }
@@ -750,14 +658,86 @@ fn label(text: String, cx: &App) -> impl IntoElement {
         .child(text)
 }
 
-fn field(label_text: String, input: Input) -> impl IntoElement {
-    v_flex().gap_2().child(label_text).child(input)
+/// Label above its input, with the field's explanation behind an info icon
+/// beside it.  The label sits in a row-height box so the form's first label
+/// lands on the same baseline as the first list row and nav item; the tighter
+/// gap keeps the label-to-input distance where it was.
+fn field(id: &str, label_text: String, info: String, input: Input, cx: &App) -> impl IntoElement {
+    v_flex()
+        .gap_1()
+        .child(
+            h_flex()
+                .h(ROW_HEIGHT)
+                .items_center()
+                .child(super::ui::labelled(label(label_text, cx), id, info, cx)),
+        )
+        .child(input)
 }
 
-fn compatibility_dropdown_row(label: String, control: AnyElement) -> impl IntoElement {
+/// Single-line control row: label plus info icon on the left, control on the
+/// right.
+fn dropdown_row(
+    id: &str,
+    label: String,
+    info: String,
+    control: AnyElement,
+    cx: &App,
+) -> impl IntoElement {
     h_flex()
+        .items_center()
         .justify_between()
         .gap_4()
-        .child(label)
+        .child(super::ui::labelled(label, id, info, cx))
         .child(control)
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_i18n::t;
+
+    /// Every field on this page explains itself through a hover icon whose
+    /// text is looked up at render time.  A missing or misspelled key resolves
+    /// to the key path itself and would ship as visible gibberish, so each one
+    /// must exist in both locales.
+    #[test]
+    fn every_field_description_resolves_in_both_locales() {
+        const KEYS: [&str; 13] = [
+            "name_desc",
+            "base_url_desc",
+            "wire_api_desc",
+            "api_key_desc",
+            "models_desc",
+            "compatibility_desc",
+            "max_tokens_field_desc",
+            "system_role_desc",
+            "reasoning_field_desc",
+            "responses_instructions_desc",
+            "stream_usage_desc",
+            "nullable_tool_fields_desc",
+            "object_tool_arguments_desc",
+        ];
+
+        for key in KEYS {
+            let path = format!("settings.providers.{key}");
+            for locale in ["zh-CN", "en"] {
+                let text = t!(&path, locale = locale);
+                assert_ne!(text, path, "{path} is missing for {locale}");
+                assert!(!text.is_empty(), "{path} is empty for {locale}");
+            }
+        }
+    }
+
+    /// The unnamed-row label is resolved at render time and numbered, so it
+    /// must interpolate rather than leak a `%{index}` placeholder, and it must
+    /// follow whichever locale is active.
+    #[test]
+    fn unnamed_provider_label_is_numbered_per_locale() {
+        for (locale, expected) in [("zh-CN", "未命名供应商 2"), ("en", "Unnamed provider 2")]
+        {
+            assert_eq!(
+                t!("settings.providers.unnamed", locale = locale, index = 2),
+                expected
+            );
+        }
+    }
 }

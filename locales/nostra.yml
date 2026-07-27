@@ -49,26 +49,26 @@ chat:
     zh-CN: 模型不可用
   no_models:
     en: Configure a provider and model in Settings
-    zh-CN: 请先在设置中配置提供商和模型
+    zh-CN: 请先在设置中配置供应商和模型
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
   error:
     configuration:
       en: Select an available provider and model in Settings.
-      zh-CN: 请在设置中选择可用的提供商和模型。
+      zh-CN: 请在设置中选择可用的供应商和模型。
     connection:
       en: Unable to connect to the provider.
-      zh-CN: 无法连接到提供商。
+      zh-CN: 无法连接到供应商。
     interrupted:
       en: The provider stream was interrupted.
-      zh-CN: 提供商响应流意外中断。
+      zh-CN: 供应商响应流意外中断。
     http:
       en: "The provider returned HTTP %{status}."
-      zh-CN: "提供商返回了 HTTP %{status}。"
+      zh-CN: "供应商返回了 HTTP %{status}。"
     provider:
       en: The provider request failed.
-      zh-CN: 提供商请求失败。
+      zh-CN: 供应商请求失败。
     request_id:
       en: Request ID
       zh-CN: 请求 ID
@@ -104,6 +104,9 @@ settings:
   title:
     en: Settings
     zh-CN: 设置
+  more_information:
+    en: More information
+    zh-CN: 更多信息
   page:
     general:
       en: General
@@ -113,7 +116,7 @@ settings:
       zh-CN: 外观
     providers:
       en: Providers
-      zh-CN: 提供商
+      zh-CN: 供应商
     about:
       en: About
       zh-CN: 关于
@@ -157,6 +160,12 @@ settings:
   composer_font_desc:
     en: Bundled font used by the message input; both options keep soft-wrap positions exact.
     zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  hide_info_buttons:
+    en: Hide info buttons
+    zh-CN: 隐藏提示按钮
+  hide_info_buttons_desc:
+    en: Hide the information buttons next to settings that show additional explanations.
+    zh-CN: 隐藏设置项旁用于显示补充说明的提示按钮。
   glass_effect:
     en: Glass effect
     zh-CN: 毛玻璃效果
@@ -170,60 +179,84 @@ settings:
     en: Adjust the opacity of the theme tint above the native blurred backdrop.
     zh-CN: 调整原生模糊背景上方主题色遮罩的不透明度。
   providers:
-    new_profile:
-      en: New provider
-      zh-CN: 新提供商
     unnamed:
-      en: Unnamed provider
-      zh-CN: 未命名提供商
+      en: "Unnamed provider %{index}"
+      zh-CN: "未命名供应商 %{index}"
     add_profile:
       en: Add provider
-      zh-CN: 添加提供商
+      zh-CN: 添加供应商
+    more_actions:
+      en: More actions
+      zh-CN: 更多操作
     delete_profile:
-      en: Delete provider
-      zh-CN: 删除提供商
-    delete_profile_title:
-      en: Delete this provider?
-      zh-CN: 删除此提供商？
-    delete_profile_desc:
-      en: Its models and credentials will also be removed. Existing chats will require another model selection.
-      zh-CN: 其模型和凭据也会被删除，已有聊天需要重新选择模型。
-    delete:
-      en: Delete
-      zh-CN: 删除
-    cancel:
-      en: Cancel
-      zh-CN: 取消
+      en: Delete this provider
+      zh-CN: 删除此供应商
     empty:
       en: Add a provider to start configuring models.
-      zh-CN: 添加提供商以开始配置模型。
+      zh-CN: 添加供应商以开始配置模型。
     name:
       en: Provider name
-      zh-CN: 提供商名称
+      zh-CN: 供应商名称
+    name_desc:
+      en: Display name for this provider, used in the list here and in the model picker. Required — a provider without a name cannot be used.
+      zh-CN: 此供应商的显示名称，用于左侧列表和模型选择菜单。必填，未命名的供应商无法使用。
+    name_placeholder:
+      en: e.g. OpenAI
+      zh-CN: 例如 OpenAI
     base_url:
       en: API Base URL
       zh-CN: API Base URL
+    base_url_desc:
+      en: "Root address of the OpenAI-compatible API, e.g. https://api.openai.com/v1. The endpoint path is appended automatically, so do not include /chat/completions or /responses, nor a query string."
+      zh-CN: "OpenAI 兼容 API 的根地址，例如 https://api.openai.com/v1。接口路径会自动追加，因此不要填写 /chat/completions 或 /responses，也不要带查询参数。"
     wire_api:
       en: Wire API
       zh-CN: 接口协议
+    wire_api_desc:
+      en: "Request format used against this provider, which also decides the endpoint path: Chat Completions (/chat/completions) is the widest supported; Responses (/responses) is OpenAI's newer API and can carry reasoning state across turns."
+      zh-CN: "向该供应商发起请求所用的格式，同时决定追加的接口路径：Chat Completions（/chat/completions）兼容性最广；Responses（/responses）是 OpenAI 的较新接口，可跨轮携带推理状态。"
     api_key:
       en: API Key
       zh-CN: API Key
+    api_key_desc:
+      en: Sent as an Authorization Bearer header on every request. Stored as plain text in this machine's preferences file, so treat that file as a secret.
+      zh-CN: 每次请求都会以 Authorization Bearer 请求头发送。它以明文保存在本机的配置文件中，请将该文件视为敏感信息。
+    show_api_key:
+      en: Show API Key
+      zh-CN: 显示 API Key
+    hide_api_key:
+      en: Hide API Key
+      zh-CN: 隐藏 API Key
     compatibility:
       en: Compatibility
       zh-CN: 兼容选项
+    compatibility_desc:
+      en: Wire-format tweaks for gateways and third-party services that only partly follow the OpenAI spec. The defaults suit most providers — reach for these when a request is rejected or reasoning output fails to show up.
+      zh-CN: 针对网关和第三方服务只部分遵循 OpenAI 规范的传输格式微调。默认值适用于大多数供应商，只在请求被拒绝或推理内容无法显示时才需要调整。
     max_tokens_field:
       en: Token limit field
       zh-CN: Token 上限字段
+    max_tokens_field_desc:
+      en: Field name carrying the output token cap. max_completion_tokens is the current OpenAI spelling; switch to max_tokens for older gateways that reject the newer name.
+      zh-CN: 用于传递输出 token 上限的字段名。max_completion_tokens 是 OpenAI 当前的写法；若网关较旧、不接受新字段名，则改用 max_tokens。
     system_role:
       en: System instruction role
       zh-CN: 系统指令角色
+    system_role_desc:
+      en: Role name used when sending system instructions. Preserve keeps whatever the message already carries; pick system or developer to force every system instruction onto one role that this provider accepts.
+      zh-CN: 发送系统指令时所用的角色名。保持原样即沿用消息自带的角色；选择 system 或 developer 可将所有系统指令统一改写为该供应商接受的角色。
     reasoning_field:
       en: Reasoning field
       zh-CN: 推理字段
+    reasoning_field_desc:
+      en: Field the reasoning text is read from in a streamed Chat Completions response. Auto tries reasoning_content, reasoning, then reasoning_text; name one explicitly if the provider fills several and the wrong one is picked.
+      zh-CN: 从 Chat Completions 流式响应中读取推理内容的字段。自动会依次尝试 reasoning_content、reasoning、reasoning_text；若供应商同时返回多个而选错，可指定其中一个。
     responses_instructions:
       en: Responses instructions
       zh-CN: Responses 指令位置
+    responses_instructions_desc:
+      en: Where system instructions go in a Responses request. Top level merges them into the instructions field; input items leaves them as ordinary messages, which some compatible implementations require. Ignored by Chat Completions.
+      zh-CN: Responses 请求中系统指令的放置位置。顶层字段会合并到 instructions；输入项则保留为普通消息，部分兼容实现要求这样。Chat Completions 不受此项影响。
     option:
       preserve:
         en: Preserve
@@ -240,30 +273,36 @@ settings:
     stream_usage:
       en: Request stream usage
       zh-CN: 请求流式用量
+    stream_usage_desc:
+      en: Asks a streamed Chat Completions request to report token usage via stream_options.include_usage. Turn it off for providers that reject the parameter; usage figures are then unavailable.
+      zh-CN: 在 Chat Completions 流式请求中通过 stream_options.include_usage 索取 token 用量。若供应商不接受该参数，可关闭，代价是拿不到用量数据。
     nullable_tool_fields:
       en: Accept nullable tool fields
       zh-CN: 接受可空工具字段
+    nullable_tool_fields_desc:
+      en: Tolerates null id, name, or arguments in a streamed tool call instead of failing the response. Keep it on unless you want strict protocol checking.
+      zh-CN: 容忍流式工具调用中 id、name 或 arguments 为 null，而不是直接判定响应失败。除非需要严格校验协议，建议保持开启。
     object_tool_arguments:
       en: Accept object tool arguments
       zh-CN: 接受对象形式工具参数
+    object_tool_arguments_desc:
+      en: Accepts tool arguments sent as a JSON object and re-serializes them, rather than requiring the JSON string the spec calls for. Needed by providers that skip the stringify step.
+      zh-CN: 接受以 JSON 对象形式发来的工具参数并重新序列化，而不强制要求规范规定的 JSON 字符串。部分供应商省略了字符串化，需要此项。
     models:
       en: Models
       zh-CN: 模型
+    models_desc:
+      en: Models exposed by this provider. Each row takes the upstream model ID sent in requests (left) and an optional display alias (right). At least one model with an ID is required before the provider can be selected in a chat.
+      zh-CN: 该供应商可用的模型。每行左侧填请求中实际发送的上游模型 ID，右侧填可选的显示别名。至少需要一个填好 ID 的模型，供应商才能在聊天中被选用。
     add_model:
       en: Add model
       zh-CN: 添加模型
     delete_model:
       en: Delete model
       zh-CN: 删除模型
-    delete_model_title:
-      en: Delete this model?
-      zh-CN: 删除此模型？
-    delete_model_desc:
-      en: Existing chats using this model will require another model selection.
-      zh-CN: 使用此模型的已有聊天将需要重新选择模型。
     model_name_placeholder:
-      en: Optional name
-      zh-CN: 可选名称
+      en: Display name (optional)
+      zh-CN: 显示别名（可选）
     model_id_placeholder:
       en: Model ID
       zh-CN: 模型 ID

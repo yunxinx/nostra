@@ -76,6 +76,10 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(title_bar_options()),
+            // The app draws the interactive titlebar. On macOS this prevents
+            // AppKit from treating buttons inside the transparent titlebar as
+            // native window-drag regions; ChatApp supplies the blank drag area.
+            app_owns_titlebar_drag: cfg!(target_os = "macos"),
             window_min_size: Some(MIN_SIZE),
             kind: WindowKind::Normal,
             #[cfg(target_os = "macos")]

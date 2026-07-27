@@ -38,6 +38,8 @@ pub struct Preferences {
     pub glass_effect: bool,
     /// Opacity of the theme tint drawn above the native blurred backdrop.
     pub glass_tint_opacity: f32,
+    /// Whether settings omit the buttons that reveal explanatory text.
+    pub hide_settings_info_buttons: bool,
     /// UI language.
     pub language: Language,
     /// Theme name applied while in light mode.  `None` or an unregistered
@@ -70,6 +72,7 @@ impl Default for Preferences {
             composer_font: ComposerFont::default(),
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
+            hide_settings_info_buttons: false,
             language: Language::default(),
             light_theme: None,
             dark_theme: None,
@@ -355,6 +358,17 @@ mod tests {
         unknown_top_level["legacy_provider"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<Preferences>(unknown_top_level).is_err());
 
+        let mut missing_current_field =
+            serde_json::to_value(Preferences::default()).expect("serialize");
+        assert!(
+            missing_current_field
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("hide_settings_info_buttons")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_current_field).is_err());
+
         let mut unknown_geometry = serde_json::to_value(Preferences {
             window: Some(WindowGeometry {
                 x: 0.,
@@ -370,10 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn glass_effect_is_disabled_by_default() {
+    fn appearance_preferences_have_expected_defaults() {
         let prefs = Preferences::default();
         assert!(!prefs.glass_effect);
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
+        assert!(!prefs.hide_settings_info_buttons);
     }
 
     #[test]
@@ -384,6 +399,7 @@ mod tests {
         let prefs = Preferences {
             sidebar_width: 336.0,
             language: Language::En,
+            hide_settings_info_buttons: true,
             ..Preferences::default()
         };
 
@@ -393,6 +409,7 @@ mod tests {
         let parsed: Preferences = serde_json::from_str(&saved).expect("saved JSON must parse");
         assert_eq!(parsed.sidebar_width, 336.0);
         assert_eq!(parsed.language, Language::En);
+        assert!(parsed.hide_settings_info_buttons);
     }
 
     #[test]

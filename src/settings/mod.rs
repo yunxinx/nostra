@@ -40,7 +40,10 @@ const MIN_SIZE: Size<Pixels> = Size {
 
 /// Width of the left navigation rail.
 const NAV_WIDTH: Pixels = px(200.);
-
+/// Height of a single selectable row.  Shared by the nav items and the
+/// providers list so the two columns' first rows sit on the same baseline;
+/// the providers form aligns its first label to the same box.
+pub(super) const ROW_HEIGHT: Pixels = px(30.);
 /// Left-pad so nav content sits right of the macOS traffic lights.
 #[cfg(target_os = "macos")]
 const TRAFFIC_LIGHT_PAD: Pixels = px(80.);
@@ -263,7 +266,7 @@ impl SettingsWindow {
                 .aria_selected(is_active)
                 .track_focus(&focus_handle.tab_stop(true))
                 .focus_visible(|this| this.border_1().border_color(focus_ring))
-                .h(px(30.))
+                .h(ROW_HEIGHT)
                 .px_2()
                 .gap_2()
                 .items_center()
@@ -330,27 +333,49 @@ impl SettingsWindow {
             Page::About => about::render(cx),
         };
 
+        // The providers page is a split view whose two columns scroll
+        // independently, so it takes the content box at full height and owns
+        // its own scrolling.  Every other page is a plain column inside one
+        // shared scroll view.
+        let immersive = matches!(self.active, Page::Providers);
+        let content = match self.active {
+            Page::Providers => div()
+                .flex_1()
+                .min_h_0()
+                // Left inset matches the gap the list keeps on its own right
+                // edge, so the column sits evenly between nav and divider.
+                // The columns supply the rest of their padding, and the detail
+                // column's scrollbar rides the window edge.
+                .pl_3()
+                .child(body)
+                .into_any_element(),
+            _ => div()
+                .id("settings-content")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_10()
+                // No top padding: the first row's own `py_3` lands its
+                // label level with the nav's first item (`pt_2` + 30px
+                // box), keeping both columns' tops flush.
+                .pb_4()
+                .child(body)
+                .into_any_element(),
+        };
+
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(cx.theme().background)
             // Keep the top strip empty: it doubles as the native drag region
-            // of the transparent title bar.
-            .child(div().h(TITLE_BAR_HEIGHT).flex_shrink_0())
-            .child(
-                div()
-                    .id("settings-content")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_10()
-                    // No top padding: the first row's own `py_3` lands its
-                    // label level with the nav's first item (`pt_2` + 30px
-                    // box), keeping both columns' tops flush.
-                    .pb_4()
-                    .child(body),
-            )
+            // of the transparent title bar.  The providers split reserves the
+            // same strip inside each of its columns instead, so its divider
+            // can run the full height of the window.
+            .when(!immersive, |this| {
+                this.child(div().h(TITLE_BAR_HEIGHT).flex_shrink_0())
+            })
+            .child(content)
     }
 }
 
