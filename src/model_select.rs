@@ -60,7 +60,11 @@ impl PopoverDismissHandle {
     }
 }
 
-const MODEL_PILL_MAX_WIDTH: Pixels = px(280.);
+/// Width at which the pill stops growing and the model name truncates.  Longer
+/// model ids were clipping noticeably at the previous 280px, so this buys ~20%
+/// more room; much beyond that and the pill starts eating into the title bar's
+/// drag region on a narrow window.
+const MODEL_PILL_MAX_WIDTH: Pixels = px(336.);
 const MODEL_MENU_WIDTH: Pixels = px(320.);
 const MODEL_MENU_HEIGHT: Pixels = px(320.);
 

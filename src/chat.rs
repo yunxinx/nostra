@@ -73,6 +73,16 @@ pub struct ChatView {
     /// Last measured height of the complete floating composer, including its
     /// outer padding. Used as the transcript's bottom inset.
     composer_height: Pixels,
+    /// Composer height measured while the input was empty, i.e. at its
+    /// single-row resting size.  The empty state centers against this instead
+    /// of the live height so a multi-line draft grows the composer upward
+    /// *over* the greeting rather than pushing it up the panel.  Re-measured
+    /// whenever the input goes back to empty, so a font or text-size change
+    /// recalibrates it on its own.
+    base_composer_height: Pixels,
+    /// Snapshot maintained by the input subscription. Rendering hooks must not
+    /// read the external `InputState` entity while recording layout bounds.
+    input_empty: bool,
     scroll_handle: ScrollHandle,
     /// Whether streaming updates may pin the view to the bottom.  A single
     /// upward wheel tick clears it — distance alone isn't enough, because
@@ -112,6 +122,7 @@ impl ChatView {
                     InputEvent::PressEnter { shift, .. } if !shift => {
                         let text = input.read(cx).value().trim().to_string();
                         if this.submit(text, cx) {
+                            this.input_empty = true;
                             input.update(cx, |state, cx| state.set_value("", window, cx));
                         }
                     }
@@ -123,14 +134,16 @@ impl ChatView {
                         // frame's layout, so pasting many lines into a shorter
                         // document clamps its scroll target to zero and the view
                         // stays stuck at the top.
-                        let (cursor_line, lines_len, x) = {
+                        let (input_empty, cursor_line, lines_len, x) = {
                             let state = input.read(cx);
                             (
+                                state.value().is_empty(),
                                 state.cursor_position().line as usize,
                                 state.text().lines_len(),
                                 state.scroll_offset().x,
                             )
                         };
+                        this.input_empty = input_empty;
                         if lines_len > 1 && cursor_line + 1 == lines_len {
                             input.update(cx, |state, cx| {
                                 state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
@@ -148,6 +161,8 @@ impl ChatView {
             input,
             placeholder,
             composer_height: DEFAULT_COMPOSER_HEIGHT,
+            base_composer_height: DEFAULT_COMPOSER_HEIGHT,
+            input_empty: true,
             scroll_handle: ScrollHandle::new(),
             follow: true,
             selection,
@@ -348,6 +363,7 @@ impl ChatView {
     fn on_send_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
         if self.submit(text, cx) {
+            self.input_empty = true;
             self.input
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
@@ -378,6 +394,7 @@ impl Render for ChatView {
             || self.input.read(cx).value().trim().is_empty()
             || !self.selection_available;
         let composer_height = self.composer_height;
+        let base_composer_height = self.base_composer_height;
         let view = cx.weak_entity();
 
         // Full-height message viewport with a floating composer stacked on top
@@ -391,7 +408,7 @@ impl Render for ChatView {
                 self.render_message_list(composer_height, cx)
                     .into_any_element()
             } else {
-                render_empty_state(composer_height, cx).into_any_element()
+                render_empty_state(base_composer_height, cx).into_any_element()
             })
             .child(
                 div()
@@ -402,9 +419,7 @@ impl Render for ChatView {
                     .child(self.render_input_area(send_disabled, cx))
                     .on_prepaint(move |bounds, _, cx| {
                         view.update(cx, |this, cx| {
-                            let height = bounds.size.height;
-                            if this.composer_height != height {
-                                this.composer_height = height;
+                            if this.record_composer_height(bounds.size.height) {
                                 cx.notify();
                             }
                         })
@@ -419,6 +434,26 @@ fn is_replayable(message: &LlmMessage) -> bool {
 }
 
 impl ChatView {
+    /// Fold a fresh composer measurement into the two tracked heights, and
+    /// report whether either moved (i.e. whether a re-render is needed).
+    ///
+    /// The live height follows every frame, but the resting height only
+    /// records while the input is empty — and an empty input is exactly one
+    /// row tall.  That keeps the greeting anchored when a draft grows the
+    /// composer, without hard-coding what one row measures.
+    fn record_composer_height(&mut self, height: Pixels) -> bool {
+        let mut changed = false;
+        if self.composer_height != height {
+            self.composer_height = height;
+            changed = true;
+        }
+        if self.input_empty && self.base_composer_height != height {
+            self.base_composer_height = height;
+            changed = true;
+        }
+        changed
+    }
+
     fn render_message_list(
         &self,
         composer_height: Pixels,
@@ -599,13 +634,16 @@ fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
         .child(div().w_full().max_w(CONTENT_MAX_WIDTH).child(inner))
 }
 
-fn render_empty_state(composer_height: Pixels, cx: &App) -> impl IntoElement {
+/// Greeting shown before the first turn.  Takes the composer's *resting*
+/// height (see `ChatView::base_composer_height`) so the block stays anchored
+/// while a multi-line draft grows the composer over it.
+fn render_empty_state(base_composer_height: Pixels, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     v_flex()
         .size_full()
         .items_center()
         .justify_center()
-        .pb(composer_height)
+        .pb(base_composer_height)
         .gap_2()
         .child(
             div()
@@ -636,9 +674,13 @@ fn derive_title(text: &str) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
+    use gpui::{TestAppContext, px};
+    use gpui_component::input::InputEvent;
 
-    use super::is_replayable;
+    use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
+    use crate::preferences;
+
+    use super::{ChatView, is_replayable};
 
     #[test]
     fn empty_assistant_placeholders_are_not_replayed() {
@@ -658,5 +700,63 @@ mod tests {
 
         assert!(!is_replayable(&empty_assistant));
         assert!(is_replayable(&user));
+    }
+
+    /// The greeting is laid out against the *resting* composer height, so a
+    /// growing draft must not move that number — otherwise the empty state
+    /// gets pushed up the panel one row at a time.
+    #[gpui::test]
+    fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            preferences::init_global(preferences::Preferences::default(), cx);
+        });
+        let cx = cx.add_empty_window();
+        let chat = cx.update(ChatView::view);
+        let input = cx.update(|_, cx| chat.read(cx).input.clone());
+
+        // First measurement of an empty composer sets both heights.
+        cx.update(|_, cx| {
+            chat.update(cx, |this, _| {
+                assert!(this.record_composer_height(px(96.)));
+                assert_eq!(this.composer_height, px(96.));
+                assert_eq!(this.base_composer_height, px(96.));
+            });
+        });
+
+        // A draft grows the composer: the live height tracks it, the resting
+        // height stays where the greeting was placed.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("line\nline\nline", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        });
+        cx.update(|_, cx| {
+            chat.update(cx, |this, _| {
+                assert!(!this.input_empty);
+                assert!(this.record_composer_height(px(168.)));
+                assert_eq!(this.composer_height, px(168.));
+                assert_eq!(this.base_composer_height, px(96.));
+            });
+        });
+
+        // Clearing the draft re-measures the resting height, which is how a
+        // font or text-size change recalibrates it.
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                cx.emit(InputEvent::Change);
+            });
+        });
+        cx.update(|_, cx| {
+            chat.update(cx, |this, _| {
+                assert!(this.input_empty);
+                assert!(this.record_composer_height(px(104.)));
+                assert_eq!(this.base_composer_height, px(104.));
+                // Idempotent: the same measurement asks for no re-render.
+                assert!(!this.record_composer_height(px(104.)));
+            });
+        });
     }
 }

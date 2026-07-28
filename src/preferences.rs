@@ -28,6 +28,10 @@ pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.85;
 pub struct Preferences {
     /// Sidebar width in the expanded state.
     pub sidebar_width: f32,
+    /// Width of the profile-list column in the provider settings split.  The
+    /// detail column takes the remainder, so one value pins the divider.
+    /// Clamped into the page's allowed range when restored.
+    pub provider_list_width: f32,
     /// Whether the sidebar is collapsed.
     pub sidebar_collapsed: bool,
     /// Explicit theme mode override.  `None` means "follow system".
@@ -63,10 +67,15 @@ fn default_sidebar_width() -> f32 {
     272.0
 }
 
+/// Starting position of the provider settings divider, i.e. where the list
+/// column sits until the user drags it.
+pub const DEFAULT_PROVIDER_LIST_WIDTH: f32 = 220.0;
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             sidebar_width: default_sidebar_width(),
+            provider_list_width: DEFAULT_PROVIDER_LIST_WIDTH,
             sidebar_collapsed: false,
             theme_mode: None,
             composer_font: ComposerFont::default(),
@@ -399,6 +408,28 @@ mod tests {
         assert!(!prefs.glass_effect);
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
         assert!(!prefs.hide_settings_info_buttons);
+    }
+
+    /// Both split geometries are plain widths, and both must survive a round
+    /// trip — the provider divider was persisted later than the sidebar, so
+    /// this pins them together.
+    #[test]
+    fn split_widths_round_trip() {
+        assert_eq!(
+            Preferences::default().provider_list_width,
+            DEFAULT_PROVIDER_LIST_WIDTH
+        );
+
+        let prefs = Preferences {
+            sidebar_width: 300.0,
+            provider_list_width: 288.0,
+            ..Preferences::default()
+        };
+        let back: Preferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(back.sidebar_width, 300.0);
+        assert_eq!(back.provider_list_width, 288.0);
     }
 
     #[test]

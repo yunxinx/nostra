@@ -24,20 +24,31 @@ use rust_i18n::t;
 use super::{ROW_HEIGHT, ui::IconButton};
 use crate::{
     llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString},
-    providers,
+    preferences, providers,
 };
 
 /// Shown as the Base URL placeholder rather than pre-filled, so the field
 /// reads as a hint instead of a value the user has to notice and correct.
 const BASE_URL_HINT: &str = "https://api.openai.com/v1";
 
-/// Initial width of the profile list column.
-const LIST_WIDTH: Pixels = px(220.);
-
 /// Travel limits of the divider: narrow enough to stay compact, wide enough
 /// to still show a long provider name without truncating everything.
 const LIST_MIN_WIDTH: Pixels = px(160.);
 const LIST_MAX_WIDTH: Pixels = px(320.);
+
+/// Gate for the persisted divider position, applied in both directions: a
+/// hand-edited or stale preferences value can't push the list outside the
+/// range the drag itself allows, and a measured width is normalized the same
+/// way before it is written back.
+fn clamp_list_width(width: Pixels) -> Pixels {
+    width.clamp(LIST_MIN_WIDTH, LIST_MAX_WIDTH)
+}
+
+/// Normalize a measured width and return it only when persistence is needed.
+fn changed_list_width(current: f32, measured: Pixels) -> Option<f32> {
+    let measured = clamp_list_width(measured).as_f32();
+    (current != measured).then_some(measured)
+}
 
 /// Keeps the detail form readable however far the divider is dragged left.
 /// Both floors together must fit the narrowest content box the window allows
@@ -93,8 +104,12 @@ pub(super) struct ProvidersPage {
     models: Vec<ModelEditor>,
     placeholders: ProviderPlaceholders,
     /// Divider position of the list / detail split.  Owned here (not by the
-    /// element) so the width survives re-renders and page switches.
+    /// element) so the width survives re-renders and page switches; the value
+    /// itself is seeded from and written back to preferences, so it also
+    /// survives closing the settings window.
     layout: Entity<ResizableState>,
+    /// Restored list width, used as the split's initial size on first render.
+    list_width: Pixels,
     /// Wire-format switches stay folded away until asked for.
     compatibility_open: bool,
     /// Row the pointer is over, so its remove button can appear.
@@ -142,6 +157,7 @@ impl ProvidersPage {
             models: Vec::new(),
             placeholders,
             layout: cx.new(|_| ResizableState::default()),
+            list_width: clamp_list_width(px(preferences::get(cx).provider_list_width)),
             compatibility_open: false,
             hovered: None,
             api_key_masked: true,
@@ -525,9 +541,22 @@ impl Render for ProvidersPage {
         // settings window's own scroll view.
         h_resizable("providers-split")
             .with_state(&self.layout)
+            // Fires once per drag, on mouse-up, so the divider persists at the
+            // same granularity as the main window's sidebar — without a write
+            // per intermediate mouse-move.
+            .on_resize(|state, _, cx| {
+                let Some(width) = state.read(cx).sizes().first().copied() else {
+                    return;
+                };
+                if let Some(width) =
+                    changed_list_width(preferences::get(cx).provider_list_width, width)
+                {
+                    preferences::update(cx, |prefs| prefs.provider_list_width = width);
+                }
+            })
             .child(
                 resizable_panel()
-                    .size(LIST_WIDTH)
+                    .size(self.list_width)
                     .size_range(LIST_MIN_WIDTH..LIST_MAX_WIDTH)
                     // Sized panel next to a growing sibling: opt out of the
                     // panel's internal `flex_grow: 1` so the detail column
@@ -786,10 +815,55 @@ fn dropdown_row(
 
 #[cfg(test)]
 mod tests {
+    use gpui::{AppContext as _, TestAppContext, px};
     use rust_i18n::t;
 
-    use super::{ModelField, ModelFieldBinding};
+    use super::{
+        LIST_MAX_WIDTH, LIST_MIN_WIDTH, ModelField, ModelFieldBinding, ProvidersPage,
+        changed_list_width, clamp_list_width,
+    };
     use crate::llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString};
+    use crate::preferences;
+
+    /// A persisted width outside the drag range (hand-edited file, or a range
+    /// narrowed in a later version) must not place the divider somewhere the
+    /// user can't drag it back from.
+    #[test]
+    fn persisted_list_width_is_gated_by_the_drag_range() {
+        assert_eq!(clamp_list_width(px(240.)), px(240.));
+        assert_eq!(clamp_list_width(px(40.)), LIST_MIN_WIDTH);
+        assert_eq!(clamp_list_width(px(9_000.)), LIST_MAX_WIDTH);
+    }
+
+    #[test]
+    fn resized_list_width_is_normalized_and_only_writes_changes() {
+        assert_eq!(changed_list_width(220.0, px(220.)), None);
+        assert_eq!(changed_list_width(220.0, px(288.)), Some(288.0));
+        assert_eq!(
+            changed_list_width(220.0, px(9_000.)),
+            Some(LIST_MAX_WIDTH.as_f32())
+        );
+    }
+
+    /// The page seeds its split from preferences, so reopening the settings
+    /// window restores the divider instead of snapping back to the default.
+    #[gpui::test]
+    fn page_restores_the_persisted_divider_position(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            preferences::init_global(
+                preferences::Preferences {
+                    provider_list_width: 288.0,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let cx = cx.add_empty_window();
+        let page = cx.update(|window, cx| cx.new(|cx| ProvidersPage::new(window, cx)));
+
+        cx.update(|_, cx| assert_eq!(page.read(cx).list_width, px(288.)));
+    }
 
     fn edit_profile(id: &str, upstream_id: &str, display_name: &str) -> ProviderProfile {
         ProviderProfile {
