@@ -5,12 +5,12 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _,
-    StyledExt as _, TITLE_BAR_HEIGHT,
+    ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
+    TITLE_BAR_HEIGHT,
     animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::DropdownMenu as _,
     sidebar::SidebarToggleButton,
     v_flex,
 };
@@ -19,8 +19,9 @@ use rust_i18n::t;
 use crate::actions::{OpenSettings, ToggleTheme};
 use crate::chat::{ChatEvent, ChatView};
 use crate::llm::ModelSelection;
+use crate::model_select::ModelPicker;
 use crate::preferences::{self, Preferences, WindowGeometry};
-use crate::{glass, providers, theme, ui};
+use crate::{glass, theme, ui};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -64,6 +65,7 @@ pub struct ChatApp {
     /// Latest main-window restore bounds, kept fresh by a window-bounds
     /// observer and persisted on quit.
     window_geometry: Option<WindowGeometry>,
+    model_picker: Entity<ModelPicker>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -83,6 +85,21 @@ impl ChatApp {
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
 
+        let parent = cx.weak_entity();
+        let model_picker = cx.new(|cx| {
+            ModelPicker::new(
+                prefs.last_model_selection.clone(),
+                false,
+                move |selection, cx| {
+                    parent
+                        .update(cx, |app, cx| app.select_model_from_picker(selection, cx))
+                        .unwrap_or(false)
+                },
+                window,
+                cx,
+            )
+        });
+
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             conversations: Vec::new(),
@@ -93,6 +110,7 @@ impl ChatApp {
             resize_start: None,
             titlebar_move_pending: false,
             window_geometry: Some(WindowGeometry::from_window(window)),
+            model_picker,
             _subscriptions: Vec::new(),
         };
         this.track_window_geometry(window, cx);
@@ -146,16 +164,19 @@ impl ChatApp {
     }
 
     fn spawn_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.model_picker
+            .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
         let view = ChatView::view(window, cx);
-        let sub = cx.subscribe(&view, |this, view, event, cx| {
-            let Some(conversation) = this
+        let sub = cx.subscribe_in(&view, window, |this, view, event, window, cx| {
+            let Some(index) = this
                 .conversations
-                .iter_mut()
-                .find(|conversation| conversation.view.entity_id() == view.entity_id())
+                .iter()
+                .position(|conversation| conversation.view.entity_id() == view.entity_id())
             else {
                 return;
             };
+            let conversation = &mut this.conversations[index];
             match event {
                 ChatEvent::TitleChanged(title) => {
                     if conversation.title != *title {
@@ -167,6 +188,9 @@ impl ChatApp {
                     if conversation.selection != *selection || conversation.pending != *pending {
                         conversation.selection = selection.clone();
                         conversation.pending = *pending;
+                        if index == this.active {
+                            this.sync_model_picker_to_active(window, cx);
+                        }
                         cx.notify();
                     }
                 }
@@ -181,14 +205,46 @@ impl ChatApp {
         });
         self._subscriptions.push(sub);
         self.active = self.conversations.len() - 1;
+        self.sync_model_picker_to_active(window, cx);
         cx.notify();
     }
 
-    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.conversations.len() && ix != self.active {
+            self.model_picker
+                .update(cx, |picker, cx| picker.dismiss(window, cx));
             self.active = ix;
+            self.sync_model_picker_to_active(window, cx);
             cx.notify();
         }
+    }
+
+    fn sync_model_picker_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation) = self.conversations.get(self.active) else {
+            return;
+        };
+        let selection = conversation.selection.clone();
+        let pending = conversation.pending;
+        self.model_picker.update(cx, |picker, cx| {
+            picker.set_conversation(selection, pending, window, cx)
+        });
+    }
+
+    fn select_model_from_picker(
+        &mut self,
+        selection: ModelSelection,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(conversation) = self.conversations.get(self.active) else {
+            return false;
+        };
+        if conversation.pending {
+            return false;
+        }
+
+        let view = conversation.view.clone();
+        view.update(cx, |chat, cx| chat.select_model(selection, cx));
+        true
     }
 
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -313,10 +369,10 @@ impl ChatApp {
                     })
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                         if ui::consume_button_key(event, window, cx) {
-                            this.select(i, cx);
+                            this.select(i, window, cx);
                         }
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(i, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| this.select(i, window, cx)))
                     .child(div().overflow_hidden().text_ellipsis().child(title))
             })
             .collect::<Vec<_>>();
@@ -423,13 +479,7 @@ impl Render for ChatApp {
             .conversations
             .get(active)
             .map(|conversation| conversation.view.clone());
-        let active_state = self.conversations.get(active).map(|conversation| {
-            (
-                conversation.view.clone(),
-                conversation.selection.clone(),
-                conversation.pending,
-            )
-        });
+        let has_active = active_view.is_some();
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
         // inside the top-level view of the window.
@@ -554,9 +604,7 @@ impl Render for ChatApp {
             .flex()
             .items_center()
             .occlude()
-            .when_some(active_state, |this, (view, selection, pending)| {
-                this.child(model_pill(view, selection, pending, cx))
-            });
+            .when(has_active, |this| this.child(self.model_picker.clone()));
 
         // AppKit otherwise treats every point in a transparent native
         // titlebar as draggable, including controls. This layer sits behind
@@ -624,66 +672,6 @@ impl Render for ChatApp {
             .children(dialog_layer)
             .children(notification_layer)
     }
-}
-
-fn model_pill(
-    view: Entity<ChatView>,
-    selection: Option<ModelSelection>,
-    pending: bool,
-    cx: &App,
-) -> impl IntoElement {
-    let models = providers::selectable_models(cx);
-    let selected_label = selection
-        .as_ref()
-        .and_then(|selection| models.iter().find(|model| &model.selection == selection))
-        .map(|model| format!("{} / {}", model.profile_name, model.model_name))
-        .unwrap_or_else(|| {
-            if selection.is_some() {
-                t!("chat.unavailable_model").to_string()
-            } else {
-                t!("chat.select_model").to_string()
-            }
-        });
-
-    Button::new("model-pill")
-        .ghost()
-        .small()
-        .label(selected_label)
-        .icon(IconName::ChevronDown)
-        .disabled(pending)
-        .dropdown_menu(move |menu, window, _| {
-            let mut menu = menu.scrollable(true).max_h(px(480.));
-            let mut model_count = 0;
-            let mut current_profile = None;
-            for model in &models {
-                if current_profile.as_deref() != Some(model.selection.profile_id.as_str()) {
-                    current_profile = Some(model.selection.profile_id.clone());
-                    menu = menu.label(model.profile_name.clone());
-                }
-                model_count += 1;
-                let item_selection = model.selection.clone();
-                let checked = selection.as_ref() == Some(&item_selection);
-                let view = view.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(model.model_name.clone())
-                        .checked(checked)
-                        .on_click(window.listener_for(&view, move |chat, _, _, cx| {
-                            chat.select_model(item_selection.clone(), cx);
-                        })),
-                );
-            }
-            if model_count == 0 {
-                menu = menu
-                    .item(PopupMenuItem::new(t!("chat.no_models").to_string()).disabled(true))
-                    .separator()
-                    .menu_with_icon(
-                        t!("account.settings").to_string(),
-                        IconName::Settings,
-                        Box::new(OpenSettings),
-                    );
-            }
-            menu
-        })
 }
 
 /// Zero-sized marker used as the payload type of the sidebar-resize drag

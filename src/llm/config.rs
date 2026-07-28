@@ -3,7 +3,10 @@
 //! Settings may retain invalid profiles so users can repair them. Generation
 //! must cross the validation boundary in this module before building a request.
 
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -97,6 +100,12 @@ pub fn resolve_selection<'a>(
 }
 
 impl ProviderProfile {
+    /// Validate a profile for runtime use.
+    ///
+    /// Models with an empty upstream ID are retained as editable drafts, but
+    /// the profile must contain at least one configured model. Drafts still
+    /// require unique internal IDs and unique non-empty display names. All
+    /// non-empty upstream model IDs must also be unique after trimming.
     pub fn validate(&self) -> Result<(), GatewayError> {
         if self.id.trim().is_empty() {
             return Err(GatewayError::configuration("provider ID must not be empty"));
@@ -107,23 +116,81 @@ impl ProviderProfile {
             ));
         }
         self.validated_base_url()?;
-        if self.models.is_empty() {
-            return Err(GatewayError::configuration(
-                "provider must contain at least one model",
-            ));
-        }
-        let mut ids = HashSet::new();
+
+        let mut display_name_counts = HashMap::new();
+        let mut upstream_id_counts = HashMap::new();
         for model in &self.models {
-            if model.id.trim().is_empty() || model.model_id.trim().is_empty() {
-                return Err(GatewayError::configuration(
-                    "model ID and upstream model ID must not be empty",
-                ));
+            if let Some(display_name) = model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                *display_name_counts.entry(display_name).or_insert(0usize) += 1;
             }
-            if !ids.insert(model.id.as_str()) {
+
+            let upstream_id = model.model_id.trim();
+            if !upstream_id.is_empty() {
+                *upstream_id_counts.entry(upstream_id).or_insert(0usize) += 1;
+            }
+        }
+
+        let mut ids = HashSet::new();
+        let mut configured_models = 0usize;
+        for model in &self.models {
+            let id = model.id.trim();
+            if id.is_empty() {
+                return Err(GatewayError::configuration("model ID must not be empty"));
+            }
+            if !ids.insert(id) {
                 return Err(GatewayError::configuration("model IDs must be unique"));
             }
+
+            if let Some(display_name) = model
+                .display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                && display_name_counts.get(display_name) != Some(&1)
+            {
+                return Err(GatewayError::configuration(
+                    "model display names must be unique",
+                ));
+            }
+
+            let upstream_id = model.model_id.trim();
+            if upstream_id.is_empty() {
+                continue;
+            }
+            configured_models += 1;
+            if upstream_id_counts.get(upstream_id) != Some(&1) {
+                return Err(GatewayError::configuration(
+                    "upstream model IDs must be unique",
+                ));
+            }
+        }
+        if configured_models == 0 {
+            return Err(GatewayError::configuration(
+                "provider must contain at least one configured model",
+            ));
         }
         Ok(())
+    }
+
+    pub(crate) fn upstream_model_id_is_available(
+        &self,
+        upstream_id: &str,
+        excluding_id: &str,
+    ) -> bool {
+        model_value_is_available(&self.models, upstream_id, excluding_id, |model| {
+            Some(model.model_id.as_str())
+        })
+    }
+
+    pub(crate) fn display_name_is_available(&self, display_name: &str, excluding_id: &str) -> bool {
+        model_value_is_available(&self.models, display_name, excluding_id, |model| {
+            model.display_name.as_deref()
+        })
     }
 
     pub fn validated_base_url(&self) -> Result<String, GatewayError> {
@@ -156,6 +223,19 @@ impl ProviderProfile {
             .find(|model| model.id == id && !model.model_id.trim().is_empty())
             .ok_or_else(|| GatewayError::configuration("selected model is unavailable"))
     }
+}
+
+fn model_value_is_available<'a>(
+    models: &'a [ModelConfig],
+    candidate: &str,
+    excluding_id: &str,
+    value: impl Fn(&'a ModelConfig) -> Option<&'a str>,
+) -> bool {
+    let candidate = candidate.trim();
+    candidate.is_empty()
+        || models.iter().all(|model| {
+            model.id == excluding_id || value(model).is_none_or(|value| value.trim() != candidate)
+        })
 }
 
 #[cfg(test)]
@@ -193,6 +273,149 @@ mod tests {
         duplicate.base_url = "https://example.com/v1".into();
         duplicate.models.push(duplicate.models[0].clone());
         assert!(duplicate.validate().is_err());
+    }
+
+    #[test]
+    fn incomplete_model_drafts_do_not_invalidate_configured_models() {
+        let mut profile = ProviderProfile {
+            id: "p".into(),
+            name: "Provider".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![ModelConfig {
+                id: "configured".into(),
+                model_id: "vendor/model".into(),
+                display_name: Some("Model".into()),
+            }],
+        };
+        let selection = ModelSelection {
+            profile_id: profile.id.clone(),
+            model_id: profile.models[0].id.clone(),
+        };
+        profile.models.push(ModelConfig {
+            id: "draft".into(),
+            model_id: String::new(),
+            display_name: None,
+        });
+
+        assert!(profile.validate().is_ok());
+        assert!(resolve_selection(&[profile], &selection).is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_upstream_ids_and_display_names() {
+        let profile = ProviderProfile {
+            id: "p".into(),
+            name: "Provider".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![
+                ModelConfig {
+                    id: "first".into(),
+                    model_id: "vendor/model".into(),
+                    display_name: Some("Model".into()),
+                },
+                ModelConfig {
+                    id: "second".into(),
+                    model_id: "vendor/model".into(),
+                    display_name: Some("Other".into()),
+                },
+            ],
+        };
+        assert!(profile.validate().is_err());
+
+        let mut duplicate_name = profile;
+        duplicate_name.models[1].model_id = "vendor/other".into();
+        duplicate_name.models[1].display_name = Some("Model".into());
+        assert!(duplicate_name.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_display_name_on_an_incomplete_draft() {
+        let mut profile = ProviderProfile {
+            id: "p".into(),
+            name: "Provider".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![ModelConfig {
+                id: "configured".into(),
+                model_id: "vendor/model".into(),
+                display_name: Some("Model".into()),
+            }],
+        };
+        profile.models.push(ModelConfig {
+            id: "draft".into(),
+            model_id: String::new(),
+            display_name: Some(" Model ".into()),
+        });
+
+        assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn validation_compares_trimmed_model_values() {
+        let mut duplicate_name = ProviderProfile {
+            id: "p".into(),
+            name: "Provider".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![
+                ModelConfig {
+                    id: "first".into(),
+                    model_id: "vendor/first".into(),
+                    display_name: Some("Model".into()),
+                },
+                ModelConfig {
+                    id: "second".into(),
+                    model_id: "vendor/second".into(),
+                    display_name: Some(" Model ".into()),
+                },
+            ],
+        };
+        assert!(duplicate_name.validate().is_err());
+
+        duplicate_name.models[1].display_name = Some("Other".into());
+        duplicate_name.models[1].model_id = " vendor/first ".into();
+        assert!(duplicate_name.validate().is_err());
+    }
+
+    #[test]
+    fn empty_draft_values_do_not_participate_in_uniqueness_checks() {
+        let profile = ProviderProfile {
+            id: "p".into(),
+            name: "Provider".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![
+                ModelConfig {
+                    id: "configured".into(),
+                    model_id: "vendor/model".into(),
+                    display_name: Some("Model".into()),
+                },
+                ModelConfig {
+                    id: "draft-one".into(),
+                    model_id: String::new(),
+                    display_name: None,
+                },
+                ModelConfig {
+                    id: "draft-two".into(),
+                    model_id: "   ".into(),
+                    display_name: Some("   ".into()),
+                },
+            ],
+        };
+
+        assert!(profile.validate().is_ok());
     }
 
     #[test]

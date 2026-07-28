@@ -236,19 +236,21 @@ impl ThemeMode {
 /// between startup and quit.  UI state that only matters at exit (sidebar
 /// geometry, window bounds) is written back by `ChatApp` on quit; settings
 /// changes go through [`update`] and persist immediately.
-pub struct Prefs(pub Preferences);
+pub struct Prefs {
+    preferences: Preferences,
+}
 
 impl Global for Prefs {}
 
 /// Seed the [`Prefs`] global from the loaded preferences.  Must run during
 /// app init, before any UI reads settings.
 pub fn init_global(prefs: Preferences, cx: &mut App) {
-    cx.set_global(Prefs(prefs));
+    cx.set_global(Prefs { preferences: prefs });
 }
 
 /// The live preferences.
 pub fn get(cx: &App) -> &Preferences {
-    &cx.global::<Prefs>().0
+    &cx.global::<Prefs>().preferences
 }
 
 /// Mutate the live preferences and persist the result.  The write happens
@@ -258,19 +260,27 @@ pub fn get(cx: &App) -> &Preferences {
 /// last-written).  Save errors are logged and otherwise ignored — a failed
 /// write never breaks the running app.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
-    let prefs = &mut cx.global_mut::<Prefs>().0;
-    f(prefs);
-    let snapshot = prefs.clone();
-    if let Err(e) = save(&snapshot) {
+    let prefs = cx.global_mut::<Prefs>();
+    f(&mut prefs.preferences);
+    let snapshot = prefs.preferences.clone();
+    let result = save(&snapshot);
+    if let Err(e) = result {
         eprintln!("failed to save preferences: {e:?}");
     }
+}
+
+/// Mutate live preferences without persistence so entity tests can exercise
+/// global observation without writing to the user's configuration directory.
+#[cfg(test)]
+pub(crate) fn update_in_memory(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
+    f(&mut cx.global_mut::<Prefs>().preferences);
 }
 
 /// Fold exit-time state into the live preferences and return the merged
 /// snapshot.  Unlike [`update`] this does not spawn a save — quit hooks run
 /// the flush themselves so gpui can await it before the process exits.
 pub fn snapshot_with(cx: &mut App, f: impl FnOnce(&mut Preferences)) -> Preferences {
-    let prefs = &mut cx.global_mut::<Prefs>().0;
+    let prefs = &mut cx.global_mut::<Prefs>().preferences;
     f(prefs);
     prefs.clone()
 }

@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
-    ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, h_flex,
+    ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, WindowExt as _, h_flex,
     input::{Input, InputContentType, InputEvent, InputState},
+    notification::NotificationType,
     resizable::{ResizableState, h_resizable, resizable_panel},
     scroll::ScrollableElement as _,
     v_flex,
@@ -187,14 +188,17 @@ impl ProvidersPage {
         cx: &mut Context<Self>,
     ) {
         self.models.clear();
-        let models = profile.map_or(&[][..], |profile| profile.models.as_slice());
-        for model in models {
-            self.push_model_editor(model, window, cx);
+        let Some(profile) = profile else {
+            return;
+        };
+        for model in &profile.models {
+            self.push_model_editor(&profile.id, model, window, cx);
         }
     }
 
     fn push_model_editor(
         &mut self,
+        profile_id: &str,
         model: &ModelConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -216,25 +220,66 @@ impl ProvidersPage {
             (name.clone(), ModelField::DisplayName),
             (model_id.clone(), ModelField::UpstreamId),
         ] {
-            let id = model.id.clone();
+            let mut binding = ModelFieldBinding::new(profile_id, &model.id, field);
             subscriptions.push(cx.subscribe_in(
                 &state,
                 window,
-                move |this, input, event, _, cx| {
-                    if !matches!(event, InputEvent::Change) {
-                        return;
+                move |_, input, event, window, cx| match event {
+                    InputEvent::Focus => {
+                        binding.remember_focus(input.read(cx).value().as_ref());
                     }
-                    let Some(profile_id) = this.selected.clone() else {
-                        return;
-                    };
-                    let value = input.read(cx).value().to_string();
-                    providers::update_model(&profile_id, &id, cx, |model| match field {
-                        ModelField::DisplayName => {
-                            model.display_name = (!value.trim().is_empty()).then_some(value)
+                    InputEvent::Change => {
+                        let value = input.read(cx).value().to_string();
+                        let Some(profile) = providers::find(&binding.profile_id, cx) else {
+                            return;
+                        };
+                        let Some(value) = binding.accepted_value(profile, value) else {
+                            return;
+                        };
+                        let field = binding.field;
+                        providers::update_model(
+                            &binding.profile_id,
+                            &binding.config_id,
+                            cx,
+                            |model| set_model_field(model, field, value),
+                        );
+                        cx.notify();
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        let value = input.read(cx).value().to_string();
+                        let duplicate = providers::find(&binding.profile_id, cx)
+                            .is_some_and(|profile| !binding.value_is_available(profile, &value));
+                        if !duplicate {
+                            if matches!(event, InputEvent::PressEnter { .. }) {
+                                binding.remember_focus(&value);
+                            }
+                            return;
                         }
-                        ModelField::UpstreamId => model.model_id = value,
-                    });
-                    cx.notify();
+
+                        let previous = binding.value_on_focus.clone();
+                        let input = input.clone();
+                        let profile_id = binding.profile_id.clone();
+                        let config_id = binding.config_id.clone();
+                        let field = binding.field;
+                        let message = match binding.field {
+                            ModelField::DisplayName => {
+                                t!("settings.providers.duplicate_model_name").to_string()
+                            }
+                            ModelField::UpstreamId => {
+                                t!("settings.providers.duplicate_model_id").to_string()
+                            }
+                        };
+                        cx.defer_in(window, move |_, window, cx| {
+                            input.update(cx, |input, cx| {
+                                input.set_value(previous.clone(), window, cx)
+                            });
+                            providers::update_model(&profile_id, &config_id, cx, |model| {
+                                set_model_field(model, field, previous.clone())
+                            });
+                            window.push_notification((NotificationType::Error, message), cx);
+                            cx.notify();
+                        });
+                    }
                 },
             ));
         }
@@ -336,7 +381,7 @@ impl ProvidersPage {
             display_name: None,
         };
         providers::add_model(&profile_id, model.clone(), cx);
-        self.push_model_editor(&model, window, cx);
+        self.push_model_editor(&profile_id, &model, window, cx);
         cx.notify();
     }
 
@@ -407,6 +452,55 @@ enum ProfileField {
 enum ModelField {
     DisplayName,
     UpstreamId,
+}
+
+struct ModelFieldBinding {
+    profile_id: String,
+    config_id: String,
+    field: ModelField,
+    value_on_focus: String,
+}
+
+impl ModelFieldBinding {
+    fn new(profile_id: &str, config_id: &str, field: ModelField) -> Self {
+        Self {
+            profile_id: profile_id.to_string(),
+            config_id: config_id.to_string(),
+            field,
+            value_on_focus: String::new(),
+        }
+    }
+
+    fn remember_focus(&mut self, value: &str) {
+        value.clone_into(&mut self.value_on_focus);
+    }
+
+    fn value_is_available(&self, profile: &ProviderProfile, value: &str) -> bool {
+        model_field_is_available(profile, &self.config_id, self.field, value)
+    }
+
+    fn accepted_value(&self, profile: &ProviderProfile, value: String) -> Option<String> {
+        self.value_is_available(profile, &value).then_some(value)
+    }
+}
+
+fn model_field_is_available(
+    profile: &ProviderProfile,
+    config_id: &str,
+    field: ModelField,
+    value: &str,
+) -> bool {
+    match field {
+        ModelField::DisplayName => profile.display_name_is_available(value, config_id),
+        ModelField::UpstreamId => profile.upstream_model_id_is_available(value, config_id),
+    }
+}
+
+fn set_model_field(model: &mut ModelConfig, field: ModelField, value: String) {
+    match field {
+        ModelField::DisplayName => model.display_name = (!value.trim().is_empty()).then_some(value),
+        ModelField::UpstreamId => model.model_id = value,
+    }
 }
 
 fn input_with_placeholder(
@@ -694,6 +788,32 @@ fn dropdown_row(
 mod tests {
     use rust_i18n::t;
 
+    use super::{ModelField, ModelFieldBinding};
+    use crate::llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString};
+
+    fn edit_profile(id: &str, upstream_id: &str, display_name: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.into(),
+            name: id.into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![
+                ModelConfig {
+                    id: "edited".into(),
+                    model_id: upstream_id.into(),
+                    display_name: Some(display_name.into()),
+                },
+                ModelConfig {
+                    id: "existing".into(),
+                    model_id: "vendor/taken".into(),
+                    display_name: Some("Taken".into()),
+                },
+            ],
+        }
+    }
+
     /// Every field on this page explains itself through a hover icon whose
     /// text is looked up at render time.  A missing or misspelled key resolves
     /// to the key path itself and would ship as visible gibberish, so each one
@@ -737,6 +857,41 @@ mod tests {
                 t!("settings.providers.unnamed", locale = locale, index = 2),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn duplicate_model_notifications_resolve_in_both_locales() {
+        for key in ["duplicate_model_id", "duplicate_model_name"] {
+            let path = format!("settings.providers.{key}");
+            for locale in ["zh-CN", "en"] {
+                let text = t!(&path, locale = locale);
+                assert_ne!(text, path, "{path} is missing for {locale}");
+                assert!(!text.is_empty(), "{path} is empty for {locale}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_edits_retain_the_value_captured_on_focus() {
+        let profile = edit_profile("owner", "vendor/original", "Original");
+        for field in [ModelField::DisplayName, ModelField::UpstreamId] {
+            let (initial, intermediate, duplicate) = match field {
+                ModelField::DisplayName => ("Original", "Take", "Taken"),
+                ModelField::UpstreamId => ("vendor/original", "vendor/take", "vendor/taken"),
+            };
+            let mut binding = ModelFieldBinding::new(&profile.id, "edited", field);
+            binding.remember_focus(initial);
+
+            assert_eq!(
+                binding.accepted_value(&profile, intermediate.to_string()),
+                Some(intermediate.to_string())
+            );
+            assert_eq!(
+                binding.accepted_value(&profile, duplicate.to_string()),
+                None
+            );
+            assert_eq!(binding.value_on_focus, initial);
         }
     }
 }

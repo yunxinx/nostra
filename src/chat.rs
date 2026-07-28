@@ -574,8 +574,12 @@ fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
                     .rounded(theme.radius_lg)
                     .bg(theme.secondary)
                     .text_color(theme.secondary_foreground)
-                    .px_4()
-                    .py_2p5()
+                    // Kept tight on purpose: the body inherits the window's
+                    // 16px base size, so its line box is already ~24px tall and
+                    // generous padding on top of that makes a one-word turn
+                    // read as a block.
+                    .px_3()
+                    .py_1p5()
                     .child(TextView::new(&msg.body).selectable(true)),
             )
             .into_any_element()

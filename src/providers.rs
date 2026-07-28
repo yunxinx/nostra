@@ -64,23 +64,27 @@ fn selectable_models_from(profiles: &[ProviderProfile]) -> Vec<SelectableModel> 
         .filter(|profile| profile_id_counts.get(profile.id.as_str()) == Some(&1))
         .filter(|profile| profile.validate().is_ok())
         .flat_map(|profile| {
-            profile.models.iter().map(|model| {
-                let selection = ModelSelection {
-                    profile_id: profile.id.clone(),
-                    model_id: model.id.clone(),
-                };
-                let model_name = model
-                    .display_name
-                    .as_deref()
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or(&model.model_id)
-                    .to_string();
-                SelectableModel {
-                    selection,
-                    profile_name: profile.name.clone(),
-                    model_name,
-                }
-            })
+            profile
+                .models
+                .iter()
+                .filter(|model| !model.model_id.trim().is_empty())
+                .map(|model| {
+                    let selection = ModelSelection {
+                        profile_id: profile.id.clone(),
+                        model_id: model.id.clone(),
+                    };
+                    let model_name = model
+                        .display_name
+                        .as_deref()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(&model.model_id)
+                        .to_string();
+                    SelectableModel {
+                        selection,
+                        profile_name: profile.name.clone(),
+                        model_name,
+                    }
+                })
         })
         .collect()
 }
@@ -135,6 +139,30 @@ pub fn update_model(
             change(model);
         }
     });
+}
+
+#[cfg(test)]
+pub(crate) fn update_model_in_memory(
+    profile_id: &str,
+    model_id: &str,
+    cx: &mut App,
+    change: impl FnOnce(&mut ModelConfig),
+) {
+    preferences::update_in_memory(cx, |prefs| {
+        let Some(profile) = prefs
+            .provider_profiles
+            .iter_mut()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return;
+        };
+        let Some(model) = profile.models.iter_mut().find(|model| model.id == model_id) else {
+            return;
+        };
+        change(model);
+    });
+    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+    cx.refresh_windows();
 }
 
 pub fn remove_model(profile_id: &str, model_id: &str, cx: &mut App) {
@@ -201,5 +229,21 @@ mod tests {
         assert_eq!(selectable.len(), 1);
         assert_eq!(selectable[0].selection.profile_id, "valid");
         assert_eq!(selectable[0].model_name, "gpt");
+    }
+
+    #[test]
+    fn incomplete_model_draft_does_not_hide_existing_selectable_models() {
+        let mut profile = profile("provider", "Provider", "vendor/model");
+        profile.models.push(ModelConfig {
+            id: "draft".into(),
+            model_id: String::new(),
+            display_name: None,
+        });
+
+        let selectable = selectable_models_from(&[profile]);
+
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].selection.model_id, "model");
+        assert_eq!(selectable[0].model_name, "vendor/model");
     }
 }

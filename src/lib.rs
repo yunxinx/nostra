@@ -16,6 +16,7 @@ mod fonts;
 mod glass;
 mod i18n;
 pub mod llm;
+mod model_select;
 pub mod preferences;
 mod providers;
 mod settings;

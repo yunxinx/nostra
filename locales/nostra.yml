@@ -50,6 +50,12 @@ chat:
   no_models:
     en: Configure a provider and model in Settings
     zh-CN: 请先在设置中配置供应商和模型
+  search_model:
+    en: Search provider or model
+    zh-CN: 搜索供应商或模型
+  no_matching_models:
+    en: No matching model
+    zh-CN: 没有匹配的模型
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
@@ -292,8 +298,8 @@ settings:
       en: Models
       zh-CN: 模型
     models_desc:
-      en: Models exposed by this provider. Each row takes the upstream model ID sent in requests (left) and an optional display alias (right). At least one model with an ID is required before the provider can be selected in a chat.
-      zh-CN: 该供应商可用的模型。每行左侧填请求中实际发送的上游模型 ID，右侧填可选的显示别名。至少需要一个填好 ID 的模型，供应商才能在聊天中被选用。
+      en: Models exposed by this provider. Each row takes the unique upstream model ID sent in requests (left) and an optional unique display alias (right). At least one model with an ID is required before the provider can be selected in a chat.
+      zh-CN: 该供应商可用的模型。每行左侧填请求中实际发送且不可重复的上游模型 ID，右侧填可选且不可重复的显示别名。至少需要一个填好 ID 的模型，供应商才能在聊天中被选用。
     add_model:
       en: Add model
       zh-CN: 添加模型
@@ -306,6 +312,12 @@ settings:
     model_id_placeholder:
       en: Model ID
       zh-CN: 模型 ID
+    duplicate_model_id:
+      en: Model IDs must be unique within a provider. The previous value was restored.
+      zh-CN: 同一供应商内的模型 ID 不可重复，已恢复为修改前的值。
+    duplicate_model_name:
+      en: Display aliases must be unique within a provider. The previous value was restored.
+      zh-CN: 同一供应商内的显示别名不可重复，已恢复为修改前的值。
   about:
     version:
       en: Version
