@@ -119,7 +119,10 @@ impl ChatCompletionsSession {
         let value: Value = serde_json::from_str(data)
             .map_err(|_| GatewayError::protocol("invalid Chat Completions stream JSON"))?;
         if let Some(error) = value.get("error") {
-            return Err(provider_error(error));
+            // `data` rather than a re-serialization of `error`: the raw frame is
+            // what the provider actually sent, with its own key order and any
+            // sibling fields an adapter would drop.
+            return Err(provider_error(error).with_upstream_body(data));
         }
         let mut events = Vec::new();
         self.response_id = string_at(&value, "id").or_else(|| self.response_id.clone());
@@ -646,14 +649,31 @@ mod tests {
     }
 
     #[test]
-    fn provider_error_does_not_retain_upstream_message_or_unsafe_code() {
+    fn provider_error_keeps_safe_fields_clean_and_debug_free_of_upstream_text() {
         let error = provider_error(&json!({
             "message": "request echoed secret-key",
             "code": "unsafe code: secret-key"
-        }));
+        }))
+        .with_upstream_body(r#"{"error":{"message":"request echoed secret-key"}}"#);
+        // The safe tier is unchanged: fixed message, code rejected by the allowlist.
         assert_eq!(error.safe_message(), "provider rejected the request");
         assert_eq!(error.provider_code, None);
+        // Debug is what reaches logs, so it must not carry the body.
         assert!(!format!("{error:?}").contains("secret-key"));
+        // The captured frame itself is retained for the UI to render.
+        assert_eq!(
+            error.upstream_body(),
+            Some(r#"{"error":{"message":"request echoed secret-key"}}"#)
+        );
+    }
+
+    #[test]
+    fn in_stream_error_frame_is_retained_as_captured() {
+        let frame = r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#;
+        let mut session = ChatCompletionsSession::new(CompatibilityProfile::default());
+        let error = session.ingest(frame).expect_err("provider error frame");
+        assert_eq!(error.upstream_body(), Some(frame));
+        assert_eq!(error.provider_code.as_deref(), Some("rate_limit_exceeded"));
     }
 
     #[test]

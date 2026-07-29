@@ -344,7 +344,8 @@ impl ResponsesSession {
                     GatewayError::provider(
                         "provider response was incomplete",
                         Some("response_incomplete".into()),
-                    ),
+                    )
+                    .with_upstream_body(data),
                     events,
                 );
             }
@@ -352,7 +353,9 @@ impl ResponsesSession {
                 return self.failed_terminal(
                     &value,
                     FinishReason::Other("failed".into()),
-                    response_failure(&value),
+                    // Raw frame, not a re-serialization: preserves the provider's
+                    // own key order and any fields the adapter does not model.
+                    response_failure(&value).with_upstream_body(data),
                     events,
                 );
             }
@@ -1259,13 +1262,34 @@ mod tests {
     }
 
     #[test]
-    fn provider_failure_does_not_retain_upstream_message() {
+    fn provider_failure_keeps_safe_fields_clean_and_debug_free_of_upstream_text() {
         let error = response_failure(&json!({
             "error": {"message": "echoed secret-key", "code": "bad_request"}
-        }));
+        }))
+        .with_upstream_body(r#"{"error":{"message":"echoed secret-key"}}"#);
         assert_eq!(error.safe_message(), "provider response failed");
         assert_eq!(error.provider_code.as_deref(), Some("bad_request"));
         assert!(!format!("{error:?}").contains("secret-key"));
+        assert_eq!(
+            error.upstream_body(),
+            Some(r#"{"error":{"message":"echoed secret-key"}}"#)
+        );
+    }
+
+    #[test]
+    fn failed_terminal_carries_the_raw_frame_to_the_outcome() {
+        let frame = r#"{"type":"response.failed","response":{"id":"resp_1","error":{"code":"server_error","message":"upstream exploded"}}}"#;
+        let mut session = ResponsesSession::new(CompatibilityProfile::default());
+        session
+            .ingest(r#"{"type":"response.created","response":{"id":"resp_1"}}"#)
+            .expect("created");
+        let terminal = session
+            .ingest(frame)
+            .expect("failed terminal is not an Err")
+            .terminal
+            .expect("terminal present");
+        let error = terminal.error.expect("terminal error");
+        assert_eq!(error.upstream_body(), Some(frame));
     }
 
     #[test]

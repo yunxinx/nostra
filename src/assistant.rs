@@ -19,8 +19,8 @@ use rust_i18n::t;
 use crate::{
     chat::ChatView,
     llm::{
-        ErrorKind, Gateway, GatewayError, GenerateRequest, GenerationEvent, HttpTransport,
-        InMemoryMetrics, Message as LlmMessage, ModelSelection, OutcomeStatus,
+        Gateway, GatewayError, GenerateRequest, GenerationEvent, HttpTransport, InMemoryMetrics,
+        Message as LlmMessage, ModelSelection, OutcomeStatus,
     },
     providers,
 };
@@ -126,8 +126,10 @@ pub fn stream_reply(
         let mut generation = match prepared {
             Ok(generation) => generation,
             Err(error) => {
-                show_setup_error(&target, &localized_error(&error), cx);
-                view.update(cx, |chat, cx| chat.finish_reply(None, cx)).ok();
+                // Same card as an upstream failure. There is no response body to
+                // show — the request never left — so it renders headline-only.
+                view.update(cx, |chat, cx| chat.finish_reply(None, Some(error), cx))
+                    .ok();
                 return;
             }
         };
@@ -184,29 +186,21 @@ fn process_event(
             .is_err()
         }
         GenerationEvent::Finished(outcome) => {
+            let outcome = *outcome;
             let deltas = drain_pending(pending);
-            let mut display = visible_text(&deltas);
-            if outcome.status == OutcomeStatus::Failed {
-                let base_message = outcome
-                    .error
-                    .as_ref()
-                    .map(localized_error)
-                    .unwrap_or_else(|| t!("chat.error.provider").to_string());
-                let message = format!(
-                    "{base_message} {}: {}",
-                    t!("chat.error.request_id"),
-                    outcome.request_id
-                );
-                display.push_str(&format!("\n\n> {message}"));
-            }
+            let display = visible_text(&deltas);
             if !display.is_empty() {
                 target.update(cx, |state, cx| state.push_str(&display, cx));
             }
-            let message = outcome.message.clone();
+            // A failure becomes a card rather than trailing markdown, so the
+            // upstream body keeps its own frame, highlighting, and copy button
+            // instead of being flattened into the assistant's prose.
+            let failure = terminal_failure(outcome.status, outcome.error, outcome.request_id);
+            let message = outcome.message;
             view.update(cx, |chat, cx| {
                 apply_deltas(chat, deltas);
                 chat.follow_stream();
-                chat.finish_reply(message, cx);
+                chat.finish_reply(message, failure, cx);
             })
             .ok();
             true
@@ -286,22 +280,25 @@ fn apply_deltas(chat: &mut ChatView, deltas: Vec<StreamDelta>) {
     }
 }
 
-fn show_setup_error(target: &Entity<TextViewState>, message: &str, cx: &mut gpui::AsyncApp) {
-    let text = format!("> {message}");
-    target.update(cx, |state, cx| state.set_text(&text, cx));
-}
-
-fn localized_error(error: &GatewayError) -> String {
-    match error.kind {
-        ErrorKind::Configuration => t!("chat.error.configuration").to_string(),
-        ErrorKind::Transport => t!("chat.error.connection").to_string(),
-        ErrorKind::Http => error.status.map_or_else(
-            || t!("chat.error.provider").to_string(),
-            |status| t!("chat.error.http", status = status).to_string(),
-        ),
-        ErrorKind::Protocol => t!("chat.error.interrupted").to_string(),
-        ErrorKind::Provider => t!("chat.error.provider").to_string(),
-    }
+/// Stand-in for a `Failed` outcome that arrived without an error attached. The
+/// gateway always populates one, so this only guards against a future adapter
+/// reporting failure without a reason.
+fn terminal_failure(
+    status: OutcomeStatus,
+    error: Option<GatewayError>,
+    request_id: String,
+) -> Option<GatewayError> {
+    (status == OutcomeStatus::Failed).then(|| {
+        let mut error = error.unwrap_or_else(|| {
+            // Defensive fallback for a future adapter that violates the gateway
+            // invariant by reporting Failed without an attached error.
+            GatewayError::provider("provider request failed", None)
+        });
+        // The outcome is the authoritative correlation boundary. Preserve an
+        // adapter-provided id, but never let a failed UI card lose the outcome id.
+        error.request_id.get_or_insert(request_id);
+        error
+    })
 }
 
 #[cfg(test)]
@@ -348,5 +345,24 @@ mod tests {
             pending.push(StreamDelta::Text("third".into())),
             FlushAction::Schedule
         );
+    }
+
+    #[test]
+    fn failed_terminal_always_carries_the_outcome_request_id() {
+        let fallback = terminal_failure(OutcomeStatus::Failed, None, "request-1".into())
+            .expect("failed outcome");
+        assert_eq!(fallback.request_id.as_deref(), Some("request-1"));
+
+        let mut adapter_error = GatewayError::provider("failed", None);
+        adapter_error.request_id = Some("adapter-id".into());
+        let preserved = terminal_failure(
+            OutcomeStatus::Failed,
+            Some(adapter_error),
+            "outcome-id".into(),
+        )
+        .expect("failed outcome");
+        assert_eq!(preserved.request_id.as_deref(), Some("adapter-id"));
+
+        assert!(terminal_failure(OutcomeStatus::Completed, None, "unused".into()).is_none());
     }
 }

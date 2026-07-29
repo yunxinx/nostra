@@ -61,6 +61,161 @@
         "list.active.border": "#316dca",
         "list.even.background": "#262c34",
         "list.head.background": "#2d333b"
+      },
+      "highlight": {
+        "editor.foreground": "#adbac7",
+        "editor.background": "#22272e",
+        "editor.active_line.background": "#2d333b",
+        "editor.line_number": "#768390",
+        "editor.active_line_number": "#adbac7",
+        "editor.invisible": "#76839066",
+        "editor.gutter.background": "#22272e",
+        "conflict": "#c69026",
+        "created": "#57ab5a",
+        "deleted": "#e5534b",
+        "error": "#e5534b",
+        "hidden": "#768390",
+        "hint": "#6cb6ff",
+        "ignored": "#768390",
+        "info": "#539bf5",
+        "modified": "#c69026",
+        "predictive": "#768390",
+        "renamed": "#539bf5",
+        "success": "#57ab5a",
+        "unreachable": "#768390",
+        "warning": "#c69026",
+        "syntax": {
+          "attribute": {
+            "color": "#6cb6ff"
+          },
+          "boolean": {
+            "color": "#6cb6ff"
+          },
+          "comment": {
+            "color": "#768390",
+            "font_style": "italic"
+          },
+          "comment.doc": {
+            "color": "#768390",
+            "font_style": "italic"
+          },
+          "constant": {
+            "color": "#6cb6ff"
+          },
+          "constructor": {
+            "color": "#dcbdfb"
+          },
+          "embedded": {
+            "color": "#adbac7"
+          },
+          "emphasis": {
+            "color": "#adbac7",
+            "font_style": "italic"
+          },
+          "emphasis.strong": {
+            "color": "#adbac7",
+            "font_weight": 700
+          },
+          "enum": {
+            "color": "#f69d50"
+          },
+          "function": {
+            "color": "#dcbdfb"
+          },
+          "hint": {
+            "color": "#768390"
+          },
+          "keyword": {
+            "color": "#f47067"
+          },
+          "label": {
+            "color": "#6cb6ff"
+          },
+          "link_text": {
+            "color": "#96d0ff",
+            "font_style": "underline"
+          },
+          "link_uri": {
+            "color": "#316dca",
+            "font_style": "italic"
+          },
+          "number": {
+            "color": "#6cb6ff"
+          },
+          "operator": {
+            "color": "#f47067"
+          },
+          "predictive": {
+            "color": "#768390"
+          },
+          "preproc": {
+            "color": "#f47067"
+          },
+          "primary": {
+            "color": "#adbac7"
+          },
+          "property": {
+            "color": "#6cb6ff"
+          },
+          "punctuation": {
+            "color": "#adbac7"
+          },
+          "punctuation.bracket": {
+            "color": "#adbac7"
+          },
+          "punctuation.delimiter": {
+            "color": "#768390"
+          },
+          "punctuation.list_marker": {
+            "color": "#adbac7"
+          },
+          "punctuation.special": {
+            "color": "#f47067"
+          },
+          "string": {
+            "color": "#96d0ff"
+          },
+          "string.escape": {
+            "color": "#f69d50"
+          },
+          "string.regex": {
+            "color": "#96d0ff"
+          },
+          "string.special": {
+            "color": "#f69d50"
+          },
+          "string.special.symbol": {
+            "color": "#f69d50"
+          },
+          "tag": {
+            "color": "#8ddb8c"
+          },
+          "tag.doctype": {
+            "color": "#768390"
+          },
+          "text.code.span": {
+            "color": "#96d0ff"
+          },
+          "text.literal": {
+            "color": "#adbac7"
+          },
+          "title": {
+            "color": "#316dca",
+            "font_weight": 600
+          },
+          "type": {
+            "color": "#f69d50"
+          },
+          "variable": {
+            "color": "#adbac7"
+          },
+          "variable.special": {
+            "color": "#f69d50"
+          },
+          "variant": {
+            "color": "#f69d50"
+          }
+        }
       }
     }
   ]

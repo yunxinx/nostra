@@ -547,6 +547,10 @@ impl GatewaySession {
         // observers and callers see the terminal outcome exactly once.
         debug_assert!(!self.finished, "terminal outcome must be emitted once");
         self.finished = true;
+        // Observers receive the same live outcome as the UI, including captured
+        // upstream text. This is intentional: the text must remain verbatim and
+        // available to the error card. Storage implementations own the separate
+        // no-persistence boundary (InMemoryMetrics strips it before enqueueing).
         if let Some(observer) = &self.observer {
             observer.on_finish(&outcome);
         }
@@ -727,6 +731,48 @@ mod tests {
         assert!(session.finish_eof().is_some());
         assert!(session.finish_eof().is_none());
         assert_eq!(metrics.recent()[0].status, OutcomeStatus::Failed);
+    }
+
+    #[test]
+    fn chat_error_frame_reaches_live_outcome_and_observer_verbatim() {
+        struct LiveObserver(Mutex<Option<String>>);
+
+        impl OutcomeObserver for LiveObserver {
+            fn on_finish(&self, outcome: &GenerationOutcome) {
+                *self.0.lock().expect("observer lock") = outcome
+                    .error
+                    .as_ref()
+                    .and_then(GatewayError::upstream_body)
+                    .map(str::to_string);
+            }
+        }
+
+        let frame = r#"{"error":{"message":"raw provider detail","code":"bad_request"}}"#;
+        let observer = Arc::new(LiveObserver(Mutex::new(None)));
+        let mut session = GatewaySession::new(
+            RequestContext::new("p", "m", Protocol::ChatCompletions),
+            ProtocolSession::new(Protocol::ChatCompletions, CompatibilityProfile::default()),
+            Some(observer.clone()),
+        );
+
+        let outcome = session
+            .ingest_sse_data(frame)
+            .into_iter()
+            .find_map(|event| match event {
+                GenerationEvent::Finished(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("failed outcome");
+
+        assert_eq!(
+            outcome.error.as_ref().and_then(GatewayError::upstream_body),
+            Some(frame)
+        );
+        assert_eq!(
+            observer.0.lock().expect("observer lock").as_deref(),
+            Some(frame),
+            "live observers intentionally receive the original response; storage observers must discard it"
+        );
     }
 
     #[test]

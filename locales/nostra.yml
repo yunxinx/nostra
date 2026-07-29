@@ -70,14 +70,26 @@ chat:
       en: The provider stream was interrupted.
       zh-CN: 供应商响应流意外中断。
     http:
-      en: "The provider returned HTTP %{status}."
-      zh-CN: "供应商返回了 HTTP %{status}。"
+      en: "The provider returned HTTP %{status}"
+      zh-CN: "上游返回 HTTP %{status}"
     provider:
       en: The provider request failed.
       zh-CN: 供应商请求失败。
     request_id:
       en: Request ID
       zh-CN: 请求 ID
+    copy:
+      en: Copy raw response
+      zh-CN: 复制原始响应
+    collapse:
+      en: Collapse response
+      zh-CN: 折叠响应
+    expand:
+      en: Expand response
+      zh-CN: 展开响应
+    preview_truncated:
+      en: Preview truncated for performance. Copy retains the complete captured response.
+      zh-CN: 为保证性能，预览已截断；复制仍会保留完整捕获响应。
   empty_title:
     en: How can I help you today?
     zh-CN: 今天我能帮你做点什么？

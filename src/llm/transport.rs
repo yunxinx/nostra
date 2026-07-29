@@ -152,8 +152,10 @@ async fn read_http_error(response: &mut Response<AsyncBody>) -> GatewayError {
         .take(MAX_ERROR_BODY_BYTES)
         .read_to_end(&mut body)
         .await;
-    // Discard the raw body after extracting a bounded, allowlisted code. Provider
-    // messages frequently echo prompts or credentials and must not reach errors.
+    // Two separate extractions from the same bytes: an allowlisted code for
+    // metrics and logs, and the captured response text for the UI. The body is
+    // kept because a bare status code does not tell the user which quota they
+    // hit, which field was rejected, or which key was refused.
     let provider_code = serde_json::from_slice::<serde_json::Value>(&body)
         .ok()
         .and_then(|value| {
@@ -163,15 +165,10 @@ async fn read_http_error(response: &mut Response<AsyncBody>) -> GatewayError {
                 .and_then(serde_json::Value::as_str)
                 .and_then(allowlisted_provider_token)
         });
-    GatewayError {
-        kind: ErrorKind::Http,
-        message: format!("Provider returned HTTP {status}."),
-        request_id: None,
-        status: Some(status),
-        provider_code,
-        retryable: status == 429 || status >= 500,
-        output_started: false,
-    }
+    let error = GatewayError::http(status, provider_code);
+    // Lossy decode: a non-UTF-8 error body (a mislabelled proxy page, say) is
+    // still worth showing as text rather than degrading to "HTTP 502".
+    error.with_upstream_body(String::from_utf8_lossy(&body).into_owned())
 }
 
 fn retry_delay(headers: &HeaderMap) -> Option<Duration> {
@@ -189,15 +186,8 @@ fn external_error(
     status: Option<u16>,
     retryable: bool,
 ) -> GatewayError {
-    GatewayError {
-        kind,
-        message: message.into(),
-        request_id: None,
-        status,
-        provider_code: None,
-        retryable,
-        output_started: false,
-    }
+    // Local failures (connect, decode, stream reset) have no upstream text.
+    GatewayError::external(kind, message, status, retryable)
 }
 
 #[derive(Debug)]
@@ -405,10 +395,11 @@ mod tests {
     }
 
     #[test]
-    fn captures_only_allowlisted_http_error_code() {
+    fn http_error_retains_the_captured_body_but_keeps_it_out_of_debug() {
+        let body = r#"{"error":{"code":"bad_request","message":"secret echoed"}}"#;
         let client = TestClient::new([ResponseSpec::Status {
             status: 400,
-            body: r#"{"error":{"code":"bad_request","message":"secret echoed"}}"#,
+            body,
             retry_after: None,
         }]);
         let error =
@@ -416,7 +407,57 @@ mod tests {
                 .expect_err("HTTP failure");
         assert_eq!(error.status, Some(400));
         assert_eq!(error.provider_code.as_deref(), Some("bad_request"));
+        // The body is the diagnostic the UI shows.
+        assert_eq!(error.upstream_body(), Some(body));
+        // ...but Debug (i.e. logs) still must not carry it.
         assert!(!format!("{error:?}").contains("secret echoed"));
+    }
+
+    /// 403 rather than a 5xx: a retryable status would consume a second attempt,
+    /// and this test is about the body, not the retry ladder.
+    #[test]
+    fn non_json_error_body_survives_as_text() {
+        let client = TestClient::new([ResponseSpec::Status {
+            status: 403,
+            body: "<html><body>403 Forbidden</body></html>",
+            retry_after: None,
+        }]);
+        let error =
+            futures::executor::block_on(HttpTransport::new(client).stream(&request(), |_| true))
+                .expect_err("HTTP failure");
+        assert_eq!(
+            error.upstream_body(),
+            Some("<html><body>403 Forbidden</body></html>")
+        );
+        // No JSON `code` to extract, so the safe tier stays empty.
+        assert_eq!(error.provider_code, None);
+    }
+
+    #[test]
+    fn empty_error_body_leaves_no_upstream_text() {
+        let client = TestClient::new([ResponseSpec::Status {
+            status: 401,
+            body: "   \n  ",
+            retry_after: None,
+        }]);
+        let error =
+            futures::executor::block_on(HttpTransport::new(client).stream(&request(), |_| true))
+                .expect_err("HTTP failure");
+        assert_eq!(error.upstream_body(), None);
+    }
+
+    #[test]
+    fn http_error_body_capture_stops_at_the_configured_byte_limit() {
+        let body = "x".repeat(MAX_ERROR_BODY_BYTES as usize + 17);
+        let mut response = Response::builder()
+            .status(400)
+            .body(AsyncBody::from(body))
+            .expect("test response");
+
+        let error = futures::executor::block_on(read_http_error(&mut response));
+        let captured = error.upstream_body().expect("captured body");
+        assert_eq!(captured.len(), MAX_ERROR_BODY_BYTES as usize);
+        assert!(captured.bytes().all(|byte| byte == b'x'));
     }
 
     #[test]

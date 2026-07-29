@@ -15,10 +15,11 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::assistant;
+use crate::error_card::{self, TurnError};
 use crate::fonts;
 use crate::llm::{
-    ContentBlock, Message as LlmMessage, ModelSelection, ProviderMetadata, ReasoningContent,
-    ToolCall,
+    ContentBlock, GatewayError, Message as LlmMessage, ModelSelection, ProviderMetadata,
+    ReasoningContent, ToolCall,
 };
 use crate::providers;
 
@@ -41,17 +42,21 @@ const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
     User,
     Assistant,
 }
 
-#[derive(Clone)]
 pub struct Message {
     pub role: Role,
     pub body: Entity<TextViewState>,
     pub canonical: LlmMessage,
+    /// Set when the generation for this turn failed. Rendered as a card below
+    /// whatever text streamed before the failure, and deliberately kept out of
+    /// `canonical` so a provider's error text is never replayed as conversation
+    /// history on the next turn.
+    pub error: Option<TurnError>,
 }
 
 #[derive(Clone)]
@@ -154,6 +159,13 @@ impl ChatView {
                 },
             );
 
+        // A theme switch repaints everything, but a markdown code block's syntax
+        // colors are fixed when it is parsed — so error cards have to be re-parsed
+        // explicitly or they keep the previous theme's palette.
+        let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
+            this.refresh_error_highlights(cx);
+        });
+
         let selection = providers::last_selection(cx);
         let selection_available = providers::selection_is_available(selection.as_ref(), cx);
         Self {
@@ -175,7 +187,22 @@ impl ChatView {
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             next_turn_id: 1,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![subscription, theme_observer],
+        }
+    }
+
+    /// Re-parse every visible error card against the active theme. Cheap in
+    /// practice: only failed turns hold a card, and only their JSON body is
+    /// re-highlighted.
+    fn refresh_error_highlights(&mut self, cx: &mut Context<Self>) {
+        let mut refreshed = false;
+        for message in &mut self.messages {
+            if let Some(error) = &mut message.error {
+                refreshed |= error.refresh_highlight(cx);
+            }
+        }
+        if refreshed {
+            cx.notify();
         }
     }
 
@@ -230,6 +257,7 @@ impl ChatView {
                 }],
                 provider_metadata: ProviderMetadata::default(),
             },
+            error: None,
         });
 
         let assistant_body = cx.new(|cx| TextViewState::markdown("", cx));
@@ -241,6 +269,7 @@ impl ChatView {
                 content: Vec::new(),
                 provider_metadata: ProviderMetadata::default(),
             },
+            error: None,
         });
 
         self.pending = true;
@@ -268,9 +297,21 @@ impl ChatView {
         true
     }
 
-    pub fn finish_reply(&mut self, message: Option<LlmMessage>, cx: &mut Context<Self>) {
-        if let (Some(message), Some(last)) = (message, self.messages.last_mut()) {
-            last.canonical = message;
+    /// Finish the turn in flight and attach its terminal error, if any. The
+    /// error card's state is built here, outside render, and all terminal state
+    /// changes are published with one notification.
+    pub fn finish_reply(
+        &mut self,
+        message: Option<LlmMessage>,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        let turn_error = error.map(|error| TurnError::new(error, cx));
+        if let Some(last) = self.messages.last_mut() {
+            if let Some(message) = message {
+                last.canonical = message;
+            }
+            last.error = turn_error;
         }
         self.pending = false;
         self.reply_task = None;
@@ -405,7 +446,7 @@ impl Render for ChatView {
             .relative()
             .size_full()
             .child(if has_messages {
-                self.render_message_list(composer_height, cx)
+                self.render_message_list(composer_height, window, cx)
                     .into_any_element()
             } else {
                 render_empty_state(base_composer_height, cx).into_any_element()
@@ -457,8 +498,19 @@ impl ChatView {
     fn render_message_list(
         &self,
         composer_height: Pixels,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        // Rendered up front rather than inside `.children()`: an error card needs
+        // `&mut Window` for its collapse state, which cannot escape the `FnMut`
+        // closure that a lazy iterator would be called from.
+        let rendered = self
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| render_message(message, index, window, cx).into_any_element())
+            .collect::<Vec<_>>();
+
         // Relative, non-scrolling wrapper so the overlay scrollbar anchors to
         // the full panel height (including under the floating composer).
         div()
@@ -492,7 +544,7 @@ impl ChatView {
                             // Leave exactly enough room for the measured floating composer.
                             .pb(composer_height)
                             .gap_5()
-                            .children(self.messages.iter().map(|m| render_message(m, cx))),
+                            .children(rendered),
                     ),
             )
             .vertical_scrollbar(&self.scroll_handle)
@@ -594,7 +646,12 @@ impl ChatView {
     }
 }
 
-fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
+fn render_message(
+    msg: &Message,
+    index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
     let theme = cx.theme();
     let is_user = msg.role == Role::User;
 
@@ -619,11 +676,17 @@ fn render_message(msg: &Message, cx: &App) -> impl IntoElement {
             )
             .into_any_element()
     } else {
-        // Assistant turn: flat markdown, no avatar, full width.
-        div()
+        // Assistant turn: flat markdown, no avatar, full width.  A failed turn
+        // keeps whatever text streamed before the failure and appends the
+        // upstream error card below it.
+        v_flex()
             .w_full()
+            .gap_3()
             .text_color(theme.foreground)
             .child(TextView::new(&msg.body).selectable(true))
+            .when_some(msg.error.as_ref(), |this, error| {
+                this.child(error_card::render(error, index, window, cx))
+            })
             .into_any_element()
     };
 
@@ -674,13 +737,13 @@ fn derive_title(text: &str) -> SharedString {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{TestAppContext, px};
-    use gpui_component::input::InputEvent;
+    use gpui::{AppContext as _, IntoElement as _, TestAppContext, px};
+    use gpui_component::{input::InputEvent, text::TextViewState};
 
     use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
     use crate::preferences;
 
-    use super::{ChatView, is_replayable};
+    use super::{ChatView, Message, Role, is_replayable};
 
     #[test]
     fn empty_assistant_placeholders_are_not_replayed() {
@@ -700,6 +763,139 @@ mod tests {
 
         assert!(!is_replayable(&empty_assistant));
         assert!(is_replayable(&user));
+    }
+
+    /// A failed turn must render its upstream error card through a real view
+    /// pass: the card reads window-keyed collapse state, which is only available
+    /// with a rendering view on the stack.
+    #[gpui::test]
+    fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
+        let prefs = preferences::Preferences::default();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            // The composer resolves its font family from this global during render.
+            crate::fonts::init(prefs.composer_font, cx);
+            preferences::init_global(prefs, cx);
+        });
+        let cx = cx.add_empty_window();
+        let chat = cx.update(ChatView::view);
+
+        // A completed user turn plus the assistant placeholder a reply streams
+        // into. Pushed directly rather than through `submit`, which is gated on a
+        // configured provider that a unit test has no reason to stand up.
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                for role in [Role::User, Role::Assistant] {
+                    let body = cx.new(|cx| TextViewState::markdown("", cx));
+                    this.messages.push(Message {
+                        role,
+                        body,
+                        canonical: LlmMessage {
+                            role: match role {
+                                Role::User => crate::llm::Role::User,
+                                Role::Assistant => crate::llm::Role::Assistant,
+                            },
+                            content: Vec::new(),
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                        error: None,
+                    });
+                }
+            });
+        });
+
+        let mut error = crate::llm::GatewayError::http(429, Some("rate_limit_exceeded".into()))
+            .with_upstream_body(
+                r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#,
+            );
+        error.request_id = Some("nostra-1".into());
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| this.finish_reply(None, Some(error), cx));
+        });
+
+        cx.update(|_, cx| {
+            let this = chat.read(cx);
+            // Attached to the assistant turn, not the user's message.
+            let assistant = this.messages.last().expect("assistant turn");
+            assert_eq!(assistant.role, Role::Assistant);
+            assert!(
+                assistant.error.is_some(),
+                "card attached to the failed turn"
+            );
+            assert_eq!(
+                assistant
+                    .error
+                    .as_ref()
+                    .and_then(crate::error_card::TurnError::request_id),
+                Some("nostra-1"),
+                "the visible card retains the correlation id"
+            );
+            assert!(
+                this.messages[0].error.is_none(),
+                "the user's own turn carries no error"
+            );
+            // The provider's error text must not leak into replayable history.
+            assert!(
+                this.messages
+                    .iter()
+                    .all(
+                        |message| message.canonical.content.iter().all(|block| !matches!(
+                            block,
+                            ContentBlock::Text { text, .. } if text.contains("rate_limit_exceeded")
+                        ))
+                    ),
+                "error text must stay out of canonical content"
+            );
+        });
+
+        // Draws the whole view, card included, without panicking.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(900.), px(700.)),
+            |_, _| chat.clone().into_any_element(),
+        );
+
+        let error_body_before_theme_switch = cx.update(|_, cx| {
+            chat.read(cx)
+                .messages
+                .last()
+                .and_then(|message| message.error.as_ref())
+                .and_then(|error| error.body_entity_id())
+                .expect("error body entity")
+        });
+
+        // A theme switch fires the global observer, which replaces each card's
+        // body while `ChatView` itself is mid-update. Creating the separate body
+        // entity here is safe; re-entering `ChatView` through its handle would
+        // panic.
+        //
+        // `Theme::change` rather than `theme::set_mode`: the latter persists to
+        // the user's real configuration directory.
+        cx.update(|_, cx| {
+            gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            let this = chat.read(cx);
+            let error = this
+                .messages
+                .last()
+                .and_then(|message| message.error.as_ref())
+                .expect("the card survives a theme switch");
+            let error_body_after_theme_switch = error.body_entity_id().expect("error body entity");
+            assert_ne!(
+                error_body_after_theme_switch, error_body_before_theme_switch,
+                "theme changes must replace the parsed markdown state"
+            );
+        });
+
+        // Re-draws cleanly against the new theme.
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(900.), px(700.)),
+            |_, _| chat.clone().into_any_element(),
+        );
     }
 
     /// The greeting is laid out against the *resting* composer height, so a

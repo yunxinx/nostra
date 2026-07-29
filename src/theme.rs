@@ -206,6 +206,48 @@ mod tests {
         }
     }
 
+    /// Every bundled theme must define a `highlight` block.
+    ///
+    /// `Theme::apply_config` only assigns `highlight_theme` when the config
+    /// carries one — a theme without it silently keeps whatever the *previous*
+    /// theme installed, defaulting to `HighlightTheme::default_light()`. The
+    /// symptom is quiet and confusing: dark UI with light syntax colors, and
+    /// switching themes appears to do nothing to code blocks.
+    #[test]
+    fn every_bundled_theme_defines_highlight_styles() {
+        for path in THEME_FILES {
+            let bytes = assets::embedded(path).unwrap_or_else(|| panic!("missing embed: {path}"));
+            let set: ThemeSet =
+                serde_json::from_str(std::str::from_utf8(&bytes).expect("UTF-8")).expect("parses");
+            for theme in &set.themes {
+                let highlight = theme.highlight.as_ref().unwrap_or_else(|| {
+                    panic!(
+                        "{path}: theme {:?} has no `highlight` block, so selecting it would \
+                         leave code blocks in the previously active theme's palette",
+                        theme.name
+                    )
+                });
+                // JSON error bodies lean on these three: keys, values, and the
+                // punctuation between them.
+                assert!(
+                    highlight.syntax.property.is_some(),
+                    "{path}: theme {:?} defines no syntax.property (JSON keys)",
+                    theme.name
+                );
+                assert!(
+                    highlight.syntax.string.is_some(),
+                    "{path}: theme {:?} defines no syntax.string",
+                    theme.name
+                );
+                assert!(
+                    highlight.syntax.number.is_some(),
+                    "{path}: theme {:?} defines no syntax.number",
+                    theme.name
+                );
+            }
+        }
+    }
+
     /// The app's default dark theme must exist with the exact name the
     /// resolver falls back to, and actually be a dark theme.
     #[test]
@@ -219,5 +261,49 @@ mod tests {
             .find(|t| t.name.as_ref() == DEFAULT_DARK)
             .expect("Nostra Dark theme present");
         assert!(dark.mode.is_dark());
+    }
+
+    /// Switching between the app's light and dark slots must actually move
+    /// `highlight_theme`, which is what code blocks colour themselves from.
+    /// Before Nostra Dark carried a `highlight` block this stayed pinned to the
+    /// default light palette no matter what the user selected.
+    #[gpui::test]
+    fn switching_mode_changes_the_active_highlight_theme(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            preferences::init_global(Preferences::default(), cx);
+
+            let prefs = Preferences {
+                theme_mode: Some(preferences::ThemeMode::Dark),
+                ..Preferences::default()
+            };
+            init(&prefs, cx);
+
+            let dark = cx.theme().highlight_theme.clone();
+            assert_eq!(
+                dark.name, DEFAULT_DARK,
+                "the dark slot's own highlight theme is active"
+            );
+
+            // `Theme::change` rather than `set_mode`, which would persist to the
+            // user's real configuration directory.
+            Theme::change(ThemeMode::Light, None, cx);
+            let light = cx.theme().highlight_theme.clone();
+            assert_ne!(
+                light.name, dark.name,
+                "switching to the light slot must install a different highlight theme"
+            );
+            assert_ne!(
+                light.style.syntax.string, dark.style.syntax.string,
+                "string colour must differ between the light and dark palettes"
+            );
+
+            Theme::change(ThemeMode::Dark, None, cx);
+            assert_eq!(
+                cx.theme().highlight_theme.name,
+                dark.name,
+                "switching back restores the dark highlight theme"
+            );
+        });
     }
 }
