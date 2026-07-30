@@ -18,10 +18,11 @@ use crate::assistant;
 use crate::error_card::{self, TurnError};
 use crate::fonts;
 use crate::llm::{
-    ContentBlock, GatewayError, Message as LlmMessage, ModelSelection, ProviderMetadata,
-    ReasoningContent, ToolCall,
+    ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
+    ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
+use crate::reasoning_card::{self, ReasoningTrace};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,6 +42,7 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -48,15 +50,273 @@ pub enum Role {
     Assistant,
 }
 
+pub enum MessagePart {
+    Text {
+        content_index: usize,
+        ui_id: u64,
+        id: String,
+        text: String,
+        replay: ProviderMetadata,
+        finished: bool,
+        body: Entity<TextViewState>,
+    },
+    Reasoning {
+        content_index: usize,
+        ui_id: u64,
+        id: String,
+        reasoning: ReasoningContent,
+        finished: bool,
+        trace: Option<ReasoningTrace>,
+    },
+    ToolCall {
+        content_index: usize,
+        ui_id: u64,
+        index: usize,
+        id: String,
+        name: String,
+        tool_call: Option<ToolCall>,
+    },
+    ToolResult {
+        content_index: usize,
+        tool_result: ToolResult,
+        body: Entity<TextViewState>,
+    },
+}
+
 pub struct Message {
     pub role: Role,
-    pub body: Entity<TextViewState>,
-    pub canonical: LlmMessage,
+    pub parts: Vec<MessagePart>,
+    pub provider_metadata: ProviderMetadata,
     /// Set when the generation for this turn failed. Rendered as a card below
     /// whatever text streamed before the failure, and deliberately kept out of
-    /// `canonical` so a provider's error text is never replayed as conversation
+    /// the parts so a provider's error text is never replayed as conversation
     /// history on the next turn.
     pub error: Option<TurnError>,
+}
+
+impl Message {
+    fn empty(role: Role) -> Self {
+        Self {
+            role,
+            parts: Vec::new(),
+            provider_metadata: ProviderMetadata::default(),
+            error: None,
+        }
+    }
+
+    fn from_canonical(message: LlmMessage, cx: &mut App) -> Self {
+        let role = match message.role {
+            crate::llm::Role::Assistant => Role::Assistant,
+            _ => Role::User,
+        };
+        let parts = message
+            .content
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| MessagePart::from_canonical(index, block, cx))
+            .collect();
+        Self {
+            role,
+            parts,
+            provider_metadata: message.provider_metadata,
+            error: None,
+        }
+    }
+
+    fn canonical(&self) -> LlmMessage {
+        LlmMessage {
+            role: match self.role {
+                Role::User => crate::llm::Role::User,
+                Role::Assistant => crate::llm::Role::Assistant,
+            },
+            content: self
+                .parts
+                .iter()
+                .filter_map(MessagePart::canonical)
+                .collect(),
+            provider_metadata: self.provider_metadata.clone(),
+        }
+    }
+
+    fn replace_with_canonical(&mut self, message: IndexedMessage, cx: &mut App) {
+        let mut previous = std::mem::take(&mut self.parts)
+            .into_iter()
+            .map(|part| (part.content_index(), part))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        self.parts = message
+            .content
+            .into_iter()
+            .map(|part| {
+                let old = previous.remove(&part.content_index);
+                MessagePart::reconcile(part.content_index, old, part.block, cx)
+            })
+            .collect();
+        self.provider_metadata = message.provider_metadata;
+    }
+
+    fn finish_reasoning(&mut self, id: Option<&str>) {
+        for part in &mut self.parts {
+            let MessagePart::Reasoning {
+                id: part_id,
+                finished,
+                trace,
+                ..
+            } = part
+            else {
+                continue;
+            };
+            if id.is_none_or(|id| id == part_id) {
+                *finished = true;
+                if let Some(trace) = trace {
+                    trace.finish();
+                }
+            }
+        }
+    }
+}
+
+impl MessagePart {
+    fn from_canonical(index: usize, block: ContentBlock, cx: &mut App) -> Self {
+        let ui_id = NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed);
+        match block {
+            ContentBlock::Text {
+                text,
+                provider_metadata,
+            } => Self::Text {
+                content_index: index,
+                ui_id,
+                id: format!("terminal-text-{index}"),
+                body: cx.new(|cx| TextViewState::markdown(&text, cx)),
+                text,
+                replay: provider_metadata,
+                finished: true,
+            },
+            ContentBlock::Reasoning { reasoning } => Self::Reasoning {
+                content_index: index,
+                ui_id,
+                id: format!("terminal-reasoning-{index}"),
+                finished: true,
+                trace: (!reasoning.display.is_empty())
+                    .then(|| ReasoningTrace::completed(reasoning.display.clone(), cx)),
+                reasoning,
+            },
+            ContentBlock::ToolCall { tool_call } => Self::ToolCall {
+                content_index: index,
+                ui_id,
+                index,
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                tool_call: Some(tool_call),
+            },
+            ContentBlock::ToolResult { tool_result } => Self::ToolResult {
+                content_index: index,
+                body: cx.new(|cx| TextViewState::markdown(&tool_result.content, cx)),
+                tool_result,
+            },
+        }
+    }
+
+    fn canonical(&self) -> Option<ContentBlock> {
+        match self {
+            Self::Text { text, replay, .. } if !text.is_empty() => Some(ContentBlock::Text {
+                text: text.clone(),
+                provider_metadata: replay.clone(),
+            }),
+            Self::Reasoning { reasoning, .. }
+                if !reasoning.display.is_empty() || reasoning.replay.is_some() =>
+            {
+                Some(ContentBlock::Reasoning {
+                    reasoning: reasoning.clone(),
+                })
+            }
+            Self::ToolCall {
+                tool_call: Some(tool_call),
+                ..
+            } => Some(ContentBlock::ToolCall {
+                tool_call: tool_call.clone(),
+            }),
+            Self::ToolResult { tool_result, .. } => Some(ContentBlock::ToolResult {
+                tool_result: tool_result.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn content_index(&self) -> usize {
+        match self {
+            Self::Text { content_index, .. }
+            | Self::Reasoning { content_index, .. }
+            | Self::ToolCall { content_index, .. }
+            | Self::ToolResult { content_index, .. } => *content_index,
+        }
+    }
+
+    fn reconcile(index: usize, old: Option<Self>, block: ContentBlock, cx: &mut App) -> Self {
+        match (old, block) {
+            (
+                Some(Self::Text {
+                    ui_id, id, body, ..
+                }),
+                ContentBlock::Text {
+                    text,
+                    provider_metadata,
+                },
+            ) => {
+                body.update(cx, |state, cx| state.set_text(&text, cx));
+                Self::Text {
+                    content_index: index,
+                    ui_id,
+                    id,
+                    text,
+                    replay: provider_metadata,
+                    finished: true,
+                    body,
+                }
+            }
+            (
+                Some(Self::Reasoning {
+                    ui_id,
+                    id,
+                    trace: Some(mut trace),
+                    ..
+                }),
+                ContentBlock::Reasoning { reasoning },
+            ) if !reasoning.display.is_empty() => {
+                trace.set_source(&reasoning.display, cx);
+                trace.finish();
+                Self::Reasoning {
+                    content_index: index,
+                    ui_id,
+                    id,
+                    reasoning,
+                    finished: true,
+                    trace: Some(trace),
+                }
+            }
+            (
+                Some(Self::ToolCall {
+                    ui_id,
+                    index,
+                    id,
+                    name,
+                    ..
+                }),
+                ContentBlock::ToolCall { tool_call },
+            ) => Self::ToolCall {
+                content_index: index,
+                ui_id,
+                index,
+                id,
+                name: if tool_call.name.is_empty() {
+                    name
+                } else {
+                    tool_call.name.clone()
+                },
+                tool_call: Some(tool_call),
+            },
+            (_, block) => Self::from_canonical(index, block, cx),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -163,7 +423,7 @@ impl ChatView {
         // colors are fixed when it is parsed — so error cards have to be re-parsed
         // explicitly or they keep the previous theme's palette.
         let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
-            this.refresh_error_highlights(cx);
+            this.refresh_markdown_highlights(cx);
         });
 
         let selection = providers::last_selection(cx);
@@ -191,14 +451,27 @@ impl ChatView {
         }
     }
 
-    /// Re-parse every visible error card against the active theme. Cheap in
-    /// practice: only failed turns hold a card, and only their JSON body is
-    /// re-highlighted.
-    fn refresh_error_highlights(&mut self, cx: &mut Context<Self>) {
+    /// Re-parse every card that holds its own markdown against the active theme.
+    /// Cheap in practice: only failed turns hold an error card, and only
+    /// reasoning blocks hold traces.
+    fn refresh_markdown_highlights(&mut self, cx: &mut Context<Self>) {
         let mut refreshed = false;
         for message in &mut self.messages {
             if let Some(error) = &mut message.error {
                 refreshed |= error.refresh_highlight(cx);
+            }
+            for part in &mut message.parts {
+                if let MessagePart::Reasoning {
+                    reasoning,
+                    trace: Some(trace),
+                    ..
+                } = part
+                {
+                    // Reasoning is markdown like any other body, so a fenced
+                    // block keeps the old palette across a theme switch for the
+                    // same reason an error card does.
+                    refreshed |= trace.refresh_highlight(&reasoning.display, cx);
+                }
             }
         }
         if refreshed {
@@ -245,40 +518,27 @@ impl ChatView {
             cx.emit(ChatEvent::TitleChanged(derive_title(&text)));
         }
 
-        let user_body = cx.new(|cx| TextViewState::markdown(&text, cx));
-        self.messages.push(Message {
-            role: Role::User,
-            body: user_body,
-            canonical: LlmMessage {
+        self.messages.push(Message::from_canonical(
+            LlmMessage {
                 role: crate::llm::Role::User,
                 content: vec![ContentBlock::Text {
-                    text: text.clone(),
+                    text,
                     provider_metadata: ProviderMetadata::default(),
                 }],
                 provider_metadata: ProviderMetadata::default(),
             },
-            error: None,
-        });
+            cx,
+        ));
 
-        let assistant_body = cx.new(|cx| TextViewState::markdown("", cx));
-        self.messages.push(Message {
-            role: Role::Assistant,
-            body: assistant_body.clone(),
-            canonical: LlmMessage {
-                role: crate::llm::Role::Assistant,
-                content: Vec::new(),
-                provider_metadata: ProviderMetadata::default(),
-            },
-            error: None,
-        });
+        self.messages.push(Message::empty(Role::Assistant));
 
         self.pending = true;
         let history = self
             .messages
             .iter()
             .take(self.messages.len().saturating_sub(1))
-            .filter(|message| is_replayable(&message.canonical))
-            .map(|message| message.canonical.clone())
+            .map(Message::canonical)
+            .filter(is_replayable)
             .collect();
         let turn_id = format!("turn-{}", self.next_turn_id);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
@@ -287,7 +547,6 @@ impl ChatView {
             self.selection.clone(),
             self.conversation_id.clone(),
             turn_id,
-            assistant_body,
             cx,
         ));
         self.follow = true;
@@ -302,16 +561,22 @@ impl ChatView {
     /// changes are published with one notification.
     pub fn finish_reply(
         &mut self,
-        message: Option<LlmMessage>,
+        message: Option<IndexedMessage>,
         error: Option<GatewayError>,
         cx: &mut Context<Self>,
     ) {
         let turn_error = error.map(|error| TurnError::new(error, cx));
         if let Some(last) = self.messages.last_mut() {
             if let Some(message) = message {
-                last.canonical = message;
+                // Match pi's message lifecycle: deltas provide a responsive live
+                // projection, then the complete message_end snapshot becomes
+                // authoritative for both rendering and replay.
+                last.replace_with_canonical(message, cx);
             }
             last.error = turn_error;
+            // Terminal fallback for a stream that never delivered its explicit
+            // `ReasoningFinished` boundary, including cancellation and failure.
+            last.finish_reasoning(None);
         }
         self.pending = false;
         self.reply_task = None;
@@ -319,39 +584,281 @@ impl ChatView {
         cx.notify();
     }
 
-    pub fn append_stream_text(&mut self, delta: &str) {
+    pub fn start_stream_text(&mut self, content_index: usize, id: String, cx: &mut App) {
         let Some(last) = self.messages.last_mut() else {
             return;
         };
-        match last.canonical.content.last_mut() {
-            Some(ContentBlock::Text { text, .. }) => text.push_str(delta),
-            _ => last.canonical.content.push(ContentBlock::Text {
-                text: delta.to_string(),
-                provider_metadata: ProviderMetadata::default(),
-            }),
+        if last
+            .parts
+            .iter()
+            .any(|part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id))
+        {
+            return;
         }
+        last.parts.push(MessagePart::Text {
+            content_index,
+            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
+            id,
+            text: String::new(),
+            replay: ProviderMetadata::default(),
+            finished: false,
+            body: cx.new(|cx| TextViewState::markdown("", cx)),
+        });
+        last.parts.sort_by_key(MessagePart::content_index);
     }
 
-    pub fn append_stream_reasoning(&mut self, delta: &str) {
+    pub fn append_stream_text(
+        &mut self,
+        content_index: usize,
+        id: String,
+        delta: &str,
+        cx: &mut App,
+    ) {
+        // OpenAI Responses, like pi's adapter, forwards text deltas as received;
+        // an empty delta carries no content and must not create a canonical block
+        // or alter the independent reasoning lifecycle.
+        if delta.is_empty() {
+            return;
+        }
         let Some(last) = self.messages.last_mut() else {
             return;
         };
-        match last.canonical.content.last_mut() {
-            Some(ContentBlock::Reasoning { reasoning }) => reasoning.display.push_str(delta),
-            _ => last.canonical.content.push(ContentBlock::Reasoning {
-                reasoning: ReasoningContent {
-                    display: delta.to_string(),
-                    replay: None,
-                },
-            }),
+        let Some(position) = last.parts.iter().position(
+            |part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
+        ) else {
+            self.start_stream_text(content_index, id.clone(), cx);
+            self.append_stream_text(content_index, id, delta, cx);
+            return;
+        };
+        if let MessagePart::Text {
+            text,
+            finished,
+            body,
+            ..
+        } = &mut last.parts[position]
+        {
+            if *finished {
+                return;
+            }
+            text.push_str(delta);
+            body.update(cx, |state, cx| state.push_str(delta, cx));
         }
     }
 
-    pub fn append_stream_tool_call(&mut self, tool_call: ToolCall) {
-        if let Some(last) = self.messages.last_mut() {
-            last.canonical
-                .content
-                .push(ContentBlock::ToolCall { tool_call });
+    pub fn finish_stream_text(
+        &mut self,
+        content_index: usize,
+        id: &str,
+        replay: Option<ProviderMetadata>,
+    ) {
+        let Some(MessagePart::Text {
+            replay: current,
+            finished,
+            ..
+        }) = self.messages.last_mut().and_then(|message| {
+            message
+                .parts
+                .iter_mut()
+                .find(|part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == id))
+        })
+        else {
+            return;
+        };
+        if let Some(replay) = replay {
+            *current = replay;
+        }
+        *finished = true;
+    }
+
+    /// Start the reasoning content block identified by the gateway stream.
+    ///
+    /// Protocol adapters emit this boundary before starting a different content
+    /// block, so the presentation layer never infers one block's lifecycle from
+    /// another block's deltas.
+    pub fn start_stream_reasoning(&mut self, content_index: usize, id: String) {
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        if last.parts.iter().any(
+            |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
+        ) {
+            return;
+        }
+        last.parts.push(MessagePart::Reasoning {
+            content_index,
+            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
+            id,
+            reasoning: ReasoningContent {
+                display: String::new(),
+                replay: None,
+            },
+            finished: false,
+            trace: None,
+        });
+        last.parts.sort_by_key(MessagePart::content_index);
+    }
+
+    pub fn append_stream_reasoning(
+        &mut self,
+        content_index: usize,
+        id: String,
+        delta: &str,
+        cx: &mut App,
+    ) {
+        // Empty protocol deltas carry no visible state and must not create a
+        // card or start its duration clock.
+        if delta.is_empty() {
+            return;
+        }
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        let Some(position) = last.parts.iter().position(
+            |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
+        ) else {
+            self.start_stream_reasoning(content_index, id.clone());
+            self.append_stream_reasoning(content_index, id, delta, cx);
+            return;
+        };
+        if let MessagePart::Reasoning {
+            reasoning,
+            finished,
+            trace,
+            ..
+        } = &mut last.parts[position]
+        {
+            // A finished block is immutable. Protocol adapters must allocate a
+            // new id for later reasoning so its card, timer, disclosure, and
+            // canonical position remain independent.
+            if *finished {
+                return;
+            }
+            reasoning.display.push_str(delta);
+            trace
+                .get_or_insert_with(|| ReasoningTrace::new(cx))
+                .push(delta, cx);
+        }
+    }
+
+    pub fn finish_stream_reasoning(
+        &mut self,
+        content_index: usize,
+        id: &str,
+        replay: Option<ProviderMetadata>,
+    ) {
+        let Some(MessagePart::Reasoning {
+            reasoning,
+            finished,
+            trace,
+            ..
+        }) = self.messages.last_mut().and_then(|message| {
+            message.parts.iter_mut().find(
+                |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == id),
+            )
+        })
+        else {
+            return;
+        };
+        if let Some(replay) = replay {
+            reasoning.replay = Some(replay);
+        }
+        *finished = true;
+        if let Some(trace) = trace {
+            trace.finish();
+        }
+    }
+
+    /// Apply an authoritative provider snapshot without changing this block's
+    /// disclosure, timer, or stable GPUI identity.
+    pub fn update_stream_reasoning_snapshot(
+        &mut self,
+        content_index: usize,
+        id: &str,
+        snapshot: ReasoningContent,
+        cx: &mut App,
+    ) {
+        let Some(MessagePart::Reasoning {
+            reasoning,
+            finished,
+            trace,
+            ..
+        }) = self.messages.last_mut().and_then(|message| {
+            message.parts.iter_mut().find(
+                |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == id),
+            )
+        })
+        else {
+            return;
+        };
+        if !*finished {
+            return;
+        }
+        if snapshot.display.is_empty() {
+            *trace = None;
+        } else if let Some(trace) = trace.as_mut() {
+            trace.set_source(&snapshot.display, cx);
+        } else {
+            *trace = Some(ReasoningTrace::completed(snapshot.display.clone(), cx));
+        }
+        *reasoning = snapshot;
+    }
+
+    pub fn start_stream_tool_call(
+        &mut self,
+        content_index: usize,
+        index: usize,
+        id: String,
+        name: String,
+    ) {
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        if last.parts.iter().any(
+            |part| matches!(part, MessagePart::ToolCall { content_index: current, .. } if *current == content_index),
+        ) {
+            return;
+        }
+        last.parts.push(MessagePart::ToolCall {
+            content_index,
+            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
+            index,
+            id,
+            name,
+            tool_call: None,
+        });
+        last.parts.sort_by_key(MessagePart::content_index);
+    }
+
+    pub fn finish_stream_tool_call(
+        &mut self,
+        content_index: usize,
+        index: usize,
+        tool_call: ToolCall,
+    ) {
+        let Some(last) = self.messages.last_mut() else {
+            return;
+        };
+        if let Some(MessagePart::ToolCall {
+            id,
+            name,
+            tool_call: current,
+            ..
+        }) = last.parts.iter_mut().find(
+            |part| matches!(part, MessagePart::ToolCall { content_index: current, index: current_index, .. } if *current == content_index && *current_index == index),
+        ) {
+            *id = tool_call.id.clone();
+            *name = tool_call.name.clone();
+            *current = Some(tool_call);
+        } else {
+            last.parts.push(MessagePart::ToolCall {
+                content_index,
+                ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
+                index,
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                tool_call: Some(tool_call),
+            });
+            last.parts.sort_by_key(MessagePart::content_index);
         }
     }
 
@@ -648,12 +1155,107 @@ impl ChatView {
 
 fn render_message(
     msg: &Message,
-    index: usize,
+    message_index: usize,
     window: &mut Window,
-    cx: &mut App,
+    cx: &mut Context<ChatView>,
 ) -> impl IntoElement {
-    let theme = cx.theme();
+    let (radius_lg, secondary, secondary_foreground, foreground, muted_foreground) = {
+        let theme = cx.theme();
+        (
+            theme.radius_lg,
+            theme.secondary,
+            theme.secondary_foreground,
+            theme.foreground,
+            theme.muted_foreground,
+        )
+    };
     let is_user = msg.role == Role::User;
+    let parts = msg.parts.iter().filter_map(|part| {
+            match part {
+                MessagePart::Text { text, body, .. } if !text.is_empty() => {
+                    Some(TextView::new(body).selectable(true).into_any_element())
+                }
+                MessagePart::Reasoning {
+                    ui_id,
+                    reasoning,
+                    finished,
+                    trace: Some(trace),
+                    ..
+                } => {
+                    // Each content block owns independent disclosure and copy
+                    // state. `ui_id` survives terminal reconciliation and vector
+                    // reordering, so keyed GPUI/Clipboard state remains stable.
+                    let ui_id = *ui_id;
+                    let content_index = part.content_index();
+                    let on_toggle = cx.listener(move |this: &mut ChatView, _, _, cx| {
+                        if let Some(MessagePart::Reasoning {
+                            trace: Some(trace), ..
+                        }) = this
+                            .messages
+                            .get_mut(message_index)
+                            .and_then(|message| {
+                                message.parts.iter_mut().find(|part| {
+                                    matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
+                                })
+                            })
+                        {
+                            trace.toggle();
+                            cx.notify();
+                        }
+                    });
+                    let view = cx.entity().downgrade();
+                    let copy_value = move |_: &mut Window, cx: &mut App| {
+                        view.upgrade()
+                            .and_then(|view| {
+                                let view = view.read(cx);
+                                match view
+                                    .messages
+                                    .get(message_index)
+                                    .and_then(|message| {
+                                        message.parts.iter().find(|part| {
+                                            matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
+                                        })
+                                    })
+                                {
+                                    Some(MessagePart::Reasoning {
+                                        reasoning,
+                                        trace: Some(_),
+                                        ..
+                                    }) => Some(reasoning.display.clone().into()),
+                                    _ => None,
+                                }
+                            })
+                            .unwrap_or_default()
+                    };
+                    Some(reasoning_card::render(
+                        trace,
+                        &reasoning.display,
+                        *finished,
+                        reasoning_card::ReasoningCardId {
+                            ui_id,
+                            content_index,
+                        },
+                        reasoning_card::ReasoningCardActions {
+                            on_toggle: std::rc::Rc::new(on_toggle),
+                            copy_value: std::rc::Rc::new(copy_value),
+                        },
+                        window,
+                        cx,
+                    ))
+                }
+                MessagePart::ToolCall { name, .. } if !name.is_empty() => Some(
+                    div()
+                        .text_color(muted_foreground)
+                        .child(t!("chat.tool_requested", name = name.clone()).to_string())
+                        .into_any_element(),
+                ),
+                MessagePart::ToolResult { body, .. } => {
+                    Some(TextView::new(body).selectable(true).into_any_element())
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
 
     let inner: AnyElement = if is_user {
         // Right-aligned bubble for user turns.
@@ -663,29 +1265,29 @@ fn render_message(
             .child(
                 div()
                     .max_w(px(560.))
-                    .rounded(theme.radius_lg)
-                    .bg(theme.secondary)
-                    .text_color(theme.secondary_foreground)
+                    .rounded(radius_lg)
+                    .bg(secondary)
+                    .text_color(secondary_foreground)
                     // Kept tight on purpose: the body inherits the window's
                     // 16px base size, so its line box is already ~24px tall and
                     // generous padding on top of that makes a one-word turn
                     // read as a block.
                     .px_3()
                     .py_1p5()
-                    .child(TextView::new(&msg.body).selectable(true)),
+                    .children(parts),
             )
             .into_any_element()
     } else {
-        // Assistant turn: flat markdown, no avatar, full width.  A failed turn
-        // keeps whatever text streamed before the failure and appends the
-        // upstream error card below it.
+        // Assistant content is rendered in canonical block order. Reasoning
+        // cards are normal flex children, so text/tool interleaving is preserved
+        // without overlays or a second presentation ordering model.
         v_flex()
             .w_full()
             .gap_3()
-            .text_color(theme.foreground)
-            .child(TextView::new(&msg.body).selectable(true))
+            .text_color(foreground)
+            .children(parts)
             .when_some(msg.error.as_ref(), |this, error| {
-                this.child(error_card::render(error, index, window, cx))
+                this.child(error_card::render(error, message_index, window, cx))
             })
             .into_any_element()
     };
@@ -736,223 +1338,4 @@ fn derive_title(text: &str) -> SharedString {
 }
 
 #[cfg(test)]
-mod tests {
-    use gpui::{AppContext as _, IntoElement as _, TestAppContext, px};
-    use gpui_component::{input::InputEvent, text::TextViewState};
-
-    use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
-    use crate::preferences;
-
-    use super::{ChatView, Message, Role, is_replayable};
-
-    #[test]
-    fn empty_assistant_placeholders_are_not_replayed() {
-        let empty_assistant = LlmMessage {
-            role: crate::llm::Role::Assistant,
-            content: Vec::new(),
-            provider_metadata: ProviderMetadata::default(),
-        };
-        let user = LlmMessage {
-            role: crate::llm::Role::User,
-            content: vec![ContentBlock::Text {
-                text: "hi".into(),
-                provider_metadata: ProviderMetadata::default(),
-            }],
-            provider_metadata: ProviderMetadata::default(),
-        };
-
-        assert!(!is_replayable(&empty_assistant));
-        assert!(is_replayable(&user));
-    }
-
-    /// A failed turn must render its upstream error card through a real view
-    /// pass: the card reads window-keyed collapse state, which is only available
-    /// with a rendering view on the stack.
-    #[gpui::test]
-    fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
-        let prefs = preferences::Preferences::default();
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            // The composer resolves its font family from this global during render.
-            crate::fonts::init(prefs.composer_font, cx);
-            preferences::init_global(prefs, cx);
-        });
-        let cx = cx.add_empty_window();
-        let chat = cx.update(ChatView::view);
-
-        // A completed user turn plus the assistant placeholder a reply streams
-        // into. Pushed directly rather than through `submit`, which is gated on a
-        // configured provider that a unit test has no reason to stand up.
-        cx.update(|_, cx| {
-            chat.update(cx, |this, cx| {
-                for role in [Role::User, Role::Assistant] {
-                    let body = cx.new(|cx| TextViewState::markdown("", cx));
-                    this.messages.push(Message {
-                        role,
-                        body,
-                        canonical: LlmMessage {
-                            role: match role {
-                                Role::User => crate::llm::Role::User,
-                                Role::Assistant => crate::llm::Role::Assistant,
-                            },
-                            content: Vec::new(),
-                            provider_metadata: ProviderMetadata::default(),
-                        },
-                        error: None,
-                    });
-                }
-            });
-        });
-
-        let mut error = crate::llm::GatewayError::http(429, Some("rate_limit_exceeded".into()))
-            .with_upstream_body(
-                r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#,
-            );
-        error.request_id = Some("nostra-1".into());
-        cx.update(|_, cx| {
-            chat.update(cx, |this, cx| this.finish_reply(None, Some(error), cx));
-        });
-
-        cx.update(|_, cx| {
-            let this = chat.read(cx);
-            // Attached to the assistant turn, not the user's message.
-            let assistant = this.messages.last().expect("assistant turn");
-            assert_eq!(assistant.role, Role::Assistant);
-            assert!(
-                assistant.error.is_some(),
-                "card attached to the failed turn"
-            );
-            assert_eq!(
-                assistant
-                    .error
-                    .as_ref()
-                    .and_then(crate::error_card::TurnError::request_id),
-                Some("nostra-1"),
-                "the visible card retains the correlation id"
-            );
-            assert!(
-                this.messages[0].error.is_none(),
-                "the user's own turn carries no error"
-            );
-            // The provider's error text must not leak into replayable history.
-            assert!(
-                this.messages
-                    .iter()
-                    .all(
-                        |message| message.canonical.content.iter().all(|block| !matches!(
-                            block,
-                            ContentBlock::Text { text, .. } if text.contains("rate_limit_exceeded")
-                        ))
-                    ),
-                "error text must stay out of canonical content"
-            );
-        });
-
-        // Draws the whole view, card included, without panicking.
-        cx.draw(
-            gpui::point(px(0.), px(0.)),
-            gpui::size(px(900.), px(700.)),
-            |_, _| chat.clone().into_any_element(),
-        );
-
-        let error_body_before_theme_switch = cx.update(|_, cx| {
-            chat.read(cx)
-                .messages
-                .last()
-                .and_then(|message| message.error.as_ref())
-                .and_then(|error| error.body_entity_id())
-                .expect("error body entity")
-        });
-
-        // A theme switch fires the global observer, which replaces each card's
-        // body while `ChatView` itself is mid-update. Creating the separate body
-        // entity here is safe; re-entering `ChatView` through its handle would
-        // panic.
-        //
-        // `Theme::change` rather than `theme::set_mode`: the latter persists to
-        // the user's real configuration directory.
-        cx.update(|_, cx| {
-            gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-        });
-        cx.run_until_parked();
-
-        cx.update(|_, cx| {
-            let this = chat.read(cx);
-            let error = this
-                .messages
-                .last()
-                .and_then(|message| message.error.as_ref())
-                .expect("the card survives a theme switch");
-            let error_body_after_theme_switch = error.body_entity_id().expect("error body entity");
-            assert_ne!(
-                error_body_after_theme_switch, error_body_before_theme_switch,
-                "theme changes must replace the parsed markdown state"
-            );
-        });
-
-        // Re-draws cleanly against the new theme.
-        cx.draw(
-            gpui::point(px(0.), px(0.)),
-            gpui::size(px(900.), px(700.)),
-            |_, _| chat.clone().into_any_element(),
-        );
-    }
-
-    /// The greeting is laid out against the *resting* composer height, so a
-    /// growing draft must not move that number — otherwise the empty state
-    /// gets pushed up the panel one row at a time.
-    #[gpui::test]
-    fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            preferences::init_global(preferences::Preferences::default(), cx);
-        });
-        let cx = cx.add_empty_window();
-        let chat = cx.update(ChatView::view);
-        let input = cx.update(|_, cx| chat.read(cx).input.clone());
-
-        // First measurement of an empty composer sets both heights.
-        cx.update(|_, cx| {
-            chat.update(cx, |this, _| {
-                assert!(this.record_composer_height(px(96.)));
-                assert_eq!(this.composer_height, px(96.));
-                assert_eq!(this.base_composer_height, px(96.));
-            });
-        });
-
-        // A draft grows the composer: the live height tracks it, the resting
-        // height stays where the greeting was placed.
-        cx.update(|window, cx| {
-            input.update(cx, |state, cx| {
-                state.set_value("line\nline\nline", window, cx);
-                cx.emit(InputEvent::Change);
-            });
-        });
-        cx.update(|_, cx| {
-            chat.update(cx, |this, _| {
-                assert!(!this.input_empty);
-                assert!(this.record_composer_height(px(168.)));
-                assert_eq!(this.composer_height, px(168.));
-                assert_eq!(this.base_composer_height, px(96.));
-            });
-        });
-
-        // Clearing the draft re-measures the resting height, which is how a
-        // font or text-size change recalibrates it.
-        cx.update(|window, cx| {
-            input.update(cx, |state, cx| {
-                state.set_value("", window, cx);
-                cx.emit(InputEvent::Change);
-            });
-        });
-        cx.update(|_, cx| {
-            chat.update(cx, |this, _| {
-                assert!(this.input_empty);
-                assert!(this.record_composer_height(px(104.)));
-                assert_eq!(this.base_composer_height, px(104.));
-                // Idempotent: the same measurement asks for no re-render.
-                assert!(!this.record_composer_height(px(104.)));
-            });
-        });
-    }
-}
+mod tests;

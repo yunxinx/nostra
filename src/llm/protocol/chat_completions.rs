@@ -20,10 +20,16 @@ use super::{
 
 #[derive(Default)]
 struct ToolAccumulator {
+    content_index: Option<usize>,
     id: String,
     name: String,
     arguments: String,
     started: bool,
+}
+
+struct OpenContent {
+    content_index: usize,
+    id: String,
 }
 
 pub(crate) struct ChatCompletionsSession {
@@ -35,8 +41,11 @@ pub(crate) struct ChatCompletionsSession {
     response_id: Option<String>,
     upstream_model: Option<String>,
     usage: Usage,
-    text_started: bool,
-    reasoning_started: bool,
+    text: Option<OpenContent>,
+    reasoning: Option<OpenContent>,
+    next_text_index: usize,
+    next_reasoning_index: usize,
+    next_content_index: usize,
     reasoning_field: Option<ChatReasoningField>,
     reasoning_details: Option<Value>,
     tools: BTreeMap<usize, ToolAccumulator>,
@@ -55,8 +64,11 @@ impl ChatCompletionsSession {
             response_id: None,
             upstream_model: None,
             usage: Usage::default(),
-            text_started: false,
-            reasoning_started: false,
+            text: None,
+            reasoning: None,
+            next_text_index: 0,
+            next_reasoning_index: 0,
+            next_content_index: 0,
             reasoning_field: None,
             reasoning_details: None,
             tools: BTreeMap::new(),
@@ -149,14 +161,10 @@ impl ChatCompletionsSession {
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                 {
-                    if !self.text_started {
-                        self.text_started = true;
-                        events.push(GenerationEvent::TextStarted {
-                            id: "text-0".into(),
-                        });
-                    }
+                    let (content_index, id) = self.start_text(&mut events);
                     events.push(GenerationEvent::TextDelta {
-                        id: "text-0".into(),
+                        content_index,
+                        id,
                         delta: text.into(),
                     });
                 }
@@ -165,14 +173,10 @@ impl ChatCompletionsSession {
                 {
                     if !reasoning.is_empty() {
                         self.reasoning_field.get_or_insert(field);
-                        if !self.reasoning_started {
-                            self.reasoning_started = true;
-                            events.push(GenerationEvent::ReasoningStarted {
-                                id: "reasoning-0".into(),
-                            });
-                        }
+                        let (content_index, id) = self.start_reasoning(&mut events);
                         events.push(GenerationEvent::ReasoningDelta {
-                            id: "reasoning-0".into(),
+                            content_index,
+                            id,
                             delta: reasoning,
                         });
                     }
@@ -184,6 +188,9 @@ impl ChatCompletionsSession {
                     merge_reasoning_details(&mut self.reasoning_details, details.clone());
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                    if !tool_calls.is_empty() {
+                        self.finish_open_content(&mut events);
+                    }
                     for (position, raw) in tool_calls.iter().enumerate() {
                         self.accumulate_tool(raw, position, &mut events)?;
                     }
@@ -254,7 +261,9 @@ impl ChatCompletionsSession {
         }
         if !accumulator.started {
             accumulator.started = true;
+            accumulator.content_index = Some(self.next_content_index);
             events.push(GenerationEvent::ToolCallStarted {
+                content_index: self.next_content_index,
                 index,
                 id: if accumulator.id.is_empty() {
                     format!("call-{index}")
@@ -263,6 +272,7 @@ impl ChatCompletionsSession {
                 },
                 name: accumulator.name.clone(),
             });
+            self.next_content_index = self.next_content_index.saturating_add(1);
         }
         if let Some(arguments) = function.get("arguments") {
             let fragment = if let Some(text) = arguments.as_str() {
@@ -280,6 +290,9 @@ impl ChatCompletionsSession {
             accumulator.arguments.push_str(&fragment);
             if !fragment.is_empty() {
                 events.push(GenerationEvent::ToolCallDelta {
+                    content_index: accumulator.content_index.ok_or_else(|| {
+                        GatewayError::protocol("started tool call is missing its content index")
+                    })?,
                     index,
                     delta: fragment,
                 });
@@ -289,20 +302,7 @@ impl ChatCompletionsSession {
     }
 
     fn finish_parts(&mut self, events: &mut Vec<GenerationEvent>) -> Result<(), GatewayError> {
-        if self.text_started {
-            events.push(GenerationEvent::TextFinished {
-                id: "text-0".into(),
-                replay: None,
-            });
-            self.text_started = false;
-        }
-        if self.reasoning_started {
-            events.push(GenerationEvent::ReasoningFinished {
-                id: "reasoning-0".into(),
-                replay: self.chat_replay_metadata(),
-            });
-            self.reasoning_started = false;
-        }
+        self.finish_open_content(events);
         for (index, accumulator) in &self.tools {
             let id = if accumulator.id.is_empty() {
                 format!("call-{index}")
@@ -312,6 +312,9 @@ impl ChatCompletionsSession {
             let arguments = serde_json::from_str(&accumulator.arguments)
                 .unwrap_or(Value::String(accumulator.arguments.clone()));
             events.push(GenerationEvent::ToolCallFinished {
+                content_index: accumulator.content_index.ok_or_else(|| {
+                    GatewayError::protocol("finished tool call is missing its content index")
+                })?,
                 index: *index,
                 tool_call: Box::new(ToolCall {
                     id,
@@ -323,6 +326,71 @@ impl ChatCompletionsSession {
             });
         }
         Ok(())
+    }
+
+    fn start_text(&mut self, events: &mut Vec<GenerationEvent>) -> (usize, String) {
+        self.finish_reasoning(events);
+        if let Some(open) = &self.text {
+            return (open.content_index, open.id.clone());
+        }
+        let open = OpenContent {
+            content_index: self.next_content_index,
+            id: format!("text-{}", self.next_text_index),
+        };
+        self.next_text_index = self.next_text_index.saturating_add(1);
+        self.next_content_index = self.next_content_index.saturating_add(1);
+        events.push(GenerationEvent::TextStarted {
+            content_index: open.content_index,
+            id: open.id.clone(),
+        });
+        let result = (open.content_index, open.id.clone());
+        self.text = Some(open);
+        result
+    }
+
+    fn start_reasoning(&mut self, events: &mut Vec<GenerationEvent>) -> (usize, String) {
+        self.finish_text(events);
+        if let Some(open) = &self.reasoning {
+            return (open.content_index, open.id.clone());
+        }
+        let open = OpenContent {
+            content_index: self.next_content_index,
+            id: format!("reasoning-{}", self.next_reasoning_index),
+        };
+        self.next_reasoning_index = self.next_reasoning_index.saturating_add(1);
+        self.next_content_index = self.next_content_index.saturating_add(1);
+        events.push(GenerationEvent::ReasoningStarted {
+            content_index: open.content_index,
+            id: open.id.clone(),
+        });
+        let result = (open.content_index, open.id.clone());
+        self.reasoning = Some(open);
+        result
+    }
+
+    fn finish_open_content(&mut self, events: &mut Vec<GenerationEvent>) {
+        self.finish_text(events);
+        self.finish_reasoning(events);
+    }
+
+    fn finish_text(&mut self, events: &mut Vec<GenerationEvent>) {
+        if let Some(open) = self.text.take() {
+            events.push(GenerationEvent::TextFinished {
+                content_index: open.content_index,
+                id: open.id,
+                replay: None,
+            });
+        }
+    }
+
+    fn finish_reasoning(&mut self, events: &mut Vec<GenerationEvent>) {
+        if let Some(open) = self.reasoning.take() {
+            events.push(GenerationEvent::ReasoningFinished {
+                content_index: open.content_index,
+                id: open.id,
+                replay: self.chat_replay_metadata(),
+            });
+        }
     }
 
     fn maybe_terminal(&mut self) -> Result<ProtocolUpdate, GatewayError> {
@@ -767,6 +835,91 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(deltas, vec!["first"]);
+    }
+
+    #[test]
+    fn content_type_transitions_create_new_ordered_blocks() {
+        let mut session = ChatCompletionsSession::new(CompatibilityProfile::default());
+        let chunks = [
+            r#"{"choices":[{"delta":{"reasoning_content":"first"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"content":"answer"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"second"},"finish_reason":"stop"}]}"#,
+        ];
+        let events = chunks
+            .into_iter()
+            .flat_map(|chunk| session.ingest(chunk).expect("chunk").events)
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                GenerationEvent::Started(_),
+                GenerationEvent::ReasoningStarted { content_index: 0, id: first_start },
+                GenerationEvent::ReasoningDelta { content_index: 0, id: first_delta, delta: first },
+                GenerationEvent::ReasoningFinished { id: first_end, .. },
+                GenerationEvent::TextStarted { content_index: 1, id: text_start },
+                GenerationEvent::TextDelta { content_index: 1, id: text_delta, delta: text },
+                GenerationEvent::TextFinished { id: text_end, .. },
+                GenerationEvent::ReasoningStarted { content_index: 2, id: second_start },
+                GenerationEvent::ReasoningDelta { content_index: 2, id: second_delta, delta: second },
+                GenerationEvent::ReasoningFinished { id: second_end, .. },
+            ] if first_start == "reasoning-0"
+                && first_delta == first_start
+                && first_end == first_start
+                && first == "first"
+                && text_start == "text-0"
+                && text_delta == text_start
+                && text_end == text_start
+                && text == "answer"
+                && second_start == "reasoning-1"
+                && second_delta == second_start
+                && second_end == second_start
+                && second == "second"
+        ));
+    }
+
+    #[test]
+    fn tool_calls_separate_reasoning_blocks() {
+        let mut session = ChatCompletionsSession::new(CompatibilityProfile::default());
+        let chunks = [
+            r#"{"choices":[{"delta":{"reasoning_content":"before"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-0","function":{"name":"lookup","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_content":"after"},"finish_reason":"stop"}]}"#,
+        ];
+        let events = chunks
+            .into_iter()
+            .flat_map(|chunk| session.ingest(chunk).expect("chunk").events)
+            .collect::<Vec<_>>();
+
+        let structural = events
+            .iter()
+            .filter_map(|event| match event {
+                GenerationEvent::ReasoningStarted { id, .. } => {
+                    Some(("reasoning-start", id.as_str()))
+                }
+                GenerationEvent::ReasoningFinished { id, .. } => {
+                    Some(("reasoning-finish", id.as_str()))
+                }
+                GenerationEvent::ToolCallStarted { id, .. } => Some(("tool-start", id.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            structural,
+            vec![
+                ("reasoning-start", "reasoning-0"),
+                ("reasoning-finish", "reasoning-0"),
+                ("tool-start", "call-0"),
+                ("reasoning-start", "reasoning-1"),
+                ("reasoning-finish", "reasoning-1"),
+            ]
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::ToolCallFinished { tool_call, .. }
+                if tool_call.name == "lookup"
+        )));
     }
 
     #[test]

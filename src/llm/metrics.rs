@@ -194,14 +194,16 @@ mod tests {
             message: None,
             error: None,
         };
-        outcome.message = Some(crate::llm::Message {
-            role: crate::llm::Role::Assistant,
-            content: vec![crate::llm::ContentBlock::Text {
-                text: "private text".into(),
+        outcome.message = Some(crate::llm::IndexedMessage::from_message(
+            crate::llm::Message {
+                role: crate::llm::Role::Assistant,
+                content: vec![crate::llm::ContentBlock::Text {
+                    text: "private text".into(),
+                    provider_metadata: Default::default(),
+                }],
                 provider_metadata: Default::default(),
-            }],
-            provider_metadata: Default::default(),
-        });
+            },
+        ));
         metrics.on_finish(&outcome);
         assert!(metrics.recent()[0].message.is_none());
     }

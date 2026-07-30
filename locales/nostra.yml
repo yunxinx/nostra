@@ -59,6 +59,25 @@ chat:
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
+  reasoning:
+    streaming:
+      en: Thinking…
+      zh-CN: 正在思考…
+    finished:
+      en: "Thought for %{duration}s"
+      zh-CN: "已思考 %{duration} 秒"
+    completed:
+      en: Thought process
+      zh-CN: 思考过程
+    collapse:
+      en: Collapse reasoning
+      zh-CN: 折叠思考过程
+    expand:
+      en: Expand reasoning
+      zh-CN: 展开思考过程
+    copy:
+      en: Copy reasoning
+      zh-CN: 复制思考过程
   error:
     configuration:
       en: Select an available provider and model in Settings.

@@ -5,6 +5,7 @@
 //! every prepared generation, including cancellation and drop.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -13,9 +14,9 @@ use std::{
 };
 
 use crate::llm::{
-    ContentBlock, FinishReason, GatewayError, GenerationEvent, GenerationOutcome, Message,
-    ModelSelection, OutcomeObserver, OutcomeStatus, Protocol, ProtocolSession, ProviderMetadata,
-    ProviderProfile, ReasoningContent, Role, ToolCall, Usage,
+    ContentBlock, FinishReason, GatewayError, GenerationEvent, GenerationOutcome,
+    IndexedContentBlock, IndexedMessage, ModelSelection, OutcomeObserver, OutcomeStatus, Protocol,
+    ProtocolSession, ProviderMetadata, ProviderProfile, ReasoningContent, Role, ToolCall, Usage,
     transport::{HttpTransport, TransportEvent, TransportRequest},
 };
 
@@ -172,11 +173,13 @@ enum AssembledBlock {
         id: String,
         text: String,
         replay: Option<crate::llm::ReplayMetadata>,
+        finished: bool,
     },
     Reasoning {
         id: String,
         display: String,
         replay: Option<crate::llm::ReplayMetadata>,
+        finished: bool,
     },
     Tool {
         index: usize,
@@ -186,14 +189,15 @@ enum AssembledBlock {
 
 #[derive(Default)]
 struct MessageAssembler {
-    // Block insertion order follows Started/Delta events, preserving the
-    // assistant's interleaving of text, reasoning, and tool calls for replay.
-    blocks: Vec<AssembledBlock>,
+    // The protocol-owned content index is stable across live events and
+    // terminal backfill, so a missing earlier Responses output can be inserted
+    // without changing canonical order.
+    blocks: BTreeMap<usize, AssembledBlock>,
 }
 
 impl MessageAssembler {
     fn is_empty(&self) -> bool {
-        !self.blocks.iter().any(|block| match block {
+        !self.blocks.values().any(|block| match block {
             AssembledBlock::Text { text, .. } => !text.is_empty(),
             AssembledBlock::Reasoning {
                 display, replay, ..
@@ -202,133 +206,254 @@ impl MessageAssembler {
         })
     }
 
-    fn observe(&mut self, event: &GenerationEvent) {
+    fn observe(&mut self, event: &GenerationEvent) -> Result<(), GatewayError> {
         match event {
-            GenerationEvent::TextStarted { id } => {
-                self.ensure_text(id);
+            GenerationEvent::TextStarted { content_index, id } => {
+                self.start_text(*content_index, id)?;
             }
-            GenerationEvent::TextDelta { id, delta } => {
-                self.ensure_text(id).0.push_str(delta);
+            GenerationEvent::TextDelta {
+                content_index,
+                id,
+                delta,
+            } => {
+                let (text, _, finished) = self.text(*content_index, id)?;
+                if *finished {
+                    return Err(GatewayError::protocol(
+                        "text delta arrived after content completion",
+                    ));
+                }
+                text.push_str(delta);
             }
-            GenerationEvent::TextFinished { id, replay } => {
+            GenerationEvent::TextFinished {
+                content_index,
+                id,
+                replay,
+            } => {
+                let (_, current_replay, finished) = self.text(*content_index, id)?;
+                *finished = true;
                 if replay.is_some() {
-                    *self.ensure_text(id).1 = replay.clone();
+                    *current_replay = replay.clone();
                 }
             }
-            GenerationEvent::ReasoningStarted { id } => {
-                self.ensure_reasoning(id);
+            GenerationEvent::ReasoningStarted { content_index, id } => {
+                self.start_reasoning(*content_index, id)?;
             }
-            GenerationEvent::ReasoningDelta { id, delta } => {
-                self.ensure_reasoning(id).0.push_str(delta);
+            GenerationEvent::ReasoningDelta {
+                content_index,
+                id,
+                delta,
+            } => {
+                let (display, _, finished) = self.reasoning(*content_index, id)?;
+                if *finished {
+                    return Err(GatewayError::protocol(
+                        "reasoning delta arrived after content completion",
+                    ));
+                }
+                display.push_str(delta);
             }
-            GenerationEvent::ReasoningFinished { id, replay } => {
+            GenerationEvent::ReasoningFinished {
+                content_index,
+                id,
+                replay,
+            } => {
+                let (_, current_replay, finished) = self.reasoning(*content_index, id)?;
+                *finished = true;
                 if replay.is_some() {
-                    *self.ensure_reasoning(id).1 = replay.clone();
+                    *current_replay = replay.clone();
                 }
             }
-            GenerationEvent::ToolCallStarted { index, .. } => {
-                if !self.blocks.iter().any(
-                    |block| matches!(block, AssembledBlock::Tool { index: current, .. } if current == index),
-                ) {
-                    self.blocks.push(AssembledBlock::Tool {
+            GenerationEvent::ReasoningSnapshotUpdated {
+                content_index,
+                id,
+                reasoning,
+            } => {
+                let (display, replay, finished) = self.reasoning(*content_index, id)?;
+                if !*finished {
+                    return Err(GatewayError::protocol(
+                        "reasoning snapshot arrived before content completion",
+                    ));
+                }
+                display.clone_from(&reasoning.display);
+                replay.clone_from(&reasoning.replay);
+            }
+            GenerationEvent::ToolCallStarted {
+                content_index,
+                index,
+                ..
+            } => match self.blocks.entry(*content_index) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(AssembledBlock::Tool {
                         index: *index,
                         tool_call: None,
                     });
                 }
-            }
-            GenerationEvent::ToolCallFinished { index, tool_call } => {
-                if let Some(AssembledBlock::Tool {
-                    tool_call: current,
-                    ..
-                }) = self.blocks.iter_mut().find(
-                    |block| matches!(block, AssembledBlock::Tool { index: current, .. } if current == index),
-                ) {
-                    *current = Some((**tool_call).clone());
-                } else {
-                    self.blocks.push(AssembledBlock::Tool {
-                        index: *index,
-                        tool_call: Some((**tool_call).clone()),
-                    });
+                std::collections::btree_map::Entry::Occupied(entry) if matches!(entry.get(), AssembledBlock::Tool { index: current, .. } if current == index) =>
+                    {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(GatewayError::protocol(
+                        "content index was reused by a different block",
+                    ));
                 }
-            }
+            },
+            GenerationEvent::ToolCallFinished {
+                content_index,
+                index,
+                tool_call,
+            } => match self.blocks.get_mut(content_index) {
+                Some(AssembledBlock::Tool {
+                    index: current,
+                    tool_call: slot,
+                }) if current == index => {
+                    *slot = Some((**tool_call).clone());
+                }
+                None => {
+                    self.blocks.insert(
+                        *content_index,
+                        AssembledBlock::Tool {
+                            index: *index,
+                            tool_call: Some((**tool_call).clone()),
+                        },
+                    );
+                }
+                _ => {
+                    return Err(GatewayError::protocol(
+                        "tool completion did not match its content block",
+                    ));
+                }
+            },
             _ => {}
         }
+        Ok(())
     }
 
-    fn ensure_text(&mut self, id: &str) -> (&mut String, &mut Option<crate::llm::ReplayMetadata>) {
-        let position = self
-            .blocks
-            .iter()
-            .position(
-                |block| matches!(block, AssembledBlock::Text { id: current, .. } if current == id),
-            )
-            .unwrap_or_else(|| {
-                self.blocks.push(AssembledBlock::Text {
+    fn start_text(&mut self, content_index: usize, id: &str) -> Result<(), GatewayError> {
+        match self.blocks.entry(content_index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(AssembledBlock::Text {
                     id: id.to_string(),
                     text: String::new(),
                     replay: None,
+                    finished: false,
                 });
-                self.blocks.len() - 1
-            });
-        match &mut self.blocks[position] {
-            AssembledBlock::Text { text, replay, .. } => (text, replay),
-            _ => unreachable!("located text block"),
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if matches!(entry.get(), AssembledBlock::Text { id: current, .. } if current == id) => {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(GatewayError::protocol(
+                "content index was reused by a different block",
+            )),
         }
     }
 
-    fn ensure_reasoning(
+    fn text(
         &mut self,
+        content_index: usize,
         id: &str,
-    ) -> (&mut String, &mut Option<crate::llm::ReplayMetadata>) {
-        let position = self
-            .blocks
-            .iter()
-            .position(|block| matches!(block, AssembledBlock::Reasoning { id: current, .. } if current == id))
-            .unwrap_or_else(|| {
-                self.blocks.push(AssembledBlock::Reasoning {
+    ) -> Result<
+        (
+            &mut String,
+            &mut Option<crate::llm::ReplayMetadata>,
+            &mut bool,
+        ),
+        GatewayError,
+    > {
+        match self.blocks.get_mut(&content_index) {
+            Some(AssembledBlock::Text {
+                id: current,
+                text,
+                replay,
+                finished,
+            }) if current == id => Ok((text, replay, finished)),
+            _ => Err(GatewayError::protocol(
+                "text event did not match a started content block",
+            )),
+        }
+    }
+
+    fn start_reasoning(&mut self, content_index: usize, id: &str) -> Result<(), GatewayError> {
+        match self.blocks.entry(content_index) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(AssembledBlock::Reasoning {
                     id: id.to_string(),
                     display: String::new(),
                     replay: None,
+                    finished: false,
                 });
-                self.blocks.len() - 1
-            });
-        match &mut self.blocks[position] {
-            AssembledBlock::Reasoning {
-                display, replay, ..
-            } => (display, replay),
-            _ => unreachable!("located reasoning block"),
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if matches!(entry.get(), AssembledBlock::Reasoning { id: current, .. } if current == id) => {
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => Err(GatewayError::protocol(
+                "content index was reused by a different block",
+            )),
         }
     }
 
-    fn message(&self) -> Message {
+    fn reasoning(
+        &mut self,
+        content_index: usize,
+        id: &str,
+    ) -> Result<
+        (
+            &mut String,
+            &mut Option<crate::llm::ReplayMetadata>,
+            &mut bool,
+        ),
+        GatewayError,
+    > {
+        match self.blocks.get_mut(&content_index) {
+            Some(AssembledBlock::Reasoning {
+                id: current,
+                display,
+                replay,
+                finished,
+            }) if current == id => Ok((display, replay, finished)),
+            _ => Err(GatewayError::protocol(
+                "reasoning event did not match a started content block",
+            )),
+        }
+    }
+
+    fn message(&self) -> IndexedMessage {
         let content = self
             .blocks
             .iter()
-            .filter_map(|block| match block {
+            .filter_map(|(content_index, block)| match block {
                 AssembledBlock::Text { text, replay, .. } if !text.is_empty() => {
-                    Some(ContentBlock::Text {
-                        text: text.clone(),
-                        provider_metadata: replay.clone().unwrap_or_default(),
+                    Some(IndexedContentBlock {
+                        content_index: *content_index,
+                        block: ContentBlock::Text {
+                            text: text.clone(),
+                            provider_metadata: replay.clone().unwrap_or_default(),
+                        },
                     })
                 }
                 AssembledBlock::Reasoning {
                     display, replay, ..
-                } if !display.is_empty() || replay.is_some() => Some(ContentBlock::Reasoning {
-                    reasoning: ReasoningContent {
-                        display: display.clone(),
-                        replay: replay.clone(),
+                } if !display.is_empty() || replay.is_some() => Some(IndexedContentBlock {
+                    content_index: *content_index,
+                    block: ContentBlock::Reasoning {
+                        reasoning: ReasoningContent {
+                            display: display.clone(),
+                            replay: replay.clone(),
+                        },
                     },
                 }),
                 AssembledBlock::Tool {
                     tool_call: Some(tool_call),
                     ..
-                } => Some(ContentBlock::ToolCall {
-                    tool_call: tool_call.clone(),
+                } => Some(IndexedContentBlock {
+                    content_index: *content_index,
+                    block: ContentBlock::ToolCall {
+                        tool_call: tool_call.clone(),
+                    },
                 }),
                 _ => None,
             })
             .collect();
-        Message {
+        IndexedMessage {
             role: Role::Assistant,
             content,
             provider_metadata: ProviderMetadata::default(),
@@ -391,7 +516,9 @@ impl GatewaySession {
                     if let GenerationEvent::UsageUpdated(usage) = event {
                         self.latest_usage = usage.clone();
                     }
-                    self.assembler.observe(event);
+                    if let Err(error) = self.assembler.observe(event) {
+                        return vec![self.fail(error)];
+                    }
                     if let Some(observer) = &self.observer {
                         observer.on_event(&self.context, event);
                     }
@@ -680,10 +807,9 @@ mod tests {
         assert_eq!(outcome.status, OutcomeStatus::Cancelled);
         assert!(outcome.error.is_none());
         assert!(outcome.message.as_ref().is_some_and(|message| {
-            message
-                .content
-                .iter()
-                .any(|block| matches!(block, ContentBlock::Text { text, .. } if text == "partial"))
+            message.content.iter().any(
+                |part| matches!(&part.block, ContentBlock::Text { text, .. } if text == "partial"),
+            )
         }));
         assert!(generation.cancel().is_none());
         drop(generation);
@@ -782,12 +908,81 @@ mod tests {
             ProtocolSession::new(Protocol::Responses, CompatibilityProfile::default()),
             None,
         );
+        let mut reasoning_finish_count = 0;
+        let mut snapshot_update_count = 0;
         for event in [
             r#"{"type":"response.created","response":{"id":"resp"}}"#,
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning-item","encrypted_content":"opaque"}}"#,
-            r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":"think"}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"reasoning-item"}}"#,
+            r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":"streamed draft"}"#,
             r#"{"type":"response.reasoning_text.done","output_index":0,"content_index":0}"#,
             r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"message-item"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"answer"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"reasoning-item","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"authoritative summary"}]}}"#,
+        ] {
+            let events = session.ingest_sse_data(event);
+            reasoning_finish_count += events
+                .iter()
+                .filter(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
+                .count();
+            snapshot_update_count += events
+                .iter()
+                .filter(|event| matches!(event, GenerationEvent::ReasoningSnapshotUpdated { .. }))
+                .count();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, GenerationEvent::Finished(_)))
+            );
+        }
+        assert_eq!(reasoning_finish_count, 1);
+        assert_eq!(snapshot_update_count, 1);
+        let events =
+            session.ingest_sse_data(r#"{"type":"response.completed","response":{"id":"resp","output":[{"type":"reasoning","id":"reasoning-item","encrypted_content":"opaque","summary":[{"type":"summary_text","text":"authoritative summary"}]},{"type":"message","id":"message-item","content":[{"type":"output_text","text":"answer"}]}]}}"#);
+        let outcome = events
+            .into_iter()
+            .find_map(|event| match event {
+                GenerationEvent::Finished(outcome) => Some(outcome),
+                _ => None,
+            })
+            .expect("terminal outcome");
+        let message = outcome.message.expect("assembled message").into_message();
+        let metadata = message
+            .provider_metadata
+            .responses
+            .expect("message metadata");
+        assert_eq!(metadata.response_id.as_deref(), Some("resp"));
+        let reasoning = message
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Reasoning { reasoning } => Some(reasoning),
+                _ => None,
+            })
+            .expect("reasoning content");
+        assert_eq!(reasoning.display, "authoritative summary");
+        let replay = reasoning
+            .replay
+            .as_ref()
+            .and_then(|metadata| metadata.responses.as_ref())
+            .expect("reasoning replay metadata");
+        assert_eq!(replay.item_id.as_deref(), Some("reasoning-item"));
+        assert_eq!(replay.encrypted_reasoning.as_deref(), Some("opaque"));
+    }
+
+    #[test]
+    fn responses_unsupported_output_keeps_the_later_canonical_index() {
+        let mut session = GatewaySession::new(
+            RequestContext::new("p", "m", Protocol::Responses),
+            ProtocolSession::new(Protocol::Responses, CompatibilityProfile::default()),
+            None,
+        );
+        for event in [
+            r#"{"type":"response.created","response":{"id":"resp"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"future_output","id":"future"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"future_output","id":"future"}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"reasoning-item"}}"#,
+            r#"{"type":"response.reasoning_text.delta","output_index":1,"delta":"thought"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"reasoning-item","summary":[{"type":"summary_text","text":"thought"}]}}"#,
         ] {
             assert!(
                 !session
@@ -796,32 +991,25 @@ mod tests {
                     .any(|event| matches!(event, GenerationEvent::Finished(_)))
             );
         }
-        let events =
-            session.ingest_sse_data(r#"{"type":"response.completed","response":{"id":"resp"}}"#);
-        let outcome = events
+
+        let events = session.ingest_sse_data(
+            r#"{"type":"response.completed","response":{"id":"resp","output":[{"type":"future_output","id":"future"},{"type":"reasoning","id":"reasoning-item","summary":[{"type":"summary_text","text":"thought"}]}]}}"#,
+        );
+        let message = events
             .into_iter()
             .find_map(|event| match event {
-                GenerationEvent::Finished(outcome) => Some(outcome),
+                GenerationEvent::Finished(outcome) => outcome.message,
                 _ => None,
             })
-            .expect("terminal outcome");
-        let message = outcome.message.expect("assembled message");
-        let metadata = message
-            .provider_metadata
-            .responses
-            .expect("message metadata");
-        assert_eq!(metadata.response_id.as_deref(), Some("resp"));
-        let replay = message
-            .content
-            .iter()
-            .find_map(|block| match block {
-                ContentBlock::Reasoning { reasoning } => reasoning.replay.as_ref(),
-                _ => None,
-            })
-            .and_then(|metadata| metadata.responses.as_ref())
-            .expect("reasoning replay metadata");
-        assert_eq!(replay.item_id.as_deref(), Some("reasoning-item"));
-        assert_eq!(replay.encrypted_reasoning.as_deref(), Some("opaque"));
+            .expect("terminal message");
+
+        assert!(matches!(
+            message.content.as_slice(),
+            [IndexedContentBlock {
+                content_index: 1,
+                block: ContentBlock::Reasoning { reasoning },
+            }] if reasoning.display == "thought"
+        ));
     }
 
     #[test]
@@ -847,7 +1035,9 @@ mod tests {
         let message = events
             .into_iter()
             .find_map(|event| match event {
-                GenerationEvent::Finished(outcome) => outcome.message,
+                GenerationEvent::Finished(outcome) => {
+                    outcome.message.map(IndexedMessage::into_message)
+                }
                 _ => None,
             })
             .expect("assembled message");
@@ -871,19 +1061,191 @@ mod tests {
     #[test]
     fn assembler_preserves_started_block_order() {
         let mut assembler = MessageAssembler::default();
-        assembler.observe(&GenerationEvent::TextStarted { id: "t".into() });
-        assembler.observe(&GenerationEvent::TextDelta {
-            id: "t".into(),
-            delta: "answer".into(),
-        });
-        assembler.observe(&GenerationEvent::ReasoningStarted { id: "r".into() });
-        assembler.observe(&GenerationEvent::ReasoningDelta {
-            id: "r".into(),
-            delta: "later".into(),
-        });
+        assembler
+            .observe(&GenerationEvent::TextStarted {
+                content_index: 0,
+                id: "t".into(),
+            })
+            .expect("text start");
+        assembler
+            .observe(&GenerationEvent::TextDelta {
+                content_index: 0,
+                id: "t".into(),
+                delta: "answer".into(),
+            })
+            .expect("text delta");
+        assembler
+            .observe(&GenerationEvent::ReasoningStarted {
+                content_index: 1,
+                id: "r".into(),
+            })
+            .expect("reasoning start");
+        assembler
+            .observe(&GenerationEvent::ReasoningDelta {
+                content_index: 1,
+                id: "r".into(),
+                delta: "later".into(),
+            })
+            .expect("reasoning delta");
         let message = assembler.message();
-        assert!(matches!(message.content[0], ContentBlock::Text { .. }));
-        assert!(matches!(message.content[1], ContentBlock::Reasoning { .. }));
+        assert!(matches!(
+            message.content[0].block,
+            ContentBlock::Text { .. }
+        ));
+        assert!(matches!(
+            message.content[1].block,
+            ContentBlock::Reasoning { .. }
+        ));
+        assert_eq!(
+            message
+                .content
+                .iter()
+                .map(|part| part.content_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn assembler_orders_terminal_backfill_by_content_index() {
+        let mut assembler = MessageAssembler::default();
+        for event in [
+            GenerationEvent::TextStarted {
+                content_index: 1,
+                id: "text".into(),
+            },
+            GenerationEvent::TextDelta {
+                content_index: 1,
+                id: "text".into(),
+                delta: "answer".into(),
+            },
+            GenerationEvent::ReasoningStarted {
+                content_index: 0,
+                id: "reasoning".into(),
+            },
+            GenerationEvent::ReasoningDelta {
+                content_index: 0,
+                id: "reasoning".into(),
+                delta: "first".into(),
+            },
+        ] {
+            assembler.observe(&event).expect("valid event");
+        }
+        let message = assembler.message();
+        assert_eq!(
+            message
+                .content
+                .iter()
+                .map(|part| part.content_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                IndexedContentBlock {
+                    block: ContentBlock::Reasoning { .. },
+                    ..
+                },
+                IndexedContentBlock {
+                    block: ContentBlock::Text { .. },
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn assembler_rejects_delta_after_block_finish() {
+        let mut assembler = MessageAssembler::default();
+        assembler
+            .observe(&GenerationEvent::ReasoningStarted {
+                content_index: 0,
+                id: "reasoning".into(),
+            })
+            .expect("start");
+        assembler
+            .observe(&GenerationEvent::ReasoningFinished {
+                content_index: 0,
+                id: "reasoning".into(),
+                replay: None,
+            })
+            .expect("finish");
+        assert!(
+            assembler
+                .observe(&GenerationEvent::ReasoningDelta {
+                    content_index: 0,
+                    id: "reasoning".into(),
+                    delta: "late".into()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn assembler_preserves_reasoning_around_a_tool_call() {
+        let mut assembler = MessageAssembler::default();
+        let tool_call = ToolCall {
+            id: "call-0".into(),
+            name: "lookup".into(),
+            arguments: serde_json::json!({}),
+            raw_arguments: "{}".into(),
+            provider_metadata: ProviderMetadata::default(),
+        };
+        let events = [
+            GenerationEvent::ReasoningStarted {
+                content_index: 0,
+                id: "reasoning-0".into(),
+            },
+            GenerationEvent::ReasoningDelta {
+                content_index: 0,
+                id: "reasoning-0".into(),
+                delta: "before".into(),
+            },
+            GenerationEvent::ToolCallStarted {
+                content_index: 1,
+                index: 0,
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+            },
+            GenerationEvent::ReasoningStarted {
+                content_index: 2,
+                id: "reasoning-1".into(),
+            },
+            GenerationEvent::ReasoningDelta {
+                content_index: 2,
+                id: "reasoning-1".into(),
+                delta: "after".into(),
+            },
+            GenerationEvent::ToolCallFinished {
+                content_index: 1,
+                index: 0,
+                tool_call: Box::new(tool_call.clone()),
+            },
+        ];
+        for event in &events {
+            assembler.observe(event).expect("valid event");
+        }
+
+        let message = assembler.message();
+        assert!(matches!(
+            message.content.as_slice(),
+            [
+                IndexedContentBlock { block: ContentBlock::Reasoning { reasoning: first }, .. },
+                IndexedContentBlock { block: ContentBlock::ToolCall { tool_call: middle }, .. },
+                IndexedContentBlock { block: ContentBlock::Reasoning { reasoning: second }, .. },
+            ] if first.display == "before"
+                && middle == &tool_call
+                && second.display == "after"
+        ));
+        assert_eq!(
+            message
+                .content
+                .iter()
+                .map(|part| part.content_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]

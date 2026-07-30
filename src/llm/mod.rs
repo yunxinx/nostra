@@ -18,7 +18,10 @@ pub use config::{
     resolve_selection,
 };
 pub use error::{ErrorKind, GatewayError};
-pub use event::{FinishReason, GenerationEvent, GenerationOutcome, OutcomeStatus, StreamMetadata};
+pub use event::{
+    FinishReason, GenerationEvent, GenerationOutcome, IndexedContentBlock, IndexedMessage,
+    OutcomeStatus, StreamMetadata,
+};
 pub use gateway::{Gateway, Generation, RequestContext};
 pub use metrics::{AggregateKey, AggregateUsage, InMemoryMetrics, OutcomeObserver};
 pub use model::*;

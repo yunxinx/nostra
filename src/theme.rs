@@ -83,14 +83,7 @@ pub fn select_theme(name: &str, cx: &mut App) {
 
     let dark_slot = config.mode.is_dark();
     let saved: String = config.name.to_string();
-    {
-        let theme = Theme::global_mut(cx);
-        if dark_slot {
-            theme.dark_theme = config;
-        } else {
-            theme.light_theme = config;
-        }
-    }
+    apply_theme_config(config, cx);
     preferences::update(cx, |p| {
         let slot = if dark_slot {
             &mut p.dark_theme
@@ -104,6 +97,32 @@ pub fn select_theme(name: &str, cx: &mut App) {
     let current = cx.theme().mode;
     Theme::change(current, None, cx);
     cx.refresh_windows();
+}
+
+/// Install a theme into its matching slot without changing user preferences.
+///
+/// Keeping this separate from [`select_theme`] lets tests exercise every
+/// bundled palette without touching the process-wide preferences file.
+fn apply_theme_config(config: Rc<ThemeConfig>, cx: &mut App) {
+    let theme = Theme::global_mut(cx);
+    if config.mode.is_dark() {
+        theme.dark_theme = config;
+    } else {
+        theme.light_theme = config;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn select_theme_for_test(name: &str, cx: &mut App) {
+    let config = ThemeRegistry::global(cx)
+        .themes()
+        .get(name)
+        .unwrap_or_else(|| panic!("registered theme {name:?}"))
+        .clone();
+    apply_theme_config(config, cx);
+
+    let current = cx.theme().mode;
+    Theme::change(current, None, cx);
 }
 
 /// Names of all registered themes matching the given appearance, sorted —

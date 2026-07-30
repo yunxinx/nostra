@@ -9,7 +9,8 @@ use serde_json::{Map, Value, json};
 
 use crate::llm::{
     ContentBlock, FinishReason, GatewayError, GenerateRequest, GenerationEvent, ProviderMetadata,
-    ResponsesReplayMetadata, Role, StreamMetadata, ToolCall, Usage, UsageProvenance,
+    ReasoningContent, ResponsesReplayMetadata, Role, StreamMetadata, ToolCall, Usage,
+    UsageProvenance,
     error::{allowlisted_provider_code, allowlisted_provider_token},
 };
 
@@ -51,7 +52,6 @@ pub(crate) struct ResponsesSession {
     text_buffers: BTreeMap<(usize, usize), String>,
     finished_text: BTreeSet<(usize, usize)>,
     open_reasoning: BTreeMap<(usize, usize), String>,
-    pending_reasoning_finish: BTreeMap<(usize, usize), String>,
     reasoning_buffers: BTreeMap<usize, String>,
     finished_reasoning: BTreeSet<usize>,
     reasoning_replay: BTreeMap<usize, ResponsesReplayMetadata>,
@@ -75,7 +75,6 @@ impl ResponsesSession {
             text_buffers: BTreeMap::new(),
             finished_text: BTreeSet::new(),
             open_reasoning: BTreeMap::new(),
-            pending_reasoning_finish: BTreeMap::new(),
             reasoning_buffers: BTreeMap::new(),
             finished_reasoning: BTreeSet::new(),
             reasoning_replay: BTreeMap::new(),
@@ -214,10 +213,14 @@ impl ResponsesSession {
                     .or_insert_with(|| format!("text-{}-{}", key.0, key.1))
                     .clone();
                 if is_new {
-                    events.push(GenerationEvent::TextStarted { id: id.clone() });
+                    events.push(GenerationEvent::TextStarted {
+                        content_index: key.0,
+                        id: id.clone(),
+                    });
                 }
                 self.text_buffers.entry(key).or_default().push_str(delta);
                 events.push(GenerationEvent::TextDelta {
+                    content_index: key.0,
                     id,
                     delta: delta.into(),
                 });
@@ -235,9 +238,7 @@ impl ResponsesSession {
                 let delta =
                     required_string(&value, "delta", "Responses reasoning delta is not a string")?;
                 let key = (index, 0);
-                if self.pending_reasoning_finish.contains_key(&key)
-                    || self.finished_reasoning.contains(&index)
-                {
+                if self.finished_reasoning.contains(&index) {
                     return Err(GatewayError::protocol(
                         "Responses reasoning delta arrived after reasoning completion",
                     ));
@@ -249,23 +250,23 @@ impl ResponsesSession {
                     .or_insert_with(|| format!("reasoning-{}-{}", key.0, key.1))
                     .clone();
                 if is_new {
-                    events.push(GenerationEvent::ReasoningStarted { id: id.clone() });
+                    events.push(GenerationEvent::ReasoningStarted {
+                        content_index: index,
+                        id: id.clone(),
+                    });
                 }
                 self.reasoning_buffers
                     .entry(index)
                     .or_default()
                     .push_str(delta);
                 events.push(GenerationEvent::ReasoningDelta {
+                    content_index: index,
                     id,
                     delta: delta.into(),
                 });
             }
             "response.reasoning_summary_text.done" | "response.reasoning_text.done" => {
-                let index = self.require_output_kind(&value, OutputKind::Reasoning)?;
-                let key = (index, 0);
-                if let Some(id) = self.open_reasoning.remove(&key) {
-                    self.pending_reasoning_finish.insert(key, id);
-                }
+                self.require_output_kind(&value, OutputKind::Reasoning)?;
             }
             "response.reasoning_summary_part.added" => {
                 self.require_output_kind(&value, OutputKind::Reasoning)?;
@@ -281,6 +282,7 @@ impl ResponsesSession {
                     .or_default()
                     .push_str("\n\n");
                 events.push(GenerationEvent::ReasoningDelta {
+                    content_index: index,
                     id,
                     delta: "\n\n".into(),
                 });
@@ -410,6 +412,10 @@ impl ResponsesSession {
                 "Responses output index was added more than once",
             ));
         }
+        // Responses normally closes a reasoning item before adding the next
+        // output. Compatible endpoints may reveal the next block first; close
+        // older reasoning here so visible text never inherits its live timer.
+        self.finish_other_reasoning(index, events);
         match kind {
             OutputKind::FunctionCall => {
                 let accumulator = self.functions.entry(index).or_default();
@@ -419,13 +425,16 @@ impl ResponsesSession {
                 accumulator.arguments = field_string(item, "arguments");
                 accumulator.started = true;
                 events.push(GenerationEvent::ToolCallStarted {
+                    content_index: index,
                     index,
                     id: call_id(accumulator, index),
                     name: accumulator.name.clone(),
                 });
             }
             OutputKind::Message => {}
-            OutputKind::Reasoning => self.capture_reasoning_replay(index, item),
+            OutputKind::Reasoning => {
+                self.capture_reasoning_replay(index, item);
+            }
             OutputKind::Unsupported => {}
         }
         Ok(())
@@ -446,6 +455,7 @@ impl ResponsesSession {
         if !accumulator.started {
             accumulator.started = true;
             events.push(GenerationEvent::ToolCallStarted {
+                content_index: index,
                 index,
                 id: call_id(accumulator, index),
                 name: accumulator.name.clone(),
@@ -457,6 +467,7 @@ impl ResponsesSession {
             .ok_or_else(|| GatewayError::protocol("function arguments delta is not a string"))?;
         accumulator.arguments.push_str(delta);
         events.push(GenerationEvent::ToolCallDelta {
+            content_index: index,
             index,
             delta: delta.into(),
         });
@@ -496,15 +507,20 @@ impl ResponsesSession {
             .get("item")
             .ok_or_else(|| GatewayError::protocol("output item done without item"))?;
         let kind = output_kind(item);
-        if let Some(added_kind) = self.output_kinds.get(&index) {
+        let was_added = if let Some(added_kind) = self.output_kinds.get(&index) {
             if *added_kind != kind {
                 return Err(GatewayError::protocol(
                     "Responses output item type changed before completion",
                 ));
             }
+            true
         } else {
             // Some compatible endpoints only send the authoritative done item.
             self.output_kinds.insert(index, kind);
+            false
+        };
+        if !was_added {
+            self.finish_other_reasoning(index, events);
         }
         match kind {
             OutputKind::FunctionCall if !self.finished_functions.contains(&index) => {
@@ -565,6 +581,7 @@ impl ResponsesSession {
         let id = call_id(&accumulator, index);
         if !accumulator.started {
             events.push(GenerationEvent::ToolCallStarted {
+                content_index: index,
                 index,
                 id: id.clone(),
                 name: accumulator.name.clone(),
@@ -574,6 +591,7 @@ impl ResponsesSession {
         let arguments =
             serde_json::from_str(&raw_arguments).unwrap_or(Value::String(raw_arguments.clone()));
         events.push(GenerationEvent::ToolCallFinished {
+            content_index: index,
             index,
             tool_call: Box::new(ToolCall {
                 id,
@@ -595,25 +613,21 @@ impl ResponsesSession {
 
     fn close_open_parts(&mut self, events: &mut Vec<GenerationEvent>) {
         for (key, id) in std::mem::take(&mut self.open_text) {
-            events.push(GenerationEvent::TextFinished { id, replay: None });
+            events.push(GenerationEvent::TextFinished {
+                content_index: key.0,
+                id,
+                replay: None,
+            });
             self.finished_text.insert(key);
         }
         for (key, id) in std::mem::take(&mut self.open_reasoning) {
-            self.pending_reasoning_finish.insert(key, id);
-        }
-        let pending = std::mem::take(&mut self.pending_reasoning_finish);
-        for ((output_index, _), id) in pending {
+            let output_index = key.0;
             events.push(GenerationEvent::ReasoningFinished {
+                content_index: output_index,
                 id,
-                replay: self
-                    .reasoning_replay
-                    .get(&output_index)
-                    .cloned()
-                    .map(|responses| ProviderMetadata {
-                        chat: None,
-                        responses: Some(responses),
-                    }),
+                replay: self.reasoning_provider_metadata(output_index),
             });
+            self.finished_reasoning.insert(output_index);
         }
     }
 
@@ -625,41 +639,17 @@ impl ResponsesSession {
         if self.finished_reasoning.contains(&output_index) {
             return;
         }
-        let open_keys = self
-            .open_reasoning
-            .keys()
-            .filter(|(index, _)| *index == output_index)
-            .copied()
-            .collect::<Vec<_>>();
-        for key in open_keys {
-            if let Some(id) = self.open_reasoning.remove(&key) {
-                self.pending_reasoning_finish.insert(key, id);
-            }
-        }
-        let keys = self
-            .pending_reasoning_finish
-            .keys()
-            .filter(|(index, _)| *index == output_index)
-            .copied()
-            .collect::<Vec<_>>();
-        let mut emitted = false;
-        for key in keys {
-            let Some(id) = self.pending_reasoning_finish.remove(&key) else {
-                continue;
-            };
+        let key = (output_index, 0);
+        let mut emitted = if let Some(id) = self.open_reasoning.remove(&key) {
             events.push(GenerationEvent::ReasoningFinished {
+                content_index: output_index,
                 id,
-                replay: self
-                    .reasoning_replay
-                    .get(&output_index)
-                    .cloned()
-                    .map(|responses| ProviderMetadata {
-                        chat: None,
-                        responses: Some(responses),
-                    }),
+                replay: self.reasoning_provider_metadata(output_index),
             });
-            emitted = true;
-        }
+            true
+        } else {
+            false
+        };
         if !emitted
             && self
                 .reasoning_replay
@@ -668,17 +658,14 @@ impl ResponsesSession {
                 .is_some()
         {
             let id = format!("reasoning-{output_index}-0");
-            events.push(GenerationEvent::ReasoningStarted { id: id.clone() });
+            events.push(GenerationEvent::ReasoningStarted {
+                content_index: output_index,
+                id: id.clone(),
+            });
             events.push(GenerationEvent::ReasoningFinished {
+                content_index: output_index,
                 id,
-                replay: self
-                    .reasoning_replay
-                    .get(&output_index)
-                    .cloned()
-                    .map(|responses| ProviderMetadata {
-                        chat: None,
-                        responses: Some(responses),
-                    }),
+                replay: self.reasoning_provider_metadata(output_index),
             });
             emitted = true;
         }
@@ -687,8 +674,20 @@ impl ResponsesSession {
         }
     }
 
-    fn capture_reasoning_replay(&mut self, index: usize, item: &Value) {
+    fn finish_other_reasoning(&mut self, output_index: usize, events: &mut Vec<GenerationEvent>) {
+        let open = self
+            .open_reasoning
+            .keys()
+            .filter_map(|(index, _)| (*index != output_index).then_some(*index))
+            .collect::<BTreeSet<_>>();
+        for index in open {
+            self.finish_reasoning_for_output(index, events);
+        }
+    }
+
+    fn capture_reasoning_replay(&mut self, index: usize, item: &Value) -> bool {
         let metadata = self.reasoning_replay.entry(index).or_default();
+        let previous = metadata.clone();
         if let Some(id) = nonempty(field_string(item, "id")) {
             metadata.item_id = Some(id);
         }
@@ -699,6 +698,24 @@ impl ResponsesSession {
         {
             metadata.encrypted_reasoning = Some(encrypted.to_string());
         }
+        *metadata != previous
+    }
+
+    fn reasoning_provider_metadata(&self, index: usize) -> Option<ProviderMetadata> {
+        self.reasoning_replay
+            .get(&index)
+            .cloned()
+            .map(|responses| ProviderMetadata {
+                chat: None,
+                responses: Some(responses),
+            })
+    }
+
+    fn reasoning_snapshot(&self, index: usize, display: String) -> ReasoningContent {
+        ReasoningContent {
+            display,
+            replay: self.reasoning_provider_metadata(index),
+        }
     }
 
     fn capture_reasoning_item(
@@ -707,9 +724,8 @@ impl ResponsesSession {
         item: &Value,
         events: &mut Vec<GenerationEvent>,
     ) -> Result<(), GatewayError> {
-        self.capture_reasoning_replay(output_index, item);
-        let has_authoritative_text = item.get("summary").and_then(Value::as_array).is_some()
-            || item.get("content").and_then(Value::as_array).is_some();
+        let replay_changed = self.capture_reasoning_replay(output_index, item);
+        let was_finished = self.finished_reasoning.contains(&output_index);
         let summary = item
             .get("summary")
             .and_then(Value::as_array)
@@ -720,38 +736,92 @@ impl ResponsesSession {
             .and_then(Value::as_array)
             .map(|parts| collect_text_fields(parts, "text", "\n\n"))
             .unwrap_or_default();
-        let final_text = if summary.is_empty() { content } else { summary };
-        let streamed = self.reasoning_buffers.entry(output_index).or_default();
-        if has_authoritative_text && !final_text.starts_with(streamed.as_str()) {
-            return Err(GatewayError::protocol(
-                "Responses final reasoning does not match streamed reasoning",
-            ));
+        // Match pi's `summary || content || streamed` precedence. Empty arrays
+        // are not an instruction to erase reasoning already delivered live.
+        let authoritative = (!summary.is_empty())
+            .then_some(summary)
+            .or_else(|| (!content.is_empty()).then_some(content));
+        let streamed = self
+            .reasoning_buffers
+            .get(&output_index)
+            .cloned()
+            .unwrap_or_default();
+        if was_finished {
+            let display_changed = authoritative
+                .as_ref()
+                .is_some_and(|final_text| final_text != &streamed);
+            if let Some(final_text) = authoritative.as_ref().filter(|_| display_changed) {
+                self.reasoning_buffers
+                    .insert(output_index, final_text.clone());
+            }
+            if display_changed || replay_changed {
+                // A compatible endpoint may finish the item after the next
+                // output starts. Update persistence without extending the card
+                // timer or emitting a second lifecycle end.
+                events.push(GenerationEvent::ReasoningSnapshotUpdated {
+                    content_index: output_index,
+                    id: format!("reasoning-{output_index}-0"),
+                    reasoning: self
+                        .reasoning_snapshot(output_index, authoritative.unwrap_or(streamed)),
+                });
+            }
+            return Ok(());
         }
-        let suffix = if has_authoritative_text {
-            &final_text[streamed.len()..]
-        } else {
-            ""
-        };
+
         let key = (output_index, 0);
-        if streamed.is_empty() && !final_text.is_empty() {
-            let id = format!("reasoning-{output_index}-0");
-            self.open_reasoning.insert(key, id.clone());
-            events.push(GenerationEvent::ReasoningStarted { id });
+        let display_changed = authoritative
+            .as_ref()
+            .is_some_and(|final_text| final_text != &streamed);
+        let can_append = authoritative
+            .as_ref()
+            .filter(|_| display_changed)
+            .and_then(|final_text| final_text.strip_prefix(&streamed));
+
+        if let Some(suffix) = can_append {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.open_reasoning.entry(key)
+            {
+                let id = format!("reasoning-{output_index}-0");
+                entry.insert(id.clone());
+                events.push(GenerationEvent::ReasoningStarted {
+                    content_index: output_index,
+                    id,
+                });
+            }
+            if !suffix.is_empty() {
+                let id = self.open_reasoning[&key].clone();
+                events.push(GenerationEvent::ReasoningDelta {
+                    content_index: output_index,
+                    id,
+                    delta: suffix.to_string(),
+                });
+            }
+            if let Some(final_text) = &authoritative {
+                self.reasoning_buffers
+                    .insert(output_index, final_text.clone());
+            }
         }
-        if !suffix.is_empty() {
-            let id = self
-                .open_reasoning
-                .get(&key)
-                .or_else(|| self.pending_reasoning_finish.get(&key))
-                .cloned()
-                .unwrap_or_else(|| format!("reasoning-{output_index}-0"));
-            events.push(GenerationEvent::ReasoningDelta {
-                id,
-                delta: suffix.to_string(),
-            });
-            streamed.push_str(suffix);
-        }
+
         self.finish_reasoning_for_output(output_index, events);
+
+        if display_changed
+            && can_append.is_none()
+            && let Some(final_text) = authoritative
+        {
+            self.reasoning_buffers
+                .insert(output_index, final_text.clone());
+            if self.finished_reasoning.contains(&output_index) {
+                // `output_item.done` is the lifecycle boundary. A complete
+                // provider snapshot may differ from streamed chunks (including
+                // a trailing summary-part separator), so replace it only after
+                // the card has closed rather than reopening the block.
+                events.push(GenerationEvent::ReasoningSnapshotUpdated {
+                    content_index: output_index,
+                    id: format!("reasoning-{output_index}-0"),
+                    reasoning: self.reasoning_snapshot(output_index, final_text),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -826,10 +896,14 @@ impl ResponsesSession {
         };
         let id = format!("text-{}-{}", key.0, key.1);
         if streamed.is_empty() && !final_text.is_empty() {
-            events.push(GenerationEvent::TextStarted { id: id.clone() });
+            events.push(GenerationEvent::TextStarted {
+                content_index: key.0,
+                id: id.clone(),
+            });
         }
         if !suffix.is_empty() {
             events.push(GenerationEvent::TextDelta {
+                content_index: key.0,
                 id: id.clone(),
                 delta: suffix.to_string(),
             });
@@ -839,7 +913,11 @@ impl ResponsesSession {
             && !self.finished_text.contains(&key)
             && (self.open_text.remove(&key).is_some() || !final_text.is_empty())
         {
-            events.push(GenerationEvent::TextFinished { id, replay });
+            events.push(GenerationEvent::TextFinished {
+                content_index: key.0,
+                id,
+                replay,
+            });
             self.finished_text.insert(key);
         }
         Ok(())
@@ -1411,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_finish_waits_for_encrypted_item_metadata() {
+    fn next_output_finishes_reasoning_before_text_and_late_replay_metadata() {
         let mut session = ResponsesSession::new(CompatibilityProfile::default());
         session
             .ingest(r#"{"type":"response.created","response":{}}"#)
@@ -1425,8 +1503,24 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
         );
+        let message = session.ingest(r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message","id":"msg_1"}}"#).expect("message item");
+        assert!(message.events.iter().any(|event| matches!(event, GenerationEvent::ReasoningFinished { replay: Some(metadata), .. } if metadata.responses.as_ref().and_then(|metadata| metadata.item_id.as_deref()) == Some("rs_1"))));
+        let text = session.ingest(r#"{"type":"response.output_text.delta","output_index":1,"content_index":0,"delta":"answer"}"#).expect("text");
+        assert!(matches!(
+            text.events.as_slice(),
+            [
+                GenerationEvent::TextStarted { content_index: 1, .. },
+                GenerationEvent::TextDelta { content_index: 1, delta, .. }
+            ] if delta == "answer"
+        ));
         let item = session.ingest(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}"#).expect("item done");
-        assert!(item.events.iter().any(|event| matches!(event, GenerationEvent::ReasoningFinished { replay: Some(metadata), .. } if metadata.responses.as_ref().and_then(|metadata| metadata.encrypted_reasoning.as_deref()) == Some("opaque"))));
+        assert!(item.events.iter().any(|event| matches!(event, GenerationEvent::ReasoningSnapshotUpdated { reasoning, .. } if reasoning.replay.as_ref().and_then(|metadata| metadata.responses.as_ref()).and_then(|metadata| metadata.encrypted_reasoning.as_deref()) == Some("opaque"))));
+        assert!(
+            !item
+                .events
+                .iter()
+                .any(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
+        );
         let completed = session.ingest(r#"{"type":"response.completed","response":{"output":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}]}}"#).expect("completed");
         assert!(
             !completed
@@ -1434,6 +1528,48 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
         );
+    }
+
+    #[test]
+    fn late_reasoning_item_done_does_not_finish_the_new_reasoning_block() {
+        let mut session = ResponsesSession::new(CompatibilityProfile::default());
+        session
+            .ingest(r#"{"type":"response.created","response":{}}"#)
+            .expect("created");
+        session.ingest(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_0"}}"#).expect("first item");
+        session
+            .ingest(r#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"first"}"#)
+            .expect("first delta");
+
+        let second = session.ingest(r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"reasoning","id":"rs_1"}}"#).expect("second item");
+        assert!(second.events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::ReasoningFinished {
+                content_index: 0,
+                ..
+            }
+        )));
+        session
+            .ingest(r#"{"type":"response.reasoning_text.delta","output_index":1,"delta":"second"}"#)
+            .expect("second delta");
+
+        let first_done = session.ingest(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_0","encrypted_content":"opaque"}}"#).expect("late first done");
+        assert!(!first_done.events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::ReasoningFinished {
+                content_index: 1,
+                ..
+            }
+        )));
+
+        let second_done = session.ingest(r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"reasoning","id":"rs_1"}}"#).expect("second done");
+        assert!(second_done.events.iter().any(|event| matches!(
+            event,
+            GenerationEvent::ReasoningFinished {
+                content_index: 1,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1622,17 +1758,77 @@ mod tests {
             .expect("created");
         session.ingest(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#).expect("item");
         session.ingest(r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"first"}"#).expect("first");
+        let text_done = session
+            .ingest(r#"{"type":"response.reasoning_summary_text.done","output_index":0}"#)
+            .expect("summary text done");
+        assert!(
+            !text_done
+                .events
+                .iter()
+                .any(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
+        );
         let separator = session
             .ingest(r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#)
             .expect("part");
         assert!(separator.events.iter().any(|event| matches!(event, GenerationEvent::ReasoningDelta { delta, .. } if delta == "\n\n")));
         session.ingest(r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"second"}"#).expect("second");
+        session
+            .ingest(r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#)
+            .expect("final part");
         let done = session.ingest(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"first"},{"type":"summary_text","text":"second"}]}}"#).expect("done");
-        assert!(
-            done.events
-                .iter()
-                .any(|event| matches!(event, GenerationEvent::ReasoningFinished { .. }))
-        );
+        assert!(matches!(
+            done.events.as_slice(),
+            [
+                GenerationEvent::ReasoningFinished { .. },
+                GenerationEvent::ReasoningSnapshotUpdated { reasoning, .. }
+            ] if reasoning.display == "first\n\nsecond"
+        ));
+    }
+
+    #[test]
+    fn final_summary_part_separator_is_reconciled_by_authoritative_snapshot() {
+        let mut session = ResponsesSession::new(CompatibilityProfile::default());
+        session
+            .ingest(r#"{"type":"response.created","response":{}}"#)
+            .expect("created");
+        session.ingest(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#).expect("item");
+        session.ingest(r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"delta":"thought"}"#).expect("delta");
+        session
+            .ingest(r#"{"type":"response.reasoning_summary_text.done","output_index":0}"#)
+            .expect("text done");
+        session
+            .ingest(r#"{"type":"response.reasoning_summary_part.done","output_index":0}"#)
+            .expect("part done");
+
+        let done = session.ingest(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thought"}]}}"#).expect("item done");
+
+        assert!(matches!(
+            done.events.as_slice(),
+            [
+                GenerationEvent::ReasoningFinished { .. },
+                GenerationEvent::ReasoningSnapshotUpdated { reasoning, .. }
+            ] if reasoning.display == "thought"
+        ));
+    }
+
+    #[test]
+    fn authoritative_reasoning_replaces_non_prefix_streamed_text() {
+        let mut session = ResponsesSession::new(CompatibilityProfile::default());
+        session
+            .ingest(r#"{"type":"response.created","response":{}}"#)
+            .expect("created");
+        session.ingest(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#).expect("item");
+        session.ingest(r#"{"type":"response.reasoning_text.delta","output_index":0,"delta":"streamed draft"}"#).expect("delta");
+
+        let done = session.ingest(r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"authoritative summary"}]}}"#).expect("item done");
+
+        assert!(matches!(
+            done.events.as_slice(),
+            [
+                GenerationEvent::ReasoningFinished { .. },
+                GenerationEvent::ReasoningSnapshotUpdated { reasoning, .. }
+            ] if reasoning.display == "authoritative summary"
+        ));
     }
 
     #[test]

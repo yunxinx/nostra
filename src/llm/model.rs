@@ -262,6 +262,7 @@ mod tests {
             }),
         };
         let event = crate::llm::GenerationEvent::ReasoningFinished {
+            content_index: 0,
             id: "reasoning".into(),
             replay: Some(metadata.clone()),
         };

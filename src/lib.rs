@@ -20,6 +20,7 @@ pub mod llm;
 mod model_select;
 pub mod preferences;
 mod providers;
+mod reasoning_card;
 mod settings;
 mod theme;
 mod ui;
