@@ -261,6 +261,65 @@ fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContex
     });
 }
 
+/// A user bubble must obey the conversation column when the window narrows.
+/// Its Markdown body has an intrinsic width, so this is asserted through the
+/// real flex tree instead of a standalone style value.
+#[gpui::test]
+fn user_message_bubble_shrinks_with_the_viewport(cx: &mut TestAppContext) {
+    init_app(cx);
+    let cx = cx.add_empty_window();
+    let chat = cx.update(ChatView::view);
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Please extract factorio-headless.tar.xz into factorio-2.1.12 without changing its contents."
+                            .into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    cx.run_until_parked();
+
+    let draw = |width: f32, cx: &mut gpui::VisualTestContext| {
+        cx.draw(
+            gpui::point(px(0.), px(0.)),
+            gpui::size(px(width), px(700.)),
+            |_, _| chat.clone().into_any_element(),
+        );
+        cx.debug_bounds("user-message-bubble-0")
+            .expect("the user bubble was drawn")
+    };
+
+    let narrow_viewport_width = 440.;
+    let content_inset = px(24.);
+    let wide = draw(900., cx);
+    let narrow = draw(narrow_viewport_width, cx);
+
+    assert_eq!(wide.size.width, px(560.), "wide bubbles keep their cap");
+    assert!(
+        narrow.size.width < wide.size.width,
+        "the bubble stayed {:?} wide in a {narrow_viewport_width}px viewport",
+        narrow.size.width
+    );
+    assert!(
+        narrow.left() >= content_inset,
+        "the bubble left edge {:?} escaped the padded content column",
+        narrow.left()
+    );
+    assert!(
+        narrow.right() <= px(narrow_viewport_width) - content_inset,
+        "the bubble right edge {:?} escaped the padded content column",
+        narrow.right()
+    );
+}
+
 /// The regression this whole module exists for: reasoning deltas were being
 /// folded into canonical content and then never rendered. A streaming trace
 /// must reach a visible, expanded card *and* stay out of the prose body.

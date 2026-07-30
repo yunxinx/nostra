@@ -1264,6 +1264,11 @@ fn render_message(
             .justify_end()
             .child(
                 div()
+                    .debug_selector(move || format!("user-message-bubble-{message_index}"))
+                    // Markdown contributes an intrinsic min-content width. As a
+                    // horizontal flex item the bubble must be allowed to shrink
+                    // below it when the conversation column narrows.
+                    .min_w_0()
                     .max_w(px(560.))
                     .rounded(radius_lg)
                     .bg(secondary)
