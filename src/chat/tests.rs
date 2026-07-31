@@ -77,7 +77,7 @@ fn init_app(cx: &mut TestAppContext) {
     let prefs = preferences::Preferences::default();
     cx.update(|cx| {
         gpui_component::init(cx);
-        crate::fonts::init(prefs.composer_font, cx);
+        crate::appearance::fonts::init(prefs.composer_font, cx);
         preferences::init_global(prefs, cx);
     });
 }
@@ -507,8 +507,8 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
     let second_number = selectors("line-number", 1, "-0");
 
     cx.update(|_, cx| {
-        assert!(!crate::code_block::global_wrap_enabled(cx));
-        assert!(!crate::code_block::line_numbers_enabled(cx));
+        assert!(!crate::ui::markdown::global_wrap_enabled(cx));
+        assert!(!crate::ui::markdown::line_numbers_enabled(cx));
     });
     assert!(cx.debug_bounds(first_number).is_none());
     assert!(cx.debug_bounds(second_number).is_none());
@@ -545,8 +545,8 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
     redraw(cx);
 
     cx.update(|_, cx| {
-        assert!(!crate::code_block::global_wrap_enabled(cx));
-        assert!(crate::code_block::line_numbers_enabled(cx));
+        assert!(!crate::ui::markdown::global_wrap_enabled(cx));
+        assert!(crate::ui::markdown::line_numbers_enabled(cx));
     });
     let number_bounds = cx.debug_bounds(first_number).expect("fixed line number");
     let numbered_scroll_bounds = cx
@@ -568,14 +568,14 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
         .expect("unchanged second block");
     assert!(locally_wrapped_first.size.height > nowrap_line.size.height);
     assert_eq!(unchanged_second.size.height, nowrap_second.size.height);
-    cx.update(|_, cx| assert!(!crate::code_block::global_wrap_enabled(cx)));
+    cx.update(|_, cx| assert!(!crate::ui::markdown::global_wrap_enabled(cx)));
 
-    cx.update(|_, cx| crate::code_block::set_global_wrap_in_memory(true, cx));
+    cx.update(|_, cx| crate::ui::markdown::set_global_wrap_in_memory(true, cx));
     redraw(cx);
 
     cx.update(|_, cx| {
-        assert!(crate::code_block::global_wrap_enabled(cx));
-        assert!(crate::code_block::line_numbers_enabled(cx));
+        assert!(crate::ui::markdown::global_wrap_enabled(cx));
+        assert!(crate::ui::markdown::line_numbers_enabled(cx));
     });
     let wrapped_first = cx.debug_bounds(first_line).expect("wrapped first block");
     let wrapped_second = cx.debug_bounds(second_line).expect("wrapped second block");
@@ -585,7 +585,7 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
         "a global change must reset every code block to the new value"
     );
 
-    cx.update(|_, cx| crate::code_block::set_global_wrap_in_memory(false, cx));
+    cx.update(|_, cx| crate::ui::markdown::set_global_wrap_in_memory(false, cx));
     redraw(cx);
 
     let reset_first = cx
@@ -596,9 +596,9 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
         .expect("globally reset second block");
     assert_eq!(reset_first.size.height, nowrap_line.size.height);
     assert_eq!(reset_second.size.height, nowrap_second.size.height);
-    cx.update(|_, cx| assert!(!crate::code_block::global_wrap_enabled(cx)));
+    cx.update(|_, cx| assert!(!crate::ui::markdown::global_wrap_enabled(cx)));
 
-    cx.update(|_, cx| crate::code_block::set_global_wrap_in_memory(true, cx));
+    cx.update(|_, cx| crate::ui::markdown::set_global_wrap_in_memory(true, cx));
     redraw(cx);
 
     let first_wrap_bounds = cx.debug_bounds(first_wrap).expect("first wrap control");
@@ -614,7 +614,7 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
     assert_eq!(locally_unwrapped_first.size.height, nowrap_line.size.height);
     assert!(still_wrapped_second.size.height > nowrap_second.size.height);
     assert!(cx.debug_bounds(second_wrap).is_some());
-    cx.update(|_, cx| assert!(crate::code_block::global_wrap_enabled(cx)));
+    cx.update(|_, cx| assert!(crate::ui::markdown::global_wrap_enabled(cx)));
 }
 
 #[gpui::test]
@@ -966,7 +966,7 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
             assistant
                 .error
                 .as_ref()
-                .and_then(crate::error_card::TurnError::request_id),
+                .and_then(crate::chat::error_card::TurnError::request_id),
             Some("nostra-1"),
             "the visible card retains the correlation id"
         );
@@ -1249,7 +1249,7 @@ fn canonical_events_close_reasoning_before_prose_reaches_the_view(cx: &mut TestA
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![
                     crate::llm::GenerationEvent::ReasoningDelta {
@@ -1300,7 +1300,7 @@ fn prose_does_not_infer_a_reasoning_boundary(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![
                     crate::llm::GenerationEvent::ReasoningDelta {
@@ -1316,7 +1316,7 @@ fn prose_does_not_infer_a_reasoning_boundary(cx: &mut TestAppContext) {
                 ],
                 cx,
             );
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![crate::llm::GenerationEvent::TextDelta {
                     content_index: 1,
@@ -1350,7 +1350,7 @@ fn reasoning_after_prose_creates_a_second_ordered_card(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![
                     crate::llm::GenerationEvent::ReasoningStarted {
@@ -1769,7 +1769,7 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
 
     let (ui_id, body_id, elapsed) = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![
                     crate::llm::GenerationEvent::ReasoningStarted {
@@ -1805,7 +1805,7 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![crate::llm::GenerationEvent::ReasoningSnapshotUpdated {
                     content_index: 0,
@@ -1871,7 +1871,7 @@ fn reasoning_after_a_tool_call_creates_a_second_ordered_card(cx: &mut TestAppCon
     };
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            crate::assistant::apply_generation_events_for_test(
+            crate::chat::assistant::apply_generation_events_for_test(
                 this,
                 vec![
                     crate::llm::GenerationEvent::ReasoningStarted {

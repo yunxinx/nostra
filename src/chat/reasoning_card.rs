@@ -6,7 +6,7 @@
 //! reasoning model emitted was captured and then dropped on the floor. This
 //! module is where it surfaces.
 //!
-//! Each card owns a [`MarkdownBody`](crate::code_block::MarkdownBody), so
+//! Each card owns a [`MarkdownBody`](crate::ui::markdown::MarkdownBody), so
 //! reasoning streams as live markdown
 //! through the same `push_str` path as prose rather than being flattened into
 //! it. Two properties keep it from taking over the transcript:
@@ -42,7 +42,7 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::code_block::MarkdownBody;
+use crate::ui::markdown::MarkdownBody;
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
 /// card without accidentally matching another card in the same turn.
@@ -66,7 +66,7 @@ const PARAGRAPH_GAP: f32 = 0.5;
 /// One reasoning content block, prepared for rendering.
 ///
 /// Holds a markdown state entity, so — like
-/// [`TurnError`](crate::error_card::TurnError) — it must be constructed from an
+/// [`TurnError`](crate::chat::error_card::TurnError) — it must be constructed from an
 /// update, never from inside a render pass.
 pub(crate) struct ReasoningTrace {
     /// Live markdown state, appended to with `push_str` so the card streams
@@ -444,7 +444,7 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::preferences::init_global(crate::preferences::Preferences::default(), cx);
-            crate::theme::init(&crate::preferences::Preferences::default(), cx);
+            crate::appearance::theme::init(&crate::preferences::Preferences::default(), cx);
 
             for dark in [true, false] {
                 // `Theme::change` rather than `theme::set_mode`, which would
@@ -459,11 +459,11 @@ mod tests {
                     cx,
                 );
 
-                for name in crate::theme::theme_names(dark, cx) {
+                for name in crate::appearance::theme::theme_names(dark, cx) {
                     // Palette coverage must not pass through the production
                     // preference writer: tests may run beside the real app or
                     // in parallel with other theme tests.
-                    crate::theme::select_theme_for_test(name.as_ref(), cx);
+                    crate::appearance::theme::select_theme_for_test(name.as_ref(), cx);
 
                     // What `render` actually pairs: the body's own colour against
                     // the surface it sits on, which for an outline-only card is

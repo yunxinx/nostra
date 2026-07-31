@@ -6,14 +6,18 @@
 //! and restoring the previous session's window geometry.
 
 use anyhow::{Context as _, Result};
-use gpui::*;
+use gpui::{
+    App, AppContext as _, Bounds, Context, Focusable as _, Global, Menu, MenuItem, Pixels, Size,
+    Styled as _, TaskExt as _, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowKind,
+    WindowOptions, point, px, size,
+};
 use gpui_component::{ActiveTheme, Root, TitleBar};
 use rust_i18n::t;
 
-use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
-use crate::app::ChatApp;
-use crate::glass;
+use crate::appearance::glass;
 use crate::preferences::{Preferences, WindowGeometry};
+use crate::shell::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
+use crate::shell::app::ChatApp;
 
 /// Weak handle used by application-level commands to reach the main view
 /// regardless of which window currently owns focus.

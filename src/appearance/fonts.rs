@@ -1,6 +1,6 @@
 //! Bundled composer fonts: registration with gpui and the active-font global.
 //!
-//! Both fonts are embedded via `assets.rs` and registered into the text
+//! Both fonts are embedded via `assets` and registered into the text
 //! system at startup, so `font_family("Sarasa Mono SC")` (etc.) resolves to
 //! the bundled file on every platform — no system-font variation involved.
 

@@ -1,4 +1,12 @@
-//! Shared interaction primitives for app-specific UI elements.
+//! View primitives shared across features.
+//!
+//! [`markdown`] renders assistant prose and fenced code blocks; it is used both
+//! by the transcript and by any card that shows model output. [`model_select`]
+//! is the title-bar model picker. Interaction helpers small enough not to need a
+//! module of their own live directly here.
+
+pub(crate) mod markdown;
+pub(crate) mod model_select;
 
 use gpui::{App, KeyDownEvent, Window};
 

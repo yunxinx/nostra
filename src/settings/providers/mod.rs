@@ -10,7 +10,10 @@ mod profile_list;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{
+    AnyElement, App, AppContext as _, Context, ElementId, Entity, IntoElement, ParentElement as _,
+    Pixels, Render, SharedString, Styled as _, Subscription, Window, div, px,
+};
 use gpui_component::{
     ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, WindowExt as _, h_flex,
     input::{Input, InputContentType, InputEvent, InputState},

@@ -1,8 +1,24 @@
 //! Single conversation view: message list, streaming assistant turn, and
 //! composer input.
+//!
+//! [`ChatView`] owns the transcript and the composer. The pieces a turn is made
+//! of live beside it: [`assistant`] bridges gateway events into this view's
+//! entities, and [`error_card`] / [`reasoning_card`] render the two turn parts
+//! that need more than markdown prose.
+
+mod assistant;
+mod error_card;
+mod reasoning_card;
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
+    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollHandle,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Window, div, point, px,
+};
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
@@ -14,18 +30,16 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::assistant;
-use crate::code_block::MarkdownBody;
-use crate::error_card::{self, TurnError};
-use crate::fonts;
+use crate::appearance::fonts;
 use crate::llm::{
     ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
     ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
-use crate::reasoning_card::{self, ReasoningTrace};
+use crate::ui::markdown::MarkdownBody;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use self::error_card::TurnError;
+use self::reasoning_card::ReasoningTrace;
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 

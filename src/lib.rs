@@ -1,31 +1,32 @@
 //! Nostra — a desktop chat client.
 //!
 //! The crate is organised as a library plus a thin binary so both `cargo
-//! run` and downstream consumers get a clean surface.  All platform wiring
-//! lives in `window`, all keyboard actions in `actions`, theme management in
-//! `theme`, locale management in `i18n`, the settings window in `settings`,
-//! and persisted user preferences in `preferences`.  The UI itself is the
-//! `ChatApp` view inside `app.rs`.
+//! run` and downstream consumers get a clean surface.  Modules are grouped by
+//! responsibility:
+//!
+//! * `shell` — the root view, its native window, and app-level actions.
+//! * `chat` — one conversation: transcript, composer, and streaming turn.
+//! * `ui` — view primitives shared across features.
+//! * `appearance` — theme, fonts, and the macOS glass effect.
+//! * `settings` — the standalone settings window.
+//! * [`llm`] — the UI-independent model generation gateway.
+//! * [`preferences`] — persisted user settings and the live `Prefs` global.
+//! * `providers`, `i18n`, `assets` — provider profiles, locale management, and
+//!   embedded assets.
+//!
+//! Only `llm` and `preferences` are part of the crate's public surface; the rest
+//! are internal and linked here as plain names.
 
-mod actions;
-mod app;
+mod appearance;
 mod assets;
-mod assistant;
 mod chat;
-mod code_block;
-mod error_card;
-mod fonts;
-mod glass;
 mod i18n;
 pub mod llm;
-mod model_select;
 pub mod preferences;
 mod providers;
-mod reasoning_card;
 mod settings;
-mod theme;
+mod shell;
 mod ui;
-mod window;
 
 // Locale files live in `locales/`; English is the fallback for any key a
 // locale is missing.  The active locale defaults to zh-CN via preferences.
@@ -35,8 +36,10 @@ use gpui::App;
 use gpui_component::ActiveTheme;
 use reqwest_client::ReqwestClient;
 
-use crate::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
+use crate::appearance::{fonts, glass, theme};
 use crate::assets::NostraAssets;
+use crate::shell::actions::{self, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
+use crate::shell::window;
 
 /// Entry point used by `main.rs`.
 pub fn run() {
@@ -71,7 +74,7 @@ fn init(prefs: preferences::Preferences, cx: &mut App) {
     cx.activate(true);
 }
 
-/// Application-scoped action handlers (per-view actions live in `app.rs`).
+/// Application-scoped action handlers (per-view actions live in `shell::app`).
 fn install_action_handlers(cx: &mut App) {
     cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
 

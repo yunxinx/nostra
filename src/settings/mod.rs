@@ -13,18 +13,21 @@ mod providers;
 mod ui;
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{
+    App, AppContext as _, Context, ElementId, Entity, FocusHandle, Focusable, Global,
+    InteractiveElement as _, IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, Role,
+    Size, StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, div, px,
+};
 #[cfg(target_os = "macos")]
 use gpui_component::slider::{SliderEvent, SliderState};
 use gpui_component::{ActiveTheme, Icon, IconName, Root, TITLE_BAR_HEIGHT, h_flex, v_flex};
 use rust_i18n::t;
 
-use crate::{
-    glass,
-    preferences::{self, WindowGeometry},
-    ui::consume_button_key,
-    window,
-};
+use crate::appearance::glass;
+use crate::preferences::{self, WindowGeometry};
+use crate::shell::window;
+use crate::ui::consume_button_key;
 
 /// Preferred size of the settings window; clamped to 85% of the display.
 const PREFERRED_SIZE: Size<Pixels> = Size {

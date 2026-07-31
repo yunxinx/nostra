@@ -2,7 +2,10 @@
 //! display map uses to decide soft-wrap points) against the width shape_line
 //! actually paints for each wrapped segment.  Run: cargo run --example wrap_probe
 
-use gpui::*;
+use gpui::{
+    AppContext as _, Context, IntoElement, LineFragment, Pixels, Render, TextRun, Window,
+    WindowOptions, black, div, font, px,
+};
 
 struct Probe;
 

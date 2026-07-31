@@ -22,7 +22,9 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::{llm::ModelSelection, preferences, providers, providers::SelectableModel};
+use crate::llm::ModelSelection;
+use crate::preferences;
+use crate::providers::{self, SelectableModel};
 
 type ConfirmHandler = Rc<dyn Fn(ModelSelection, &mut App) -> bool>;
 
@@ -517,7 +519,10 @@ impl ListDelegate for ModelListDelegate {
                         .label(t!("account.settings").to_string())
                         .on_click(move |_, window, cx| {
                             popover.dismiss_then(window, cx, |window, cx| {
-                                window.dispatch_action(Box::new(crate::actions::OpenSettings), cx);
+                                window.dispatch_action(
+                                    Box::new(crate::shell::actions::OpenSettings),
+                                    cx,
+                                );
                             });
                         }),
                 )

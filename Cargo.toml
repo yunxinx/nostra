@@ -56,7 +56,7 @@ reqwest_client = { git = "https://github.com/zed-industries/zed" }
 # per-char isolated width estimates, which under-measure CJK fullwidth
 # punctuation under proportional fonts (rightmost glyph clips).  The composer
 # works around it by rendering with a bundled full-coverage CJK-mono font
-# (see chat.rs / fonts.rs); a root fix exists on the local gpui-component
+# (see src/chat/ and src/appearance/fonts.rs); a root fix exists on the local gpui-component
 # branch `fix/input-soft-wrap-shaped-width` should it ever be needed
 # (upstream PR material).
 #

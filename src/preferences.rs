@@ -179,7 +179,7 @@ impl WindowGeometry {
 
 /// Fonts the composer can render with.  The default bundles Latin + CJK +
 /// fullwidth punctuation in one file, which keeps the input's soft-wrap
-/// estimates exact on every platform (see chat.rs).  The JetBrains option
+/// estimates exact on every platform (see `chat`).  The JetBrains option
 /// bundles only Latin and lets CJK fall back to the platform font (PingFang
 /// on macOS) — same drift-safety mechanism, since the primary font carries
 /// no fullwidth glyphs at all.

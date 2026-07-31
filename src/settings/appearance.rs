@@ -13,9 +13,10 @@ use rust_i18n::t;
 
 use super::ui;
 #[cfg(target_os = "macos")]
-use crate::glass;
+use crate::appearance::glass;
+use crate::appearance::{fonts, theme};
 use crate::preferences::{ComposerFont, ThemeMode};
-use crate::{code_block, fonts, theme};
+use crate::ui::markdown;
 
 /// Dropdown identifier for "follow system" (the absence of a mode override).
 const MODE_SYSTEM: &str = "system";
@@ -51,8 +52,8 @@ fn code_wrap_row(cx: &App) -> AnyElement {
         Some(t!("settings.code_wrap_desc").to_string()),
         Switch::new("code-wrap-switch")
             .small()
-            .checked(code_block::global_wrap_enabled(cx))
-            .on_click(|checked, _, cx| code_block::set_global_wrap(*checked, cx))
+            .checked(markdown::global_wrap_enabled(cx))
+            .on_click(|checked, _, cx| markdown::set_global_wrap(*checked, cx))
             .into_any_element(),
         cx,
     )
@@ -65,8 +66,8 @@ fn code_line_numbers_row(cx: &App) -> AnyElement {
         Some(t!("settings.code_line_numbers_desc").to_string()),
         Switch::new("code-line-numbers-switch")
             .small()
-            .checked(code_block::line_numbers_enabled(cx))
-            .on_click(|checked, _, cx| code_block::set_line_numbers(*checked, cx))
+            .checked(markdown::line_numbers_enabled(cx))
+            .on_click(|checked, _, cx| markdown::set_line_numbers(*checked, cx))
             .into_any_element(),
         cx,
     )

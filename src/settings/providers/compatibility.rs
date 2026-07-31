@@ -1,7 +1,7 @@
 //! Compatibility controls for provider-specific wire-format differences.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{Context, IntoElement, ParentElement as _, Styled as _};
 use gpui_component::{
     IconName, Sizable as _,
     button::Button,

@@ -3,7 +3,12 @@
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{
+    AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, EmptyView, Entity,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement as _, Pixels, Render, Role, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowControlArea, div, px,
+};
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
     TITLE_BAR_HEIGHT,
@@ -16,12 +21,12 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::actions::{OpenSettings, ToggleTheme};
+use crate::appearance::{glass, theme};
 use crate::chat::{ChatEvent, ChatView};
 use crate::llm::ModelSelection;
-use crate::model_select::ModelPicker;
 use crate::preferences::{self, Preferences, WindowGeometry};
-use crate::{glass, theme, ui};
+use crate::shell::actions::{OpenSettings, ToggleTheme};
+use crate::ui::{self, model_select::ModelPicker};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);

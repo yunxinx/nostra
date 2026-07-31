@@ -9,7 +9,7 @@
 use gpui::App;
 
 use crate::preferences::{self, Language};
-use crate::window;
+use crate::shell::window;
 
 /// Apply the saved language before any window opens.
 pub fn init(lang: Language) {

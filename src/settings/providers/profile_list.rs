@@ -1,7 +1,11 @@
 //! Provider selection list and its row actions.
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::*;
+use gpui::{
+    Anchor, AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement as _, Role, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px,
+};
 use gpui_component::{
     ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, h_flex, list::ListItem,
     menu::PopupMenuItem, scroll::ScrollableElement as _, v_flex,

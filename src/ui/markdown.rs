@@ -709,7 +709,7 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             preferences::init_global(prefs.clone(), cx);
-            crate::theme::init(&prefs, cx);
+            crate::appearance::theme::init(&prefs, cx);
 
             for dark in [true, false] {
                 Theme::change(
@@ -722,8 +722,8 @@ mod tests {
                     cx,
                 );
 
-                for name in crate::theme::theme_names(dark, cx) {
-                    crate::theme::select_theme_for_test(name.as_ref(), cx);
+                for name in crate::appearance::theme::theme_names(dark, cx) {
+                    crate::appearance::theme::select_theme_for_test(name.as_ref(), cx);
 
                     let body = opaque_surface(cx.theme().background, cx.theme().muted);
                     let header = code_header_surface(cx);
