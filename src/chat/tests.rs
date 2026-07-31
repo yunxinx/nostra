@@ -11,7 +11,7 @@ use crate::preferences;
 
 use super::{
     CONTENT_MAX_WIDTH, ChatEvent, ChatView, Message, MessagePart, ReasoningTrace, Role,
-    is_replayable,
+    STICK_THRESHOLD, is_replayable,
 };
 
 /// A completed user turn plus the assistant placeholder a reply streams
@@ -2381,6 +2381,139 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
         before,
         "a capped card must not change the transcript's layout as it streams"
     );
+}
+
+/// Streaming reasoning follows the same manual-scroll contract as the main
+/// transcript: an upward gesture pauses following, and a later downward
+/// gesture at the end re-arms it.
+#[gpui::test]
+fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = cx.add_window_view(ChatView::new);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            for line in 0..50 {
+                this.append_stream_reasoning(
+                    0,
+                    "reasoning-0".into(),
+                    &format!("Reasoning line {line}.\n\n"),
+                    cx,
+                );
+            }
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the expanded reasoning body was drawn");
+    let (bottom_offset, max_offset) = cx.update(|_, cx| {
+        chat.read(cx)
+            .messages
+            .last()
+            .map_or((px(0.), px(0.)), |turn| {
+                let trace = reasoning_part(turn).expect("reasoning trace");
+                (trace.scroll_offset().y, trace.scroll_max().y)
+            })
+    });
+    assert!(
+        max_offset > px(80.),
+        "the fixture must have scrollable reasoning"
+    );
+    assert_eq!(bottom_offset, -max_offset);
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        ..Default::default()
+    });
+    redraw(cx);
+
+    let paused_offset = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            !trace.is_following(),
+            "upward scrolling must pause following"
+        );
+        trace.scroll_offset().y
+    });
+    assert!(paused_offset > bottom_offset, "the card should move upward");
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            for line in 50..100 {
+                this.append_stream_reasoning(
+                    0,
+                    "reasoning-0".into(),
+                    &format!("Reasoning line {line}.\n\n"),
+                    cx,
+                );
+            }
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let still_paused = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        reasoning_part(turn)
+            .expect("reasoning trace")
+            .scroll_offset()
+            .y
+    });
+    assert_eq!(
+        still_paused, paused_offset,
+        "new reasoning must not force a user who scrolled up back to the end"
+    );
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the reasoning body remains visible");
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+        ..Default::default()
+    });
+    redraw(cx);
+
+    let rearmed = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            trace.is_following(),
+            "scrolling down at the end must re-arm following (offset={:?}, max={:?})",
+            trace.scroll_offset(),
+            trace.scroll_max()
+        );
+        trace.scroll_offset().y
+    });
+    assert!(
+        cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            let trace = reasoning_part(turn).expect("reasoning trace");
+            trace.scroll_max().y + rearmed <= STICK_THRESHOLD
+        }),
+        "the downward gesture should reach the card's end"
+    );
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), "final line.\n\n", cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    assert!(cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD
+    }));
 }
 
 /// Reasoning code blocks resolve the active palette in their custom renderer,

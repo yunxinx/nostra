@@ -33,8 +33,8 @@ use std::{
 // shadows the built-in `#[test]` attribute in this module's test submodule.
 use gpui::{
     AnyElement, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, rems,
+    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, prelude::FluentBuilder as _, rems,
 };
 use gpui_component::{
     ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
@@ -82,8 +82,11 @@ pub(crate) struct ReasoningTrace {
     /// Start of this block's stream, cleared exactly once by [`Self::finish`].
     started_at: Option<Instant>,
     /// Keeps the newest reasoning in view while the card is capped and
-    /// streaming.
+    /// streaming, as long as the user has not scrolled away from the end.
     scroll: ScrollHandle,
+    /// Whether streaming updates may pin the card to its end. This follows the
+    /// transcript's behavior so reading earlier reasoning is not interrupted.
+    follow: bool,
 }
 
 impl ReasoningTrace {
@@ -97,6 +100,7 @@ impl ReasoningTrace {
             elapsed: None,
             started_at: Some(Instant::now()),
             scroll: ScrollHandle::new(),
+            follow: true,
         }
     }
 
@@ -110,21 +114,21 @@ impl ReasoningTrace {
             elapsed: None,
             started_at: None,
             scroll: ScrollHandle::new(),
+            follow: true,
         }
     }
 
     /// Append a reasoning delta, and keep the newest text in view.
     ///
-    /// Unlike the transcript's own follow logic there is no "did the user scroll
-    /// away" guard: the card is at most [`VISIBLE_LINES`] tall and collapses on
-    /// its own when the stream ends, so pinning it to the bottom costs the user
-    /// nothing they were reading.
+    /// Follow the end only while the user is still reading there. Once the
+    /// card is scrolled upward, later deltas preserve that position until a
+    /// downward gesture brings it back to the end.
     pub(crate) fn push(&mut self, delta: &str, cx: &mut App) {
         if delta.is_empty() {
             return;
         }
         self.body.push_str(delta, cx);
-        self.scroll.scroll_to_bottom();
+        super::follow_scroll(&self.scroll, self.follow);
     }
 
     /// Close this block and bank its duration. Collapses the card unless the
@@ -152,7 +156,13 @@ impl ReasoningTrace {
     /// streaming.
     pub(crate) fn set_source(&mut self, source: &str, cx: &mut App) {
         self.body.set_text(source, cx);
-        self.scroll.scroll_to_bottom();
+        super::follow_scroll(&self.scroll, self.follow);
+    }
+
+    /// Record wheel intent for the card's own follow state. The surrounding
+    /// transcript remains a separate scroll boundary.
+    pub(crate) fn handle_scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window) {
+        super::update_scroll_follow(&mut self.follow, &self.scroll, event, window);
     }
 
     /// Localized trigger text: a live label while thinking, the banked duration
@@ -195,6 +205,21 @@ impl ReasoningTrace {
     pub(crate) fn scroll_max_offset(&self) -> gpui::Pixels {
         self.scroll.max_offset().y
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_following(&self) -> bool {
+        self.follow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.scroll.offset()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_max(&self) -> gpui::Point<gpui::Pixels> {
+        self.scroll.max_offset()
+    }
 }
 
 /// Stable identities used by one reasoning card.
@@ -205,11 +230,13 @@ pub(crate) struct ReasoningCardId {
 
 type ToggleHandler = Rc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>;
 type CopyValue = Rc<dyn Fn(&mut Window, &mut App) -> SharedString>;
+type ScrollHandler = Rc<dyn Fn(&ScrollWheelEvent, &mut Window, &mut App)>;
 
 /// Actions owned by one reasoning card.
 pub(crate) struct ReasoningCardActions {
     pub(crate) on_toggle: ToggleHandler,
     pub(crate) copy_value: CopyValue,
+    pub(crate) on_scroll: ScrollHandler,
 }
 
 /// Render one reasoning card. `id.ui_id` disambiguates every block across the
@@ -234,6 +261,7 @@ pub(crate) fn render(
     let ReasoningCardActions {
         on_toggle,
         copy_value,
+        on_scroll,
     } = actions;
     let theme = cx.theme();
     let (body_foreground, border, radius) = (
@@ -349,6 +377,7 @@ pub(crate) fn render(
                     .child(
                         div()
                             .id(ElementId::NamedInteger("turn-reasoning-body".into(), ui_id))
+                            .debug_selector(move || block_selector("body", content_index))
                             .w_full()
                             // `max_h` rather than a fixed `h`: a two-line trace
                             // gets a two-line card, and only a long one hits the
@@ -371,7 +400,10 @@ pub(crate) fn render(
                             // top or bottom) falls through and scrolls the
                             // transcript out from under the pointer. Same
                             // containment the floating composer applies.
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                            .on_scroll_wheel(move |event, window, cx| {
+                                on_scroll(event, window, cx);
+                                cx.stop_propagation();
+                            })
                             .child(trace.body.text_view(
                                 TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
                             )),

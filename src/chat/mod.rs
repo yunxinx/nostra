@@ -56,6 +56,39 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 /// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
+/// Whether a scrollable view is close enough to its end to keep following new
+/// content. GPUI stores vertical scroll offsets as negative values: zero is
+/// the top and `-max_offset.y` is the bottom.
+fn scroll_is_near_bottom(scroll_handle: &ScrollHandle) -> bool {
+    let offset = scroll_handle.offset().y;
+    let max = scroll_handle.max_offset().y;
+    max + offset <= STICK_THRESHOLD
+}
+
+/// Keep a stream pinned only while the user has left its viewport at the end.
+fn follow_scroll(scroll_handle: &ScrollHandle, follow: bool) {
+    if follow && scroll_is_near_bottom(scroll_handle) {
+        scroll_handle.scroll_to_bottom();
+    }
+}
+
+/// Apply the same wheel-intent rules to the transcript and to an expanded
+/// reasoning card. A small upward gesture disarms following immediately;
+/// scrolling back to the end re-arms it.
+fn update_scroll_follow(
+    follow: &mut bool,
+    scroll_handle: &ScrollHandle,
+    event: &ScrollWheelEvent,
+    window: &Window,
+) {
+    let dy = event.delta.pixel_delta(window.line_height()).y;
+    if dy > px(0.) {
+        *follow = false;
+    } else if dy < px(0.) && scroll_is_near_bottom(scroll_handle) {
+        *follow = true;
+    }
+}
+
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -489,18 +522,7 @@ impl ChatView {
     /// [`ChatView::follow`]), so scrolling up to re-read earlier turns is never
     /// interrupted, no matter how small the scroll was.
     pub fn follow_stream(&self) {
-        if self.follow && self.is_near_bottom() {
-            self.scroll_handle.scroll_to_bottom();
-        }
-    }
-
-    /// True when the viewport sits at (or within `STICK_THRESHOLD` of) the
-    /// bottom.  `offset.y` is `<= 0` and reaches `-max_offset.y` at the bottom,
-    /// so their sum is the remaining distance to the end of the content.
-    fn is_near_bottom(&self) -> bool {
-        let offset = self.scroll_handle.offset().y;
-        let max = self.scroll_handle.max_offset().y;
-        max + offset <= STICK_THRESHOLD
+        follow_scroll(&self.scroll_handle, self.follow);
     }
 
     /// Submit a non-empty message when no reply is already in flight.
@@ -1038,12 +1060,7 @@ impl ChatView {
                     // earlier content (gpui applies `offset.y += delta.y` with
                     // 0 = top).
                     .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, _| {
-                        let dy = ev.delta.pixel_delta(window.line_height()).y;
-                        if dy > px(0.) {
-                            this.follow = false;
-                        } else if dy < px(0.) && this.is_near_bottom() {
-                            this.follow = true;
-                        }
+                        update_scroll_follow(&mut this.follow, &this.scroll_handle, ev, window);
                     }))
                     .child(
                         v_flex()
@@ -1206,6 +1223,26 @@ fn render_message(
                             cx.notify();
                         }
                     });
+                    let on_scroll = cx.listener(
+                        move |this: &mut ChatView,
+                              event: &ScrollWheelEvent,
+                              window,
+                              _cx| {
+                            if let Some(MessagePart::Reasoning {
+                                trace: Some(trace), ..
+                            }) = this
+                                .messages
+                                .get_mut(message_index)
+                                .and_then(|message| {
+                                    message.parts.iter_mut().find(|part| {
+                                        matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
+                                    })
+                                })
+                            {
+                                trace.handle_scroll(event, window);
+                            }
+                        },
+                    );
                     let view = cx.entity().downgrade();
                     let copy_value = move |_: &mut Window, cx: &mut App| {
                         view.upgrade()
@@ -1241,6 +1278,7 @@ fn render_message(
                         reasoning_card::ReasoningCardActions {
                             on_toggle: std::rc::Rc::new(on_toggle),
                             copy_value: std::rc::Rc::new(copy_value),
+                            on_scroll: std::rc::Rc::new(on_scroll),
                         },
                         window,
                         cx,
