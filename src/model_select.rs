@@ -12,7 +12,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, IndexPath, Sizable as _, Size, StyleSized as _,
+    ActiveTheme as _, IconName, IndexPath, Sizable as _, Size, StyleSized as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::{List, ListDelegate, ListState},
@@ -76,7 +76,6 @@ pub(crate) struct ModelPicker {
     dismiss_pending: bool,
     selection: Option<ModelSelection>,
     label: Option<(SharedString, SharedString)>,
-    pending: bool,
     on_confirm: ConfirmHandler,
     popover: PopoverDismissHandle,
     _catalog_subscription: Subscription,
@@ -85,7 +84,6 @@ pub(crate) struct ModelPicker {
 impl ModelPicker {
     pub(crate) fn new(
         selection: Option<ModelSelection>,
-        pending: bool,
         on_confirm: impl Fn(ModelSelection, &mut App) -> bool + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -118,7 +116,6 @@ impl ModelPicker {
             dismiss_pending: false,
             selection,
             label,
-            pending,
             on_confirm,
             popover,
             _catalog_subscription: catalog_subscription,
@@ -134,22 +131,13 @@ impl ModelPicker {
     pub(crate) fn set_conversation(
         &mut self,
         selection: Option<ModelSelection>,
-        pending: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let selection_changed = self.selection != selection;
-        let pending_changed = self.pending != pending;
-
-        self.pending = pending;
-        if pending {
-            self.dismiss(window, cx);
-        }
         if selection_changed {
             self.selection = selection;
             self.refresh_catalog(self.models.clone(), window, cx);
-        }
-        if selection_changed || pending_changed {
             cx.notify();
         }
     }
@@ -230,7 +218,6 @@ impl Render for ModelPicker {
                     .ghost()
                     .small()
                     .dropdown_caret(true)
-                    .disabled(self.pending)
                     .max_w(MODEL_PILL_MAX_WIDTH)
                     .child(title),
             )
@@ -729,7 +716,7 @@ mod tests {
         });
         let cx = cx.add_empty_window();
         let picker = cx.update(|window, cx| {
-            cx.new(|cx| ModelPicker::new(selection.clone().into(), false, |_, _| true, window, cx))
+            cx.new(|cx| ModelPicker::new(selection.clone().into(), |_, _| true, window, cx))
         });
         cx.run_until_parked();
         cx.update(|_, cx| {
@@ -830,7 +817,6 @@ mod tests {
                 cx.new(|cx| {
                     ModelPicker::new(
                         None,
-                        false,
                         move |selection, _| {
                             confirmed.borrow_mut().push(selection);
                             true

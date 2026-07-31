@@ -189,6 +189,13 @@ pub fn remove_model(profile_id: &str, model_id: &str, cx: &mut App) {
 }
 
 pub fn select_model(selection: ModelSelection, cx: &mut App) {
+    // Entity tests exercise the same ChatView::select_model -> provider
+    // persistence boundary as production. Keep that path intact while avoiding
+    // writes to the developer's real configuration directory under `cargo
+    // test`; the in-memory global remains the authoritative observable state.
+    #[cfg(test)]
+    preferences::update_in_memory(cx, |prefs| prefs.last_model_selection = Some(selection));
+    #[cfg(not(test))]
     preferences::update(cx, |prefs| prefs.last_model_selection = Some(selection));
 }
 

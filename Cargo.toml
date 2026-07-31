@@ -47,11 +47,12 @@ gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
 http_client = { git = "https://github.com/zed-industries/zed" }
 reqwest_client = { git = "https://github.com/zed-industries/zed" }
 
-# gpui-component (and its assets crate) live in the same upstream repo.  Pin
-# to a specific rev so the app builds against the exact API surface it was
-# written against; bump this when adopting new component features.
+# gpui-component and Zed/GPUI evolve as one compatible Git dependency set.
+# Keep both declarations on their upstream default branches so routine
+# upgrades can resolve the complete set together; Cargo.lock records the
+# exact verified commits used by a checkout.
 #
-# Known upstream issue at bc174a7: the input's soft-wrap points come from
+# Known upstream issue: the input's soft-wrap points come from
 # per-char isolated width estimates, which under-measure CJK fullwidth
 # punctuation under proportional fonts (rightmost glyph clips).  The composer
 # works around it by rendering with a bundled full-coverage CJK-mono font
@@ -59,16 +60,17 @@ reqwest_client = { git = "https://github.com/zed-industries/zed" }
 # branch `fix/input-soft-wrap-shaped-width` should it ever be needed
 # (upstream PR material).
 #
-# The `tree-sitter` feature is required for syntax highlighting in markdown code
-# blocks — without it `highlighter` compiles to a stub whose `highlight()`
-# returns no styles, so fenced blocks render as unstyled monospace.  The base
-# feature pulls in exactly `tree-sitter` + `tree-sitter-json`, which is all the
-# upstream error cards need; the much larger `tree-sitter-languages` bundle is
-# deliberately left off.
-gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7", features = [
-    "tree-sitter",
+# Match gpui-component's story crate: chat content can contain any fenced
+# language, so the complete built-in grammar registry is required. The base
+# `tree-sitter` feature only includes JSON and silently leaves common Rust,
+# Python, JavaScript, and other fences unstyled.
+# The locked upstream revision must include ScrollableMask's capture-phase
+# horizontal handling and edge-event consumption. Both properties are required
+# when a code viewport is nested in the vertically scrolling transcript.
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", features = [
+    "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "bc174a7" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }

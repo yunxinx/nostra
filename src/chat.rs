@@ -9,12 +9,13 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _},
     scroll::ScrollableElement as _,
-    text::{TextView, TextViewState},
+    text::TextViewStyle,
     v_flex,
 };
 use rust_i18n::t;
 
 use crate::assistant;
+use crate::code_block::MarkdownBody;
 use crate::error_card::{self, TurnError};
 use crate::fonts;
 use crate::llm::{
@@ -58,7 +59,7 @@ pub enum MessagePart {
         text: String,
         replay: ProviderMetadata,
         finished: bool,
-        body: Entity<TextViewState>,
+        body: MarkdownBody,
     },
     Reasoning {
         content_index: usize,
@@ -79,7 +80,7 @@ pub enum MessagePart {
     ToolResult {
         content_index: usize,
         tool_result: ToolResult,
-        body: Entity<TextViewState>,
+        body: MarkdownBody,
     },
 }
 
@@ -186,7 +187,7 @@ impl MessagePart {
                 content_index: index,
                 ui_id,
                 id: format!("terminal-text-{index}"),
-                body: cx.new(|cx| TextViewState::markdown(&text, cx)),
+                body: MarkdownBody::new(&text, ui_id, cx),
                 text,
                 replay: provider_metadata,
                 finished: true,
@@ -197,7 +198,7 @@ impl MessagePart {
                 id: format!("terminal-reasoning-{index}"),
                 finished: true,
                 trace: (!reasoning.display.is_empty())
-                    .then(|| ReasoningTrace::completed(reasoning.display.clone(), cx)),
+                    .then(|| ReasoningTrace::completed(reasoning.display.clone(), ui_id, cx)),
                 reasoning,
             },
             ContentBlock::ToolCall { tool_call } => Self::ToolCall {
@@ -210,7 +211,7 @@ impl MessagePart {
             },
             ContentBlock::ToolResult { tool_result } => Self::ToolResult {
                 content_index: index,
-                body: cx.new(|cx| TextViewState::markdown(&tool_result.content, cx)),
+                body: MarkdownBody::new(&tool_result.content, ui_id, cx),
                 tool_result,
             },
         }
@@ -262,7 +263,8 @@ impl MessagePart {
                     provider_metadata,
                 },
             ) => {
-                body.update(cx, |state, cx| state.set_text(&text, cx));
+                let mut body = body;
+                body.set_text(&text, cx);
                 Self::Text {
                     content_index: index,
                     ui_id,
@@ -322,10 +324,7 @@ impl MessagePart {
 #[derive(Clone)]
 pub enum ChatEvent {
     TitleChanged(SharedString),
-    StateChanged {
-        selection: Option<ModelSelection>,
-        pending: bool,
-    },
+    SelectionChanged(ModelSelection),
 }
 
 pub struct ChatView {
@@ -419,11 +418,11 @@ impl ChatView {
                 },
             );
 
-        // A theme switch repaints everything, but a markdown code block's syntax
-        // colors are fixed when it is parsed — so error cards have to be re-parsed
-        // explicitly or they keep the previous theme's palette.
+        // Error cards use TextView's native code blocks, whose syntax colors are
+        // fixed when parsed. Chat code blocks read the current theme in their
+        // custom renderer and invalidate their own highlight cache.
         let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
-            this.refresh_markdown_highlights(cx);
+            this.refresh_error_highlights(cx);
         });
 
         let selection = providers::last_selection(cx);
@@ -451,27 +450,12 @@ impl ChatView {
         }
     }
 
-    /// Re-parse every card that holds its own markdown against the active theme.
-    /// Cheap in practice: only failed turns hold an error card, and only
-    /// reasoning blocks hold traces.
-    fn refresh_markdown_highlights(&mut self, cx: &mut Context<Self>) {
+    /// Re-parse native code blocks in error cards against the active palette.
+    fn refresh_error_highlights(&mut self, cx: &mut Context<Self>) {
         let mut refreshed = false;
         for message in &mut self.messages {
             if let Some(error) = &mut message.error {
                 refreshed |= error.refresh_highlight(cx);
-            }
-            for part in &mut message.parts {
-                if let MessagePart::Reasoning {
-                    reasoning,
-                    trace: Some(trace),
-                    ..
-                } = part
-                {
-                    // Reasoning is markdown like any other body, so a fenced
-                    // block keeps the old palette across a theme switch for the
-                    // same reason an error card does.
-                    refreshed |= trace.refresh_highlight(&reasoning.display, cx);
-                }
             }
         }
         if refreshed {
@@ -551,7 +535,6 @@ impl ChatView {
         ));
         self.follow = true;
         self.scroll_to_bottom();
-        self.emit_state(cx);
         cx.notify();
         true
     }
@@ -580,7 +563,6 @@ impl ChatView {
         }
         self.pending = false;
         self.reply_task = None;
-        self.emit_state(cx);
         cx.notify();
     }
 
@@ -595,14 +577,15 @@ impl ChatView {
         {
             return;
         }
+        let ui_id = NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed);
         last.parts.push(MessagePart::Text {
             content_index,
-            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
+            ui_id,
             id,
             text: String::new(),
             replay: ProviderMetadata::default(),
             finished: false,
-            body: cx.new(|cx| TextViewState::markdown("", cx)),
+            body: MarkdownBody::new("", ui_id, cx),
         });
         last.parts.sort_by_key(MessagePart::content_index);
     }
@@ -641,7 +624,7 @@ impl ChatView {
                 return;
             }
             text.push_str(delta);
-            body.update(cx, |state, cx| state.push_str(delta, cx));
+            body.push_str(delta, cx);
         }
     }
 
@@ -721,6 +704,7 @@ impl ChatView {
             return;
         };
         if let MessagePart::Reasoning {
+            ui_id,
             reasoning,
             finished,
             trace,
@@ -735,7 +719,7 @@ impl ChatView {
             }
             reasoning.display.push_str(delta);
             trace
-                .get_or_insert_with(|| ReasoningTrace::new(cx))
+                .get_or_insert_with(|| ReasoningTrace::new(*ui_id, cx))
                 .push(delta, cx);
         }
     }
@@ -778,6 +762,7 @@ impl ChatView {
         cx: &mut App,
     ) {
         let Some(MessagePart::Reasoning {
+            ui_id,
             reasoning,
             finished,
             trace,
@@ -798,7 +783,11 @@ impl ChatView {
         } else if let Some(trace) = trace.as_mut() {
             trace.set_source(&snapshot.display, cx);
         } else {
-            *trace = Some(ReasoningTrace::completed(snapshot.display.clone(), cx));
+            *trace = Some(ReasoningTrace::completed(
+                snapshot.display.clone(),
+                *ui_id,
+                cx,
+            ));
         }
         *reasoning = snapshot;
     }
@@ -877,26 +866,26 @@ impl ChatView {
     }
 
     pub fn select_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
-        if self.pending || self.selection.as_ref() == Some(&selection) {
+        if !self.update_selection(selection.clone()) {
             return;
         }
-        self.selection = Some(selection.clone());
+        providers::select_model(selection.clone(), cx);
+        cx.emit(ChatEvent::SelectionChanged(selection));
+        cx.notify();
+    }
+
+    fn update_selection(&mut self, selection: ModelSelection) -> bool {
+        if self.selection.as_ref() == Some(&selection) {
+            return false;
+        }
+        self.selection = Some(selection);
         self.selection_available = true;
         self.provider_catalog_revision = providers::catalog_revision();
-        providers::select_model(selection, cx);
-        self.emit_state(cx);
-        cx.notify();
+        true
     }
 
     pub fn selection(&self) -> Option<ModelSelection> {
         self.selection.clone()
-    }
-
-    fn emit_state(&self, cx: &mut Context<Self>) {
-        cx.emit(ChatEvent::StateChanged {
-            selection: self.selection.clone(),
-            pending: self.pending,
-        });
     }
 
     fn sync_selection_availability(&mut self, cx: &App) {
@@ -1095,7 +1084,7 @@ impl ChatView {
                     // toolbar row below carries its own inset.
                     //
                     // The bundled font is load-bearing, not cosmetic: upstream
-                    // gpui-component (bc174a7) computes soft-wrap points from
+                    // gpui-component computes soft-wrap points from
                     // per-char isolated measurements.  Under a proportional
                     // system font, fullwidth punctuation (，。) measures ~0.5em
                     // alone but paints at 1em inside a CJK run, so wrapped lines
@@ -1173,7 +1162,7 @@ fn render_message(
     let parts = msg.parts.iter().filter_map(|part| {
             match part {
                 MessagePart::Text { text, body, .. } if !text.is_empty() => {
-                    Some(TextView::new(body).selectable(true).into_any_element())
+                    Some(body.text_view(TextViewStyle::default()).into_any_element())
                 }
                 MessagePart::Reasoning {
                     ui_id,
@@ -1250,7 +1239,7 @@ fn render_message(
                         .into_any_element(),
                 ),
                 MessagePart::ToolResult { body, .. } => {
-                    Some(TextView::new(body).selectable(true).into_any_element())
+                    Some(body.text_view(TextViewStyle::default()).into_any_element())
                 }
                 _ => None,
             }

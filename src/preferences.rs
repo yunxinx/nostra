@@ -44,6 +44,12 @@ pub struct Preferences {
     pub glass_tint_opacity: f32,
     /// Whether settings omit the buttons that reveal explanatory text.
     pub hide_settings_info_buttons: bool,
+    /// Global fenced-code wrap value applied whenever the setting changes.
+    pub code_block_wrap: bool,
+    /// Monotonic reset generation for per-block wrap controls.
+    pub code_block_wrap_revision: u64,
+    /// Whether fenced code displays a line-number gutter.
+    pub code_block_line_numbers: bool,
     /// UI language.
     pub language: Language,
     /// Theme name applied while in light mode.  `None` or an unregistered
@@ -82,6 +88,9 @@ impl Default for Preferences {
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             hide_settings_info_buttons: false,
+            code_block_wrap: false,
+            code_block_wrap_revision: 0,
+            code_block_line_numbers: false,
             language: Language::default(),
             light_theme: None,
             dark_theme: None,
@@ -388,6 +397,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_current_field).is_err());
 
+        let mut missing_wrap_revision =
+            serde_json::to_value(Preferences::default()).expect("serialize");
+        assert!(
+            missing_wrap_revision
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("code_block_wrap_revision")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_wrap_revision).is_err());
+
         let mut unknown_geometry = serde_json::to_value(Preferences {
             window: Some(WindowGeometry {
                 x: 0.,
@@ -408,6 +428,24 @@ mod tests {
         assert!(!prefs.glass_effect);
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
         assert!(!prefs.hide_settings_info_buttons);
+        assert!(!prefs.code_block_wrap);
+        assert_eq!(prefs.code_block_wrap_revision, 0);
+        assert!(!prefs.code_block_line_numbers);
+    }
+
+    #[test]
+    fn code_block_preferences_round_trip() {
+        let prefs = Preferences {
+            code_block_wrap: true,
+            code_block_wrap_revision: 7,
+            code_block_line_numbers: true,
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize code preferences");
+        let back: Preferences = serde_json::from_str(&json).expect("deserialize code preferences");
+        assert!(back.code_block_wrap);
+        assert_eq!(back.code_block_wrap_revision, 7);
+        assert!(back.code_block_line_numbers);
     }
 
     /// Both split geometries are plain widths, and both must survive a round

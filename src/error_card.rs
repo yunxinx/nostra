@@ -563,11 +563,10 @@ mod tests {
         assert!(fenced_block("plain", None).starts_with("```\n"));
     }
 
-    /// The card is only useful if the highlighter is compiled in. Without the
-    /// gpui-component `tree-sitter` feature the whole `highlighter::Language`
-    /// enum is `#[cfg]`-ed out and replaced by a stub, so naming `Language::Json`
-    /// fails the build — which is the point. Easy to lose when bumping the
-    /// dependency, and the symptom (unstyled monospace) is quiet.
+    /// The card is only useful if the highlighter is compiled in. Without a
+    /// gpui-component Tree-sitter feature the whole `highlighter::Language` enum
+    /// is replaced by a stub, so naming `Language::Json` fails the build. Easy to
+    /// lose when bumping the dependency, and the symptom is quiet.
     #[test]
     fn json_highlighting_is_compiled_in() {
         assert_eq!(gpui_component::highlighter::Language::Json.name(), "json");

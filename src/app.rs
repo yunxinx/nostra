@@ -73,7 +73,6 @@ struct Conversation {
     view: Entity<ChatView>,
     title: SharedString,
     selection: Option<ModelSelection>,
-    pending: bool,
 }
 
 impl ChatApp {
@@ -89,7 +88,6 @@ impl ChatApp {
         let model_picker = cx.new(|cx| {
             ModelPicker::new(
                 prefs.last_model_selection.clone(),
-                false,
                 move |selection, cx| {
                     parent
                         .update(cx, |app, cx| app.select_model_from_picker(selection, cx))
@@ -184,10 +182,9 @@ impl ChatApp {
                         cx.notify();
                     }
                 }
-                ChatEvent::StateChanged { selection, pending } => {
-                    if conversation.selection != *selection || conversation.pending != *pending {
-                        conversation.selection = selection.clone();
-                        conversation.pending = *pending;
+                ChatEvent::SelectionChanged(selection) => {
+                    if conversation.selection.as_ref() != Some(selection) {
+                        conversation.selection = Some(selection.clone());
                         if index == this.active {
                             this.sync_model_picker_to_active(window, cx);
                         }
@@ -201,7 +198,6 @@ impl ChatApp {
             view,
             title,
             selection,
-            pending: false,
         });
         self._subscriptions.push(sub);
         self.active = self.conversations.len() - 1;
@@ -224,9 +220,8 @@ impl ChatApp {
             return;
         };
         let selection = conversation.selection.clone();
-        let pending = conversation.pending;
         self.model_picker.update(cx, |picker, cx| {
-            picker.set_conversation(selection, pending, window, cx)
+            picker.set_conversation(selection, window, cx)
         });
     }
 
@@ -238,10 +233,6 @@ impl ChatApp {
         let Some(conversation) = self.conversations.get(self.active) else {
             return false;
         };
-        if conversation.pending {
-            return false;
-        }
-
         let view = conversation.view.clone();
         view.update(cx, |chat, cx| chat.select_model(selection, cx));
         true

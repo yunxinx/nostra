@@ -15,7 +15,7 @@ use super::ui;
 #[cfg(target_os = "macos")]
 use crate::glass;
 use crate::preferences::{ComposerFont, ThemeMode};
-use crate::{fonts, theme};
+use crate::{code_block, fonts, theme};
 
 /// Dropdown identifier for "follow system" (the absence of a mode override).
 const MODE_SYSTEM: &str = "system";
@@ -31,6 +31,8 @@ pub(super) fn render(
         theme_row(false, cx),
         theme_row(true, cx),
         composer_font_row(cx),
+        code_wrap_row(cx),
+        code_line_numbers_row(cx),
     ];
     #[cfg(target_os = "macos")]
     {
@@ -40,6 +42,34 @@ pub(super) fn render(
     rows.push(info_buttons_row(cx));
 
     ui::section(rows, cx)
+}
+
+fn code_wrap_row(cx: &App) -> AnyElement {
+    ui::row(
+        "code-wrap",
+        t!("settings.code_wrap").to_string(),
+        Some(t!("settings.code_wrap_desc").to_string()),
+        Switch::new("code-wrap-switch")
+            .small()
+            .checked(code_block::global_wrap_enabled(cx))
+            .on_click(|checked, _, cx| code_block::set_global_wrap(*checked, cx))
+            .into_any_element(),
+        cx,
+    )
+}
+
+fn code_line_numbers_row(cx: &App) -> AnyElement {
+    ui::row(
+        "code-line-numbers",
+        t!("settings.code_line_numbers").to_string(),
+        Some(t!("settings.code_line_numbers_desc").to_string()),
+        Switch::new("code-line-numbers-switch")
+            .small()
+            .checked(code_block::line_numbers_enabled(cx))
+            .on_click(|checked, _, cx| code_block::set_line_numbers(*checked, cx))
+            .into_any_element(),
+        cx,
+    )
 }
 
 fn info_buttons_row(cx: &App) -> AnyElement {
@@ -191,5 +221,25 @@ fn mode_from_key(key: &str) -> Option<ThemeMode> {
         MODE_LIGHT => Some(ThemeMode::Light),
         MODE_DARK => Some(ThemeMode::Dark),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn code_block_labels_resolve_in_every_locale() {
+        for locale in ["en", "zh-CN"] {
+            for key in [
+                "settings.code_wrap",
+                "settings.code_wrap_desc",
+                "settings.code_line_numbers",
+                "settings.code_line_numbers_desc",
+            ] {
+                let resolved = t!(key, locale = locale).to_string();
+                assert!(!resolved.contains(key), "{key} unresolved for {locale}");
+            }
+        }
     }
 }

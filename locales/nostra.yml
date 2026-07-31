@@ -59,6 +59,13 @@ chat:
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
+  code:
+    copy:
+      en: Copy code
+      zh-CN: 复制代码
+    wrap:
+      en: Wrap long lines
+      zh-CN: 自动换行
   reasoning:
     streaming:
       en: Thinking…
@@ -197,6 +204,18 @@ settings:
   composer_font_desc:
     en: Bundled font used by the message input; both options keep soft-wrap positions exact.
     zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  code_wrap:
+    en: Code block wrapping
+    zh-CN: 代码块自动换行
+  code_wrap_desc:
+    en: Set wrapping for all code blocks; each block can still be changed separately afterward.
+    zh-CN: 为所有代码块设置自动换行；之后仍可单独调整每个代码块。
+  code_line_numbers:
+    en: Code block line numbers
+    zh-CN: 代码块行号
+  code_line_numbers_desc:
+    en: Show a line-number gutter in fenced code blocks.
+    zh-CN: 在围栏代码块中显示行号栏。
   hide_info_buttons:
     en: Hide info buttons
     zh-CN: 隐藏提示按钮

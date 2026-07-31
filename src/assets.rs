@@ -54,3 +54,11 @@ impl AssetSource for NostraAssets {
         Ok(names)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn code_wrap_icon_is_embedded() {
+        assert!(super::embedded("icons/wrap-text.svg").is_some());
+    }
+}

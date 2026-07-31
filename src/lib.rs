@@ -12,6 +12,7 @@ mod app;
 mod assets;
 mod assistant;
 mod chat;
+mod code_block;
 mod error_card;
 mod fonts;
 mod glass;

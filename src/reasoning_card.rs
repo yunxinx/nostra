@@ -6,7 +6,8 @@
 //! reasoning model emitted was captured and then dropped on the floor. This
 //! module is where it surfaces.
 //!
-//! Each card owns a [`TextViewState`], so reasoning streams as live markdown
+//! Each card owns a [`MarkdownBody`](crate::code_block::MarkdownBody), so
+//! reasoning streams as live markdown
 //! through the same `push_str` path as prose rather than being flattened into
 //! it. Two properties keep it from taking over the transcript:
 //!
@@ -31,20 +32,17 @@ use std::{
 // Imported by name rather than glob: `gpui::*` exports a `test` macro that
 // shadows the built-in `#[test]` attribute in this module's test submodule.
 use gpui::{
-    AnyElement, App, AppContext as _, ElementId, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, prelude::FluentBuilder as _, rems,
+    AnyElement, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    prelude::FluentBuilder as _, rems,
 };
 use gpui_component::{
-    ActiveTheme, Sizable as _,
-    button::Button,
-    clipboard::Clipboard,
-    h_flex,
-    scroll::ScrollableElement as _,
-    text::{TextView, TextViewState, TextViewStyle},
-    v_flex,
+    ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
+    scroll::ScrollableElement as _, text::TextViewStyle, v_flex,
 };
 use rust_i18n::t;
+
+use crate::code_block::MarkdownBody;
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
 /// card without accidentally matching another card in the same turn.
@@ -67,13 +65,13 @@ const PARAGRAPH_GAP: f32 = 0.5;
 
 /// One reasoning content block, prepared for rendering.
 ///
-/// Holds a `TextViewState` entity, so — like
+/// Holds a markdown state entity, so — like
 /// [`TurnError`](crate::error_card::TurnError) — it must be constructed from an
 /// update, never from inside a render pass.
 pub(crate) struct ReasoningTrace {
     /// Live markdown state, appended to with `push_str` so the card streams
     /// instead of re-parsing on every delta.
-    body: Entity<TextViewState>,
+    body: MarkdownBody,
     /// Whether the body is currently visible.
     expanded: bool,
     /// Set once the user works the toggle. From then on neither auto-expand nor
@@ -91,9 +89,9 @@ pub(crate) struct ReasoningTrace {
 impl ReasoningTrace {
     /// Open a trace for a block that just started reasoning. Auto-expanded: the
     /// point of streaming reasoning is that it is visible as it arrives.
-    pub(crate) fn new(cx: &mut App) -> Self {
+    pub(crate) fn new(owner_id: u64, cx: &mut App) -> Self {
         Self {
-            body: cx.new(|cx| TextViewState::markdown("", cx)),
+            body: MarkdownBody::new("", owner_id, cx),
             expanded: true,
             user_controlled: false,
             elapsed: None,
@@ -103,9 +101,9 @@ impl ReasoningTrace {
     }
 
     /// Build a closed trace from an authoritative terminal message.
-    pub(crate) fn completed(source: String, cx: &mut App) -> Self {
+    pub(crate) fn completed(source: String, owner_id: u64, cx: &mut App) -> Self {
         Self {
-            body: cx.new(|cx| TextViewState::markdown(&source, cx)),
+            body: MarkdownBody::new(&source, owner_id, cx),
             expanded: false,
             user_controlled: false,
             // A terminal-only block was not timed on this client.
@@ -125,7 +123,7 @@ impl ReasoningTrace {
         if delta.is_empty() {
             return;
         }
-        self.body.update(cx, |state, cx| state.push_str(delta, cx));
+        self.body.push_str(delta, cx);
         self.scroll.scroll_to_bottom();
     }
 
@@ -149,27 +147,11 @@ impl ReasoningTrace {
         self.expanded = !self.expanded;
     }
 
-    /// Re-parse the body so its markdown code blocks pick up the active theme's
-    /// syntax colors.
-    ///
-    /// Same constraint as [`TurnError::refresh_highlight`](crate::error_card::TurnError::refresh_highlight):
-    /// a code block memoizes its styles from the `HighlightTheme` captured when
-    /// it was parsed, and `TextViewState::set_text` ignores an unchanged value,
-    /// so the state entity has to be replaced outright. Reasoning is markdown
-    /// like any other body, so it can contain fenced code.
-    pub(crate) fn refresh_highlight(&mut self, source: &str, cx: &mut App) -> bool {
-        if source.is_empty() {
-            return false;
-        }
-        self.body = cx.new(|cx| TextViewState::markdown(source, cx));
-        true
-    }
-
     /// Apply the terminal message's complete reasoning snapshot while retaining
     /// disclosure, timing, and keyed markdown entity accumulated during
     /// streaming.
     pub(crate) fn set_source(&mut self, source: &str, cx: &mut App) {
-        self.body.update(cx, |state, cx| state.set_text(source, cx));
+        self.body.set_text(source, cx);
         self.scroll.scroll_to_bottom();
     }
 
@@ -390,7 +372,7 @@ pub(crate) fn render(
                             // transcript out from under the pointer. Same
                             // containment the floating composer applies.
                             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                            .child(TextView::new(&trace.body).selectable(true).style(
+                            .child(trace.body.text_view(
                                 TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
                             )),
                     )
@@ -504,7 +486,7 @@ mod tests {
     ) {
         cx.update(gpui_component::init);
         let window = cx.add_empty_window();
-        let mut trace = window.update(|_, cx| ReasoningTrace::new(cx));
+        let mut trace = window.update(|_, cx| ReasoningTrace::new(1, cx));
 
         assert_eq!(
             trace.label(false),
@@ -524,7 +506,7 @@ mod tests {
     fn finish_is_idempotent_and_preserves_user_disclosure(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let window = cx.add_empty_window();
-        let mut trace = window.update(|_, cx| ReasoningTrace::new(cx));
+        let mut trace = window.update(|_, cx| ReasoningTrace::new(1, cx));
 
         trace.finish();
         let elapsed = trace.elapsed;
@@ -542,7 +524,8 @@ mod tests {
     fn terminal_only_block_uses_an_untimed_completion_label(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let window = cx.add_empty_window();
-        let trace = window.update(|_, cx| ReasoningTrace::completed("complete block".into(), cx));
+        let trace =
+            window.update(|_, cx| ReasoningTrace::completed("complete block".into(), 1, cx));
 
         assert_eq!(
             trace.label(true),
@@ -554,7 +537,7 @@ mod tests {
     fn empty_deltas_do_not_start_or_change_timing(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let window = cx.add_empty_window();
-        let mut trace = window.update(|_, cx| ReasoningTrace::new(cx));
+        let mut trace = window.update(|_, cx| ReasoningTrace::new(1, cx));
         trace.finish();
         let elapsed = trace.elapsed;
 
@@ -564,22 +547,5 @@ mod tests {
             "an empty delta has no lifecycle meaning"
         );
         assert_eq!(trace.elapsed, elapsed);
-    }
-
-    /// Nothing to re-parse before the first delta, so a theme switch on a bare
-    /// trace must not churn the entity (or ask the transcript to re-render).
-    #[gpui::test]
-    fn refresh_is_a_no_op_until_something_streamed(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let window = cx.add_empty_window();
-        let mut trace = window.update(|_, cx| ReasoningTrace::new(cx));
-
-        let before = trace.body_entity_id();
-        assert!(!window.update(|_, cx| trace.refresh_highlight("", cx)));
-        assert_eq!(trace.body_entity_id(), before);
-
-        window.update(|_, cx| trace.push("thought", cx));
-        assert!(window.update(|_, cx| trace.refresh_highlight("thought", cx)));
-        assert_ne!(trace.body_entity_id(), before);
     }
 }
