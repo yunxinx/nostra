@@ -6,6 +6,7 @@
 //! module of their own live directly here.
 
 pub(crate) mod markdown;
+pub(crate) mod math;
 pub(crate) mod model_select;
 
 use gpui::{App, KeyDownEvent, Window};

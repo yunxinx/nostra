@@ -33,47 +33,51 @@ tempfile = "3"
 futures = "0.3"
 async-io = "2"
 url = "2"
+markdown = "1.0.0"
 
-# Zed's gpui runtime.  Kept unpinned (branch = main) here to match the version
-# gpui-component itself declares in its workspace; Cargo.lock captures the
-# exact commit for reproducibility.
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = [
+# Zed/GPUI and gpui-component are maintained as one verified fork set. Checked-in
+# dependencies pin exact commits: every GPUI crate shares one Zed revision and
+# both component crates share one gpui-component revision.
+gpui = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a" }
+gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a", features = [
     "font-kit",
     "x11",
     "wayland",
     "runtime_shaders",
 ] }
-http_client = { git = "https://github.com/zed-industries/zed" }
-reqwest_client = { git = "https://github.com/zed-industries/zed" }
+http_client = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a" }
+reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a" }
 
-# gpui-component and Zed/GPUI evolve as one compatible Git dependency set.
-# Keep both declarations on their upstream default branches so routine
-# upgrades can resolve the complete set together; Cargo.lock records the
-# exact verified commits used by a checkout.
-#
-# Known upstream issue: the input's soft-wrap points come from
-# per-char isolated width estimates, which under-measure CJK fullwidth
-# punctuation under proportional fonts (rightmost glyph clips).  The composer
-# works around it by rendering with a bundled full-coverage CJK-mono font
-# (see src/chat/ and src/appearance/fonts.rs); a root fix exists on the local gpui-component
-# branch `fix/input-soft-wrap-shaped-width` should it ever be needed
-# (upstream PR material).
+# Bundled composer fonts remain reliable, cross-platform product defaults.
+# Soft wrapping is now measured through production shaping, so correctness no
+# longer depends on bundled font coverage; `examples/wrap_probe.rs` guards that
+# contract with real bundled and system fonts.
 #
 # Match gpui-component's story crate: chat content can contain any fenced
 # language, so the complete built-in grammar registry is required. The base
 # `tree-sitter` feature only includes JSON and silently leaves common Rust,
 # Python, JavaScript, and other fences unstyled.
-# The locked upstream revision must include ScrollableMask's capture-phase
+# The pinned gpui-component revision must include ScrollableMask's capture-phase
 # horizontal handling and edge-event consumption. Both properties are required
 # when a code viewport is nested in the vertically scrolling transcript.
-gpui-component = { git = "https://github.com/longbridge/gpui-component.git", features = [
+gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "bb07ed984181e9de21107200ba398afc68a5d4d3", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git" }
+gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "bb07ed984181e9de21107200ba398afc68a5d4d3" }
+
+# RaTeX publishes versioned crates on crates.io, so use a semver-compatible
+# requirement here; Cargo.lock records the exact verified release. The
+# `embed-fonts` feature makes formula images self-contained, so the desktop app
+# does not need Node.js, WebView, CSS, or a system KaTeX font installation.
+ratex-parser = "0.1.14"
+ratex-layout = "0.1.14"
+ratex-types = "0.1.14"
+ratex-svg = { version = "0.1.14", features = [
+    "embed-fonts",
+] }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/zed-industries/zed", features = ["test-support"] }
+gpui = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a", features = ["test-support"] }
 
 # Build tweaks copied from the gpui-component workspace to keep dev builds
 # usable; without these the dev binary is very slow.

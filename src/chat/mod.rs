@@ -1108,23 +1108,19 @@ impl ChatView {
                     // edge sits at `text_right + padding.right − 12px`, so the
                     // glyph→thumb gap works out to `padding.right − 2px`: the
                     // default 12px padding reads as a too-wide 10px gap, 8px
-                    // brings it to 6px.  Don't go much lower — the gap is only
-                    // guaranteed because the bundled fonts wrap with zero
-                    // estimate drift (see the font note below).  The card adds
-                    // no horizontal padding of its own around the input; the
-                    // toolbar row below carries its own inset.
+                    // brings it to 6px. Don't go much lower: this is the final
+                    // visual separation between the production-shaped line and
+                    // the thumb. The card adds no horizontal padding of its own
+                    // around the input; the toolbar row below carries its own
+                    // inset.
                     //
-                    // The bundled font is load-bearing, not cosmetic: upstream
-                    // gpui-component computes soft-wrap points from
-                    // per-char isolated measurements.  Under a proportional
-                    // system font, fullwidth punctuation (，。) measures ~0.5em
-                    // alone but paints at 1em inside a CJK run, so wrapped lines
-                    // overflow and the rightmost glyph clips.  Both bundled
-                    // choices avoid that: Maple Mono CN covers Latin + CJK +
-                    // fullwidth forms itself (no fallback at all), and JetBrains
-                    // Mono carries no fullwidth glyphs whatsoever, so both
-                    // measurement paths fall back identically.  Verify with
-                    // `cargo run --example wrap_probe`.
+                    // Bundled fonts remain the product defaults for consistent
+                    // cross-platform appearance, but are no longer a wrapping
+                    // workaround. gpui-component derives soft-wrap points from
+                    // production-shaped widths, including system fallback and
+                    // fullwidth punctuation. `cargo run --example wrap_probe`
+                    // compares the legacy estimator with production shaping on
+                    // real fonts; production lines must remain overflow-free.
                     .child(
                         Input::new(&self.input)
                             .appearance(false)
@@ -1338,11 +1334,13 @@ fn render_message(
             .into_any_element()
     };
 
-    h_flex()
-        .w_full()
-        .justify_center()
-        .px_6()
-        .child(div().w_full().max_w(CONTENT_MAX_WIDTH).child(inner))
+    h_flex().w_full().justify_center().px_6().child(
+        div()
+            .debug_selector(move || format!("assistant-message-content-{message_index}"))
+            .w_full()
+            .max_w(CONTENT_MAX_WIDTH)
+            .child(inner),
+    )
 }
 
 /// Greeting shown before the first turn.  Takes the composer's *resting*

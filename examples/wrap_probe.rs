@@ -1,11 +1,27 @@
-//! Empirical probe: compare LineWrapper's wrap boundaries (what the input's
-//! display map uses to decide soft-wrap points) against the width shape_line
-//! actually paints for each wrapped segment.  Run: cargo run --example wrap_probe
+//! Real-font soft-wrap regression probe.
+//!
+//! The legacy phase intentionally contrasts GPUI's isolated-character width
+//! estimator with the width eventually painted by shaping. The production
+//! phase follows gpui-component's input path: `shape_text` chooses boundaries,
+//! public shaped-run/glyph APIs map them to UTF-8 offsets, and each visual line
+//! is shaped again exactly as it is painted.
+//!
+//! Run with `cargo run --example wrap_probe`.
+
+use std::ops::Range;
 
 use gpui::{
     AppContext as _, Context, IntoElement, LineFragment, Pixels, Render, TextRun, Window,
     WindowOptions, black, div, font, px,
 };
+
+const WRAP_WIDTH_EPSILON: Pixels = px(0.01);
+
+const SAMPLES: &[&str] = &[
+    "这是一段比较长的中文内容用来验证软换行的断行位置估算是否与实际绘制宽度一致再补充一些文字",
+    "而应该是这样的，建议你在输入框里粘贴一大段中文，然后观察最右侧的字符是否被遮挡了一半。",
+    "中文与English混排的情况test一下wrap行为123，看看结果如何。",
+];
 
 struct Probe;
 
@@ -16,10 +32,7 @@ impl Render for Probe {
 }
 
 fn main() {
-    let app = gpui_platform::application();
-    app.run(move |cx| {
-        // Register the bundled fonts the same way the app does, so the probe
-        // measures exactly what the composer renders.
+    gpui_platform::application().run(move |cx| {
         cx.text_system()
             .add_fonts(vec![
                 std::borrow::Cow::Borrowed(
@@ -29,168 +42,92 @@ fn main() {
                     include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice(),
                 ),
             ])
-            .expect("register bundled fonts");
+            .expect("register bundled probe fonts");
 
         cx.open_window(WindowOptions::default(), |window, cx| {
-            // First family: what the UI inherits by default (proportional —
-            // exhibits the estimator drift).  Then the theme mono font, then
-            // the two bundled fonts the composer actually uses (each must
-            // show zero phase-1 overflows for chat.rs to be safe).
-            let mono_family = if cfg!(target_os = "macos") {
+            let platform_mono = if cfg!(target_os = "macos") {
                 "Menlo"
             } else if cfg!(target_os = "windows") {
                 "Consolas"
             } else {
                 "DejaVu Sans Mono"
             };
-            for family in [
+            let families = [
                 ".SystemUIFont",
-                mono_family,
+                platform_mono,
                 "Maple Mono CN",
                 "JetBrains Mono",
-            ] {
-                println!("######## font = {family} ########");
-                let ui_font = font(family);
-                let app_ts = cx.text_system().clone();
-                let font_id = app_ts.resolve_font(&ui_font);
-
-                // Direct advance-width check: is the family metrically mono
-                // (Latin half-width, CJK/fullwidth-punct exactly double)?
-                let wa = app_ts.layout_width(font_id, px(16.), 'a');
-                let wz = app_ts.layout_width(font_id, px(16.), '中');
-                let wp = app_ts.layout_width(font_id, px(16.), '，');
-                println!("metrics@16px a={wa:?} 中={wz:?} ，={wp:?}");
-
-            let samples: &[&str] = &[
-                // Pure CJK prose
-                "这是一段比较长的中文内容用来验证软换行的断行位置估算是否与实际绘制宽度一致再补充一些文字",
-                // CJK with fullwidth punctuation, similar to chat prose
-                "而应该是这样的，建议你在输入框里粘贴一大段中文，然后观察最右侧的字符是否被遮挡了一半。",
-                // Mixed CJK + ASCII
-                "中文与English混排的情况test一下wrap行为123，看看结果如何。",
             ];
+            let mut legacy_overflows = 0;
+            let mut production_overflows = 0;
 
-            for &size in &[px(14.), px(16.)] {
-                for &wrap_width in &[px(200.), px(300.), px(420.)] {
-                    for (si, text) in samples.iter().enumerate() {
-                        let mut wrapper = app_ts.line_wrapper(ui_font.clone(), size);
-                        let mut ranges: Vec<(usize, usize)> = Vec::new();
-                        let mut prev = 0usize;
-                        for b in wrapper.wrap_line(&[LineFragment::text(text)], wrap_width) {
-                            ranges.push((prev, b.ix));
-                            prev = b.ix;
-                        }
-                        ranges.push((prev, text.len()));
-                        drop(wrapper);
+            for family in families {
+                let font = font(family);
+                let text_system = cx.text_system().clone();
+                let font_id = text_system.resolve_font(&font);
+                println!("######## font={family} ########");
+                println!(
+                    "metrics@16px a={:?} 中={:?} ，={:?}",
+                    text_system.layout_width(font_id, px(16.), 'a'),
+                    text_system.layout_width(font_id, px(16.), '中'),
+                    text_system.layout_width(font_id, px(16.), '，'),
+                );
 
-                        for (i, (s, e)) in ranges.iter().enumerate() {
-                            let seg = &text[*s..*e];
-                            // Estimate the way LineWrapper accumulates widths.
-                            let est: Pixels = seg
-                                .chars()
-                                .map(|c| app_ts.layout_width(font_id, size, c))
-                                .fold(px(0.), |a, w| a + w);
-                            let shaped = window.text_system().shape_line(
-                                seg.to_string().into(),
+                for size in [px(14.), px(16.)] {
+                    for wrap_width in [px(200.), px(300.), px(420.)] {
+                        for (sample_ix, text) in SAMPLES.iter().copied().enumerate() {
+                            let report = ProbeReport {
+                                family,
+                                sample_ix,
+                                text,
+                                wrap_width,
+                                font: font.clone(),
+                                font_size: size,
+                            };
+                            let legacy_ranges = legacy_ranges(
+                                text,
+                                wrap_width,
+                                font.clone(),
                                 size,
-                                &[TextRun {
-                                    len: seg.len(),
-                                    font: ui_font.clone(),
-                                    color: black(),
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                }],
-                                None,
+                                &text_system,
                             );
-                            let over = shaped.width - wrap_width;
-                            println!(
-                                "size={:>4} wrap={:>5} sample={} seg={} est={:>8.2?} shaped={:>8.2?} overflow={:>7.2?} {}",
-                                format!("{:?}", size),
-                                format!("{:?}", wrap_width),
-                                si,
-                                i,
-                                est,
-                                shaped.width,
-                                over,
-                                if shaped.width > wrap_width { "<-- OVERFLOW" } else { "" },
+                            legacy_overflows += report_ranges(
+                                "legacy-estimator",
+                                &legacy_ranges,
+                                &report,
+                                window,
+                            );
+
+                            let Some(production_ranges) = shaped_ranges(
+                                text,
+                                wrap_width,
+                                font.clone(),
+                                size,
+                                window,
+                            ) else {
+                                production_overflows += 1;
+                                eprintln!(
+                                    "production boundary mapping failed: font={family} size={size:?} wrap={wrap_width:?} sample={sample_ix}"
+                                );
+                                continue;
+                            };
+                            production_overflows += report_ranges(
+                                "production-shaped",
+                                &production_ranges,
+                                &report,
+                                window,
                             );
                         }
                     }
                 }
             }
 
-            // Phase 2: the FIXED pipeline (as patched gpui-component now works) —
-            // boundaries from shape_text's shaped glyph positions, then each
-            // segment re-shaped standalone exactly the way element.rs paints it.
-            println!("==== fixed pipeline (shape_text boundaries) ====");
-            let mut bad = 0usize;
-            for &size in &[px(14.), px(16.)] {
-                for &wrap_width in &[px(200.), px(300.), px(420.)] {
-                    for (si, text) in samples.iter().enumerate() {
-                        let run = TextRun {
-                            len: text.len(),
-                            font: ui_font.clone(),
-                            color: black(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let wrapped = window
-                            .text_system()
-                            .shape_text(
-                                (*text).to_string().into(),
-                                size,
-                                &[run],
-                                Some(wrap_width),
-                                None,
-                            )
-                            .expect("shape_text");
-                        let line = wrapped.first().expect("one line");
-                        let mut ranges: Vec<(usize, usize)> = Vec::new();
-                        let mut prev = 0usize;
-                        for b in line.wrap_boundaries.iter() {
-                            let ix = line.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix].index;
-                            ranges.push((prev, ix));
-                            prev = ix;
-                        }
-                        ranges.push((prev, text.len()));
-
-                        for (i, (s, e)) in ranges.iter().enumerate() {
-                            let seg = &text[*s..*e];
-                            let shaped = window.text_system().shape_line(
-                                seg.to_string().into(),
-                                size,
-                                &[TextRun {
-                                    len: seg.len(),
-                                    font: ui_font.clone(),
-                                    color: black(),
-                                    background_color: None,
-                                    underline: None,
-                                    strikethrough: None,
-                                }],
-                                None,
-                            );
-                            let over = shaped.width - wrap_width;
-                            if shaped.width > wrap_width {
-                                bad += 1;
-                            }
-                            println!(
-                                "size={:>4} wrap={:>5} sample={} seg={} shaped={:>8.2?} overflow={:>7.2?} {}",
-                                format!("{:?}", size),
-                                format!("{:?}", wrap_width),
-                                si,
-                                i,
-                                shaped.width,
-                                over,
-                                if shaped.width > wrap_width { "<-- OVERFLOW" } else { "" },
-                            );
-                        }
-                    }
-                }
-            }
-            println!("==== fixed pipeline overflow count: {} ====", bad);
-            }
+            println!("legacy estimator visual overflow count: {legacy_overflows}");
+            println!("production shaped visual overflow count: {production_overflows}");
+            assert_eq!(
+                production_overflows, 0,
+                "production soft-wrap lines must stay within width + {WRAP_WIDTH_EPSILON:?}"
+            );
 
             std::process::exit(0);
             #[allow(unreachable_code)]
@@ -198,4 +135,122 @@ fn main() {
         })
         .expect("open probe window");
     });
+}
+
+fn legacy_ranges(
+    text: &str,
+    wrap_width: Pixels,
+    font: gpui::Font,
+    font_size: Pixels,
+    text_system: &std::sync::Arc<gpui::TextSystem>,
+) -> Vec<Range<usize>> {
+    let mut wrapper = text_system.line_wrapper(font, font_size);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for boundary in wrapper.wrap_line(&[LineFragment::text(text)], wrap_width) {
+        if start < boundary.ix {
+            ranges.push(start..boundary.ix);
+        }
+        start = boundary.ix;
+    }
+    if start < text.len() {
+        ranges.push(start..text.len());
+    }
+    ranges
+}
+
+fn shaped_ranges(
+    text: &str,
+    wrap_width: Pixels,
+    font: gpui::Font,
+    font_size: Pixels,
+    window: &mut Window,
+) -> Option<Vec<Range<usize>>> {
+    let run = text_run(text.len(), font);
+    let lines = window
+        .text_system()
+        .shape_text(
+            text.to_string().into(),
+            font_size,
+            &[run],
+            Some(wrap_width),
+            None,
+        )
+        .ok()?;
+    let line = lines.first()?;
+    let mut ranges = Vec::with_capacity(line.wrap_boundaries().len() + 1);
+    let mut start = 0;
+    for boundary in line.wrap_boundaries() {
+        let end = line
+            .runs()
+            .get(boundary.run_ix)?
+            .glyphs
+            .get(boundary.glyph_ix)?
+            .index;
+        if end <= start || end > text.len() || !text.is_char_boundary(end) {
+            return None;
+        }
+        ranges.push(start..end);
+        start = end;
+    }
+    if start < text.len() {
+        ranges.push(start..text.len());
+    }
+    Some(ranges)
+}
+
+struct ProbeReport<'a> {
+    family: &'a str,
+    sample_ix: usize,
+    text: &'a str,
+    wrap_width: Pixels,
+    font: gpui::Font,
+    font_size: Pixels,
+}
+
+fn report_ranges(
+    phase: &str,
+    ranges: &[Range<usize>],
+    report: &ProbeReport<'_>,
+    window: &mut Window,
+) -> usize {
+    let mut overflows = 0;
+    for (line_ix, range) in ranges.iter().enumerate() {
+        let segment = &report.text[range.clone()];
+        let shaped = window.text_system().shape_line(
+            segment.to_string().into(),
+            report.font_size,
+            &[text_run(segment.len(), report.font.clone())],
+            None,
+        );
+        let overflow = shaped.width() - report.wrap_width;
+        let visual_overflow = shaped.width() > report.wrap_width + WRAP_WIDTH_EPSILON;
+        overflows += usize::from(visual_overflow);
+        let ProbeReport {
+            family,
+            sample_ix,
+            wrap_width,
+            font_size,
+            ..
+        } = report;
+        println!(
+            "phase={phase} font={family} size={font_size:?} wrap={wrap_width:?} sample={sample_ix} line={line_ix} shaped={:?} overflow={overflow:?}{}",
+            shaped.width(),
+            if visual_overflow {
+                " <-- VISUAL OVERFLOW"
+            } else {
+                ""
+            },
+        );
+    }
+    overflows
+}
+
+fn text_run(len: usize, font: gpui::Font) -> TextRun {
+    TextRun {
+        len,
+        font,
+        color: black(),
+        ..Default::default()
+    }
 }

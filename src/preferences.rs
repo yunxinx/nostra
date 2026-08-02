@@ -177,12 +177,11 @@ impl WindowGeometry {
     }
 }
 
-/// Fonts the composer can render with.  The default bundles Latin + CJK +
-/// fullwidth punctuation in one file, which keeps the input's soft-wrap
-/// estimates exact on every platform (see `chat`).  The JetBrains option
-/// bundles only Latin and lets CJK fall back to the platform font (PingFang
-/// on macOS) — same drift-safety mechanism, since the primary font carries
-/// no fullwidth glyphs at all.
+/// Fonts currently offered for the composer. The bundled primary faces provide
+/// reliable cross-platform defaults: Maple Mono CN covers Latin, CJK, and
+/// fullwidth punctuation, while JetBrains Mono lets CJK fall back to the
+/// platform font. Production shaping determines soft-wrap boundaries for both
+/// choices, so font coverage is no longer a wrapping-correctness requirement.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ComposerFont {

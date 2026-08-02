@@ -10,3 +10,8 @@ Bundled theme files under assets/themes/ (except nostra.json) are copied from
 the gpui-component project (https://github.com/longbridge/gpui-component),
 licensed under the Apache License, Version 2.0.
 
+RaTeX (https://github.com/erweixin/RaTeX) is used under the MIT License; the
+license text is included in `licenses/RaTeX-MIT.txt`.
+The embedded KaTeX font files distributed by RaTeX are licensed under the SIL
+Open Font License, Version 1.1. The applicable notices and license text are
+included in `licenses/KaTeX-fonts-NOTICE.txt` and `licenses/SIL-OFL-1.1.txt`.

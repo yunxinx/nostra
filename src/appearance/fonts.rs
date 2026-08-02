@@ -1,8 +1,9 @@
-//! Bundled composer fonts: registration with gpui and the active-font global.
+//! Composer font registration and the active-font global.
 //!
-//! Both fonts are embedded via `assets` and registered into the text
-//! system at startup, so `font_family("Sarasa Mono SC")` (etc.) resolves to
-//! the bundled file on every platform — no system-font variation involved.
+//! Both primary faces are embedded via `assets` and registered into the text
+//! system at startup, providing stable cross-platform defaults. JetBrains Mono
+//! intentionally permits system CJK fallback; production shaping accounts for
+//! fallback glyphs when choosing soft-wrap boundaries.
 
 use gpui::{App, Global};
 
