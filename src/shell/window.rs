@@ -16,7 +16,7 @@ use rust_i18n::t;
 
 use crate::appearance::glass;
 use crate::preferences::{Preferences, WindowGeometry};
-use crate::shell::actions::{NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
+use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
 
 /// Weak handle used by application-level commands to reach the main view
@@ -29,6 +29,11 @@ impl Global for MainView {}
 /// Route New Chat to the main window.
 pub fn new_chat(cx: &mut App) {
     update_main(cx, |app, window, cx| app.new_chat(window, cx));
+}
+
+/// Route Delete Chat to the main window.
+pub fn delete_chat(cx: &mut App) {
+    update_main(cx, |app, window, cx| app.request_delete_active(window, cx));
 }
 
 /// Route Toggle Sidebar to the main window.
@@ -135,7 +140,10 @@ pub fn install_menus(_cx: &mut App) {
             },
             Menu {
                 name: t!("menu.file").to_string().into(),
-                items: vec![MenuItem::action(t!("menu.new_chat").to_string(), NewChat)],
+                items: vec![
+                    MenuItem::action(t!("menu.new_chat").to_string(), NewChat),
+                    MenuItem::action(t!("menu.delete_chat").to_string(), DeleteChat),
+                ],
                 disabled: false,
             },
             Menu {

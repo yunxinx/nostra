@@ -11,9 +11,10 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
-    TITLE_BAR_HEIGHT,
+    TITLE_BAR_HEIGHT, WindowExt as _,
     animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
+    dialog::DialogButtonProps,
     h_flex,
     menu::DropdownMenu as _,
     sidebar::SidebarToggleButton,
@@ -78,6 +79,7 @@ struct Conversation {
     view: Entity<ChatView>,
     title: SharedString,
     selection: Option<ModelSelection>,
+    _subscription: Subscription,
 }
 
 impl ChatApp {
@@ -203,8 +205,8 @@ impl ChatApp {
             view,
             title,
             selection,
+            _subscription: sub,
         });
-        self._subscriptions.push(sub);
         self.active = self.conversations.len() - 1;
         self.sync_model_picker_to_active(window, cx);
         cx.notify();
@@ -251,6 +253,76 @@ impl ChatApp {
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.spawn_conversation(window, cx);
+    }
+
+    pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conversation) = self.conversations.get(self.active) else {
+            return;
+        };
+        let target = conversation.view.entity_id();
+        self.request_delete_conversation(target, conversation.title.clone(), window, cx);
+    }
+
+    fn request_delete_conversation(
+        &self,
+        target: gpui::EntityId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let app = cx.weak_entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let app = app.clone();
+            alert
+                .confirm()
+                .title(t!("sidebar.delete_chat_title").to_string())
+                .description(
+                    t!("sidebar.delete_chat_description", title = title.as_ref()).to_string(),
+                )
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t!("sidebar.delete_chat_confirm").to_string())
+                        .ok_variant(gpui_component::button::ButtonVariant::Danger)
+                        .cancel_text(t!("sidebar.delete_chat_cancel").to_string())
+                        .show_cancel(true),
+                )
+                .on_ok(move |_, window, cx| {
+                    app.update(cx, |this, cx| {
+                        this.delete_conversation(target, window, cx);
+                    })
+                    .is_ok()
+                })
+        });
+    }
+
+    fn delete_conversation(
+        &mut self,
+        target: gpui::EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .conversations
+            .iter()
+            .position(|conversation| conversation.view.entity_id() == target)
+        else {
+            return;
+        };
+
+        self.conversations.remove(index);
+        if self.conversations.is_empty() {
+            self.active = 0;
+            self.spawn_conversation(window, cx);
+            return;
+        }
+
+        if index < self.active {
+            self.active -= 1;
+        } else if index == self.active {
+            self.active = index.min(self.conversations.len() - 1);
+        }
+        self.sync_model_picker_to_active(window, cx);
+        cx.notify();
     }
 
     /// Vertical drag hit-area at the sidebar's right edge.  Uses gpui's
@@ -329,6 +401,7 @@ impl ChatApp {
             .enumerate()
             .map(|(i, conversation)| {
                 let title = conversation.title.clone();
+                let target = conversation.view.entity_id();
                 let is_active = i == active;
                 let id = ElementId::NamedInteger("conv".into(), i as u64);
                 let focus_handle = window
@@ -337,17 +410,11 @@ impl ChatApp {
                     .clone();
                 let focus_ring = cx.theme().ring.opacity(0.2);
 
-                div()
+                h_flex()
                     .id(id)
-                    .role(Role::Button)
-                    .aria_label(title.clone())
-                    .aria_selected(is_active)
-                    .track_focus(&focus_handle.tab_stop(true))
-                    .focus_visible(|this| this.border_1().border_color(focus_ring))
                     .flex_shrink_0()
                     .h(px(32.))
                     .px_2()
-                    .flex()
                     .items_center()
                     .rounded(cx.theme().radius)
                     .text_sm()
@@ -363,13 +430,42 @@ impl ChatApp {
                         this.bg(cx.theme().sidebar_accent)
                             .text_color(cx.theme().sidebar_accent_foreground)
                     })
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        if ui::consume_button_key(event, window, cx) {
-                            this.select(i, window, cx);
-                        }
-                    }))
-                    .on_click(cx.listener(move |this, _, window, cx| this.select(i, window, cx)))
-                    .child(div().overflow_hidden().text_ellipsis().child(title))
+                    .child(
+                        div()
+                            .id(("select-conversation", i))
+                            .role(Role::Button)
+                            .aria_label(title.clone())
+                            .aria_selected(is_active)
+                            .track_focus(&focus_handle.tab_stop(true))
+                            .focus_visible(|this| this.border_1().border_color(focus_ring))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .cursor_default()
+                            .on_key_down(cx.listener(
+                                move |this, event: &KeyDownEvent, window, cx| {
+                                    if ui::consume_button_key(event, window, cx) {
+                                        this.select(i, window, cx);
+                                    }
+                                },
+                            ))
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| this.select(i, window, cx)),
+                            )
+                            .child(div().overflow_hidden().text_ellipsis().child(title.clone())),
+                    )
+                    .child(
+                        Button::new(("delete-conversation", i))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip(t!("sidebar.delete_chat").to_string())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.request_delete_conversation(target, title.clone(), window, cx);
+                            })),
+                    )
             })
             .collect::<Vec<_>>();
 
@@ -675,3 +771,204 @@ impl Render for ChatApp {
 /// handler that this drag is ours.
 #[derive(Clone)]
 struct SidebarResize;
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::Cell, rc::Rc};
+
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    fn add_app_window(cx: &mut TestAppContext) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
+        let prefs = Preferences::default();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::appearance::fonts::init(prefs.composer_font, cx);
+            crate::preferences::init_global(prefs.clone(), cx);
+        });
+        let (root, cx) = cx.add_window_view(move |window, cx| {
+            let app = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+            Root::new(app, window, cx)
+        });
+        let app = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<ChatApp>()
+                .expect("Root must contain the ChatApp")
+        });
+        (app, cx)
+    }
+
+    #[gpui::test]
+    fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAppContext) {
+        let (app, cx) = add_app_window(cx);
+
+        let first_removed = cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                for _ in 1..20 {
+                    this.spawn_conversation(window, cx);
+                }
+                assert_eq!(this.conversations.len(), 20);
+
+                let mut removed = Vec::new();
+                while this.conversations.len() > 1 {
+                    let view = this.conversations[0].view.downgrade();
+                    let target = this.conversations[0].view.entity_id();
+                    removed.push(view);
+                    this.delete_conversation(target, window, cx);
+                }
+                assert_eq!(this.conversations.len(), 1);
+                assert_eq!(this.active, 0);
+                assert_eq!(
+                    this.conversations
+                        .iter()
+                        .filter(|conversation| {
+                            let _ = &conversation._subscription;
+                            true
+                        })
+                        .count(),
+                    1
+                );
+                removed
+            })
+        });
+        cx.run_until_parked();
+        assert!(first_removed.iter().all(|view| view.upgrade().is_none()));
+
+        let second_removed = cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                for _ in 1..20 {
+                    this.spawn_conversation(window, cx);
+                }
+                let mut removed = Vec::new();
+                while this.conversations.len() > 1 {
+                    let view = this.conversations[0].view.downgrade();
+                    let target = this.conversations[0].view.entity_id();
+                    removed.push(view);
+                    this.delete_conversation(target, window, cx);
+                }
+                assert_eq!(this.conversations.len(), 1);
+                assert_eq!(this.active, 0);
+                removed
+            })
+        });
+        cx.run_until_parked();
+        assert!(second_removed.iter().all(|view| view.upgrade().is_none()));
+    }
+
+    #[gpui::test]
+    fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestAppContext) {
+        let (app, cx) = add_app_window(cx);
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.spawn_conversation(window, cx);
+                this.spawn_conversation(window, cx);
+                this.active = 1;
+                let next = this.conversations[2].view.entity_id();
+                let middle = this.conversations[1].view.entity_id();
+                this.delete_conversation(middle, window, cx);
+                assert_eq!(this.active, 1);
+                assert_eq!(this.conversations[this.active].view.entity_id(), next);
+
+                let before = this.conversations[this.active].view.entity_id();
+                let non_active = this.conversations[0].view.entity_id();
+                this.delete_conversation(non_active, window, cx);
+                assert_eq!(this.active, 0);
+                assert_eq!(this.conversations[0].view.entity_id(), before);
+
+                let only = this.conversations[0].view.downgrade();
+                let only_id = this.conversations[0].view.entity_id();
+                this.delete_conversation(only_id, window, cx);
+                assert_eq!(this.conversations.len(), 1);
+                assert_ne!(this.conversations[0].view.entity_id(), only_id);
+                drop(only);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
+        cx: &mut TestAppContext,
+    ) {
+        let (app, cx) = add_app_window(cx);
+        let dropped = Rc::new(Cell::new(false));
+        let (target, weak) = cx.update(|_, cx| {
+            app.update(cx, |this, cx| {
+                let conversation = &this.conversations[0];
+                conversation.view.update(cx, |chat, cx| {
+                    chat.start_pending_reply_for_test(dropped.clone(), cx)
+                });
+                (conversation.view.entity_id(), conversation.view.downgrade())
+            })
+        });
+        cx.run_until_parked();
+        assert!(!dropped.get());
+
+        cx.update(|window, cx| {
+            app.update(cx, |this, cx| this.delete_conversation(target, window, cx));
+        });
+        cx.run_until_parked();
+
+        assert!(dropped.get());
+        assert!(weak.upgrade().is_none());
+        assert_eq!(app.read_with(cx, |this, _| this.conversations.len()), 1);
+    }
+
+    #[gpui::test]
+    fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAppContext) {
+        let (app, cx) = add_app_window(cx);
+        let (target, selected) = cx.update(|window, cx| {
+            app.update(cx, |this, cx| {
+                this.spawn_conversation(window, cx);
+                this.spawn_conversation(window, cx);
+                this.active = 0;
+                let target = this.conversations[0].view.entity_id();
+                let title = this.conversations[0].title.clone();
+                let selected = this.conversations[2].view.entity_id();
+                this.request_delete_conversation(target, title, window, cx);
+                this.select(2, window, cx);
+                (target, selected)
+            })
+        });
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.dispatch_action(gpui_component::dialog::ConfirmDialog);
+        cx.run_until_parked();
+
+        app.read_with(cx, |this, _| {
+            assert_eq!(this.conversations.len(), 2);
+            assert!(
+                this.conversations
+                    .iter()
+                    .all(|conversation| conversation.view.entity_id() != target)
+            );
+            assert_eq!(this.conversations[this.active].view.entity_id(), selected);
+        });
+    }
+
+    #[test]
+    fn delete_chat_labels_resolve_in_every_locale() {
+        for locale in ["en", "zh-CN"] {
+            for key in [
+                "sidebar.delete_chat",
+                "sidebar.delete_chat_title",
+                "sidebar.delete_chat_confirm",
+                "sidebar.delete_chat_cancel",
+                "menu.delete_chat",
+            ] {
+                assert_ne!(t!(key, locale = locale).to_string(), key);
+            }
+            assert!(
+                t!(
+                    "sidebar.delete_chat_description",
+                    locale = locale,
+                    title = "fixture"
+                )
+                .contains("fixture")
+            );
+        }
+    }
+}

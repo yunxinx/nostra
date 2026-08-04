@@ -38,7 +38,9 @@ use reqwest_client::ReqwestClient;
 
 use crate::appearance::{fonts, glass, theme};
 use crate::assets::NostraAssets;
-use crate::shell::actions::{self, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
+use crate::shell::actions::{
+    self, DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme,
+};
 use crate::shell::window;
 
 /// Entry point used by `main.rs`.
@@ -89,5 +91,6 @@ fn install_action_handlers(cx: &mut App) {
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| settings::open(cx));
     cx.on_action(|_: &NewChat, cx: &mut App| window::new_chat(cx));
+    cx.on_action(|_: &DeleteChat, cx: &mut App| window::delete_chat(cx));
     cx.on_action(|_: &ToggleSidebar, cx: &mut App| window::toggle_sidebar(cx));
 }

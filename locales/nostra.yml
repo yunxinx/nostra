@@ -9,6 +9,21 @@ sidebar:
   search:
     en: Search chats
     zh-CN: 搜索聊天
+  delete_chat:
+    en: Delete chat
+    zh-CN: 删除聊天
+  delete_chat_title:
+    en: Delete this chat?
+    zh-CN: 删除这个聊天？
+  delete_chat_description:
+    en: '"%{title}" and its messages will be permanently removed.'
+    zh-CN: '“%{title}”及其中的消息将被永久删除。'
+  delete_chat_confirm:
+    en: Delete
+    zh-CN: 删除
+  delete_chat_cancel:
+    en: Cancel
+    zh-CN: 取消
 account:
   settings:
     en: Settings…
@@ -135,6 +150,9 @@ menu:
   new_chat:
     en: New Chat
     zh-CN: 新建聊天
+  delete_chat:
+    en: Delete Chat
+    zh-CN: 删除聊天
   toggle_sidebar:
     en: Toggle Sidebar
     zh-CN: 切换侧边栏

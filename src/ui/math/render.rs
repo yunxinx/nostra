@@ -98,6 +98,9 @@ pub(crate) struct FormulaCacheSnapshot {
     pub(crate) color: Hsla,
     pub(crate) generation: u64,
     pub(crate) ready: bool,
+    pub(crate) active: bool,
+    pub(crate) release_count: usize,
+    pub(crate) image_drop_count: usize,
 }
 
 #[cfg(test)]
@@ -114,19 +117,49 @@ fn record_formula_cache(
     generation: u64,
     status: &FormulaStatus,
 ) {
-    formula_cache_probes()
+    let mut probes = formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = probes.get(&(owner_id, start));
+    let release_count = previous.map_or(0, |snapshot| snapshot.release_count);
+    let image_drop_count = previous.map_or(0, |snapshot| snapshot.image_drop_count);
+    probes.insert(
+        (owner_id, start),
+        FormulaCacheSnapshot {
+            source: fingerprint.source.clone(),
+            inline: fingerprint.inline,
+            color: fingerprint.color,
+            generation,
+            ready: matches!(status, FormulaStatus::Ready),
+            active: true,
+            release_count,
+            image_drop_count,
+        },
+    );
+}
+
+#[cfg(test)]
+fn record_formula_release(owner_id: u64, start: usize, dropped_image: bool) {
+    if let Some(snapshot) = formula_cache_probes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            (owner_id, start),
-            FormulaCacheSnapshot {
-                source: fingerprint.source.clone(),
-                inline: fingerprint.inline,
-                color: fingerprint.color,
-                generation,
-                ready: matches!(status, FormulaStatus::Ready),
-            },
-        );
+        .get_mut(&(owner_id, start))
+    {
+        snapshot.active = false;
+        snapshot.release_count += 1;
+        snapshot.image_drop_count += usize::from(dropped_image);
+    }
+}
+
+#[cfg(test)]
+fn record_formula_image_drop(owner_id: u64, start: usize) {
+    if let Some(snapshot) = formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_mut(&(owner_id, start))
+    {
+        snapshot.image_drop_count += 1;
+    }
 }
 
 #[cfg(test)]
@@ -205,8 +238,11 @@ pub(super) fn cached_formula(
             .observe_release(
                 &cache_cx.entity(),
                 cache_cx,
-                |cache: &mut FormulaCache, window, cx| {
-                    if let Some(image) = cache.take_image() {
+                move |cache: &mut FormulaCache, window, cx| {
+                    let image = cache.take_image();
+                    #[cfg(test)]
+                    record_formula_release(probe_key.0, probe_key.1, image.is_some());
+                    if let Some(image) = image {
                         cx.drop_image(image, Some(window));
                     }
                 },
@@ -292,9 +328,13 @@ pub(super) fn cached_formula(
                     cache_cx.notify();
                 });
                 if let Some(image) = discarded_image.take() {
+                    #[cfg(test)]
+                    record_formula_image_drop(probe_key.0, probe_key.1);
                     cx.drop_image(image, Some(window));
                 }
                 if let Some(image) = replaced_image.take() {
+                    #[cfg(test)]
+                    record_formula_image_drop(probe_key.0, probe_key.1);
                     cx.drop_image(image, Some(window));
                 }
             });

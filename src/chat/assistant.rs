@@ -448,6 +448,27 @@ impl ReplyTask {
     pub fn cancel(&self) {
         self.abort.abort();
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test(
+        dropped: Rc<std::cell::Cell<bool>>,
+        cx: &mut Context<ChatView>,
+    ) -> Self {
+        struct DropFlag(Rc<std::cell::Cell<bool>>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+
+        let (abort, _registration) = AbortHandle::new_pair();
+        let task = cx.spawn(async move |_, _| {
+            let _drop_flag = DropFlag(dropped);
+            std::future::pending::<()>().await;
+        });
+        Self { _task: task, abort }
+    }
 }
 
 pub fn stream_reply(

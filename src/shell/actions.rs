@@ -7,7 +7,14 @@ use gpui::{App, KeyBinding, actions};
 
 actions!(
     nostra,
-    [NewChat, Quit, ToggleSidebar, ToggleTheme, OpenSettings]
+    [
+        NewChat,
+        DeleteChat,
+        Quit,
+        ToggleSidebar,
+        ToggleTheme,
+        OpenSettings
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
@@ -16,6 +23,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-n", NewChat, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-n", NewChat, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-backspace", DeleteChat, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-backspace", DeleteChat, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         #[cfg(not(target_os = "macos"))]

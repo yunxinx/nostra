@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, ScrollHandle,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
-    Window, div, point, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FollowMode,
+    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, Pixels,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription, Window, div,
+    list, point, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
@@ -43,9 +43,8 @@ use self::reasoning_card::ReasoningTrace;
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 
-/// While streaming, the view re-pins to the bottom only when it is already
-/// within this distance of the end — used both as the pin guard and as the
-/// "scrolled back down" re-arm threshold for [`ChatView::follow`].
+const MESSAGE_LIST_OVERDRAW: Pixels = px(1_000.);
+const MESSAGE_HEIGHT_HINT: Pixels = px(160.);
 const STICK_THRESHOLD: Pixels = px(48.);
 
 /// First-frame fallback until the floating composer reports its actual height.
@@ -56,25 +55,18 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 /// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
-/// Whether a scrollable view is close enough to its end to keep following new
-/// content. GPUI stores vertical scroll offsets as negative values: zero is
-/// the top and `-max_offset.y` is the bottom.
 fn scroll_is_near_bottom(scroll_handle: &ScrollHandle) -> bool {
     let offset = scroll_handle.offset().y;
     let max = scroll_handle.max_offset().y;
     max + offset <= STICK_THRESHOLD
 }
 
-/// Keep a stream pinned only while the user has left its viewport at the end.
 fn follow_scroll(scroll_handle: &ScrollHandle, follow: bool) {
     if follow && scroll_is_near_bottom(scroll_handle) {
         scroll_handle.scroll_to_bottom();
     }
 }
 
-/// Apply the same wheel-intent rules to the transcript and to an expanded
-/// reasoning card. A small upward gesture disarms following immediately;
-/// scrolling back to the end re-arms it.
 fn update_scroll_follow(
     follow: &mut bool,
     scroll_handle: &ScrollHandle,
@@ -90,6 +82,7 @@ fn update_scroll_follow(
 }
 
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MESSAGE_UI_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +125,7 @@ pub enum MessagePart {
 }
 
 pub struct Message {
+    ui_id: u64,
     pub role: Role,
     pub parts: Vec<MessagePart>,
     pub provider_metadata: ProviderMetadata,
@@ -145,6 +139,7 @@ pub struct Message {
 impl Message {
     fn empty(role: Role) -> Self {
         Self {
+            ui_id: NEXT_MESSAGE_UI_ID.fetch_add(1, Ordering::Relaxed),
             role,
             parts: Vec::new(),
             provider_metadata: ProviderMetadata::default(),
@@ -164,6 +159,7 @@ impl Message {
             .map(|(index, block)| MessagePart::from_canonical(index, block, cx))
             .collect();
         Self {
+            ui_id: NEXT_MESSAGE_UI_ID.fetch_add(1, Ordering::Relaxed),
             role,
             parts,
             provider_metadata: message.provider_metadata,
@@ -394,13 +390,7 @@ pub struct ChatView {
     /// Snapshot maintained by the input subscription. Rendering hooks must not
     /// read the external `InputState` entity while recording layout bounds.
     input_empty: bool,
-    scroll_handle: ScrollHandle,
-    /// Whether streaming updates may pin the view to the bottom.  A single
-    /// upward wheel tick clears it — distance alone isn't enough, because
-    /// during fast streaming the next token re-pins before the user can
-    /// scroll past [`STICK_THRESHOLD`].  Scrolling back near the bottom, or
-    /// sending a message, re-arms it.
-    follow: bool,
+    list_state: ListState,
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
@@ -409,6 +399,8 @@ pub struct ChatView {
     conversation_id: String,
     next_turn_id: u64,
     _subscriptions: Vec<Subscription>,
+    #[cfg(test)]
+    materialized_message_indices: std::collections::BTreeSet<usize>,
 }
 
 impl ChatView {
@@ -467,6 +459,9 @@ impl ChatView {
 
         let selection = providers::last_selection(cx);
         let selection_available = providers::selection_is_available(selection.as_ref(), cx);
+        let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
+            .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
+        list_state.set_follow_mode(FollowMode::Tail);
         Self {
             messages: Vec::new(),
             input,
@@ -474,8 +469,7 @@ impl ChatView {
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
             input_empty: true,
-            scroll_handle: ScrollHandle::new(),
-            follow: true,
+            list_state,
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
@@ -487,22 +481,27 @@ impl ChatView {
             ),
             next_turn_id: 1,
             _subscriptions: vec![subscription],
+            #[cfg(test)]
+            materialized_message_indices: std::collections::BTreeSet::new(),
         }
     }
 
     /// Force the newest message into view.  Used right after the user sends a
     /// message, where jumping to the bottom is always the desired behavior.
     pub fn scroll_to_bottom(&self) {
-        self.scroll_handle.scroll_to_bottom();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.list_state.scroll_to_end();
     }
 
     /// Called on every streaming update.  Keeps the latest tokens in view, but
     /// only while auto-follow is armed and the user is actually reading the
-    /// bottom of the transcript — an upward wheel tick disarms it (see
-    /// [`ChatView::follow`]), so scrolling up to re-read earlier turns is never
-    /// interrupted, no matter how small the scroll was.
+    /// bottom of the transcript, so scrolling up to re-read earlier turns is
+    /// never interrupted. GPUI's tail-follow state re-engages after the user
+    /// scrolls back to the true bottom.
     pub fn follow_stream(&self) {
-        follow_scroll(&self.scroll_handle, self.follow);
+        if self.list_state.is_following_tail() {
+            self.list_state.scroll_to_end();
+        }
     }
 
     /// Submit a non-empty message when no reply is already in flight.
@@ -518,6 +517,7 @@ impl ChatView {
             cx.emit(ChatEvent::TitleChanged(derive_title(&text)));
         }
 
+        let old_len = self.messages.len();
         self.messages.push(Message::from_canonical(
             LlmMessage {
                 role: crate::llm::Role::User,
@@ -531,6 +531,7 @@ impl ChatView {
         ));
 
         self.messages.push(Message::empty(Role::Assistant));
+        self.list_state.splice(old_len..old_len, 2);
 
         self.pending = true;
         let history = self
@@ -549,7 +550,6 @@ impl ChatView {
             turn_id,
             cx,
         ));
-        self.follow = true;
         self.scroll_to_bottom();
         cx.notify();
         true
@@ -579,6 +579,7 @@ impl ChatView {
         }
         self.pending = false;
         self.reply_task = None;
+        self.remeasure_latest_message();
         cx.notify();
     }
 
@@ -868,6 +869,7 @@ impl ChatView {
     }
 
     pub fn finish_stream_batch(&mut self, cx: &mut Context<Self>) {
+        self.remeasure_latest_message();
         self.follow_stream();
         cx.notify();
     }
@@ -879,6 +881,16 @@ impl ChatView {
         if let Some(reply) = &self.reply_task {
             reply.cancel();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_pending_reply_for_test(
+        &mut self,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending = true;
+        self.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
     }
 
     pub fn select_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
@@ -1008,20 +1020,28 @@ impl ChatView {
     }
 
     fn render_message_list(
-        &self,
+        &mut self,
         composer_height: Pixels,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // Rendered up front rather than inside `.children()`: an error card needs
-        // `&mut Window` for its collapse state, which cannot escape the `FnMut`
-        // closure that a lazy iterator would be called from.
-        let rendered = self
-            .messages
-            .iter()
-            .enumerate()
-            .map(|(index, message)| render_message(message, index, window, cx).into_any_element())
-            .collect::<Vec<_>>();
+        self.sync_message_list_count();
+        #[cfg(test)]
+        self.materialized_message_indices.clear();
+        let message_count = self.messages.len();
+        let render_item = cx.processor(move |this, index, window, cx| {
+            #[cfg(test)]
+            this.materialized_message_indices.insert(index);
+            let Some(message) = this.messages.get(index) else {
+                return div().into_any_element();
+            };
+            let row = render_message(message, index, window, cx);
+            div()
+                .w_full()
+                .when(index + 1 < message_count, |this| this.pb_5())
+                .child(row)
+                .into_any_element()
+        });
 
         // Relative, non-scrolling wrapper so the overlay scrollbar anchors to
         // the full panel height (including under the floating composer).
@@ -1029,32 +1049,37 @@ impl ChatView {
             .relative()
             .size_full()
             .child(
-                div()
-                    .id("messages")
-                    .size_full()
-                    .track_scroll(&self.scroll_handle)
-                    .overflow_y_scroll()
-                    // Wheel intent drives auto-follow: any upward tick disarms
-                    // it immediately (no minimum distance), scrolling back to
-                    // near the bottom re-arms it.  `delta.y > 0` scrolls toward
-                    // earlier content (gpui applies `offset.y += delta.y` with
-                    // 0 = top).
-                    .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, window, _| {
-                        update_scroll_follow(&mut this.follow, &this.scroll_handle, ev, window);
-                    }))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            // Match the scrollbar thumb's 4px top inset so the
-                            // first message aligns with the top of the thumb.
-                            .pt(px(4.))
-                            // Leave exactly enough room for the measured floating composer.
-                            .pb(composer_height)
-                            .gap_5()
-                            .children(rendered),
-                    ),
+                div().id("messages").size_full().child(
+                    list(self.list_state.clone(), render_item)
+                        .size_full()
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                        // Match the scrollbar thumb's 4px top inset so the
+                        // first message aligns with the top of the thumb.
+                        .pt(px(4.))
+                        // Leave exactly enough room for the measured floating composer.
+                        .pb(composer_height),
+                ),
             )
-            .vertical_scrollbar(&self.scroll_handle)
+            .vertical_scrollbar(&self.list_state)
+    }
+
+    fn sync_message_list_count(&self) {
+        let current = self.list_state.item_count();
+        let target = self.messages.len();
+        if current == 0 && target > 0 {
+            self.list_state
+                .reset_with_uniform_height(target, MESSAGE_HEIGHT_HINT);
+        } else if current < target {
+            self.list_state.splice(current..current, target - current);
+        } else if current > target {
+            self.list_state.splice(target..current, 0);
+        }
+    }
+
+    fn remeasure_latest_message(&self) {
+        if let Some(index) = self.messages.len().checked_sub(1) {
+            self.list_state.remeasure_items(index..index + 1);
+        }
     }
 
     fn render_input_area(&self, send_disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1155,6 +1180,7 @@ fn render_message(
     window: &mut Window,
     cx: &mut Context<ChatView>,
 ) -> impl IntoElement {
+    let message_ui_id = msg.ui_id;
     let (radius_lg, secondary, secondary_foreground, foreground, muted_foreground) = {
         let theme = cx.theme();
         (
@@ -1198,7 +1224,8 @@ fn render_message(
                             trace: Some(trace), ..
                         }) = this
                             .messages
-                            .get_mut(message_index)
+                            .iter_mut()
+                            .find(|message| message.ui_id == message_ui_id)
                             .and_then(|message| {
                                 message.parts.iter_mut().find(|part| {
                                     matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
@@ -1218,7 +1245,8 @@ fn render_message(
                                 trace: Some(trace), ..
                             }) = this
                                 .messages
-                                .get_mut(message_index)
+                                .iter_mut()
+                                .find(|message| message.ui_id == message_ui_id)
                                 .and_then(|message| {
                                     message.parts.iter_mut().find(|part| {
                                         matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
@@ -1233,10 +1261,11 @@ fn render_message(
                     let copy_value = move |_: &mut Window, cx: &mut App| {
                         view.upgrade()
                             .and_then(|view| {
-                                let view = view.read(cx);
-                                match view
-                                    .messages
-                                    .get(message_index)
+                        let view = view.read(cx);
+                        match view
+                            .messages
+                            .iter()
+                            .find(|message| message.ui_id == message_ui_id)
                                     .and_then(|message| {
                                         message.parts.iter().find(|part| {
                                             matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
@@ -1319,7 +1348,7 @@ fn render_message(
             .text_color(foreground)
             .children(parts)
             .when_some(msg.error.as_ref(), |this, error| {
-                this.child(error_card::render(error, message_index, window, cx))
+                this.child(error_card::render(error, message_ui_id, window, cx))
             })
             .into_any_element()
     };

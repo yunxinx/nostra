@@ -124,9 +124,9 @@ impl TurnError {
     }
 }
 
-/// Render a turn's failure card. `index` disambiguates element ids across the
+/// Render a turn's failure card. `message_id` disambiguates element ids across the
 /// transcript so collapse state and the copy button stay per-message.
-pub fn render(error: &TurnError, index: usize, window: &mut Window, cx: &mut App) -> AnyElement {
+pub fn render(error: &TurnError, message_id: u64, window: &mut Window, cx: &mut App) -> AnyElement {
     // Theme values are copied out before `cx` is borrowed mutably for the
     // collapse state below.
     let (danger, muted_foreground, radius_lg, mono_font_family) = {
@@ -147,7 +147,7 @@ pub fn render(error: &TurnError, index: usize, window: &mut Window, cx: &mut App
     // without the transcript owning a flag per message.
     let expanded_state = if error.collapsible {
         Some(window.use_keyed_state(
-            ElementId::NamedInteger("turn-error".into(), index as u64),
+            ElementId::NamedInteger("turn-error".into(), message_id),
             cx,
             |_, _| false,
         ))
@@ -160,7 +160,7 @@ pub fn render(error: &TurnError, index: usize, window: &mut Window, cx: &mut App
     v_flex()
         .id(ElementId::NamedInteger(
             "turn-error-card".into(),
-            index as u64,
+            message_id,
         ))
         .role(Role::Alert)
         .w_full()
@@ -215,7 +215,7 @@ pub fn render(error: &TurnError, index: usize, window: &mut Window, cx: &mut App
                         .gap_1()
                         .when_some(expanded_state.clone(), |this, state| {
                             this.child(
-                                Button::new(("turn-error-toggle", index))
+                                Button::new(("turn-error-toggle", message_id))
                                     .ghost()
                                     .xsmall()
                                     .icon(if expanded {
@@ -238,7 +238,7 @@ pub fn render(error: &TurnError, index: usize, window: &mut Window, cx: &mut App
                         })
                         .when_some(error.raw_body.clone(), |this, raw| {
                             this.child(
-                                Clipboard::new(("turn-error-copy", index))
+                                Clipboard::new(("turn-error-copy", message_id))
                                     .value(raw)
                                     .tooltip(t!("chat.error.copy").to_string()),
                             )

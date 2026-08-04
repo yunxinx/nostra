@@ -1,8 +1,8 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui::{
-    IntoElement as _, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TestAppContext, point,
-    px,
+    IntoElement as _, ListOffset, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
+    TestAppContext, point, px,
 };
 use gpui_component::input::InputEvent;
 
@@ -1503,9 +1503,10 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
     });
     redraw_settled_math(cx);
     cx.update(|_, cx| {
-        chat.read(cx)
-            .scroll_handle
-            .set_offset(point(px(0.), px(0.)));
+        chat.read(cx).list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
     });
     redraw(cx);
 
@@ -1544,10 +1545,11 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
     );
 
     assert!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.max_offset().y > px(0.)),
+        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
         "the transcript fixture must have vertical overflow"
     );
-    let transcript_before_vertical = cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y);
+    let transcript_before_vertical =
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
     let row = cx.debug_bounds(row_selector).expect("display row bounds");
     cx.simulate_event(ScrollWheelEvent {
         position: row.center(),
@@ -1564,7 +1566,8 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
         "vertical wheel input must not be remapped into horizontal formula scrolling"
     );
     assert!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y) < transcript_before_vertical,
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y)
+            < transcript_before_vertical,
         "vertical wheel input over a display formula must continue to scroll the transcript"
     );
 }
@@ -2576,6 +2579,12 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
         });
     });
     redraw(cx);
+    cx.update(|_, cx| {
+        chat.read(cx)
+            .list_state
+            .set_offset_from_scrollbar(point(px(0.), px(0.)));
+    });
+    redraw(cx);
 
     let (owner_id, fence_start) = cx.update(|_, cx| {
         let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
@@ -2590,7 +2599,7 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     let first_line = selector("line", "-0");
 
     assert!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.max_offset().y > px(0.)),
+        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
         "the transcript fixture must have vertical overflow"
     );
     let line_before = cx.debug_bounds(first_line).expect("first code line");
@@ -2609,11 +2618,12 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         chat.read(cx)
-            .scroll_handle
-            .set_offset(point(px(0.), px(-20.)));
+            .list_state
+            .set_offset_from_scrollbar(point(px(0.), px(-20.)));
     });
     redraw(cx);
-    let transcript_before_left = cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y);
+    let transcript_before_left =
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
     let line_before_left = cx
         .debug_bounds(first_line)
         .expect("right-scrolled code line");
@@ -2633,7 +2643,7 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
         "leftward navigation must move the code content back toward its origin"
     );
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y),
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y),
         transcript_before_left,
         "horizontal scrolling inside a code block must never move the transcript"
     );
@@ -2648,7 +2658,8 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     let line_at_left_boundary = cx.debug_bounds(first_line).expect("left-aligned code line");
     assert_eq!(line_at_left_boundary.left(), line_before.left());
 
-    let transcript_at_left_boundary = cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y);
+    let transcript_at_left_boundary =
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
     let viewport_bounds = cx.debug_bounds(viewport).expect("horizontal viewport");
     cx.simulate_event(ScrollWheelEvent {
         position: viewport_bounds.center(),
@@ -2657,13 +2668,14 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     });
     redraw(cx);
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y),
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y),
         transcript_at_left_boundary,
         "continuing left at the code boundary must still not scroll the transcript"
     );
 
     let code_x_before_vertical = line_at_left_boundary.left();
-    let transcript_before_vertical = cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y);
+    let transcript_before_vertical =
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
     let viewport_bounds = cx.debug_bounds(viewport).expect("horizontal viewport");
     cx.simulate_event(ScrollWheelEvent {
         position: viewport_bounds.center(),
@@ -2680,9 +2692,146 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
         "vertical wheel input must not be remapped into horizontal code scrolling"
     );
     assert!(
-        cx.update(|_, cx| chat.read(cx).scroll_handle.offset().y) < transcript_before_vertical,
+        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y)
+            < transcript_before_vertical,
         "vertical wheel input over a code block must continue to scroll the transcript"
     );
+}
+
+#[gpui::test]
+fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(760.), px(640.)));
+
+    let initial_scroll_height_estimate = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            for index in 0..100 {
+                let text = if index % 3 == 0 {
+                    format!("$x_{{{index}}}^2 + y_{{{index}}}^2$")
+                } else {
+                    format!("message {index}")
+                };
+                this.messages.push(Message::from_canonical(
+                    LlmMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text,
+                            provider_metadata: ProviderMetadata::default(),
+                        }],
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                    cx,
+                ));
+            }
+            this.sync_message_list_count();
+            this.list_state.max_offset_for_scrollbar().y
+        })
+    });
+    assert!(
+        initial_scroll_height_estimate > px(15_000.),
+        "unmeasured rows must contribute their height hints to the first-frame scrollbar: {initial_scroll_height_estimate:?}"
+    );
+    redraw_settled_math(cx);
+
+    let (first_owner, last_owner, bottom_materialized) = cx.update(|_, cx| {
+        let chat = chat.read(cx);
+        let owner = |index: usize| match &chat.messages[index].parts[0] {
+            MessagePart::Text { ui_id, .. } => *ui_id,
+            _ => panic!("text fixture"),
+        };
+        (owner(0), owner(99), chat.materialized_message_indices.len())
+    });
+    assert!(
+        bottom_materialized <= 80,
+        "virtual list materialized {bottom_materialized} of 100 messages"
+    );
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("markdown-math-{last_owner}-0").into_boxed_str()
+        ))
+        .is_some(),
+        "tail formula must render while following the bottom"
+    );
+
+    cx.update(|_, cx| {
+        chat.read(cx).list_state.scroll_to(ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        });
+    });
+    redraw_settled_math(cx);
+    let top_materialized = cx.update(|_, cx| chat.read(cx).materialized_message_indices.len());
+    assert!(
+        top_materialized <= 80,
+        "top materialized {top_materialized} messages"
+    );
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("markdown-math-{first_owner}-0").into_boxed_str()
+        ))
+        .is_some(),
+        "head formula must regenerate after scrolling to the top; materialized={:?}, offset={:?}",
+        cx.update(|_, cx| chat.read(cx).materialized_message_indices.clone()),
+        cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top())
+    );
+    let head_cache = crate::ui::math::formula_cache_snapshot(first_owner, 0)
+        .expect("head formula cache after top render");
+    assert!(head_cache.active && head_cache.ready, "{head_cache:?}");
+
+    let top_before_stream = cx.update(|_, cx| {
+        let chat = chat.read(cx);
+        assert!(!chat.list_state.is_following_tail());
+        chat.list_state.logical_scroll_top()
+    });
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| chat.finish_stream_batch(cx));
+    });
+    redraw(cx);
+    cx.update(|_, cx| {
+        let chat = chat.read(cx);
+        assert!(
+            !chat.list_state.is_following_tail(),
+            "a streaming update must not re-arm follow while the user is reading the top"
+        );
+        let after_stream = chat.list_state.logical_scroll_top();
+        assert_eq!(after_stream.item_ix, top_before_stream.item_ix);
+        assert_eq!(
+            after_stream.offset_in_item,
+            top_before_stream.offset_in_item
+        );
+    });
+
+    let messages = cx
+        .debug_bounds(Box::leak(
+            format!("markdown-math-{first_owner}-0").into_boxed_str(),
+        ))
+        .expect("visible head formula bounds");
+    cx.simulate_event(ScrollWheelEvent {
+        position: messages.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+        ..Default::default()
+    });
+    redraw_settled_math(cx);
+    assert!(
+        cx.update(|_, cx| chat.read(cx).list_state.is_following_tail()),
+        "scrolling back to the true bottom must re-arm tail following"
+    );
+    assert!(
+        cx.debug_bounds(Box::leak(
+            format!("markdown-math-{last_owner}-0").into_boxed_str()
+        ))
+        .is_some(),
+        "tail formula must regenerate after a complete round trip"
+    );
+    let released = crate::ui::math::formula_cache_snapshot(first_owner, 0)
+        .expect("released head formula probe");
+    assert!(
+        !released.active,
+        "offscreen formula cache stayed active: {released:?}"
+    );
+    assert_eq!(released.release_count, 1, "{released:?}");
+    assert_eq!(released.image_drop_count, 1, "{released:?}");
 }
 
 #[test]
@@ -4083,7 +4232,7 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
         );
     };
     let transcript_content_height = |cx: &mut gpui::VisualTestContext| {
-        cx.update(|_, cx| chat.read(cx).scroll_handle.max_offset().y)
+        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y)
     };
 
     // Well past a seven-line budget, so the cap is already engaged.
