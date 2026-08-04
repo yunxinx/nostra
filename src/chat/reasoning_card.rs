@@ -87,6 +87,8 @@ pub(crate) struct ReasoningTrace {
     /// Whether streaming updates may pin the card to its end. This follows the
     /// transcript's behavior so reading earlier reasoning is not interrupted.
     follow: bool,
+    /// Discrete wheel distance waiting for the same easing used by the transcript.
+    smooth_scroll: super::SmoothScrollState,
 }
 
 impl ReasoningTrace {
@@ -101,6 +103,7 @@ impl ReasoningTrace {
             started_at: Some(Instant::now()),
             scroll: ScrollHandle::new(),
             follow: true,
+            smooth_scroll: super::SmoothScrollState::default(),
         }
     }
 
@@ -115,6 +118,7 @@ impl ReasoningTrace {
             started_at: None,
             scroll: ScrollHandle::new(),
             follow: true,
+            smooth_scroll: super::SmoothScrollState::default(),
         }
     }
 
@@ -163,6 +167,49 @@ impl ReasoningTrace {
     /// transcript remains a separate scroll boundary.
     pub(crate) fn handle_scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window) {
         super::update_scroll_follow(&mut self.follow, &self.scroll, event, window);
+    }
+
+    pub(crate) fn current_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.scroll.offset()
+    }
+
+    pub(crate) fn enqueue_smooth_scroll(
+        &mut self,
+        anchor: gpui::Point<gpui::Pixels>,
+        distance: gpui::Pixels,
+    ) {
+        self.scroll.set_offset(anchor);
+        self.smooth_scroll.enqueue(distance);
+    }
+
+    pub(crate) fn cancel_smooth_scroll(&mut self) {
+        self.smooth_scroll.cancel_motion();
+    }
+
+    pub(crate) fn cancel_smooth_scroll_frame(&mut self) {
+        self.smooth_scroll.frame_scheduled = false;
+        self.smooth_scroll.cancel_motion();
+    }
+
+    pub(crate) fn mark_smooth_frame_scheduled(&mut self) -> bool {
+        if self.smooth_scroll.frame_scheduled {
+            return false;
+        }
+        self.smooth_scroll.frame_scheduled = true;
+        true
+    }
+
+    pub(crate) fn advance_smooth_scroll(&mut self) -> Option<bool> {
+        self.smooth_scroll.frame_scheduled = false;
+        let step = self.smooth_scroll.next_step()?;
+        let offset = self.scroll.offset();
+        let max_offset = self.scroll.max_offset();
+        let next_y = (offset.y + step).clamp(-max_offset.y, gpui::Pixels::ZERO);
+        self.scroll.set_offset(gpui::point(offset.x, next_y));
+        if next_y == offset.y {
+            self.smooth_scroll.cancel_motion();
+        }
+        Some(self.smooth_scroll.remaining != gpui::Pixels::ZERO)
     }
 
     /// Localized trigger text: a live label while thinking, the banked duration
@@ -219,6 +266,11 @@ impl ReasoningTrace {
     #[cfg(test)]
     pub(crate) fn scroll_max(&self) -> gpui::Point<gpui::Pixels> {
         self.scroll.max_offset()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn smooth_scroll_remaining(&self) -> gpui::Pixels {
+        self.smooth_scroll.remaining
     }
 }
 

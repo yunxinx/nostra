@@ -4556,6 +4556,15 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             .debug_bounds("reasoning-body-0")
             .expect("the latest reasoning card must be visible");
         let transcript_before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+        let card_before = cx.update(|_, cx| {
+            chat.read(cx)
+                .messages
+                .last()
+                .and_then(reasoning_part)
+                .expect("reasoning trace")
+                .scroll_offset()
+                .y
+        });
 
         // A previously queued transcript animation must be abandoned as soon
         // as the pointer enters the nested card.
@@ -4577,19 +4586,21 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             ..Default::default()
         });
 
-        let (transcript_after, card_offset, pending_smooth_scroll) = cx.update(|_, cx| {
-            let chat = chat.read(cx);
-            let trace = chat
-                .messages
-                .last()
-                .and_then(reasoning_part)
-                .expect("reasoning trace");
-            (
-                chat.list_state.logical_scroll_top(),
-                trace.scroll_offset().y,
-                chat.smooth_scroll.remaining,
-            )
-        });
+        let (transcript_after, card_offset, pending_transcript_scroll, pending_card_scroll) = cx
+            .update(|_, cx| {
+                let chat = chat.read(cx);
+                let trace = chat
+                    .messages
+                    .last()
+                    .and_then(reasoning_part)
+                    .expect("reasoning trace");
+                (
+                    chat.list_state.logical_scroll_top(),
+                    trace.scroll_offset().y,
+                    chat.smooth_scroll.remaining,
+                    trace.smooth_scroll_remaining(),
+                )
+            });
         assert_eq!(transcript_after.item_ix, transcript_before.item_ix);
         assert_eq!(
             transcript_after.offset_in_item, transcript_before.offset_in_item,
@@ -4600,10 +4611,68 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             "the reasoning card itself must consume the wheel input"
         );
         assert_eq!(
-            pending_smooth_scroll,
+            pending_transcript_scroll,
             px(0.),
             "reasoning input must not queue transcript motion"
         );
+        if smooth_scrolling {
+            assert_eq!(
+                card_offset, card_before,
+                "smooth reasoning scrolling must restore the native wheel jump"
+            );
+            assert!(
+                pending_card_scroll != px(0.),
+                "reasoning wheel input must queue eased card motion"
+            );
+            assert!(
+                cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+                "reasoning wheel input must schedule an animation frame"
+            );
+            redraw(cx);
+            let eased_card_offset = cx.update(|_, cx| {
+                chat.read(cx)
+                    .messages
+                    .last()
+                    .and_then(reasoning_part)
+                    .expect("reasoning trace")
+                    .scroll_offset()
+                    .y
+            });
+            assert!(
+                eased_card_offset > card_before,
+                "the animation frame must advance the reasoning card"
+            );
+
+            cx.simulate_event(ScrollWheelEvent {
+                position: body.center(),
+                delta: ScrollDelta::Pixels(point(px(0.), px(20.))),
+                ..Default::default()
+            });
+            let (precise_offset, pending_after_precise) = cx.update(|_, cx| {
+                let trace = chat
+                    .read(cx)
+                    .messages
+                    .last()
+                    .and_then(reasoning_part)
+                    .expect("reasoning trace");
+                (trace.scroll_offset().y, trace.smooth_scroll_remaining())
+            });
+            assert!(
+                precise_offset > eased_card_offset,
+                "precise touchpad input must keep the card's native immediate path"
+            );
+            assert_eq!(
+                pending_after_precise,
+                px(0.),
+                "precise input must cancel queued discrete-wheel motion"
+            );
+        } else {
+            assert!(
+                card_offset > card_before,
+                "native reasoning scrolling must remain immediate when smoothing is off"
+            );
+            assert_eq!(pending_card_scroll, px(0.));
+        }
 
         // Repeated wheel ticks at either nested boundary are still contained;
         // they must not fall through just because the card cannot move further.

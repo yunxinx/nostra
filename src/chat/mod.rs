@@ -1177,6 +1177,69 @@ impl ChatView {
         }
     }
 
+    fn schedule_reasoning_scroll_frame(
+        &mut self,
+        message_ui_id: u64,
+        part_ui_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) else {
+            return;
+        };
+        if !trace.mark_smooth_frame_scheduled() {
+            return;
+        }
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.advance_reasoning_scroll(message_ui_id, part_ui_id, window, cx);
+        });
+    }
+
+    fn advance_reasoning_scroll(
+        &mut self,
+        message_ui_id: u64,
+        part_ui_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !smooth_scrolling_enabled(cx) {
+            if let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) {
+                trace.cancel_smooth_scroll_frame();
+            }
+            return;
+        }
+        let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) else {
+            return;
+        };
+        let Some(has_remaining) = trace.advance_smooth_scroll() else {
+            return;
+        };
+        cx.notify();
+        if has_remaining {
+            self.schedule_reasoning_scroll_frame(message_ui_id, part_ui_id, window, cx);
+        }
+    }
+
+    fn reasoning_trace_mut(
+        &mut self,
+        message_ui_id: u64,
+        part_ui_id: u64,
+    ) -> Option<&mut ReasoningTrace> {
+        self.messages
+            .iter_mut()
+            .find(|message| message.ui_id == message_ui_id)
+            .and_then(|message| {
+                message.parts.iter_mut().find_map(|part| match part {
+                    MessagePart::Reasoning {
+                        ui_id,
+                        trace: Some(trace),
+                        ..
+                    } if *ui_id == part_ui_id => Some(trace),
+                    _ => None,
+                })
+            })
+    }
+
     fn sync_message_list_count(&self) {
         let current = self.list_state.item_count();
         let target = self.messages.len();
@@ -1333,6 +1396,7 @@ fn render_message(
                     // reordering, so keyed GPUI/Clipboard state remains stable.
                     let ui_id = *ui_id;
                     let content_index = part.content_index();
+                    let native_scroll_anchor = trace.current_scroll_offset();
                     let on_toggle = cx.listener(move |this: &mut ChatView, _, _, cx| {
                         if let Some(MessagePart::Reasoning {
                             trace: Some(trace), ..
@@ -1354,25 +1418,35 @@ fn render_message(
                         move |this: &mut ChatView,
                               event: &ScrollWheelEvent,
                               window,
-                              _cx| {
+                              cx| {
                             // A gesture over a nested reasoning viewport takes
                             // ownership of the pointer; do not let a previously
                             // queued transcript animation keep moving underneath it.
                             this.smooth_scroll.cancel_motion();
-                            if let Some(MessagePart::Reasoning {
-                                trace: Some(trace), ..
-                            }) = this
-                                .messages
-                                .iter_mut()
-                                .find(|message| message.ui_id == message_ui_id)
-                                .and_then(|message| {
-                                    message.parts.iter_mut().find(|part| {
-                                        matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
-                                    })
-                                })
-                            {
-                                trace.handle_scroll(event, window);
+                            let smooth = smooth_scrolling_enabled(cx) && !event.delta.precise();
+                            let Some(trace) = this.reasoning_trace_mut(message_ui_id, ui_id) else {
+                                return;
+                            };
+                            trace.handle_scroll(event, window);
+                            if !smooth {
+                                trace.cancel_smooth_scroll();
+                                return;
                             }
+
+                            // The card's native scroll listener runs before this
+                            // callback. Restore its painted-frame anchor, then
+                            // replay the same distance through eased frames.
+                            let distance = event.delta.pixel_delta(window.line_height()).y;
+                            if distance == Pixels::ZERO {
+                                return;
+                            }
+                            trace.enqueue_smooth_scroll(native_scroll_anchor, distance);
+                            this.schedule_reasoning_scroll_frame(
+                                message_ui_id,
+                                ui_id,
+                                window,
+                                cx,
+                            );
                         },
                     );
                     let view = cx.entity().downgrade();
