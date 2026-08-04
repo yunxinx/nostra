@@ -1,9 +1,6 @@
 //! Markdown fenced-code rendering and its application-wide display preferences.
 
-use std::{
-    ops::Range,
-    sync::{Arc, Mutex},
-};
+use std::{ops::Range, sync::Arc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -36,27 +33,13 @@ const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
 pub(crate) struct MarkdownBody {
     state: Entity<TextViewState>,
     extensions: MarkdownExtensions,
-    style: SharedTextViewStyle,
-    original_source: SharedMarkdownSource,
-    source: String,
-    extension_syntax_seen: bool,
 }
-
-pub(crate) type SharedTextViewStyle = Arc<Mutex<TextViewStyle>>;
-pub(crate) type SharedMarkdownSource = Arc<Mutex<String>>;
 
 impl MarkdownBody {
     pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
-        let style = Arc::new(Mutex::new(TextViewStyle::default()));
-        let original_source = Arc::new(Mutex::new(source.to_string()));
-        let parse_source = super::math::protect_display_math_for_markdown(source);
         Self {
-            state: cx.new(|cx| TextViewState::markdown(&parse_source, cx)),
-            extensions: extensions(owner_id, 0, style.clone(), original_source.clone()),
-            style,
-            original_source,
-            source: source.to_string(),
-            extension_syntax_seen: contains_extension_syntax(source),
+            state: cx.new(|cx| TextViewState::markdown(source, cx)),
+            extensions: extensions(owner_id, 0),
         }
     }
 
@@ -64,74 +47,15 @@ impl MarkdownBody {
         if delta.is_empty() {
             return;
         }
-        let previous_len = self.source.len();
-        self.source.push_str(delta);
-        if let Ok(mut original) = self.original_source.lock() {
-            original.clear();
-            original.push_str(&self.source);
-        }
-        if !self.extension_syntax_seen {
-            // A code fence or math delimiter can be split across streamed
-            // deltas, so checking `delta` alone is insufficient. Only the
-            // final two bytes of the previous source can participate in a new
-            // three-byte code fence; two-byte math delimiters need less.
-            // Scanning that bounded overlap keeps detection O(total bytes)
-            // instead of rescanning the complete response every frame.
-            let scan_start = previous_len.saturating_sub(2);
-            let fence_seen = contains_fence_marker_bytes(&self.source.as_bytes()[scan_start..]);
-            // A complete inline/display formula can only become valid in a
-            // delta that contributes a dollar or backslash delimiter. Scan the
-            // authoritative source only on those uncommon boundaries. This
-            // avoids both quadratic rescans of ordinary prose and permanently
-            // switching currency-only messages to synchronous full parsing.
-            let math_seen = delta
-                .as_bytes()
-                .iter()
-                .any(|byte| matches!(byte, b'$' | b'\\'))
-                && super::math::contains_math_syntax(&self.source);
-            self.extension_syntax_seen = fence_seen || math_seen;
-        }
-        self.state.update(cx, |state, cx| {
-            if self.extension_syntax_seen {
-                // gpui-component's background append parser keeps a document
-                // snapshot that is independent from synchronous extension
-                // reparses. Once custom code or math syntax appears, full
-                // replacements prevent that stale snapshot from restoring
-                // native nodes. The assistant bridge already coalesces provider
-                // deltas into one update per frame (or 32 events), bounding
-                // this unavoidable repair to one parse per UI batch.
-                let parse_source = super::math::protect_display_math_for_markdown(&self.source);
-                state.set_text(&parse_source, cx);
-            } else {
-                state.push_str(delta, cx);
-            }
-        });
+        self.state.update(cx, |state, cx| state.push_str(delta, cx));
     }
 
     pub(crate) fn set_text(&mut self, source: &str, cx: &mut App) {
-        self.source.clear();
-        self.source.push_str(source);
-        if let Ok(mut original) = self.original_source.lock() {
-            original.clear();
-            original.push_str(source);
-        }
-        // Full snapshots are allowed to replace earlier streamed content, so
-        // derive the mode from the authoritative replacement rather than
-        // retaining a marker that may no longer exist.
-        self.extension_syntax_seen = contains_extension_syntax(source);
-        let parse_source = super::math::protect_display_math_for_markdown(source);
         self.state
-            .update(cx, |state, cx| state.set_text(&parse_source, cx));
+            .update(cx, |state, cx| state.set_text(source, cx));
     }
 
     pub(crate) fn text_view(&self, style: TextViewStyle) -> TextView {
-        // Block renderers run later during TextView layout and do not receive
-        // the caller's `TextViewStyle`. Keep a shared snapshot beside the
-        // stable extension registry so nested Markdown around display formulas
-        // inherits paragraph gaps and future style customizations.
-        if let Ok(mut current) = self.style.lock() {
-            *current = style.clone();
-        }
         TextView::new(&self.state)
             .selectable(true)
             .style(style)
@@ -148,19 +72,6 @@ impl MarkdownBody {
         self.state.update(cx, |state, cx| state.select_all(cx));
         self.state.read(cx).selected_text()
     }
-}
-
-fn contains_extension_syntax(source: &str) -> bool {
-    contains_fence_marker_bytes(source.as_bytes()) || super::math::contains_math_syntax(source)
-}
-
-fn contains_fence_marker_bytes(source: &[u8]) -> bool {
-    // Work on bytes because Markdown fence delimiters are ASCII. This also
-    // lets the streaming caller begin at an arbitrary two-byte overlap without
-    // manufacturing a potentially invalid UTF-8 boundary after CJK text.
-    source
-        .windows(3)
-        .any(|window| window == b"```" || window == b"~~~")
 }
 
 fn is_fenced_code_source(source: &str) -> bool {
@@ -196,24 +107,13 @@ struct FencedCode {
     start: usize,
 }
 
-pub(crate) fn extensions(
-    owner_id: u64,
-    source_offset: usize,
-    style: SharedTextViewStyle,
-    source: SharedMarkdownSource,
-) -> MarkdownExtensions {
-    MarkdownExtensions::default()
-        .plugin(super::math::MathPlugin::new(
-            owner_id,
-            source_offset,
-            style,
-            source,
-        ))
+pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensions {
+    let extensions = MarkdownExtensions::default().cjk_emphasis_compatibility();
+    super::math::extend(extensions, owner_id, source_offset)
         .block_parser(move |node, cx| {
             let markdown_ast::Node::Code(code) = node else {
                 return None;
             };
-            let position = code.position.as_ref()?;
             let source = cx.node_source(node)?;
             if !is_fenced_code_source(source) {
                 // Returning None preserves gpui-component's native rendering
@@ -224,7 +124,7 @@ pub(crate) fn extensions(
             // offset starts at zero. Add the fragment's document-space base so
             // code and formula state keys remain unique and stable across the
             // complete streamed message.
-            let start = source_offset + cx.offset() + position.start.offset;
+            let start = source_offset + cx.node_range(node)?.start;
             let data = FencedCode {
                 code: code.value.clone().into(),
                 language: code
@@ -720,6 +620,18 @@ pub(crate) fn line_numbers_enabled(cx: &App) -> bool {
     preferences::get(cx).code_block_line_numbers
 }
 
+pub(crate) fn user_message_markdown_enabled(cx: &App) -> bool {
+    preferences::get(cx).user_message_markdown
+}
+
+pub(crate) fn set_user_message_markdown(enabled: bool, cx: &mut App) {
+    if user_message_markdown_enabled(cx) == enabled {
+        return;
+    }
+    preferences::update(cx, |prefs| prefs.user_message_markdown = enabled);
+    cx.refresh_windows();
+}
+
 pub(crate) fn set_global_wrap(enabled: bool, cx: &mut App) {
     if global_wrap_enabled(cx) == enabled {
         return;
@@ -835,13 +747,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_backtick_and_tilde_fences() {
-        assert!(contains_fence_marker_bytes(b"before\n```Python\n"));
-        assert!(contains_fence_marker_bytes(b"before\n~~~RS\n"));
-        assert!(!contains_fence_marker_bytes(b"ordinary `inline` code"));
-    }
-
-    #[test]
     fn distinguishes_fenced_code_from_indented_code_source() {
         for source in ["```rust\nfn main() {}\n```", "   ~~~py\nprint(1)\n   ~~~"] {
             assert!(is_fenced_code_source(source), "fenced source: {source:?}");
@@ -859,89 +764,37 @@ mod tests {
     }
 
     #[gpui::test]
-    fn streamed_fence_detection_handles_markers_split_across_deltas(cx: &mut TestAppContext) {
+    fn streamed_extension_syntax_stays_in_the_authoritative_text_state(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let mut body = cx.update(|cx| MarkdownBody::new("prefix `", 1, cx));
 
         cx.update(|cx| body.push_str("`", cx));
-        assert!(!body.extension_syntax_seen);
-        cx.update(|cx| body.push_str("`rust\nfn main() {}", cx));
-        assert!(
-            body.extension_syntax_seen,
-            "the two-byte overlap must detect an opener split over three batches"
-        );
-    }
-
-    #[gpui::test]
-    fn authoritative_replacement_recomputes_fence_mode(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let mut body = cx.update(|cx| MarkdownBody::new("```rust\ncode\n```", 1, cx));
-        assert!(body.extension_syntax_seen);
-
-        cx.update(|cx| body.set_text("plain replacement\n", cx));
-        assert!(
-            !body.extension_syntax_seen,
-            "a terminal snapshot without a fence must return to incremental prose parsing"
-        );
-    }
-
-    #[gpui::test]
-    fn streamed_math_detection_handles_split_delimiters(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let mut body = cx.update(|cx| MarkdownBody::new("price ", 1, cx));
+        cx.update(|cx| body.push_str("`rust\nfn main() {}\n```\n", cx));
 
         cx.update(|cx| body.push_str("$", cx));
-        assert!(!body.extension_syntax_seen);
         cx.update(|cx| body.push_str("x", cx));
-        assert!(!body.extension_syntax_seen);
         cx.update(|cx| body.push_str("$", cx));
-        assert!(body.extension_syntax_seen);
+        cx.run_until_parked();
 
-        cx.update(|cx| body.set_text("plain replacement\n", cx));
-        assert!(!body.extension_syntax_seen);
-        cx.update(|cx| body.push_str(r"\", cx));
-        assert!(!body.extension_syntax_seen);
-        cx.update(|cx| body.push_str("[", cx));
-        assert!(!body.extension_syntax_seen);
-        cx.update(|cx| body.push_str("x", cx));
-        assert!(!body.extension_syntax_seen);
-        cx.update(|cx| body.push_str(r"\]", cx));
-        assert!(
-            body.extension_syntax_seen,
-            "split bracket delimiters must switch modes once the formula closes"
-        );
-
-        cx.update(|cx| body.set_text("Costs $5 and $10 today", cx));
-        assert!(
-            !body.extension_syntax_seen,
-            "currency must remain on the incremental prose path"
-        );
+        let selected = cx.update(|cx| body.select_all_text(cx));
+        assert!(selected.contains("fn main() {}"));
+        assert!(selected.contains("$x$"));
     }
 
     #[gpui::test]
-    fn streamed_display_math_refreshes_the_original_source_before_protected_parsing(
+    fn replacement_then_append_uses_the_replacement_as_its_worker_baseline(
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_component::init);
-        let mut body = cx.update(|cx| MarkdownBody::new("prefix\n\n$$\n", 1, cx));
+        let mut body = cx.update(|cx| MarkdownBody::new("old", 1, cx));
 
-        cx.update(|cx| body.push_str("=\n", cx));
-        assert!(matches!(
-            crate::ui::math::protect_display_math_for_markdown(&body.source),
-            std::borrow::Cow::Borrowed(_)
-        ));
-        cx.update(|cx| body.push_str("$$", cx));
+        cx.update(|cx| body.set_text("new $x$", cx));
+        cx.update(|cx| body.push_str(" tail", cx));
+        cx.run_until_parked();
 
-        let original = body
-            .original_source
-            .lock()
-            .expect("test source lock")
-            .clone();
-        assert_eq!(original, "prefix\n\n$$\n=\n$$");
-        assert_ne!(
-            crate::ui::math::protect_display_math_for_markdown(&original).as_ref(),
-            original,
-            "the completed fence must use the protected TextView parse source"
+        assert_eq!(
+            cx.update(|cx| body.select_all_text(cx)).trim(),
+            "new $x$ tail"
         );
     }
 

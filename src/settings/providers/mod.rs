@@ -15,7 +15,9 @@ use gpui::{
     Pixels, Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, WindowExt as _, h_flex,
+    ActiveTheme as _, IconName, StyledExt as _, TITLE_BAR_HEIGHT, WindowExt as _,
+    button::ButtonVariants as _,
+    h_flex,
     input::{Input, InputContentType, InputEvent, InputState},
     notification::NotificationType,
     resizable::{ResizableState, h_resizable, resizable_panel},
@@ -24,7 +26,7 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use super::{ROW_HEIGHT, ui::IconButton};
+use super::{ROW_HEIGHT, ui::icon_button};
 use crate::{
     llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString},
     preferences, providers,
@@ -588,7 +590,7 @@ impl ProvidersPage {
         };
         let weak = cx.weak_entity();
 
-        IconButton::new(
+        icon_button(
             "toggle-api-key-mask",
             if masked {
                 IconName::EyeOff
@@ -596,8 +598,10 @@ impl ProvidersPage {
                 IconName::Eye
             },
             tooltip,
+            px(20.),
+            px(16.),
         )
-        .on_activate(move |window, cx| {
+        .on_click(move |_, window, cx| {
             weak.update(cx, |this, cx| {
                 this.api_key_masked = !this.api_key_masked;
                 let masked = this.api_key_masked;
@@ -732,16 +736,17 @@ impl ProvidersPage {
                         cx,
                     ))
                     .child(
-                        IconButton::new(
+                        icon_button(
                             "add-model",
                             IconName::Plus,
                             t!("settings.providers.add_model").to_string(),
+                            px(24.),
+                            px(16.),
                         )
                         .outline()
-                        .size(px(24.))
-                        .on_activate({
+                        .on_click({
                             let weak = cx.weak_entity();
-                            move |window, cx| {
+                            move |_, window, cx| {
                                 weak.update(cx, |this, cx| this.add_model(window, cx)).ok();
                             }
                         }),
@@ -755,18 +760,19 @@ impl ProvidersPage {
                     .child(Input::new(&model.model_id).flex_1().min_w_0())
                     .child(Input::new(&model.name).flex_1().min_w_0())
                     .child(
-                        IconButton::new(
+                        icon_button(
                             ElementId::Name(format!("delete-model-{id}").into()),
                             IconName::Close,
                             t!("settings.providers.delete_model").to_string(),
+                            px(32.),
+                            px(16.),
                         )
                         .danger()
-                        .size(px(32.))
                         // A row of two text fields is cheap to retype, so
                         // this removes straight away — no confirmation.
-                        .on_activate({
+                        .on_click({
                             let weak = cx.weak_entity();
-                            move |_, cx| {
+                            move |_, _, cx| {
                                 weak.update(cx, |this, cx| this.delete_model(&id, cx)).ok();
                             }
                         }),

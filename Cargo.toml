@@ -34,6 +34,7 @@ futures = "0.3"
 async-io = "2"
 url = "2"
 markdown = "1.0.0"
+unicode-segmentation = "1.12"
 
 # Zed/GPUI and gpui-component are maintained as one verified fork set. Checked-in
 # dependencies pin exact commits: every GPUI crate shares one Zed revision and
@@ -57,13 +58,13 @@ reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf60
 # language, so the complete built-in grammar registry is required. The base
 # `tree-sitter` feature only includes JSON and silently leaves common Rust,
 # Python, JavaScript, and other fences unstyled.
-# The pinned gpui-component revision must include ScrollableMask's capture-phase
-# horizontal handling and edge-event consumption. Both properties are required
-# when a code viewport is nested in the vertically scrolling transcript.
-gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "bb07ed984181e9de21107200ba398afc68a5d4d3", features = [
+# The pinned gpui-component revision owns Nostra's authoritative streaming
+# TextView state, composable inline Markdown extensions, standard button/menu
+# interaction contract, title-bar geometry, and nested horizontal scrolling.
+gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "d4c3768ec1d1e7405c063df84d7ef0657b794573", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "bb07ed984181e9de21107200ba398afc68a5d4d3" }
+gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "d4c3768ec1d1e7405c063df84d7ef0657b794573" }
 
 # RaTeX publishes versioned crates on crates.io, so use a semver-compatible
 # requirement here; Cargo.lock records the exact verified release. The
@@ -100,8 +101,3 @@ ropey = { opt-level = 3 }
 lsp-types = { opt-level = 3 }
 markdown = { opt-level = 3 }
 xml5ever = { opt-level = 3 }
-
-# WASM-friendly psm fork; inherited from the gpui-component workspace so
-# transitive resolution stays consistent.
-[patch.crates-io]
-psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }

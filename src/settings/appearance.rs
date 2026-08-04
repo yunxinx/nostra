@@ -32,6 +32,7 @@ pub(super) fn render(
         theme_row(false, cx),
         theme_row(true, cx),
         composer_font_row(cx),
+        user_message_markdown_row(cx),
         code_wrap_row(cx),
         code_line_numbers_row(cx),
     ];
@@ -43,6 +44,22 @@ pub(super) fn render(
     rows.push(info_buttons_row(cx));
 
     ui::section(rows, cx)
+}
+
+fn user_message_markdown_row(cx: &App) -> AnyElement {
+    ui::row(
+        "user-message-markdown",
+        t!("settings.user_message_markdown").to_string(),
+        Some(t!("settings.user_message_markdown_desc").to_string()),
+        Switch::new("user-message-markdown-switch")
+            .small()
+            .checked(markdown::user_message_markdown_enabled(cx))
+            .on_click(|checked, _, cx| {
+                markdown::set_user_message_markdown(*checked, cx);
+            })
+            .into_any_element(),
+        cx,
+    )
 }
 
 fn code_wrap_row(cx: &App) -> AnyElement {
@@ -230,9 +247,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn code_block_labels_resolve_in_every_locale() {
+    fn text_rendering_labels_resolve_in_every_locale() {
         for locale in ["en", "zh-CN"] {
             for key in [
+                "settings.user_message_markdown",
+                "settings.user_message_markdown_desc",
                 "settings.code_wrap",
                 "settings.code_wrap_desc",
                 "settings.code_line_numbers",

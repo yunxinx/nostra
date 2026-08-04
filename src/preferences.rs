@@ -38,6 +38,8 @@ pub struct Preferences {
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.
     pub composer_font: ComposerFont,
+    /// Whether user-role message bodies use the Markdown presentation path.
+    pub user_message_markdown: bool,
     /// Whether supported windows use the native macOS blurred backdrop.
     pub glass_effect: bool,
     /// Opacity of the theme tint drawn above the native blurred backdrop.
@@ -85,6 +87,7 @@ impl Default for Preferences {
             sidebar_collapsed: false,
             theme_mode: None,
             composer_font: ComposerFont::default(),
+            user_message_markdown: false,
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             hide_settings_info_buttons: false,
@@ -407,6 +410,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_wrap_revision).is_err());
 
+        let mut missing_user_message_markdown =
+            serde_json::to_value(Preferences::default()).expect("serialize");
+        assert!(
+            missing_user_message_markdown
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("user_message_markdown")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_user_message_markdown).is_err());
+
         let mut unknown_geometry = serde_json::to_value(Preferences {
             window: Some(WindowGeometry {
                 x: 0.,
@@ -427,14 +441,16 @@ mod tests {
         assert!(!prefs.glass_effect);
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
         assert!(!prefs.hide_settings_info_buttons);
+        assert!(!prefs.user_message_markdown);
         assert!(!prefs.code_block_wrap);
         assert_eq!(prefs.code_block_wrap_revision, 0);
         assert!(!prefs.code_block_line_numbers);
     }
 
     #[test]
-    fn code_block_preferences_round_trip() {
+    fn text_rendering_preferences_round_trip() {
         let prefs = Preferences {
+            user_message_markdown: true,
             code_block_wrap: true,
             code_block_wrap_revision: 7,
             code_block_line_numbers: true,
@@ -445,6 +461,7 @@ mod tests {
         assert!(back.code_block_wrap);
         assert_eq!(back.code_block_wrap_revision, 7);
         assert!(back.code_block_line_numbers);
+        assert!(back.user_message_markdown);
     }
 
     /// Both split geometries are plain widths, and both must survive a round

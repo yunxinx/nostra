@@ -85,6 +85,22 @@ fn init_app(cx: &mut TestAppContext) {
     });
 }
 
+fn add_chat_window(
+    cx: &mut TestAppContext,
+) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let chat = ChatView::view(window, cx);
+        gpui_component::Root::new(chat, window, cx)
+    });
+    let chat = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ChatView>()
+            .expect("Root must contain the ChatView")
+    });
+    (chat, cx)
+}
+
 fn redraw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| {
@@ -139,7 +155,7 @@ fn complete_syntax_registry_supports_common_fence_aliases() {
 #[gpui::test]
 fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(1600.), px(3000.)));
     seed_turn(&chat, cx);
 
@@ -215,7 +231,7 @@ fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut Te
 #[gpui::test]
 fn streamed_indented_code_keeps_the_native_renderer(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
     let id = "streamed-indented-code".to_string();
 
@@ -266,9 +282,48 @@ fn streamed_indented_code_keeps_the_native_renderer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn raw_html_dollars_remain_literal_and_selectable(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let source = "<kbd>$raw$</kbd>";
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_stream_text(0, "raw-html-math".to_string(), cx);
+            this.append_stream_text(0, "raw-html-math".to_string(), source, cx);
+        });
+    });
+    redraw(cx);
+
+    let (owner_id, start, selected) = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text {
+                ui_id, text, body, ..
+            } = &this.messages[1].parts[0]
+            else {
+                panic!("streamed assistant text")
+            };
+            (
+                *ui_id,
+                text.find("$raw$").expect("literal dollars"),
+                body.select_all_text(cx),
+            )
+        })
+    });
+    let formula_selector: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(formula_selector).is_none(),
+        "raw HTML text must not be claimed by the math renderer"
+    );
+    assert_eq!(selected.trim(), "$raw$");
+}
+
+#[gpui::test]
 fn streamed_math_keeps_custom_nodes_after_later_appends(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
     let id = "streamed-math".to_string();
     let first = "根据定义：\n$$\nE = mc^2\n$$";
@@ -321,6 +376,208 @@ fn streamed_math_keeps_custom_nodes_after_later_appends(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn incomplete_streamed_math_keeps_stable_text_visible_and_recovers(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let id = "streamed-incomplete-math".to_string();
+    let chunks = [
+        "先说明结论。\n\n",
+        "$$",
+        "\nE = mc^2",
+        "\n$$",
+        "\n\n最后补充内联公式 $E = mc^2$ 与文字。",
+    ];
+    let mut expected = String::new();
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_stream_text(0, id.clone(), cx);
+        });
+    });
+
+    for chunk in chunks {
+        expected.push_str(chunk);
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                this.append_stream_text(0, id.clone(), chunk, cx);
+            });
+        });
+        redraw_settled_math(cx);
+
+        let selected = cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                let MessagePart::Text { body, .. } = &this.messages[1].parts[0] else {
+                    panic!("streamed assistant text")
+                };
+                body.select_all_text(cx)
+            })
+        });
+        for line in expected.lines().filter(|line| !line.is_empty()) {
+            assert!(
+                selected.contains(line),
+                "every streamed prefix must remain visible: missing {line:?} in {selected:?}"
+            );
+        }
+    }
+
+    let (owner_id, display_start, inline_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("streamed assistant text")
+        };
+        (
+            *ui_id,
+            text.find("$$").expect("display formula"),
+            text.rfind("$E = mc^2$").expect("inline formula"),
+        )
+    });
+    for start in [display_start, inline_start] {
+        let selector: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "the completed formula at {start} must recover its custom renderer"
+        );
+    }
+}
+
+#[gpui::test]
+fn streamed_reference_definitions_prepare_later_formula_labels(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let id = "streamed-reference-math".to_string();
+    let first = r"[label \(x\)]: https://example.com/collapsed
+[shortcut \(y\)]: https://example.com/shortcut
+[full-math]: https://example.com/full
+[Cost $5 and \(w\)]: https://example.com/currency
+
+retained";
+    let second = r"
+
+[label \(x\)][]
+[shortcut \(y\)]
+[full \(z\)][full-math]
+[Cost $5 and \(w\)][]";
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_stream_text(0, id.clone(), cx);
+            this.append_stream_text(0, id.clone(), first, cx);
+        });
+    });
+    redraw(cx);
+
+    let (owner_id, body_id) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, body, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("streamed assistant text")
+        };
+        (*ui_id, body.entity_id())
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_text(0, id, second, cx);
+        });
+    });
+    redraw_settled_math(cx);
+
+    for (formula_source, destination) in [
+        (r"\(x\)", "https://example.com/collapsed"),
+        (r"\(y\)", "https://example.com/shortcut"),
+        (r"\(z\)", "https://example.com/full"),
+        (r"\(w\)", "https://example.com/currency"),
+    ] {
+        let formula_start = first.len()
+            + second
+                .find(formula_source)
+                .expect("appended reference formula");
+        let formula: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+        let bounds = cx
+            .debug_bounds(formula)
+            .expect("appended reference formula bounds");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        assert_eq!(cx.opened_url().as_deref(), Some(destination));
+    }
+
+    let selected = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { text, body, .. } = &this.messages[1].parts[0] else {
+                panic!("streamed assistant text")
+            };
+            assert_eq!(body.entity_id(), body_id);
+            assert_eq!(text, &format!("{first}{second}"));
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(
+        selected.trim(),
+        "retained\nlabel \\(x\\)\nshortcut \\(y\\)\nfull \\(z\\)\nCost $5 and \\(w\\)"
+    );
+}
+
+#[gpui::test]
+fn streaming_does_not_resolve_a_latent_prepared_reference(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let id = "streamed-latent-reference".to_string();
+    let first = "[label \\(x\\)]: https://example.com/slash\n\nretained";
+    let second = "\n\n[label \\(x\\)][] and [$a$][label \\(x\\)] and [label $$x$$][]";
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_stream_text(0, id.clone(), cx);
+            this.append_stream_text(0, id.clone(), first, cx);
+        });
+    });
+    redraw(cx);
+    let (owner_id, body_id) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, body, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("streamed assistant text")
+        };
+        (*ui_id, body.entity_id())
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_text(0, id, second, cx);
+        });
+    });
+    redraw_settled_math(cx);
+
+    let latent_start = first.len() + second.find("$$x$$").expect("latent formula");
+    let latent: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{latent_start}").into_boxed_str());
+    let latent_bounds = cx.debug_bounds(latent).expect("latent formula bounds");
+    cx.simulate_click(latent_bounds.center(), gpui::Modifiers::default());
+    assert_eq!(
+        cx.opened_url(),
+        None,
+        "preparation must not turn unresolved reference syntax into a link"
+    );
+
+    let linked_start = first.len() + second.find("$a$").expect("linked formula");
+    let linked: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{linked_start}").into_boxed_str());
+    let linked_bounds = cx.debug_bounds(linked).expect("linked formula bounds");
+    cx.simulate_click(linked_bounds.center(), gpui::Modifiers::default());
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/slash")
+    );
+
+    cx.update(|_, cx| {
+        let MessagePart::Text { text, body, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("streamed assistant text")
+        };
+        assert_eq!(body.entity_id(), body_id);
+        assert_eq!(text, &format!("{first}{second}"));
+    });
+}
+
+#[gpui::test]
 fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContext) {
     init_app(cx);
     let cx = cx.add_empty_window();
@@ -368,7 +625,7 @@ fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContex
 #[gpui::test]
 fn block_math_after_markdown_text_is_rendered_as_its_own_block(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(900.), px(1200.)));
     let markdown = "上文\n\n$$\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2}\n$$\n\n下文";
     cx.update(|_, cx| {
@@ -424,17 +681,146 @@ fn block_math_after_markdown_text_is_rendered_as_its_own_block(cx: &mut TestAppC
 }
 
 #[gpui::test]
+fn standalone_same_line_display_math_is_centered_as_a_block(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(900.)));
+    let markdown = "上文\n\n$$x^2 + y^2$$\n\n下文";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, formula_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        (*ui_id, text.find("$$").expect("display formula"))
+    });
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+    let row: &'static str =
+        Box::leak(format!("markdown-math-block-row-{owner_id}-{formula_start}").into_boxed_str());
+    let formula_bounds = cx.debug_bounds(formula).expect("display formula bounds");
+    let row_bounds = cx
+        .debug_bounds(row)
+        .expect("standalone display formula must use the block row");
+    assert!(
+        (formula_bounds.center().x - row_bounds.center().x).abs() < px(1.),
+        "standalone display math must be centered: {formula_bounds:?} vs {row_bounds:?}"
+    );
+}
+
+#[gpui::test]
+fn blockquote_display_math_uses_container_free_formula_source(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "> $$\n> x^2 + y^2\n> $$";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, formula_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        (*ui_id, text.find("$$").expect("display formula"))
+    });
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(formula).is_some(),
+        "blockquote container markers must not be passed to RaTeX"
+    );
+
+    let selected_all = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(selected_all.trim(), "$$\nx^2 + y^2\n$$");
+}
+
+#[gpui::test]
+fn list_display_math_uses_container_free_formula_source(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "- $$\n  x^2 + y^2\n  $$";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, formula_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        (*ui_id, text.find("$$").expect("display formula"))
+    });
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(formula).is_some(),
+        "list display math must render from its container-free AST value"
+    );
+
+    let selected_all = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(selected_all.trim(), "$$\nx^2 + y^2\n$$");
+}
+
+#[gpui::test]
 fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext) {
     use gpui_component::WindowExt as _;
 
     init_app(cx);
-    let (root, cx) = cx.add_window_view(|window, cx| {
-        let chat = ChatView::view(window, cx);
-        gpui_component::Root::new(chat, window, cx)
-    });
-    let chat = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<ChatView>().unwrap()
-    });
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "$$\nx^2 + y^2\n$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -488,7 +874,7 @@ fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext
 #[gpui::test]
 fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "根据**定义**：\n$$\nE = mc^2\n$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -507,22 +893,23 @@ fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut Te
     });
     redraw_settled_math(cx);
 
-    let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+    let (owner_id, formula_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
             panic!("assistant text part")
         };
-        *ui_id
+        (*ui_id, text.find("$$").expect("display formula"))
     });
-    let flow: &'static str = Box::leak(format!("markdown-math-flow-{owner_id}-0").into_boxed_str());
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
     assert!(
-        cx.debug_bounds(flow).is_some(),
-        "Markdown adjacent to a formula must remain in its source-ordered inline flow"
+        cx.debug_bounds(formula).is_some(),
+        "native Markdown blocks must retain the adjacent display formula"
     );
 
-    // A second draw exercises the same attached flow state rather than
-    // rebuilding a nested Markdown view and losing selection identity.
+    // A second draw exercises the same TextView and display-flow state rather
+    // than rebuilding nested Markdown around the formula.
     redraw(cx);
-    assert!(cx.debug_bounds(flow).is_some());
+    assert!(cx.debug_bounds(formula).is_some());
 
     let selected_all = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -538,7 +925,7 @@ fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut Te
 #[gpui::test]
 fn inline_math_does_not_turn_markdown_marks_into_literal_text(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(240.), px(1200.)));
     let markdown = "**Bold** before $x^2$ and after";
     cx.update(|_, cx| {
@@ -571,24 +958,118 @@ fn inline_math_does_not_turn_markdown_marks_into_literal_text(cx: &mut TestAppCo
         "inline math must produce a dedicated rendered formula element"
     );
     let formula_bounds = cx.debug_bounds(formula).expect("formula bounds");
-    let flow: &'static str =
-        Box::leak(format!("markdown-math-flow-{owner_id}-{formula_start}").into_boxed_str());
-    let flow_bounds = cx.debug_bounds(flow).expect("inline flow bounds");
+    let content_bounds = cx
+        .debug_bounds("assistant-message-content-0")
+        .expect("assistant content bounds");
     assert!(
         formula_bounds.size.width > px(0.) && formula_bounds.size.height > px(0.),
         "inline formula must have visible layout bounds: {formula_bounds:?}"
     );
     assert!(
-        formula_bounds.left() >= flow_bounds.left()
-            && formula_bounds.right() <= flow_bounds.right(),
-        "wrapped inline formula must remain inside its flow: {formula_bounds:?} vs {flow_bounds:?}"
+        formula_bounds.left() >= content_bounds.left()
+            && formula_bounds.right() <= content_bounds.right(),
+        "wrapped inline formula must remain inside native Markdown content: {formula_bounds:?} vs {content_bounds:?}"
+    );
+}
+
+#[gpui::test]
+fn streamed_list_continuation_keeps_surrounding_math_renderable(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let markdown = "before $a$\n\n- item\n    $$\n    x^2\n    $$\n\nafter $b$";
+    let id = "streamed-list-continuation-math".to_string();
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| this.start_stream_text(0, id.clone(), cx));
+    });
+    for chunk in markdown.split_inclusive('\n') {
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                this.append_stream_text(0, id.clone(), chunk, cx);
+            });
+        });
+        redraw(cx);
+    }
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let snapshots = crate::ui::math::formula_cache_snapshots(owner_id);
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|(_, snapshot)| (snapshot.source.as_str(), snapshot.inline, snapshot.ready))
+            .collect::<Vec<_>>(),
+        vec![("a", true, true), ("x^2", false, true), ("b", true, true)],
+        "every formula around a four-space list continuation must settle: {snapshots:#?}",
+    );
+}
+
+#[gpui::test]
+fn pending_quoted_display_does_not_downgrade_stable_math(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(1200.), px(2000.)));
+    seed_turn(&chat, cx);
+    let id = "quoted-pending-math".to_string();
+    let source = "$$\na\n$$\n\nbefore $s_0$\n\n> quote\n> $$\n> y^2\n> $$\n";
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| this.start_stream_text(0, id.clone(), cx));
+    });
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    for chunk in source.split_inclusive('\n') {
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                this.append_stream_text(0, id.clone(), chunk, cx);
+            });
+        });
+        redraw(cx);
+    }
+    redraw_settled_math(cx);
+
+    let terminal = IndexedMessage::from_message(LlmMessage {
+        role: crate::llm::Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text: source.to_string(),
+            provider_metadata: ProviderMetadata::default(),
+        }],
+        provider_metadata: ProviderMetadata::default(),
+    });
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| this.finish_reply(Some(terminal), None, cx));
+    });
+    redraw_settled_math(cx);
+
+    let terminal_owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    assert_eq!(terminal_owner_id, owner_id);
+    let start = source.find("$s_0$").expect("stable inline formula");
+    let selector: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(selector).is_some(),
+        "the terminal snapshot must retain stable math rendered before a quoted pending display"
     );
 }
 
 #[gpui::test]
 fn heading_and_inline_display_math_use_distinct_formula_nodes(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "# 标题 $x^2$\n\n块：$$\\int_0^1 x dx$$ 和 $$y^2$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -629,17 +1110,247 @@ fn heading_and_inline_display_math_use_distinct_formula_nodes(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn formula_rendering_inherits_native_marks_and_heading_weight(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "$x+y+z$\n\n***~~$x+y+z$~~***\n\n# $x+y+z$";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let starts = [
+        markdown.find('$').expect("plain formula"),
+        markdown.find("$x+y+z$~~").expect("marked formula"),
+        markdown.rfind('$').expect("heading formula") - "$x+y+z".len(),
+    ];
+    let bounds = starts.map(|start| {
+        let selector: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+        cx.debug_bounds(selector).expect("rendered formula bounds")
+    });
+
+    assert!(
+        bounds[1].size != bounds[0].size,
+        "bold/italic/strikethrough marks must affect the rendered formula: {bounds:?}"
+    );
+    assert!(
+        bounds[2].size.height > bounds[0].size.height,
+        "the native heading size/weight must reach the formula renderer: {bounds:?}"
+    );
+    let selected_all = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(selected_all.trim(), "$x+y+z$\n$x+y+z$\n$x+y+z$");
+}
+
+#[gpui::test]
+fn theme_switch_keeps_markdown_state_and_regenerates_formula_color(cx: &mut TestAppContext) {
+    init_app(cx);
+    cx.update(|cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+    });
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "theme-aware $x+y$";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, formula_start, body_id) = cx.update(|_, cx| {
+        let MessagePart::Text {
+            ui_id, text, body, ..
+        } = &chat.read(cx).messages[0].parts[0]
+        else {
+            panic!("assistant text part")
+        };
+        (
+            *ui_id,
+            text.find("$x+y$").expect("formula"),
+            body.entity_id(),
+        )
+    });
+    let before = crate::ui::math::formula_cache_snapshot(owner_id, formula_start)
+        .expect("settled dark-theme formula cache");
+    assert!(before.ready);
+    assert_eq!(before.source, "x+y");
+    assert!(before.inline);
+
+    // `Theme::change` avoids persisting into the user's real preferences.
+    cx.update(|_, cx| {
+        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
+    });
+    redraw_settled_math(cx);
+
+    let after = crate::ui::math::formula_cache_snapshot(owner_id, formula_start)
+        .expect("settled light-theme formula cache");
+    assert!(after.ready);
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.inline, before.inline);
+    assert_ne!(
+        after.color, before.color,
+        "the resolved text color must change"
+    );
+    assert!(
+        after.generation > before.generation,
+        "the keyed formula cache must regenerate after its color fingerprint changes: {before:?} -> {after:?}"
+    );
+    cx.update(|_, cx| {
+        let MessagePart::Text { body, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        assert_eq!(
+            body.entity_id(),
+            body_id,
+            "theme changes must not replace the authoritative Markdown state"
+        );
+    });
+}
+
+#[gpui::test]
+fn failed_inline_and_display_formulas_remain_selectable_fallbacks(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = concat!(
+        "inline $\\includegraphics{missing.png}$\n\n",
+        "$$\n\\includegraphics{missing.png}\n$$",
+    );
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, inline_start, display_start) = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        (
+            *ui_id,
+            text.find("$\\includegraphics").expect("inline fallback"),
+            text.find("$$\n").expect("display fallback"),
+        )
+    });
+    for start in [inline_start, display_start] {
+        let selector: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_none(),
+            "an unsupported formula must stay on its selectable text fallback"
+        );
+    }
+    let selected_all = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(
+        selected_all.trim(),
+        "inline $\\includegraphics{missing.png}$\n$$\n\\includegraphics{missing.png}\n$$"
+    );
+}
+
+#[gpui::test]
+fn currency_closing_context_stays_native_and_selectable(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "Cost $5 and$10 today";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, dollar_start, selected_all) = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text {
+                ui_id, text, body, ..
+            } = &this.messages[0].parts[0]
+            else {
+                panic!("assistant text part")
+            };
+            (
+                *ui_id,
+                text.find('$').expect("currency dollar"),
+                body.select_all_text(cx),
+            )
+        })
+    });
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{dollar_start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(formula).is_none(),
+        "a closing dollar followed by a digit must not become a formula"
+    );
+    assert_eq!(selected_all.trim(), markdown);
+}
+
+#[gpui::test]
 fn inline_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext) {
     use gpui_component::WindowExt as _;
 
     init_app(cx);
-    let (root, cx) = cx.add_window_view(|window, cx| {
-        let chat = ChatView::view(window, cx);
-        gpui_component::Root::new(chat, window, cx)
-    });
-    let chat = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<ChatView>().unwrap()
-    });
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "before $x^2$ after";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -708,13 +1419,7 @@ fn display_formula_drag_preserves_interleaved_markdown_order(cx: &mut TestAppCon
     use gpui_component::WindowExt as _;
 
     init_app(cx);
-    let (root, cx) = cx.add_window_view(|window, cx| {
-        let chat = ChatView::view(window, cx);
-        gpui_component::Root::new(chat, window, cx)
-    });
-    let chat = root.read_with(cx, |root, _| {
-        root.view().clone().downcast::<ChatView>().unwrap()
-    });
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "$$\na\n$$\nmiddle\n$$\nb\n$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -775,7 +1480,7 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
     cx: &mut TestAppContext,
 ) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(320.), px(900.)));
     let terms = std::iter::repeat_n("x_i^2", 40)
         .collect::<Vec<_>>()
@@ -867,7 +1572,7 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
 #[gpui::test]
 fn reasoning_delimiter_ellipsis_stays_on_the_native_text_path(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
     cx.simulate_resize(gpui::size(px(210.), px(700.)));
     let reasoning = "我们要求输出一些数学公式，包括块级和内联。块级公式用$$...$$，内联用$...$。随便写点数学公式即可。注意格式。我们输出即可。";
@@ -898,7 +1603,7 @@ fn reasoning_delimiter_ellipsis_stays_on_the_native_text_path(cx: &mut TestAppCo
 #[gpui::test]
 fn linked_inline_formula_opens_its_destination(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "[$x^2$](https://example.com/math)";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -931,9 +1636,304 @@ fn linked_inline_formula_opens_its_destination(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn native_markdown_image_remains_clickable_beside_a_formula(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown =
+        "$x$[![native](https://example.com/image.svg)](https://example.com/native-image)";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let formula: &'static str = Box::leak(format!("markdown-math-{owner_id}-0").into_boxed_str());
+    let formula = cx.debug_bounds(formula).expect("formula bounds");
+    let image_center = point(formula.right() + px(4.), formula.center().y);
+    cx.simulate_click(image_center, gpui::Modifiers::default());
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/native-image"),
+        "math preparation must preserve the adjacent native image and its link"
+    );
+}
+
+#[gpui::test]
+fn reference_image_alt_hazards_keep_native_images_and_chat_rendering(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "$q$[![a $$x][r]](https://click-a.test) ![b y$$][s]\n\n[r]: https://a.test/i.svg\n[s]: https://b.test/i.svg";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        assert_eq!(text, markdown);
+        *ui_id
+    });
+    let formula: &'static str = Box::leak(format!("markdown-math-{owner_id}-0").into_boxed_str());
+    let formula = cx.debug_bounds(formula).expect("leading formula bounds");
+    let image_center = point(formula.right() + px(4.), formula.center().y);
+    cx.simulate_click(image_center, gpui::Modifiers::default());
+    assert_eq!(cx.opened_url().as_deref(), Some("https://click-a.test"));
+
+    let unclaimed_math_start = markdown.find("$$").expect("image alt delimiter");
+    let unclaimed_math: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{unclaimed_math_start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(unclaimed_math).is_none(),
+        "dollars spanning reference-image alt text must remain native image content"
+    );
+}
+
+#[gpui::test]
+fn reference_linked_formula_keeps_native_link_behavior(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = r"[$x^2$][math]
+[label \(y\)][]
+[shortcut \(z\)]
+
+[math]: https://example.com/reference-math
+[label \(y\)]: https://example.com/collapsed-math
+[shortcut \(z\)]: https://example.com/shortcut-math";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        assert_eq!(text, markdown);
+        *ui_id
+    });
+    for (formula_source, destination) in [
+        ("$x^2$", "https://example.com/reference-math"),
+        (r"\(y\)", "https://example.com/collapsed-math"),
+        (r"\(z\)", "https://example.com/shortcut-math"),
+    ] {
+        let formula_start = markdown
+            .find(formula_source)
+            .expect("reference-linked formula");
+        let formula: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+        let bounds = cx.debug_bounds(formula).expect("reference formula bounds");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        assert_eq!(cx.opened_url().as_deref(), Some(destination));
+    }
+    let selected = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(selected.trim(), "$x^2$\nlabel \\(y\\)\nshortcut \\(z\\)");
+}
+
+#[gpui::test]
+fn colliding_prepared_reference_identifiers_keep_distinct_destinations(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = r"[label \(x\)][] and [$a$][label \(x\)]
+[label $$x$$][]
+
+[label \(x\)]: https://example.com/slash
+[label $$x$$]: https://example.com/dollar";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    for (formula_source, destination) in [
+        ("$a$", "https://example.com/slash"),
+        ("$$x$$", "https://example.com/dollar"),
+    ] {
+        let formula_start = markdown.find(formula_source).expect("linked formula");
+        let formula: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+        let bounds = cx.debug_bounds(formula).expect("linked formula bounds");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        assert_eq!(cx.opened_url().as_deref(), Some(destination));
+    }
+
+    let selected = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
+                panic!("assistant text part")
+            };
+            body.select_all_text(cx)
+        })
+    });
+    assert_eq!(selected.trim(), "label (x) and $a$\nlabel $$x$$");
+}
+
+#[gpui::test]
+fn table_cell_formula_uses_native_table_flow(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "| 描述 | 数学表达式 |\n| :--- | :--- |\n| 模长大于 R | $|z| > R$ |";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let (owner_id, formula_start, selected) = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let MessagePart::Text {
+                ui_id, text, body, ..
+            } = &this.messages[0].parts[0]
+            else {
+                panic!("assistant text part")
+            };
+            (
+                *ui_id,
+                text.find("$|z| > R$").expect("table formula"),
+                body.select_all_text(cx),
+            )
+        })
+    });
+    let formula: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(formula).is_some(),
+        "the native table cell must retain its custom inline formula"
+    );
+    assert_eq!(selected.trim(), "描述 数学表达式\n模长大于 R $|z| > R$");
+}
+
+#[gpui::test]
+fn long_inline_riemann_formulas_all_render(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let formulas = [
+        r"$R^{\rho}_{\sigma\mu\nu}$",
+        r"$R^{\rho}_{\sigma\mu\nu} = \partial_{\mu} \Gamma^{\rho}_{\nu\sigma} - \partial_{\nu} \Gamma^{\rho}_{\mu\sigma}$",
+        r"$R^{\rho}_{\sigma\mu\nu} = \partial_{\mu} \Gamma^{\rho}_{\nu\sigma} - \partial_{\nu} \Gamma^{\rho}_{\mu\sigma} + \Gamma^{\rho}_{\mu\lambda} \Gamma^{\lambda}_{\nu\sigma} - \Gamma^{\rho}_{\nu\lambda} \Gamma^{\lambda}_{\mu\sigma}$",
+        r"$\displaystyle R^{\rho}_{\sigma\mu\nu} = \partial_{\mu} \Gamma^{\rho}_{\nu\sigma} - \partial_{\nu} \Gamma^{\rho}_{\mu\sigma}$",
+        r"$R^{\rho}_{\sigma\,\mu\,\nu}$",
+    ];
+    let markdown = format!(
+        "好的，这是你需要渲染的黎曼几何算子公式，直接输出如下：\n\n{}",
+        formulas.join("\n\n")
+    );
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.clone(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    for formula in formulas {
+        let start = markdown.find(formula).expect("formula source");
+        let selector: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "inline formula did not render: {formula}; caches: {:?}",
+            crate::ui::math::formula_cache_snapshots(owner_id),
+        );
+    }
+}
+
+#[gpui::test]
 fn multiline_inline_math_paragraph_lays_out_without_panicking(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(360.), px(1200.)));
     let markdown = "第一行\n第二行 $x^2$ 结尾";
     cx.update(|_, cx| {
@@ -971,7 +1971,7 @@ fn multiline_inline_math_paragraph_lays_out_without_panicking(cx: &mut TestAppCo
 #[gpui::test]
 fn multiple_display_formulas_stack_without_overlap(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(900.), px(1600.)));
     let markdown = "before\n\n$$x^2$$\n\nmiddle\n\n\\[\\frac{1}{2}\\]\n\nafter";
     cx.update(|_, cx| {
@@ -1021,7 +2021,7 @@ fn multiple_display_formulas_stack_without_overlap(cx: &mut TestAppContext) {
 #[gpui::test]
 fn matrix_display_formula_survives_markdown_block_tokenization(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(900.), px(1800.)));
     let markdown = "以下是一些数学公式：\n\n内联公式示例：勾股定理 \\(a^2+b^2=c^2\\)，欧拉公式 \\(e^{i\\pi}+1=0\\)，以及极限 \\(\\lim_{x\\to 0}\\frac{\\sin x}{x}=1\\)。\n\n块级公式示例：\n\n$$\n\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}\n$$\n\n$$\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2} = \\frac{\\pi^2}{6}\n$$\n\n$$\n\\begin{pmatrix}\n1 & 2 \\\\\n3 & 4\n\\end{pmatrix}\n\\begin{pmatrix}\nx \\\\ y\n\\end{pmatrix}\n=\n\\begin{pmatrix}\n5 \\\\ 6\n\\end{pmatrix}\n$$";
     cx.update(|_, cx| {
@@ -1063,8 +2063,9 @@ fn matrix_display_formula_survives_markdown_block_tokenization(cx: &mut TestAppC
             Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
         assert!(
             cx.debug_bounds(selector).is_some(),
-            "display formula {} must be rendered as an image-backed math node",
-            formula_ix + 1
+            "display formula {} must be rendered as an image-backed math node; caches: {:?}",
+            formula_ix + 1,
+            crate::ui::math::formula_cache_snapshots(owner_id),
         );
     }
 }
@@ -1072,7 +2073,7 @@ fn matrix_display_formula_survives_markdown_block_tokenization(cx: &mut TestAppC
 #[gpui::test]
 fn fenced_blocks_show_language_and_copy_their_own_code(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     let markdown = "Before\n\n```rust\nfn first() {}\n```\n\n```unknown-language-tag-that-must-truncate-cleanly\nsecond\n```\n\n```\nplain\n```";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -1226,7 +2227,7 @@ fn code_block_labels_resolve_in_every_locale() {
 #[gpui::test]
 fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     let long_line = "long code line ".repeat(40);
     let markdown = format!("```rust\n{long_line}\nsecond line\n```\n\n```text\n{long_line}\n```");
     cx.update(|_, cx| {
@@ -1390,7 +2391,7 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
 #[gpui::test]
 fn nowrap_code_block_exposes_a_horizontal_scrollbar(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(640.), px(420.)));
     let long_line = "horizontal overflow ".repeat(80);
     let markdown = format!("```rust\n{long_line}\n```\n\n{}", "tail\n\n".repeat(80));
@@ -1457,7 +2458,7 @@ fn nowrap_code_block_exposes_a_horizontal_scrollbar(cx: &mut TestAppContext) {
 #[gpui::test]
 fn nowrap_code_block_hides_the_horizontal_scrollbar_without_overflow(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(640.), px(420.)));
     let markdown = "```rust\nlet short = true;\n```";
     cx.update(|_, cx| {
@@ -1495,7 +2496,7 @@ fn nowrap_code_block_hides_the_horizontal_scrollbar_without_overflow(cx: &mut Te
 #[gpui::test]
 fn nowrap_code_block_updates_scrollbar_visibility_after_resize(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(1000.), px(420.)));
     let medium_line = "medium-width-code ".repeat(4);
     let markdown = format!("```rust\n{medium_line}\n```");
@@ -1552,7 +2553,7 @@ fn nowrap_code_block_updates_scrollbar_visibility_after_resize(cx: &mut TestAppC
 #[gpui::test]
 fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(640.), px(420.)));
     let long_line = "horizontal overflow ".repeat(80);
     let markdown = format!(
@@ -1774,11 +2775,6 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
             .expect("error body entity")
     });
 
-    // A theme switch fires the global observer, which replaces each card's
-    // body while `ChatView` itself is mid-update. Creating the separate body
-    // entity here is safe; re-entering `ChatView` through its handle would
-    // panic.
-    //
     // `Theme::change` rather than `theme::set_mode`: the latter persists to
     // the user's real configuration directory.
     cx.update(|_, cx| {
@@ -1794,9 +2790,9 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
             .and_then(|message| message.error.as_ref())
             .expect("the card survives a theme switch");
         let error_body_after_theme_switch = error.body_entity_id().expect("error body entity");
-        assert_ne!(
+        assert_eq!(
             error_body_after_theme_switch, error_body_before_theme_switch,
-            "theme changes must replace the parsed markdown state"
+            "theme changes must refresh native highlights without replacing TextView state"
         );
     });
 
@@ -2252,7 +3248,7 @@ fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
 #[gpui::test]
 fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -2936,15 +3932,9 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
     init_app(cx);
-    // `ChatView` is the window's own root view here, rather than
-    // `add_empty_window` plus a manual `cx.draw`: a click has to route through
-    // the window's real element tree, and a hand-drawn element is not part of
-    // it. Deliberately not wrapped in `Root` (which the app does): `Root::new`
-    // installs a macOS hit-test forwarder behind `not(test)`, and that cfg is
-    // false for gpui-component compiled as a dependency, so it reaches for a
-    // real platform window and panics under a `TestWindow`. Nothing in this
-    // test needs the overlay layers `Root` provides.
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    // Use the same rooted element tree as production so click routing and
+    // overlay ownership exercise the real window contract.
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     // Far more than the visible budget, so the copy would be lossy if it read
@@ -3009,7 +3999,7 @@ fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_copy_button_appears_only_once_there_is_reasoning(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     let draw = |cx: &mut gpui::VisualTestContext| {
@@ -3159,7 +4149,7 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
 #[gpui::test]
 fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) {
     init_app(cx);
-    let (chat, cx) = cx.add_window_view(ChatView::new);
+    let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(900.), px(700.)));
     seed_turn(&chat, cx);
 

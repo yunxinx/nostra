@@ -2,6 +2,12 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
 use gpui::{App, AppContext as _, Hsla, Pixels, RenderImage, Rgba, Task, Window, px};
 use ratex_layout::{LayoutOptions, layout, to_display_list};
 use ratex_parser::parse;
@@ -72,7 +78,7 @@ pub(super) struct FormulaRequest<'a> {
 enum FormulaStatus {
     Idle,
     Pending,
-    Ready(RenderedFormula),
+    Ready,
     Failed,
 }
 
@@ -80,7 +86,74 @@ struct FormulaCache {
     fingerprint: FormulaFingerprint,
     generation: u64,
     status: FormulaStatus,
+    displayed: Option<RenderedFormula>,
     _task: Option<Task<()>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FormulaCacheSnapshot {
+    pub(crate) source: String,
+    pub(crate) inline: bool,
+    pub(crate) color: Hsla,
+    pub(crate) generation: u64,
+    pub(crate) ready: bool,
+}
+
+#[cfg(test)]
+fn formula_cache_probes() -> &'static Mutex<HashMap<(u64, usize), FormulaCacheSnapshot>> {
+    static PROBES: OnceLock<Mutex<HashMap<(u64, usize), FormulaCacheSnapshot>>> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_formula_cache(
+    owner_id: u64,
+    start: usize,
+    fingerprint: &FormulaFingerprint,
+    generation: u64,
+    status: &FormulaStatus,
+) {
+    formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            (owner_id, start),
+            FormulaCacheSnapshot {
+                source: fingerprint.source.clone(),
+                inline: fingerprint.inline,
+                color: fingerprint.color,
+                generation,
+                ready: matches!(status, FormulaStatus::Ready),
+            },
+        );
+}
+
+#[cfg(test)]
+pub(crate) fn formula_cache_snapshot(owner_id: u64, start: usize) -> Option<FormulaCacheSnapshot> {
+    formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&(owner_id, start))
+        .cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn formula_cache_snapshots(owner_id: u64) -> Vec<(usize, FormulaCacheSnapshot)> {
+    let mut snapshots = formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(|(&(candidate_owner, start), snapshot)| {
+            if candidate_owner == owner_id {
+                Some((start, snapshot.clone()))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by_key(|(start, _)| *start);
+    snapshots
 }
 
 impl FormulaCache {
@@ -89,23 +162,17 @@ impl FormulaCache {
             fingerprint,
             generation: 0,
             status: FormulaStatus::Idle,
+            displayed: None,
             _task: None,
         }
     }
 
     fn rendered(&self) -> Option<RenderedFormula> {
-        match &self.status {
-            FormulaStatus::Ready(rendered) => Some(rendered.clone()),
-            FormulaStatus::Idle | FormulaStatus::Pending | FormulaStatus::Failed => None,
-        }
+        self.displayed.clone()
     }
 
     fn take_image(&mut self) -> Option<Arc<RenderImage>> {
-        let status = std::mem::replace(&mut self.status, FormulaStatus::Idle);
-        match status {
-            FormulaStatus::Ready(rendered) => Some(rendered.image),
-            FormulaStatus::Idle | FormulaStatus::Pending | FormulaStatus::Failed => None,
-        }
+        self.displayed.take().map(|rendered| rendered.image)
     }
 }
 
@@ -114,6 +181,8 @@ pub(super) fn cached_formula(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<RenderedFormula> {
+    #[cfg(test)]
+    let probe_key = (request.owner_id, request.start);
     let fingerprint = FormulaFingerprint {
         source: request.source.to_string(),
         inline: request.inline,
@@ -151,20 +220,26 @@ pub(super) fn cached_formula(
         cached.fingerprint != fingerprint || matches!(cached.status, FormulaStatus::Idle)
     };
     if needs_render {
-        let stale_image = cache.update(cx, |cache, _| {
-            let stale_image = cache.take_image();
+        cache.update(cx, |cache, _| {
             cache.generation = cache.generation.wrapping_add(1);
             cache.fingerprint = fingerprint.clone();
             cache.status = FormulaStatus::Pending;
             // Dropping the previous task cancels work that can no longer win.
             cache._task = None;
-            stale_image
         });
-        if let Some(image) = stale_image {
-            cx.drop_image(image, Some(window));
-        }
 
         let generation = cache.read(cx).generation;
+        #[cfg(test)]
+        {
+            let cached = cache.read(cx);
+            record_formula_cache(
+                probe_key.0,
+                probe_key.1,
+                &cached.fingerprint,
+                cached.generation,
+                &cached.status,
+            );
+        }
         let weak_cache = cache.downgrade();
         let svg_renderer = cx.svg_renderer();
         let render_fingerprint = fingerprint.clone();
@@ -178,6 +253,7 @@ pub(super) fn cached_formula(
         let task = window.spawn(cx, async move |async_cx| {
             let rendered = background.await;
             let mut discarded_image = None;
+            let mut replaced_image = None;
             let _ = async_cx.update(|window, cx| {
                 let _ = weak_cache.update(cx, |cache, cache_cx| {
                     // A streamed formula or theme/style change can supersede a
@@ -188,13 +264,37 @@ pub(super) fn cached_formula(
                         discarded_image = rendered.map(|rendered| rendered.image);
                         return;
                     }
-                    cache.status = match rendered {
-                        Some(rendered) => FormulaStatus::Ready(rendered),
-                        None => FormulaStatus::Failed,
-                    };
+                    match rendered {
+                        Some(rendered) => {
+                            replaced_image = cache
+                                .displayed
+                                .replace(rendered)
+                                .map(|rendered| rendered.image);
+                            cache.status = FormulaStatus::Ready;
+                        }
+                        None => {
+                            // A genuinely unsupported final formula must fall
+                            // back to its selectable source instead of showing
+                            // stale pixels indefinitely. Pending replacements,
+                            // by contrast, keep the last-good frame above.
+                            replaced_image = cache.take_image();
+                            cache.status = FormulaStatus::Failed;
+                        }
+                    }
+                    #[cfg(test)]
+                    record_formula_cache(
+                        probe_key.0,
+                        probe_key.1,
+                        &cache.fingerprint,
+                        cache.generation,
+                        &cache.status,
+                    );
                     cache_cx.notify();
                 });
                 if let Some(image) = discarded_image.take() {
+                    cx.drop_image(image, Some(window));
+                }
+                if let Some(image) = replaced_image.take() {
                     cx.drop_image(image, Some(window));
                 }
             });
@@ -342,6 +442,7 @@ mod tests {
     #[test]
     fn renders_representative_display_formulas() {
         for source in [
+            r"\int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}",
             r"\sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}",
             r"\begin{bmatrix} 1 & 2 & 3 \\ 4 & 5 & 6 \end{bmatrix}",
             r"f(x) = \begin{cases} x^2, & x \ge 0 \\ -x, & x < 0 \end{cases}",

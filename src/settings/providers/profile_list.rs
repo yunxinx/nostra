@@ -7,12 +7,15 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, h_flex, list::ListItem,
-    menu::PopupMenuItem, scroll::ScrollableElement as _, v_flex,
+    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, h_flex,
+    list::ListItem,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    scroll::ScrollableElement as _,
+    v_flex,
 };
 use rust_i18n::t;
 
-use super::{IconButton, ProvidersPage, ROW_HEIGHT};
+use super::{ProvidersPage, ROW_HEIGHT, icon_button};
 use crate::{llm::ProviderProfile, providers};
 
 impl ProvidersPage {
@@ -155,10 +158,12 @@ impl ProvidersPage {
         let id = id.to_string();
         let menu_id = id.clone();
 
-        IconButton::new(
+        icon_button(
             ElementId::Name(format!("provider-actions-{id}").into()),
             IconName::Ellipsis,
             t!("settings.providers.more_actions").to_string(),
+            px(20.),
+            px(16.),
         )
         // Keep the keyed trigger mounted while its menu is open.
         .when(!visible, |this| this.invisible())

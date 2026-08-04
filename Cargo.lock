@@ -2441,7 +2441,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=bb07ed984181e9de21107200ba398afc68a5d4d3#bb07ed984181e9de21107200ba398afc68a5d4d3"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=d4c3768ec1d1e7405c063df84d7ef0657b794573#d4c3768ec1d1e7405c063df84d7ef0657b794573"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2515,6 +2515,8 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+ "unicode-properties",
+ "unicode-script",
  "unicode-segmentation",
  "uuid",
  "windows 0.58.0",
@@ -2524,7 +2526,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=bb07ed984181e9de21107200ba398afc68a5d4d3#bb07ed984181e9de21107200ba398afc68a5d4d3"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=d4c3768ec1d1e7405c063df84d7ef0657b794573#d4c3768ec1d1e7405c063df84d7ef0657b794573"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2538,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=bb07ed984181e9de21107200ba398afc68a5d4d3#bb07ed984181e9de21107200ba398afc68a5d4d3"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=d4c3768ec1d1e7405c063df84d7ef0657b794573#d4c3768ec1d1e7405c063df84d7ef0657b794573"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4079,6 +4081,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "unicode-segmentation",
  "url",
 ]
 
@@ -5142,7 +5145,8 @@ dependencies = [
 [[package]]
 name = "psm"
 version = "0.1.31"
-source = "git+https://github.com/rust-lang/stacker?branch=master#1d45da4653e1d6e5d273cf20e215b372d84ade5e"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "645dbe486e346d9b5de3ef16ede18c26e6c70ad97418f4874b8b1889d6e761ea"
 dependencies = [
  "ar_archive_writer",
  "cc",

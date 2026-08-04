@@ -25,7 +25,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _},
     scroll::ScrollableElement as _,
-    text::TextViewStyle,
+    text::{TextView, TextViewStyle},
     v_flex,
 };
 use rust_i18n::t;
@@ -465,13 +465,6 @@ impl ChatView {
                 },
             );
 
-        // Error cards use TextView's native code blocks, whose syntax colors are
-        // fixed when parsed. Chat code blocks read the current theme in their
-        // custom renderer and invalidate their own highlight cache.
-        let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
-            this.refresh_error_highlights(cx);
-        });
-
         let selection = providers::last_selection(cx);
         let selection_available = providers::selection_is_available(selection.as_ref(), cx);
         Self {
@@ -493,20 +486,7 @@ impl ChatView {
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             next_turn_id: 1,
-            _subscriptions: vec![subscription, theme_observer],
-        }
-    }
-
-    /// Re-parse native code blocks in error cards against the active palette.
-    fn refresh_error_highlights(&mut self, cx: &mut Context<Self>) {
-        let mut refreshed = false;
-        for message in &mut self.messages {
-            if let Some(error) = &mut message.error {
-                refreshed |= error.refresh_highlight(cx);
-            }
-        }
-        if refreshed {
-            cx.notify();
+            _subscriptions: vec![subscription],
         }
     }
 
@@ -1186,10 +1166,20 @@ fn render_message(
         )
     };
     let is_user = msg.role == Role::User;
+    let render_user_markdown = crate::ui::markdown::user_message_markdown_enabled(cx);
     let parts = msg.parts.iter().filter_map(|part| {
             match part {
-                MessagePart::Text { text, body, .. } if !text.is_empty() => {
-                    Some(body.text_view(TextViewStyle::default()).into_any_element())
+                MessagePart::Text {
+                    ui_id, text, body, ..
+                } if !text.is_empty() => {
+                    Some(if is_user && !render_user_markdown {
+                        TextView::plain(("user-message-plain", *ui_id), text.clone())
+                            .selectable(true)
+                            .style(TextViewStyle::default())
+                            .into_any_element()
+                    } else {
+                        body.text_view(TextViewStyle::default()).into_any_element()
+                    })
                 }
                 MessagePart::Reasoning {
                     ui_id,

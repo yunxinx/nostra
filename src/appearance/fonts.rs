@@ -60,8 +60,9 @@ mod tests {
     use super::*;
 
     /// The embed paths and the on-disk assets must stay in sync — a typo'd
-    /// path would silently skip registration and the composer would fall
-    /// back to the system font (reintroducing the wrap-drift bug).
+    /// path would silently skip registration and replace the selected product
+    /// appearance with an unintended system fallback. Wrapping correctness is
+    /// independently guaranteed by production shaping.
     #[test]
     fn bundled_font_files_resolve() {
         for path in FONT_FILES {

@@ -86,6 +86,9 @@ chat:
       en: Copy reasoning
       zh-CN: 复制思考过程
   error:
+    markdown:
+      en: Nostra could not safely render this Markdown content.
+      zh-CN: Nostra 无法安全渲染这段 Markdown 内容。
     configuration:
       en: Select an available provider and model in Settings.
       zh-CN: 请在设置中选择可用的供应商和模型。
@@ -204,6 +207,12 @@ settings:
   composer_font_desc:
     en: Bundled font used by the message input; both options keep soft-wrap positions exact.
     zh-CN: 消息输入框使用的内嵌字体；两种选择都能保证换行位置精确。
+  user_message_markdown:
+    en: User message Markdown
+    zh-CN: 用户消息 Markdown
+  user_message_markdown_desc:
+    en: Interpret Markdown and math syntax in user messages; when off, show the original text.
+    zh-CN: 渲染用户消息中的 Markdown 与数学语法；关闭时显示原始文本。
   code_wrap:
     en: Code block wrapping
     zh-CN: 代码块自动换行

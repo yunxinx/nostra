@@ -31,6 +31,8 @@ in these open-source projects:
 
 - [Zed](https://github.com/zed-industries/zed) and its GPUI framework
 - [gpui-component](https://github.com/longbridge/gpui-component)
+- [markstream-vue](https://github.com/Simon-He95/markstream-vue), whose
+  streaming Markdown and math compatibility work informed Nostra's renderer
 - [pi](https://github.com/earendil-works/pi)
 - [Rig](https://github.com/0xPlaygrounds/rig)
 - [one-api](https://github.com/songquanpeng/one-api)

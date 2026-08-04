@@ -64,11 +64,6 @@ pub struct TurnError {
     request_id: Option<SharedString>,
     /// Verbatim upstream body, retained for the clipboard.
     raw_body: Option<SharedString>,
-    /// The fenced-code-block markdown handed to `body`. Kept because a code
-    /// block's syntax colors are baked in at parse time (see
-    /// [`TurnError::refresh_highlight`]) and re-parsing needs the source again —
-    /// `TextViewState` does not expose it.
-    markdown: Option<SharedString>,
     /// Markdown-wrapped body rendered as a fenced code block, or `None` when the
     /// failure carried no upstream text (a local config or connect failure).
     body: Option<Entity<TextViewState>>,
@@ -89,7 +84,6 @@ impl TurnError {
                 code,
                 request_id,
                 raw_body: None,
-                markdown: None,
                 body: None,
                 collapsible: false,
                 preview_truncated: false,
@@ -113,29 +107,10 @@ impl TurnError {
             // deliberately not redacted: this is the provider response the user
             // asked to inspect, kept out of Debug, metrics, and canonical replay.
             raw_body: Some(raw.into()),
-            markdown: Some(markdown),
             body: Some(body),
             collapsible,
             preview_truncated: source_truncated || format_truncated,
         }
-    }
-
-    /// Re-parse the body so its code block picks up the active theme's syntax
-    /// colors.
-    ///
-    /// Markdown code blocks capture an `Arc<HighlightTheme>` when they are parsed
-    /// (`text::node::CodeBlock::new`) and memoize their styles from it, so a
-    /// theme switch alone leaves them painted in the old palette — unlike the
-    /// `Input` code editor, which resolves `cx.theme().highlight_theme` at paint
-    /// time. `TextViewState::set_text` ignores an unchanged value, so refreshing
-    /// must replace the state entity. This also drops parse tasks tied to the old
-    /// theme while keeping entity creation outside render.
-    pub fn refresh_highlight(&mut self, cx: &mut App) -> bool {
-        let Some(markdown) = self.markdown.clone() else {
-            return false;
-        };
-        self.body = Some(cx.new(|cx| TextViewState::markdown(&markdown, cx)));
-        true
     }
 
     #[cfg(test)]
