@@ -231,6 +231,12 @@ settings:
   user_message_markdown_desc:
     en: Interpret Markdown and math syntax in user messages; when off, show the original text.
     zh-CN: 渲染用户消息中的 Markdown 与数学语法；关闭时显示原始文本。
+  smooth_chat_scrolling:
+    en: Smooth conversation scrolling
+    zh-CN: 对话区域平滑滚动
+  smooth_chat_scrolling_desc:
+    en: Ease discrete mouse-wheel scrolling in the conversation area; precise touchpad scrolling is unchanged.
+    zh-CN: 让对话区域的离散鼠标滚轮滚动更平滑；触控板的精确滚动不受影响。
   code_wrap:
     en: Code block wrapping
     zh-CN: 代码块自动换行

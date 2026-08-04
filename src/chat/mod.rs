@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FollowMode,
-    InteractiveElement as _, IntoElement, ListAlignment, ListState, ParentElement as _, Pixels,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription, Window, div,
-    list, point, px,
+    InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState, ParentElement as _,
+    Pixels, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
+    Window, div, list, point, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
@@ -46,6 +46,10 @@ const CONTENT_MAX_WIDTH: Pixels = px(760.);
 const MESSAGE_LIST_OVERDRAW: Pixels = px(1_000.);
 const MESSAGE_HEIGHT_HINT: Pixels = px(160.);
 const STICK_THRESHOLD: Pixels = px(48.);
+
+/// Fraction of the remaining wheel distance applied on each animation frame.
+const SMOOTH_SCROLL_FRAME_FRACTION: f32 = 0.22;
+const SMOOTH_SCROLL_FINISH_THRESHOLD: Pixels = px(0.75);
 
 /// First-frame fallback until the floating composer reports its actual height.
 const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
@@ -79,6 +83,48 @@ fn update_scroll_follow(
     } else if dy < px(0.) && scroll_is_near_bottom(scroll_handle) {
         *follow = true;
     }
+}
+
+#[derive(Default)]
+struct SmoothScrollState {
+    remaining: Pixels,
+    frame_scheduled: bool,
+}
+
+impl SmoothScrollState {
+    fn enqueue(&mut self, distance: Pixels) {
+        self.remaining += distance;
+    }
+
+    fn next_step(&mut self) -> Option<Pixels> {
+        if self.remaining >= -SMOOTH_SCROLL_FINISH_THRESHOLD
+            && self.remaining <= SMOOTH_SCROLL_FINISH_THRESHOLD
+        {
+            let step = self.remaining;
+            self.remaining = Pixels::ZERO;
+            return (step != Pixels::ZERO).then_some(step);
+        }
+
+        let step = self.remaining * SMOOTH_SCROLL_FRAME_FRACTION;
+        self.remaining -= step;
+        Some(step)
+    }
+
+    fn cancel_motion(&mut self) {
+        self.remaining = Pixels::ZERO;
+    }
+}
+
+pub(crate) fn smooth_scrolling_enabled(cx: &App) -> bool {
+    crate::preferences::get(cx).smooth_chat_scrolling
+}
+
+pub(crate) fn set_smooth_scrolling(enabled: bool, cx: &mut App) {
+    if smooth_scrolling_enabled(cx) == enabled {
+        return;
+    }
+    crate::preferences::update(cx, |prefs| prefs.smooth_chat_scrolling = enabled);
+    cx.refresh_windows();
 }
 
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
@@ -391,6 +437,7 @@ pub struct ChatView {
     /// read the external `InputState` entity while recording layout bounds.
     input_empty: bool,
     list_state: ListState,
+    smooth_scroll: SmoothScrollState,
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
@@ -470,6 +517,7 @@ impl ChatView {
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
             input_empty: true,
             list_state,
+            smooth_scroll: SmoothScrollState::default(),
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
@@ -1029,6 +1077,7 @@ impl ChatView {
         #[cfg(test)]
         self.materialized_message_indices.clear();
         let message_count = self.messages.len();
+        let wheel_scroll_anchor = self.list_state.logical_scroll_top();
         let render_item = cx.processor(move |this, index, window, cx| {
             #[cfg(test)]
             this.materialized_message_indices.insert(index);
@@ -1049,18 +1098,83 @@ impl ChatView {
             .relative()
             .size_full()
             .child(
-                div().id("messages").size_full().child(
-                    list(self.list_state.clone(), render_item)
-                        .size_full()
-                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                        // Match the scrollbar thumb's 4px top inset so the
-                        // first message aligns with the top of the thumb.
-                        .pt(px(4.))
-                        // Leave exactly enough room for the measured floating composer.
-                        .pb(composer_height),
-                ),
+                div()
+                    .id("messages")
+                    .size_full()
+                    .on_scroll_wheel(cx.listener(move |this, event, window, cx| {
+                        this.handle_message_scroll_wheel(event, wheel_scroll_anchor, window, cx);
+                    }))
+                    .child(
+                        list(self.list_state.clone(), render_item)
+                            .size_full()
+                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                            // Match the scrollbar thumb's 4px top inset so the
+                            // first message aligns with the top of the thumb.
+                            .pt(px(4.))
+                            // Leave exactly enough room for the measured floating composer.
+                            .pb(composer_height),
+                    ),
             )
             .vertical_scrollbar(&self.list_state)
+    }
+
+    fn handle_message_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        native_anchor: ListOffset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !smooth_scrolling_enabled(cx) || event.delta.precise() {
+            self.smooth_scroll.cancel_motion();
+            return;
+        }
+
+        let distance = -event.delta.pixel_delta(window.line_height()).y;
+        if distance == Pixels::ZERO {
+            return;
+        }
+
+        // GPUI's list handles the wheel event first during bubbling. Restore
+        // the pre-event anchor before starting the eased movement so the
+        // native jump never reaches a painted frame.
+        self.list_state.scroll_to(native_anchor);
+        self.smooth_scroll.enqueue(distance);
+        self.schedule_smooth_scroll_frame(window, cx);
+        cx.stop_propagation();
+    }
+
+    fn schedule_smooth_scroll_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.smooth_scroll.frame_scheduled {
+            return;
+        }
+        self.smooth_scroll.frame_scheduled = true;
+        cx.on_next_frame(window, |this, window, cx| {
+            this.advance_smooth_scroll(window, cx);
+        });
+    }
+
+    fn advance_smooth_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.smooth_scroll.frame_scheduled = false;
+        if !smooth_scrolling_enabled(cx) {
+            self.smooth_scroll.cancel_motion();
+            return;
+        }
+
+        let Some(step) = self.smooth_scroll.next_step() else {
+            return;
+        };
+        let before = self.list_state.logical_scroll_top();
+        self.list_state.scroll_by(step);
+        let after = self.list_state.logical_scroll_top();
+        if before.item_ix == after.item_ix && before.offset_in_item == after.offset_in_item {
+            self.smooth_scroll.cancel_motion();
+        }
+
+        cx.notify();
+        if self.smooth_scroll.remaining != Pixels::ZERO {
+            self.schedule_smooth_scroll_frame(window, cx);
+        }
     }
 
     fn sync_message_list_count(&self) {
@@ -1241,6 +1355,10 @@ fn render_message(
                               event: &ScrollWheelEvent,
                               window,
                               _cx| {
+                            // A gesture over a nested reasoning viewport takes
+                            // ownership of the pointer; do not let a previously
+                            // queued transcript animation keep moving underneath it.
+                            this.smooth_scroll.cancel_motion();
                             if let Some(MessagePart::Reasoning {
                                 trace: Some(trace), ..
                             }) = this

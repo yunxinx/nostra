@@ -389,6 +389,10 @@ pub(crate) fn render(
                             // render seven lines of blank card.
                             .max_h(max_height)
                             .overflow_y_scroll()
+                            // This nested viewport must occlude the transcript's
+                            // list hitbox. Otherwise the list's native wheel
+                            // handler runs before this card's bubble handler.
+                            .occlude()
                             .track_scroll(&trace.scroll)
                             .px_3()
                             .py_2()

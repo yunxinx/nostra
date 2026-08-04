@@ -14,8 +14,36 @@ use crate::preferences;
 
 use super::{
     CONTENT_MAX_WIDTH, ChatEvent, ChatView, Message, MessagePart, ReasoningTrace, Role,
-    STICK_THRESHOLD, is_replayable,
+    SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD,
+    SmoothScrollState, is_replayable,
 };
+
+#[test]
+fn smooth_scroll_state_eases_and_accumulates_wheel_distance() {
+    let mut state = SmoothScrollState::default();
+    state.enqueue(px(240.));
+
+    let first = state.next_step().expect("a queued scroll has a first step");
+    assert_eq!(first, px(240. * SMOOTH_SCROLL_FRAME_FRACTION));
+    assert!(state.remaining < px(240.));
+
+    state.enqueue(px(-60.));
+    let mut applied = first;
+    let mut frames = 1;
+    while let Some(step) = state.next_step() {
+        applied += step;
+        frames += 1;
+        if frames > 100 {
+            panic!("smooth scroll did not converge");
+        }
+    }
+
+    assert!((applied - px(180.)).as_f32().abs() < 0.01);
+    assert!(state.remaining.as_f32().abs() <= SMOOTH_SCROLL_FINISH_THRESHOLD.as_f32());
+
+    state.enqueue(px(2_400.));
+    assert_eq!(state.remaining, px(2_400.));
+}
 
 /// A completed user turn plus the assistant placeholder a reply streams
 /// into. Pushed directly rather than through `submit`, which is gated on a
@@ -114,6 +142,58 @@ fn redraw_settled_math(cx: &mut gpui::VisualTestContext) {
     // the background executor. Drain that work and draw once more so visual
     // assertions observe the settled image rather than the text fallback.
     redraw(cx);
+}
+
+#[gpui::test]
+fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(420.)));
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
+        chat.update(cx, |chat, cx| {
+            for index in 0..20 {
+                chat.messages.push(Message::from_canonical(
+                    LlmMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: format!("message {index}\n\n{}", "body ".repeat(30)),
+                            provider_metadata: ProviderMetadata::default(),
+                        }],
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                    cx,
+                ));
+            }
+            chat.sync_message_list_count();
+            chat.list_state.scroll_to(ListOffset::default());
+        });
+    });
+    redraw(cx);
+
+    let before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(320.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., -3.)),
+        ..Default::default()
+    });
+
+    let deferred = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    let pending = cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining);
+    assert!(pending > px(0.), "wheel event must queue smooth motion");
+    assert_eq!(deferred.item_ix, before.item_ix);
+    assert_eq!(deferred.offset_in_item, before.offset_in_item);
+
+    assert!(
+        cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+        "the wheel event must schedule an animation frame"
+    );
+    redraw(cx);
+    let eased = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    assert!(
+        eased.item_ix > before.item_ix || eased.offset_in_item > before.offset_in_item,
+        "an animation frame must advance the deferred wheel distance"
+    );
 }
 
 #[test]
@@ -4423,6 +4503,135 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
         let trace = reasoning_part(turn).expect("reasoning trace");
         trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD
     }));
+}
+
+/// The reasoning viewport owns every vertical wheel gesture inside its bounds.
+/// This remains true regardless of whether transcript wheel smoothing is on.
+#[gpui::test]
+fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
+    init_app(cx);
+
+    for smooth_scrolling in [false, true] {
+        let (chat, cx) = add_chat_window(cx);
+        cx.simulate_resize(gpui::size(px(640.), px(420.)));
+        cx.update(|_, cx| {
+            preferences::update_in_memory(cx, |prefs| {
+                prefs.smooth_chat_scrolling = smooth_scrolling;
+            });
+            chat.update(cx, |this, cx| {
+                for index in 0..12 {
+                    this.messages.push(Message::from_canonical(
+                        LlmMessage {
+                            role: crate::llm::Role::Assistant,
+                            content: vec![ContentBlock::Text {
+                                text: format!("earlier message {index}\n\n{}", "body ".repeat(24)),
+                                provider_metadata: ProviderMetadata::default(),
+                            }],
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                        cx,
+                    ));
+                }
+                for role in [Role::User, Role::Assistant] {
+                    this.messages.push(Message::empty(role));
+                }
+                for line in 0..60 {
+                    this.append_stream_reasoning(
+                        0,
+                        "reasoning-0".into(),
+                        &format!("Reasoning line {line}.\n\n"),
+                        cx,
+                    );
+                }
+            });
+        });
+        redraw(cx);
+        redraw(cx);
+
+        assert!(
+            cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
+            "the transcript fixture must be scrollable"
+        );
+        let body = cx
+            .debug_bounds("reasoning-body-0")
+            .expect("the latest reasoning card must be visible");
+        let transcript_before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+
+        // A previously queued transcript animation must be abandoned as soon
+        // as the pointer enters the nested card.
+        if smooth_scrolling {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(320.), px(40.)),
+                delta: ScrollDelta::Lines(point(0., -3.)),
+                ..Default::default()
+            });
+            assert!(
+                cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining != px(0.)),
+                "the transcript fixture must have a queued smooth motion"
+            );
+        }
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: body.center(),
+            delta: ScrollDelta::Lines(point(0., 3.)),
+            ..Default::default()
+        });
+
+        let (transcript_after, card_offset, pending_smooth_scroll) = cx.update(|_, cx| {
+            let chat = chat.read(cx);
+            let trace = chat
+                .messages
+                .last()
+                .and_then(reasoning_part)
+                .expect("reasoning trace");
+            (
+                chat.list_state.logical_scroll_top(),
+                trace.scroll_offset().y,
+                chat.smooth_scroll.remaining,
+            )
+        });
+        assert_eq!(transcript_after.item_ix, transcript_before.item_ix);
+        assert_eq!(
+            transcript_after.offset_in_item, transcript_before.offset_in_item,
+            "reasoning wheel input leaked into the transcript (smooth={smooth_scrolling})"
+        );
+        assert!(
+            card_offset < px(0.),
+            "the reasoning card itself must consume the wheel input"
+        );
+        assert_eq!(
+            pending_smooth_scroll,
+            px(0.),
+            "reasoning input must not queue transcript motion"
+        );
+
+        // Repeated wheel ticks at either nested boundary are still contained;
+        // they must not fall through just because the card cannot move further.
+        for delta in [
+            ScrollDelta::Lines(point(0., 1_000.)),
+            ScrollDelta::Lines(point(0., 1_000.)),
+            ScrollDelta::Lines(point(0., -1_000.)),
+            ScrollDelta::Lines(point(0., -1_000.)),
+        ] {
+            let transcript_before_boundary =
+                cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+            cx.simulate_event(ScrollWheelEvent {
+                position: body.center(),
+                delta,
+                ..Default::default()
+            });
+            let transcript_after_boundary =
+                cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+            assert_eq!(
+                transcript_after_boundary.item_ix, transcript_before_boundary.item_ix,
+                "boundary wheel input leaked into the transcript (smooth={smooth_scrolling})"
+            );
+            assert_eq!(
+                transcript_after_boundary.offset_in_item, transcript_before_boundary.offset_in_item,
+                "boundary wheel input changed the transcript offset (smooth={smooth_scrolling})"
+            );
+        }
+    }
 }
 
 /// Reasoning code blocks resolve the active palette in their custom renderer,

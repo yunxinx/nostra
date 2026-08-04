@@ -33,6 +33,7 @@ pub(super) fn render(
         theme_row(true, cx),
         composer_font_row(cx),
         user_message_markdown_row(cx),
+        smooth_chat_scrolling_row(cx),
         code_wrap_row(cx),
         code_line_numbers_row(cx),
     ];
@@ -57,6 +58,20 @@ fn user_message_markdown_row(cx: &App) -> AnyElement {
             .on_click(|checked, _, cx| {
                 markdown::set_user_message_markdown(*checked, cx);
             })
+            .into_any_element(),
+        cx,
+    )
+}
+
+fn smooth_chat_scrolling_row(cx: &App) -> AnyElement {
+    ui::row(
+        "smooth-chat-scrolling",
+        t!("settings.smooth_chat_scrolling").to_string(),
+        Some(t!("settings.smooth_chat_scrolling_desc").to_string()),
+        Switch::new("smooth-chat-scrolling-switch")
+            .small()
+            .checked(crate::chat::smooth_scrolling_enabled(cx))
+            .on_click(|checked, _, cx| crate::chat::set_smooth_scrolling(*checked, cx))
             .into_any_element(),
         cx,
     )
@@ -252,6 +267,8 @@ mod tests {
             for key in [
                 "settings.user_message_markdown",
                 "settings.user_message_markdown_desc",
+                "settings.smooth_chat_scrolling",
+                "settings.smooth_chat_scrolling_desc",
                 "settings.code_wrap",
                 "settings.code_wrap_desc",
                 "settings.code_line_numbers",

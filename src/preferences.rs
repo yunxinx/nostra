@@ -40,6 +40,8 @@ pub struct Preferences {
     pub composer_font: ComposerFont,
     /// Whether user-role message bodies use the Markdown presentation path.
     pub user_message_markdown: bool,
+    /// Whether the conversation transcript eases discrete mouse-wheel input.
+    pub smooth_chat_scrolling: bool,
     /// Whether supported windows use the native macOS blurred backdrop.
     pub glass_effect: bool,
     /// Opacity of the theme tint drawn above the native blurred backdrop.
@@ -88,6 +90,7 @@ impl Default for Preferences {
             theme_mode: None,
             composer_font: ComposerFont::default(),
             user_message_markdown: false,
+            smooth_chat_scrolling: false,
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             hide_settings_info_buttons: false,
@@ -421,6 +424,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_user_message_markdown).is_err());
 
+        let mut missing_smooth_chat_scrolling =
+            serde_json::to_value(Preferences::default()).expect("serialize preferences");
+        assert!(
+            missing_smooth_chat_scrolling
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("smooth_chat_scrolling")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_smooth_chat_scrolling).is_err());
+
         let mut unknown_geometry = serde_json::to_value(Preferences {
             window: Some(WindowGeometry {
                 x: 0.,
@@ -442,6 +456,7 @@ mod tests {
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
         assert!(!prefs.hide_settings_info_buttons);
         assert!(!prefs.user_message_markdown);
+        assert!(!prefs.smooth_chat_scrolling);
         assert!(!prefs.code_block_wrap);
         assert_eq!(prefs.code_block_wrap_revision, 0);
         assert!(!prefs.code_block_line_numbers);
@@ -451,6 +466,7 @@ mod tests {
     fn text_rendering_preferences_round_trip() {
         let prefs = Preferences {
             user_message_markdown: true,
+            smooth_chat_scrolling: true,
             code_block_wrap: true,
             code_block_wrap_revision: 7,
             code_block_line_numbers: true,
@@ -462,6 +478,7 @@ mod tests {
         assert_eq!(back.code_block_wrap_revision, 7);
         assert!(back.code_block_line_numbers);
         assert!(back.user_message_markdown);
+        assert!(back.smooth_chat_scrolling);
     }
 
     /// Both split geometries are plain widths, and both must survive a round
