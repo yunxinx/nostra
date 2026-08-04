@@ -77,6 +77,14 @@ ratex-svg = { version = "0.1.14", features = [
     "embed-fonts",
 ] }
 
+# Nostra carries focused memory-management patches for RaTeX's font pipeline.
+# Keep the crates on 0.1.14 so the patch changes ownership, not parser/layout
+# behavior; vendor/README.md records the exact upstream revision.
+[patch.crates-io]
+ratex-font-loader = { path = "vendor/ratex-font-loader" }
+ratex-unicode-font = { path = "vendor/ratex-unicode-font" }
+ratex-svg = { path = "vendor/ratex-svg" }
+
 [dev-dependencies]
 gpui = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf605181edeba234a69942c22863c81a2a", features = ["test-support"] }
 

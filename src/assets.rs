@@ -14,13 +14,29 @@ use gpui_component_assets::Assets as ComponentAssets;
 #[derive(rust_embed::RustEmbed)]
 #[folder = "assets"]
 #[include = "icons/**/*.svg"]
-#[include = "fonts/**/*.ttf"]
 #[include = "themes/**/*.json"]
 struct AppEmbed;
+
+const BUNDLED_FONTS: &[(&str, &[u8])] = &[
+    (
+        "fonts/MapleMono-CN-Regular.ttf",
+        include_bytes!("../assets/fonts/MapleMono-CN-Regular.ttf"),
+    ),
+    (
+        "fonts/JetBrainsMono-Regular.ttf",
+        include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    ),
+];
 
 /// Raw bytes of an app-embedded asset (e.g. a bundled font), by path
 /// relative to the `assets/` folder.
 pub fn embedded(path: &str) -> Option<Cow<'static, [u8]>> {
+    if let Some((_, bytes)) = BUNDLED_FONTS
+        .iter()
+        .find(|(font_path, _)| *font_path == path)
+    {
+        return Some(Cow::Borrowed(bytes));
+    }
     AppEmbed::get(path).map(|file| file.data)
 }
 
@@ -33,8 +49,8 @@ impl AssetSource for NostraAssets {
             return Ok(None);
         }
 
-        if let Some(file) = AppEmbed::get(path) {
-            return Ok(Some(file.data));
+        if let Some(file) = embedded(path) {
+            return Ok(Some(file));
         }
 
         ComponentAssets.load(path)
@@ -44,6 +60,12 @@ impl AssetSource for NostraAssets {
         let mut names: Vec<SharedString> = AppEmbed::iter()
             .filter_map(|p| p.starts_with(path).then(|| p.into()))
             .collect();
+        names.extend(
+            BUNDLED_FONTS
+                .iter()
+                .filter(|(font_path, _)| font_path.starts_with(path))
+                .map(|(font_path, _)| (*font_path).into()),
+        );
 
         if let Ok(more) = ComponentAssets.list(path) {
             names.extend(more);
@@ -57,8 +79,17 @@ impl AssetSource for NostraAssets {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     #[test]
     fn code_wrap_icon_is_embedded() {
         assert!(super::embedded("icons/wrap-text.svg").is_some());
+    }
+
+    #[test]
+    fn bundled_fonts_are_static_borrowed_bytes_in_every_profile() {
+        for (path, _) in super::BUNDLED_FONTS {
+            assert!(matches!(super::embedded(path), Some(Cow::Borrowed(_))));
+        }
     }
 }
