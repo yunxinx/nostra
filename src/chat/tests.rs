@@ -5015,6 +5015,96 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     }));
 }
 
+#[gpui::test]
+fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            for line in 0..180 {
+                this.append_stream_reasoning(
+                    0,
+                    "reasoning-virtualized-follow".into(),
+                    &format!(
+                        "Reasoning line {line}: this fixture keeps enough prose to exercise the retained virtual list.\n\n"
+                    ),
+                    cx,
+                );
+            }
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the expanded reasoning body was drawn");
+    let (bottom_offset, max_offset, virtualized) = cx.update(|_, cx| {
+        let trace = reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+            .expect("reasoning trace");
+        (
+            trace.scroll_offset().y,
+            trace.scroll_max().y,
+            trace.uses_virtualized_scroll(),
+        )
+    });
+    assert!(
+        virtualized,
+        "long reasoning must use the retained virtual list"
+    );
+    assert!(
+        max_offset > px(100.),
+        "the fixture must have scrollable reasoning"
+    );
+    assert_eq!(bottom_offset, -max_offset);
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        ..Default::default()
+    });
+    redraw(cx);
+    let paused_offset = cx.update(|_, cx| {
+        let trace = reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+            .expect("reasoning trace");
+        assert!(
+            !trace.is_following(),
+            "manual scroll must disarm tail follow"
+        );
+        trace.scroll_offset().y
+    });
+    assert!(
+        paused_offset > bottom_offset,
+        "the card should move away from its tail"
+    );
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(
+                0,
+                "reasoning-virtualized-follow".into(),
+                "new tail content must not steal the reader's position.\n\n",
+                cx,
+            );
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+    let after_append = cx.update(|_, cx| {
+        reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+            .expect("reasoning trace")
+            .scroll_offset()
+            .y
+    });
+    assert_eq!(
+        after_append, paused_offset,
+        "streaming into a virtualized card must preserve a manually chosen offset"
+    );
+}
+
 /// The reasoning viewport owns every vertical wheel gesture inside its bounds.
 /// This remains true regardless of whether transcript wheel smoothing is on.
 #[gpui::test]

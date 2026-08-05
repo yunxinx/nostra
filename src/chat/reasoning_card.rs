@@ -102,6 +102,12 @@ impl ReasoningScroll {
             Self::Virtualized(scroll) => scroll.scroll_to_end(),
         }
     }
+
+    fn set_follow_mode(&self, mode: FollowMode) {
+        if let Self::Virtualized(scroll) = self {
+            scroll.set_follow_mode(mode);
+        }
+    }
 }
 
 /// One reasoning content block, prepared for rendering.
@@ -229,8 +235,10 @@ impl ReasoningTrace {
         let dy = event.delta.pixel_delta(window.line_height()).y;
         if dy > px(0.) {
             self.follow = false;
+            self.scroll.set_follow_mode(FollowMode::Normal);
         } else if dy < px(0.) && self.scroll_is_near_bottom() {
             self.follow = true;
+            self.scroll.set_follow_mode(FollowMode::Tail);
             // A terminal stream may never append again. Migrate as part of the
             // gesture that returns to the tail instead of relying on `push` or
             // `set_source` to provide a later update boundary.
