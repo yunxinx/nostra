@@ -17,7 +17,6 @@ use gpui_component::{
     dialog::DialogButtonProps,
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
-    popover::Popover,
     sidebar::SidebarToggleButton,
     v_flex,
 };
@@ -28,7 +27,11 @@ use crate::chat::{ChatEvent, ChatView};
 use crate::llm::ModelSelection;
 use crate::preferences::{self, Preferences, WindowGeometry};
 use crate::shell::actions::{OpenSettings, ToggleTheme};
-use crate::ui::{self, model_select::ModelPicker};
+use crate::ui::{
+    self,
+    inline_delete_confirmation::{InlineDeleteConfirmation, InlineDeleteConfirmationHandle},
+    model_select::ModelPicker,
+};
 
 /// Minimum sidebar width when the user drags the right edge inward.
 const SIDEBAR_MIN_WIDTH: Pixels = px(220.);
@@ -79,6 +82,7 @@ pub struct ChatApp {
     /// Conversation awaiting inline delete confirmation.  While set, its row
     /// shows a Popover confirm card anchored to the actions button.
     confirming: Option<gpui::EntityId>,
+    delete_confirmation: InlineDeleteConfirmationHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -125,6 +129,7 @@ impl ChatApp {
             model_picker,
             hovered: None,
             confirming: None,
+            delete_confirmation: InlineDeleteConfirmationHandle::default(),
             _subscriptions: Vec::new(),
         };
         this.track_window_geometry(window, cx);
@@ -306,7 +311,13 @@ impl ChatApp {
 
     /// Arm inline delete confirmation for a conversation.  The row's actions
     /// button becomes a Popover trigger showing a confirm card anchored to it.
-    fn begin_delete_confirmation(&mut self, target: gpui::EntityId, cx: &mut Context<Self>) {
+    fn begin_delete_confirmation(
+        &mut self,
+        target: gpui::EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_confirmation.dismiss_for_unmount(window, cx);
         self.confirming = Some(target);
         cx.notify();
     }
@@ -317,20 +328,26 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let was_confirming = self.confirming == Some(target);
+        if was_confirming {
+            self.delete_confirmation.dismiss_for_unmount(window, cx);
+            self.confirming = None;
+        }
+
         let Some(index) = self
             .conversations
             .iter()
             .position(|conversation| conversation.view.entity_id() == target)
         else {
+            if was_confirming {
+                cx.notify();
+            }
             return;
         };
 
         self.conversations.remove(index);
         if self.hovered == Some(target) {
             self.hovered = None;
-        }
-        if self.confirming == Some(target) {
-            self.confirming = None;
         }
         if self.conversations.is_empty() {
             self.active = 0;
@@ -425,7 +442,7 @@ impl ChatApp {
                 let title = conversation.title.clone();
                 let target = conversation.view.entity_id();
                 let is_active = i == active;
-                let id = ElementId::NamedInteger("conv".into(), i as u64);
+                let id: ElementId = ("conv", target).into();
                 let focus_handle = window
                     .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
                     .read(cx)
@@ -434,10 +451,11 @@ impl ChatApp {
 
                 let is_confirming = self.confirming == Some(target);
                 let actions_visible = is_active || self.hovered == Some(target) || is_confirming;
-                let row_id = ElementId::Name(format!("conv-row-{i}").into());
+                let row_id: ElementId = ("conv-row", target).into();
 
                 div()
                     .id(row_id)
+                    .debug_selector(move || format!("conversation-row-{}", target.as_u64()))
                     .relative()
                     .w_full()
                     .h(px(32.))
@@ -501,7 +519,6 @@ impl ChatApp {
                             .size_5()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.render_conversation_actions(
-                                i,
                                 target,
                                 actions_visible,
                                 is_confirming,
@@ -537,103 +554,54 @@ impl ChatApp {
     /// otherwise it opens a dropdown menu with a delete entry.
     fn render_conversation_actions(
         &self,
-        i: usize,
         target: gpui::EntityId,
         visible: bool,
         confirming: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.weak_entity();
+        let trigger = Button::new(("conversation-actions", target))
+            .debug_selector(move || format!("conversation-actions-{}", target.as_u64()))
+            .ghost()
+            .xsmall()
+            .icon(IconName::Ellipsis)
+            .tooltip(t!("sidebar.more_actions").to_string());
 
         if confirming {
-            Popover::new(("delete-confirm", i))
-                .open(true)
-                .anchor(Anchor::TopRight)
-                .p_0()
-                .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
-                    if !*open && this.confirming == Some(target) {
-                        this.confirming = None;
-                        cx.notify();
-                    }
-                }))
-                .trigger(
-                    Button::new(("conversation-actions", i))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Ellipsis)
-                        .tooltip(t!("sidebar.more_actions").to_string()),
-                )
-                .content({
-                    let weak = weak.clone();
-                    move |_, _, _| {
-                        let weak = weak.clone();
-                        v_flex()
-                            .gap_1()
-                            .p_2()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .text_center()
-                                    .text_sm()
-                                    .child(t!("sidebar.delete_chat_title").to_string()),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Button::new(("cancel-delete", i))
-                                            .ghost()
-                                            .small()
-                                            .flex_1()
-                                            .label(t!("sidebar.delete_chat_cancel").to_string())
-                                            .on_click({
-                                                let weak = weak.clone();
-                                                move |_, _, cx| {
-                                                    weak.update(cx, |this, cx| {
-                                                        this.confirming = None;
-                                                        cx.notify();
-                                                    })
-                                                    .ok();
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new(("confirm-delete", i))
-                                            .danger()
-                                            .small()
-                                            .flex_1()
-                                            .label(t!("sidebar.delete_chat_confirm").to_string())
-                                            .on_click({
-                                                let weak = weak.clone();
-                                                move |_, window, cx| {
-                                                    weak.update(cx, |this, cx| {
-                                                        this.confirming = None;
-                                                        this.delete_conversation(
-                                                            target, window, cx,
-                                                        );
-                                                    })
-                                                    .ok();
-                                                }
-                                            }),
-                                    ),
-                            )
-                    }
-                })
-                .into_any_element()
+            InlineDeleteConfirmation::new(
+                ("conversation-delete-confirm", target),
+                trigger,
+                t!("sidebar.delete_chat_title").to_string(),
+                t!("sidebar.delete_chat_cancel").to_string(),
+                t!("sidebar.delete_chat_confirm").to_string(),
+                self.delete_confirmation.clone(),
+            )
+            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                if !*open && this.confirming == Some(target) {
+                    this.confirming = None;
+                    cx.notify();
+                }
+            }))
+            .on_confirm({
+                let weak = weak.clone();
+                move |window, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.delete_conversation(target, window, cx);
+                    })
+                    .ok();
+                }
+            })
+            .into_any_element()
         } else {
-            Button::new(("conversation-actions", i))
-                .ghost()
-                .xsmall()
-                .icon(IconName::Ellipsis)
-                .tooltip(t!("sidebar.more_actions").to_string())
+            trigger
                 .when(!visible, |this| this.invisible())
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
                     let weak = weak.clone();
                     menu.item(
                         PopupMenuItem::new(t!("sidebar.delete_chat").to_string()).on_click(
-                            move |_, _, cx| {
+                            move |_, window, cx| {
                                 weak.update(cx, |this, cx| {
-                                    this.begin_delete_confirmation(target, cx)
+                                    this.begin_delete_confirmation(target, window, cx)
                                 })
                                 .ok();
                             },
@@ -954,6 +922,18 @@ mod tests {
         (app, cx)
     }
 
+    fn redraw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect("element should be drawn");
+        cx.simulate_click(bounds.center(), Default::default());
+        redraw(cx);
+    }
+
     #[gpui::test]
     fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAppContext) {
         let (app, cx) = add_app_window(cx);
@@ -1113,20 +1093,29 @@ mod tests {
                 this.active = 0;
                 let target = this.conversations[0].view.entity_id();
                 let selected = this.conversations[2].view.entity_id();
-                this.begin_delete_confirmation(target, cx);
-                this.select(2, window, cx);
-                assert_eq!(this.confirming, Some(target));
                 (target, selected)
             })
         });
+        redraw(cx);
+
+        let actions =
+            Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+        click(cx, actions);
+        cx.simulate_keystrokes("down enter");
+        redraw(cx);
+        assert_eq!(app.read_with(cx, |this, _| this.confirming), Some(target));
 
         cx.update(|window, cx| {
             app.update(cx, |this, cx| {
-                let target = this.confirming.expect("confirming armed");
-                this.delete_conversation(target, window, cx);
+                this.select(2, window, cx);
             });
         });
-        cx.run_until_parked();
+        redraw(cx);
+
+        let confirm = Box::leak(
+            format!("conversation-delete-confirm-{}-confirm", target.as_u64()).into_boxed_str(),
+        );
+        click(cx, confirm);
 
         app.read_with(cx, |this, _| {
             assert_eq!(this.conversations.len(), 2);

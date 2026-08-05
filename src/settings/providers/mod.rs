@@ -30,6 +30,7 @@ use super::{ROW_HEIGHT, ui::icon_button};
 use crate::{
     llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString},
     preferences, providers,
+    ui::inline_delete_confirmation::InlineDeleteConfirmationHandle,
 };
 
 /// Shown as the Base URL placeholder rather than pre-filled, so the field
@@ -122,6 +123,7 @@ pub(super) struct ProvidersPage {
     /// Profile awaiting inline delete confirmation.  While set, its row shows
     /// a Popover confirm card anchored to the actions button.
     confirming: Option<String>,
+    delete_confirmation: InlineDeleteConfirmationHandle,
     /// Mirrors the API key input's mask state.  Tracked here because the
     /// component's own toggle picks the opposite icon convention and its
     /// `masked` flag is not readable from outside the crate.
@@ -169,6 +171,7 @@ impl ProvidersPage {
             compatibility_open: false,
             hovered: None,
             confirming: None,
+            delete_confirmation: InlineDeleteConfirmationHandle::default(),
             api_key_masked: true,
             _subscriptions: Vec::new(),
         };
@@ -368,20 +371,26 @@ impl ProvidersPage {
 
     /// Arm inline delete confirmation for a profile.  The row's actions button
     /// becomes a Popover trigger showing a confirm card anchored to it.
-    fn begin_delete_confirmation(&mut self, id: String, cx: &mut Context<Self>) {
+    fn begin_delete_confirmation(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.delete_confirmation.dismiss_for_unmount(window, cx);
         self.confirming = Some(id);
         cx.notify();
     }
 
-    /// Drops a profile and moves the selection to whatever is left.  The row
-    /// menu is the intentional direct-delete surface, so this runs unguarded.
+    /// Drop a profile after its caller has completed the confirmation flow.
     fn delete_profile(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirming.as_deref() == Some(id) {
+            self.delete_confirmation.dismiss_for_unmount(window, cx);
+            self.confirming = None;
+        }
         providers::remove(id, cx);
         if self.hovered.as_deref() == Some(id) {
             self.hovered = None;
-        }
-        if self.confirming.as_deref() == Some(id) {
-            self.confirming = None;
         }
         if self.selected.as_deref() != Some(id) {
             cx.notify();
@@ -838,7 +847,8 @@ fn dropdown_row(
 
 #[cfg(test)]
 mod tests {
-    use gpui::{AppContext as _, TestAppContext, px};
+    use gpui::{AppContext as _, Entity, TestAppContext, px};
+    use gpui_component::Root;
     use rust_i18n::t;
 
     use super::{
@@ -847,6 +857,45 @@ mod tests {
     };
     use crate::llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString};
     use crate::preferences;
+
+    fn redraw(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect("element should be drawn");
+        cx.simulate_click(bounds.center(), Default::default());
+        redraw(cx);
+    }
+
+    fn add_providers_window(
+        cx: &mut TestAppContext,
+        profiles: Vec<ProviderProfile>,
+    ) -> (Entity<ProvidersPage>, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            preferences::init_global(
+                preferences::Preferences {
+                    provider_profiles: profiles,
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let page = cx.new(|cx| ProvidersPage::new(window, cx));
+            Root::new(page, window, cx)
+        });
+        let page = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<ProvidersPage>()
+                .expect("Root must contain ProvidersPage")
+        });
+        (page, cx)
+    }
 
     /// A persisted width outside the drag range (hand-edited file, or a range
     /// narrowed in a later version) must not place the divider somewhere the
@@ -911,6 +960,44 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn inline_confirm_deletes_original_profile_after_selection_switch(cx: &mut TestAppContext) {
+        let profiles = vec![
+            edit_profile("alpha", "vendor/alpha", "Alpha"),
+            edit_profile("beta", "vendor/beta", "Beta"),
+        ];
+        let (page, cx) = add_providers_window(cx, profiles);
+        redraw(cx);
+
+        click(cx, "provider-actions-alpha");
+        cx.simulate_keystrokes("down enter");
+        redraw(cx);
+        assert_eq!(
+            page.read_with(cx, |page, _| page.confirming.clone()),
+            Some("alpha".into())
+        );
+
+        cx.update(|window, cx| {
+            page.update(cx, |page, cx| page.select("beta".into(), window, cx));
+        });
+        redraw(cx);
+        click(cx, "provider-delete-confirm-alpha-confirm");
+
+        assert_eq!(
+            page.read_with(cx, |page, _| page.selected.clone()),
+            Some("beta".into())
+        );
+        assert_eq!(
+            cx.update(|_, cx| {
+                crate::providers::profiles(cx)
+                    .iter()
+                    .map(|profile| profile.id.clone())
+                    .collect::<Vec<_>>()
+            }),
+            vec!["beta".to_string()]
+        );
+    }
+
     /// Every field on this page explains itself through a hover icon whose
     /// text is looked up at render time.  A missing or misspelled key resolves
     /// to the key path itself and would ship as visible gibberish, so each one
@@ -939,6 +1026,21 @@ mod tests {
                 let text = t!(&path, locale = locale);
                 assert_ne!(text, path, "{path} is missing for {locale}");
                 assert!(!text.is_empty(), "{path} is empty for {locale}");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_profile_labels_resolve_in_both_locales() {
+        for locale in ["zh-CN", "en"] {
+            for key in [
+                "delete_profile",
+                "delete_profile_title",
+                "delete_profile_confirm",
+                "delete_profile_cancel",
+            ] {
+                let path = format!("settings.providers.{key}");
+                assert_ne!(t!(&path, locale = locale).to_string(), path);
             }
         }
     }

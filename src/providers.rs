@@ -29,8 +29,15 @@ pub fn catalog_revision() -> u64 {
     CATALOG_REVISION.load(Ordering::Relaxed)
 }
 
+fn update_preferences(cx: &mut App, change: impl FnOnce(&mut preferences::Preferences)) {
+    #[cfg(test)]
+    preferences::update_in_memory(cx, change);
+    #[cfg(not(test))]
+    preferences::update(cx, change);
+}
+
 fn update_catalog(cx: &mut App, change: impl FnOnce(&mut Vec<ProviderProfile>)) {
-    preferences::update(cx, |prefs| change(&mut prefs.provider_profiles));
+    update_preferences(cx, |prefs| change(&mut prefs.provider_profiles));
     CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
@@ -110,18 +117,22 @@ pub fn update(id: &str, cx: &mut App, change: impl FnOnce(&mut ProviderProfile))
 }
 
 pub fn remove(id: &str, cx: &mut App) {
-    preferences::update(cx, |prefs| {
-        prefs.provider_profiles.retain(|profile| profile.id != id);
-        if prefs
-            .last_model_selection
-            .as_ref()
-            .is_some_and(|selection| selection.profile_id == id)
-        {
-            prefs.last_model_selection = None;
-        }
+    update_preferences(cx, |prefs| {
+        remove_profile_from_preferences(id, prefs);
     });
     CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
+}
+
+fn remove_profile_from_preferences(id: &str, prefs: &mut preferences::Preferences) {
+    prefs.provider_profiles.retain(|profile| profile.id != id);
+    if prefs
+        .last_model_selection
+        .as_ref()
+        .is_some_and(|selection| selection.profile_id == id)
+    {
+        prefs.last_model_selection = None;
+    }
 }
 
 pub fn add_model(profile_id: &str, model: ModelConfig, cx: &mut App) {
@@ -166,7 +177,7 @@ pub(crate) fn update_model_in_memory(
 }
 
 pub fn remove_model(profile_id: &str, model_id: &str, cx: &mut App) {
-    preferences::update(cx, |prefs| {
+    update_preferences(cx, |prefs| {
         if let Some(profile) = prefs
             .provider_profiles
             .iter_mut()
@@ -193,10 +204,7 @@ pub fn select_model(selection: ModelSelection, cx: &mut App) {
     // persistence boundary as production. Keep that path intact while avoiding
     // writes to the developer's real configuration directory under `cargo
     // test`; the in-memory global remains the authoritative observable state.
-    #[cfg(test)]
-    preferences::update_in_memory(cx, |prefs| prefs.last_model_selection = Some(selection));
-    #[cfg(not(test))]
-    preferences::update(cx, |prefs| prefs.last_model_selection = Some(selection));
+    update_preferences(cx, |prefs| prefs.last_model_selection = Some(selection));
 }
 
 #[cfg(test)]
