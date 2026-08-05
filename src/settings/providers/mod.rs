@@ -119,6 +119,9 @@ pub(super) struct ProvidersPage {
     compatibility_open: bool,
     /// Row the pointer is over, so its remove button can appear.
     hovered: Option<String>,
+    /// Profile awaiting inline delete confirmation.  While set, its row shows
+    /// a Popover confirm card anchored to the actions button.
+    confirming: Option<String>,
     /// Mirrors the API key input's mask state.  Tracked here because the
     /// component's own toggle picks the opposite icon convention and its
     /// `masked` flag is not readable from outside the crate.
@@ -165,6 +168,7 @@ impl ProvidersPage {
             list_width: clamp_list_width(px(preferences::get(cx).provider_list_width)),
             compatibility_open: false,
             hovered: None,
+            confirming: None,
             api_key_masked: true,
             _subscriptions: Vec::new(),
         };
@@ -362,12 +366,22 @@ impl ProvidersPage {
         self.select(id, window, cx);
     }
 
+    /// Arm inline delete confirmation for a profile.  The row's actions button
+    /// becomes a Popover trigger showing a confirm card anchored to it.
+    fn begin_delete_confirmation(&mut self, id: String, cx: &mut Context<Self>) {
+        self.confirming = Some(id);
+        cx.notify();
+    }
+
     /// Drops a profile and moves the selection to whatever is left.  The row
     /// menu is the intentional direct-delete surface, so this runs unguarded.
     fn delete_profile(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         providers::remove(id, cx);
         if self.hovered.as_deref() == Some(id) {
             self.hovered = None;
+        }
+        if self.confirming.as_deref() == Some(id) {
+            self.confirming = None;
         }
         if self.selected.as_deref() != Some(id) {
             cx.notify();

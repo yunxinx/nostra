@@ -7,9 +7,12 @@ use gpui::{
     div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, TITLE_BAR_HEIGHT, h_flex,
+    ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT,
+    button::{Button, ButtonVariants as _},
+    h_flex,
     list::ListItem,
     menu::{DropdownMenu as _, PopupMenuItem},
+    popover::Popover,
     scroll::ScrollableElement as _,
     v_flex,
 };
@@ -63,7 +66,9 @@ impl ProvidersPage {
     ) -> AnyElement {
         let id = profile.id.clone();
         let active = selected.as_deref() == Some(id.as_str());
-        let actions_visible = active || self.hovered.as_deref() == Some(id.as_str());
+        let is_confirming = self.confirming.as_deref() == Some(id.as_str());
+        let actions_visible =
+            active || self.hovered.as_deref() == Some(id.as_str()) || is_confirming;
         let row_id = ElementId::Name(format!("provider-row-{id}").into());
         let focus_handle = window
             .use_keyed_state(row_id.clone(), cx, |_, cx| cx.focus_handle())
@@ -143,7 +148,7 @@ impl ProvidersPage {
                     .top(px(5.))
                     .size_5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_profile_actions(&id, actions_visible, cx)),
+                    .child(self.render_profile_actions(&id, actions_visible, is_confirming, cx)),
             )
             .into_any_element()
     }
@@ -152,33 +157,119 @@ impl ProvidersPage {
         &self,
         id: &str,
         visible: bool,
+        confirming: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let weak = cx.weak_entity();
         let id = id.to_string();
-        let menu_id = id.clone();
 
-        icon_button(
+        let trigger = icon_button(
             ElementId::Name(format!("provider-actions-{id}").into()),
             IconName::Ellipsis,
             t!("settings.providers.more_actions").to_string(),
             px(20.),
             px(16.),
-        )
-        // Keep the keyed trigger mounted while its menu is open.
-        .when(!visible, |this| this.invisible())
-        .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
-            let weak = weak.clone();
-            let id = menu_id.clone();
-            menu.item(
-                PopupMenuItem::new(t!("settings.providers.delete_profile").to_string()).on_click(
-                    move |_, window, cx| {
-                        weak.update(cx, |this, cx| this.delete_profile(&id, window, cx))
-                            .ok();
-                    },
-                ),
-            )
-        })
+        );
+
+        if confirming {
+            let on_change_id = id.clone();
+            Popover::new(ElementId::Name(
+                format!("provider-delete-confirm-{id}").into(),
+            ))
+            .open(true)
+            .anchor(Anchor::TopRight)
+            .p_0()
+            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
+                if !*open && this.confirming.as_deref() == Some(&on_change_id) {
+                    this.confirming = None;
+                    cx.notify();
+                }
+            }))
+            .trigger(trigger)
+            .content({
+                let weak = weak.clone();
+                let id = id.clone();
+                move |_, _, _| {
+                    let weak = weak.clone();
+                    let id = id.clone();
+                    v_flex()
+                        .gap_1()
+                        .p_2()
+                        .child(
+                            div()
+                                .w_full()
+                                .text_center()
+                                .text_sm()
+                                .child(t!("settings.providers.delete_profile_title").to_string()),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    Button::new(ElementId::Name(
+                                        format!("provider-cancel-delete-{id}").into(),
+                                    ))
+                                    .ghost()
+                                    .small()
+                                    .flex_1()
+                                    .label(
+                                        t!("settings.providers.delete_profile_cancel").to_string(),
+                                    )
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |_, _, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.confirming = None;
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        }
+                                    }),
+                                )
+                                .child(
+                                    Button::new(ElementId::Name(
+                                        format!("provider-confirm-delete-{id}").into(),
+                                    ))
+                                    .danger()
+                                    .small()
+                                    .flex_1()
+                                    .label(
+                                        t!("settings.providers.delete_profile_confirm").to_string(),
+                                    )
+                                    .on_click({
+                                        let weak = weak.clone();
+                                        move |_, window, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.confirming = None;
+                                                this.delete_profile(&id, window, cx);
+                                            })
+                                            .ok();
+                                        }
+                                    }),
+                                ),
+                        )
+                }
+            })
+            .into_any_element()
+        } else {
+            let menu_id = id.clone();
+            trigger
+                .when(!visible, |this| this.invisible())
+                .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _, _| {
+                    let weak = weak.clone();
+                    let id = menu_id.clone();
+                    menu.item(
+                        PopupMenuItem::new(t!("settings.providers.delete_profile").to_string())
+                            .on_click(move |_, _, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.begin_delete_confirmation(id.clone(), cx)
+                                })
+                                .ok();
+                            }),
+                    )
+                })
+                .into_any_element()
+        }
     }
 
     fn render_add_item(

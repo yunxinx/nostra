@@ -24,6 +24,9 @@ sidebar:
   delete_chat_cancel:
     en: Cancel
     zh-CN: 取消
+  more_actions:
+    en: More actions
+    zh-CN: 更多操作
 account:
   settings:
     en: Settings…
@@ -280,6 +283,15 @@ settings:
     delete_profile:
       en: Delete this provider
       zh-CN: 删除此供应商
+    delete_profile_title:
+      en: Delete this provider?
+      zh-CN: 删除此供应商？
+    delete_profile_confirm:
+      en: Delete
+      zh-CN: 删除
+    delete_profile_cancel:
+      en: Cancel
+      zh-CN: 取消
     empty:
       en: Add a provider to start configuring models.
       zh-CN: 添加供应商以开始配置模型。
