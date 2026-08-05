@@ -61,10 +61,10 @@ reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "364d53cf60
 # The pinned gpui-component revision owns Nostra's authoritative streaming
 # TextView state, composable inline Markdown extensions, standard button/menu
 # interaction contract, title-bar geometry, and nested horizontal scrolling.
-gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "ce8305e0d206470cf9eb5efe339c0d470c91b387", features = [
+gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "4a6b0330911d4afca7b1f373926d692bf33d9213", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "ce8305e0d206470cf9eb5efe339c0d470c91b387" }
+gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "4a6b0330911d4afca7b1f373926d692bf33d9213" }
 
 # RaTeX publishes versioned crates on crates.io, so use a semver-compatible
 # requirement here; Cargo.lock records the exact verified release. The

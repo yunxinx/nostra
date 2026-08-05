@@ -32,9 +32,10 @@ use std::{
 // Imported by name rather than glob: `gpui::*` exports a `test` macro that
 // shadows the built-in `#[test]` attribute in this module's test submodule.
 use gpui::{
-    AnyElement, App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
-    ScrollHandle, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window, div, prelude::FluentBuilder as _, rems,
+    AnyElement, App, ElementId, FollowMode, InteractiveElement as _, IntoElement, ListState,
+    ParentElement as _, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    rems,
 };
 use gpui_component::{
     ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
@@ -63,6 +64,46 @@ const VISIBLE_LINES: f32 = 7.;
 /// whitespace.
 const PARAGRAPH_GAP: f32 = 0.5;
 
+/// Source-size gate for the retained block-list path. This avoids laying out a
+/// large document merely to decide whether it needs virtualization.
+const VIRTUALIZED_SOURCE_BYTES: usize = 4 * 1024;
+
+#[derive(Clone)]
+enum ReasoningScroll {
+    Natural(ScrollHandle),
+    Virtualized(ListState),
+}
+
+impl ReasoningScroll {
+    fn offset(&self) -> Point<Pixels> {
+        match self {
+            Self::Natural(scroll) => scroll.offset(),
+            Self::Virtualized(scroll) => scroll.scroll_px_offset_for_scrollbar(),
+        }
+    }
+
+    fn max_offset(&self) -> Point<Pixels> {
+        match self {
+            Self::Natural(scroll) => scroll.max_offset(),
+            Self::Virtualized(scroll) => scroll.max_offset_for_scrollbar(),
+        }
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        match self {
+            Self::Natural(scroll) => scroll.set_offset(offset),
+            Self::Virtualized(scroll) => scroll.set_offset_from_scrollbar(offset),
+        }
+    }
+
+    fn scroll_to_bottom(&self) {
+        match self {
+            Self::Natural(scroll) => scroll.scroll_to_bottom(),
+            Self::Virtualized(scroll) => scroll.scroll_to_end(),
+        }
+    }
+}
+
 /// One reasoning content block, prepared for rendering.
 ///
 /// Holds a markdown state entity, so — like
@@ -83,7 +124,8 @@ pub(crate) struct ReasoningTrace {
     started_at: Option<Instant>,
     /// Keeps the newest reasoning in view while the card is capped and
     /// streaming, as long as the user has not scrolled away from the end.
-    scroll: ScrollHandle,
+    scroll: ReasoningScroll,
+    source_bytes: usize,
     /// Whether streaming updates may pin the card to its end. This follows the
     /// transcript's behavior so reading earlier reasoning is not interrupted.
     follow: bool,
@@ -95,13 +137,15 @@ impl ReasoningTrace {
     /// Open a trace for a block that just started reasoning. Auto-expanded: the
     /// point of streaming reasoning is that it is visible as it arrives.
     pub(crate) fn new(owner_id: u64, cx: &mut App) -> Self {
+        let body = MarkdownBody::new("", owner_id, cx);
         Self {
-            body: MarkdownBody::new("", owner_id, cx),
+            body,
             expanded: true,
             user_controlled: false,
             elapsed: None,
             started_at: Some(Instant::now()),
-            scroll: ScrollHandle::new(),
+            scroll: ReasoningScroll::Natural(ScrollHandle::new()),
+            source_bytes: 0,
             follow: true,
             smooth_scroll: super::SmoothScrollState::default(),
         }
@@ -109,14 +153,21 @@ impl ReasoningTrace {
 
     /// Build a closed trace from an authoritative terminal message.
     pub(crate) fn completed(source: String, owner_id: u64, cx: &mut App) -> Self {
+        let body = MarkdownBody::new(&source, owner_id, cx);
+        let scroll = if source.len() >= VIRTUALIZED_SOURCE_BYTES {
+            ReasoningScroll::Virtualized(body.scroll_state(cx))
+        } else {
+            ReasoningScroll::Natural(ScrollHandle::new())
+        };
         Self {
-            body: MarkdownBody::new(&source, owner_id, cx),
+            body,
             expanded: false,
             user_controlled: false,
             // A terminal-only block was not timed on this client.
             elapsed: None,
             started_at: None,
-            scroll: ScrollHandle::new(),
+            scroll,
+            source_bytes: source.len(),
             follow: true,
             smooth_scroll: super::SmoothScrollState::default(),
         }
@@ -132,7 +183,9 @@ impl ReasoningTrace {
             return;
         }
         self.body.push_str(delta, cx);
-        super::follow_scroll(&self.scroll, self.follow);
+        self.source_bytes = self.source_bytes.saturating_add(delta.len());
+        self.ensure_scroll_mode(cx);
+        self.follow_scroll();
     }
 
     /// Close this block and bank its duration. Collapses the card unless the
@@ -160,13 +213,29 @@ impl ReasoningTrace {
     /// streaming.
     pub(crate) fn set_source(&mut self, source: &str, cx: &mut App) {
         self.body.set_text(source, cx);
-        super::follow_scroll(&self.scroll, self.follow);
+        self.source_bytes = source.len();
+        self.ensure_scroll_mode(cx);
+        self.follow_scroll();
     }
 
     /// Record wheel intent for the card's own follow state. The surrounding
     /// transcript remains a separate scroll boundary.
-    pub(crate) fn handle_scroll(&mut self, event: &ScrollWheelEvent, window: &mut Window) {
-        super::update_scroll_follow(&mut self.follow, &self.scroll, event, window);
+    pub(crate) fn handle_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let dy = event.delta.pixel_delta(window.line_height()).y;
+        if dy > px(0.) {
+            self.follow = false;
+        } else if dy < px(0.) && self.scroll_is_near_bottom() {
+            self.follow = true;
+            // A terminal stream may never append again. Migrate as part of the
+            // gesture that returns to the tail instead of relying on `push` or
+            // `set_source` to provide a later update boundary.
+            self.ensure_scroll_mode(cx);
+        }
     }
 
     pub(crate) fn current_scroll_offset(&self) -> gpui::Point<gpui::Pixels> {
@@ -210,6 +279,33 @@ impl ReasoningTrace {
             self.smooth_scroll.cancel_motion();
         }
         Some(self.smooth_scroll.remaining != gpui::Pixels::ZERO)
+    }
+
+    fn ensure_scroll_mode(&mut self, cx: &mut App) {
+        if self.source_bytes >= VIRTUALIZED_SOURCE_BYTES
+            && self.follow
+            && matches!(self.scroll, ReasoningScroll::Natural(_))
+        {
+            self.scroll = ReasoningScroll::Virtualized(self.body.scroll_state(cx));
+            if let ReasoningScroll::Virtualized(scroll) = &self.scroll {
+                scroll.set_follow_mode(FollowMode::Tail);
+            }
+            self.scroll.scroll_to_bottom();
+        }
+    }
+
+    fn scroll_is_near_bottom(&self) -> bool {
+        self.scroll.max_offset().y + self.scroll.offset().y <= super::STICK_THRESHOLD
+    }
+
+    fn follow_scroll(&self) {
+        if self.follow && self.scroll_is_near_bottom() {
+            self.scroll.scroll_to_bottom();
+        }
+    }
+
+    fn is_virtualized(&self) -> bool {
+        matches!(self.scroll, ReasoningScroll::Virtualized(_))
     }
 
     /// Localized trigger text: a live label while thinking, the banked duration
@@ -256,6 +352,11 @@ impl ReasoningTrace {
     #[cfg(test)]
     pub(crate) fn is_following(&self) -> bool {
         self.follow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_virtualized_scroll(&self) -> bool {
+        self.is_virtualized()
     }
 
     #[cfg(test)]
@@ -333,7 +434,7 @@ pub(crate) fn render(
     // hard-coded pixel value, so it still means seven lines after a text-size
     // or font change.
     let max_height = window.line_height() * VISIBLE_LINES;
-
+    let virtualized = trace.is_virtualized();
     // Per-block group name. A shared constant would tie every card in the
     // transcript together, so hovering one would reveal every copy button.
     let hover_group: SharedString = format!("turn-reasoning-{ui_id}").into();
@@ -431,21 +532,23 @@ pub(crate) fn render(
                             .id(ElementId::NamedInteger("turn-reasoning-body".into(), ui_id))
                             .debug_selector(move || block_selector("body", content_index))
                             .w_full()
-                            // `max_h` rather than a fixed `h`: a two-line trace
-                            // gets a two-line card, and only a long one hits the
-                            // budget and starts scrolling. Pairing it with
-                            // `overflow_y_scroll` avoids `TextView`'s own
-                            // `scrollable(true)` mode, which virtualizes through
-                            // an inner `list` and therefore needs a *definite*
-                            // parent height — that would force the short case to
-                            // render seven lines of blank card.
-                            .max_h(max_height)
-                            .overflow_y_scroll()
+                            // Short traces keep natural height. Long traces use a
+                            // definite-height TextView so its retained list only
+                            // materializes visible Markdown blocks.
+                            .when(virtualized, |this| this.h(max_height))
+                            .when(!virtualized, |this| {
+                                this.max_h(max_height).overflow_y_scroll()
+                            })
                             // This nested viewport must occlude the transcript's
                             // list hitbox. Otherwise the list's native wheel
                             // handler runs before this card's bubble handler.
                             .occlude()
-                            .track_scroll(&trace.scroll)
+                            .when(!virtualized, |this| {
+                                let ReasoningScroll::Natural(scroll) = &trace.scroll else {
+                                    return this;
+                                };
+                                this.track_scroll(scroll)
+                            })
                             .px_3()
                             .py_2()
                             .text_sm()
@@ -460,11 +563,26 @@ pub(crate) fn render(
                                 on_scroll(event, window, cx);
                                 cx.stop_propagation();
                             })
-                            .child(trace.body.text_view(
-                                TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
-                            )),
+                            .child(if virtualized {
+                                trace
+                                    .body
+                                    .scrollable_text_view(
+                                        TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                trace
+                                    .body
+                                    .text_view(
+                                        TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
+                                    )
+                                    .into_any_element()
+                            }),
                     )
-                    .vertical_scrollbar(&trace.scroll),
+                    .map(|this| match &trace.scroll {
+                        ReasoningScroll::Natural(scroll) => this.vertical_scrollbar(scroll),
+                        ReasoningScroll::Virtualized(_) => this,
+                    }),
             )
         })
         .into_any_element()

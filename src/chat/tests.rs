@@ -1,4 +1,8 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     IntoElement as _, ListOffset, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
@@ -15,7 +19,8 @@ use crate::preferences;
 use super::{
     CONTENT_MAX_WIDTH, ChatEvent, ChatView, Message, MessagePart, ReasoningTrace, Role,
     SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD,
-    SmoothScrollState, is_replayable,
+    SmoothScrollState, is_replayable, reasoning_smooth_invalidations,
+    reset_reasoning_smooth_invalidations,
 };
 
 #[test]
@@ -142,6 +147,302 @@ fn redraw_settled_math(cx: &mut gpui::VisualTestContext) {
     // the background executor. Drain that work and draw once more so visual
     // assertions observe the settled image rather than the text fallback.
     redraw(cx);
+}
+
+fn measured_redraw(
+    cx: &mut gpui::VisualTestContext,
+) -> (std::time::Duration, crate::ui::markdown::MarkdownPerfProbe) {
+    crate::ui::markdown::reset_perf_probe();
+    let started = Instant::now();
+    redraw(cx);
+    (started.elapsed(), crate::ui::markdown::perf_probe())
+}
+
+fn duration_percentile(samples: &[Duration], percentile: usize) -> Duration {
+    assert!(
+        !samples.is_empty(),
+        "a percentile needs at least one sample"
+    );
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let index = ((sorted.len() - 1) * percentile.min(100)) / 100;
+    sorted[index]
+}
+
+/// Agent-runnable feedback loop for the user-visible long-content stall.
+///
+/// Keep this test deterministic: elapsed time is diagnostic, while the bound
+/// on continuous code-text elements is the pass/fail signal. A long block must
+/// not be rebuilt line-by-line for disclosure, wrap, and every smooth-scroll frame.
+#[gpui::test]
+fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
+    const CODE_LINES: usize = 640;
+    const MAX_CODE_TEXT_ELEMENTS_PER_INTERACTION: usize = 128;
+    const MAX_TEXT_VIEW_BUILDS_PER_INTERACTION: usize = 1;
+    const MAX_CODE_BLOCK_RENDERS_PER_INTERACTION: usize = 1;
+    const MAX_SMOOTH_INVALIDATIONS: usize = 24;
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(760.), px(560.)));
+
+    let prose = (0..160)
+        .map(|line| format!("Reasoning paragraph {line} with enough text to exercise layout."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let code = (0..CODE_LINES)
+        .map(|line| {
+            format!(
+                "let value_{line} = compute_really_long_identifier_{line}({line}, \"payload-{line}\");"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Keep the code in the first virtualized Markdown block. Completed
+    // reasoning intentionally opens at the document top, so placing the code
+    // at the tail would let this fixture pass without drawing the expensive
+    // path it is meant to guard.
+    let source = format!("```rust\n{code}\n```\n\n{prose}\n\nFinal reasoning paragraph.");
+    let fence_start = source.find("```rust").expect("fixture fence");
+
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| {
+            prefs.code_block_line_numbers = true;
+            prefs.smooth_chat_scrolling = false;
+        });
+        chat.update(cx, |chat, cx| {
+            chat.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: source,
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("reasoning turn");
+        let MessagePart::Reasoning { ui_id, .. } = &turn.parts[0] else {
+            panic!("reasoning part")
+        };
+        *ui_id
+    });
+    let wrap_selector: &'static str =
+        Box::leak(format!("markdown-code-wrap-{owner_id}-{fence_start}").into_boxed_str());
+
+    crate::ui::markdown::reset_perf_probe();
+    let expand_started = Instant::now();
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    let (expand_draw, expand_probe) = measured_redraw(cx);
+    let expand_elapsed = expand_started.elapsed();
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("expanded reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+    let reopen_started = Instant::now();
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed reasoning trigger after first expansion");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    let (reopen_draw, reopen_probe) = measured_redraw(cx);
+    let reopen_elapsed = reopen_started.elapsed();
+
+    let wrap = cx
+        .debug_bounds(wrap_selector)
+        .expect("wrap control in expanded reasoning");
+    crate::ui::markdown::reset_perf_probe();
+    let wrap_started = Instant::now();
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    let (wrap_draw, wrap_probe) = measured_redraw(cx);
+    let wrap_elapsed = wrap_started.elapsed();
+
+    crate::ui::markdown::reset_perf_probe();
+    let unwrap_started = Instant::now();
+    let wrap = cx
+        .debug_bounds(wrap_selector)
+        .expect("wrap control after enabling wrapping");
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    let (unwrap_draw, unwrap_probe) = measured_redraw(cx);
+    let unwrap_elapsed = unwrap_started.elapsed();
+
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
+    });
+    let combined_wrap_started = Instant::now();
+    let wrap = cx
+        .debug_bounds(wrap_selector)
+        .expect("wrap control before combined smooth scenario");
+    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    let (combined_wrap_draw, combined_wrap_probe) = measured_redraw(cx);
+    let combined_wrap_elapsed = combined_wrap_started.elapsed();
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("expanded reasoning viewport");
+    reset_reasoning_smooth_invalidations();
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Lines(point(0., -3.)),
+        ..Default::default()
+    });
+    let mut smooth_draws = Vec::new();
+    let mut smooth_probes = Vec::new();
+    for _ in 0..64 {
+        let remaining = cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("reasoning turn");
+            reasoning_part(turn)
+                .expect("reasoning trace")
+                .smooth_scroll_remaining()
+        });
+        if remaining == px(0.) {
+            break;
+        }
+        assert!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+            "queued reasoning motion must have a scheduled frame"
+        );
+        let (draw, probe) = measured_redraw(cx);
+        smooth_draws.push(draw);
+        smooth_probes.push(probe);
+    }
+    assert!(
+        !smooth_draws.is_empty(),
+        "long reasoning must schedule smooth-scroll frames"
+    );
+    assert!(
+        cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("reasoning turn");
+            reasoning_part(turn)
+                .expect("reasoning trace")
+                .smooth_scroll_remaining()
+                == px(0.)
+        }),
+        "smooth scrolling must converge within the fixture's frame budget"
+    );
+    let smooth_invalidations = reasoning_smooth_invalidations();
+    assert_eq!(
+        smooth_invalidations,
+        smooth_draws.len(),
+        "each easing step must invalidate the view exactly once"
+    );
+    assert!(
+        smooth_invalidations <= MAX_SMOOTH_INVALIDATIONS,
+        "smooth scrolling used {smooth_invalidations} invalidations for one wheel gesture"
+    );
+    let smooth_p50 = duration_percentile(&smooth_draws, 50);
+    let smooth_p95 = duration_percentile(&smooth_draws, 95);
+    let smooth_max = smooth_draws.iter().copied().max().unwrap_or_default();
+    let smooth_probe = smooth_probes
+        .iter()
+        .copied()
+        .max_by_key(|probe| probe.code_text_elements)
+        .unwrap_or_default();
+
+    eprintln!(
+        "LONG_CONTENT_PERF expand_total={expand_elapsed:?} expand_draw={expand_draw:?} \
+         expand={expand_probe:?} reopen_total={reopen_elapsed:?} reopen_draw={reopen_draw:?} \
+         reopen={reopen_probe:?} wrap_total={wrap_elapsed:?} wrap_draw={wrap_draw:?} \
+         wrap={wrap_probe:?} unwrap_total={unwrap_elapsed:?} unwrap_draw={unwrap_draw:?} \
+         unwrap={unwrap_probe:?} combined_wrap_total={combined_wrap_elapsed:?} \
+         combined_wrap_draw={combined_wrap_draw:?} combined_wrap={combined_wrap_probe:?} \
+         smooth_frames={} smooth_p50={smooth_p50:?} smooth_p95={smooth_p95:?} \
+         smooth_max={smooth_max:?} smooth={smooth_probe:?} \
+         smooth_invalidations={smooth_invalidations}",
+        smooth_draws.len()
+    );
+
+    let failures = [
+        ("reasoning expansion", expand_probe),
+        ("reasoning reopen", reopen_probe),
+        ("code wrap toggle", wrap_probe),
+        ("code unwrap toggle", unwrap_probe),
+        ("combined code wrap toggle", combined_wrap_probe),
+        ("smooth-scroll frame", smooth_probe),
+    ]
+    .into_iter()
+    .filter(|(_, probe)| probe.code_text_elements > MAX_CODE_TEXT_ELEMENTS_PER_INTERACTION)
+    .map(|(operation, probe)| {
+        format!(
+            "{operation} materialized {} code-text elements",
+            probe.code_text_elements
+        )
+    })
+    .collect::<Vec<_>>();
+
+    assert!(
+        failures.is_empty(),
+        "long-content work must be bounded independently of all {CODE_LINES} code lines: {}",
+        failures.join("; ")
+    );
+
+    for (operation, probe) in [
+        ("reasoning expansion", expand_probe),
+        ("reasoning reopen", reopen_probe),
+        ("code wrap toggle", wrap_probe),
+        ("code unwrap toggle", unwrap_probe),
+        ("combined code wrap toggle", combined_wrap_probe),
+        ("smooth-scroll frame", smooth_probe),
+    ] {
+        assert!(
+            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_INTERACTION,
+            "{operation} rebuilt {} text views",
+            probe.text_view_builds
+        );
+        assert!(
+            probe.code_block_renders <= MAX_CODE_BLOCK_RENDERS_PER_INTERACTION,
+            "{operation} reran {} code block renderers",
+            probe.code_block_renders
+        );
+        assert_eq!(
+            probe.code_text_elements, probe.code_block_renders,
+            "{operation} must build exactly one continuous code-text element per rendered block"
+        );
+    }
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).materialized_message_indices.clone()),
+        std::collections::BTreeSet::from([0]),
+        "the combined fixture must materialize only its visible transcript row"
+    );
+
+    if !cfg!(debug_assertions) {
+        assert!(
+            expand_elapsed <= Duration::from_millis(50),
+            "release reasoning expansion must stay below the frozen 50 ms guard: {expand_elapsed:?}"
+        );
+        assert!(
+            reopen_elapsed <= Duration::from_millis(50),
+            "release reasoning reopen must stay below the frozen 50 ms guard: {reopen_elapsed:?}"
+        );
+        assert!(
+            wrap_draw <= Duration::from_micros(12_900),
+            "release wrap draw must stay at least 30% below the 18.45 ms baseline: {wrap_draw:?}"
+        );
+        assert!(
+            unwrap_draw <= Duration::from_micros(12_900),
+            "release unwrap draw must stay below the frozen wrap guard: {unwrap_draw:?}"
+        );
+        assert!(
+            combined_wrap_draw <= Duration::from_micros(12_900),
+            "release combined wrap draw must stay below the frozen wrap guard: {combined_wrap_draw:?}"
+        );
+        assert!(
+            smooth_p95 <= Duration::from_micros(12_600),
+            "release smooth draw p95 must stay at least 30% below the 18.03 ms baseline: {smooth_p95:?}"
+        );
+    }
 }
 
 #[gpui::test]
@@ -4370,6 +4671,215 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
         before,
         "a capped card must not change the transcript's layout as it streams"
     );
+}
+
+/// A terminal reasoning block is historical content, so opening it starts at
+/// the beginning even though live reasoning follows the tail while streaming.
+#[gpui::test]
+fn completed_long_reasoning_opens_at_the_top(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+
+    let source = (0..240)
+        .map(|line| format!("Completed reasoning paragraph {line}."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: source,
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed completed reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+    redraw(cx);
+
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("completed reasoning trace");
+        assert!(
+            trace.uses_virtualized_scroll(),
+            "the fixture must exercise the long-document path"
+        );
+        assert_eq!(
+            trace.scroll_offset(),
+            point(px(0.), px(0.)),
+            "opening historical reasoning must not jump to its tail"
+        );
+    });
+}
+
+/// The large-document path must not turn every expanded disclosure into a
+/// fixed-height viewport. Short reasoning still grows only to its content.
+#[gpui::test]
+fn short_reasoning_keeps_its_natural_height(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+
+    let source = "Check the relevant constraints.\n\nChoose the smallest valid change.";
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: source.into(),
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed short reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("expanded short reasoning body");
+    let height_budget = cx.update(|window, _| window.line_height() * 7.);
+    assert!(
+        body.size.height < height_budget,
+        "short reasoning was stretched to the {:?} height budget",
+        height_budget
+    );
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("short reasoning trace");
+        assert!(!trace.uses_virtualized_scroll());
+        assert_eq!(trace.scroll_max_offset(), px(0.));
+    });
+}
+
+/// Crossing the large-document threshold must not replace an actively used
+/// native scroll handle. Returning to the tail must transition immediately:
+/// a completed stream may never append another delta to trigger migration.
+#[gpui::test]
+fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
+    cx: &mut TestAppContext,
+) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    let initial = (0..90)
+        .map(|line| format!("Reasoning line {line} has compact source.\n\n"))
+        .collect::<String>();
+    assert!(
+        initial.len() < 4 * 1024,
+        "the first stream segment must remain below the virtualization gate"
+    );
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the expanded reasoning body was drawn");
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(!trace.uses_virtualized_scroll());
+        assert!(trace.scroll_max().y > px(80.));
+    });
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        ..Default::default()
+    });
+    redraw(cx);
+
+    let paused_offset = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(!trace.is_following());
+        trace.scroll_offset()
+    });
+
+    let threshold_crossing = "Additional retained paragraph content.\n\n".repeat(80);
+    assert!(
+        initial.len() + threshold_crossing.len() >= 4 * 1024,
+        "the second segment must cross the virtualization gate"
+    );
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &threshold_crossing, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            !trace.uses_virtualized_scroll(),
+            "virtualization must wait while the reader is away from the tail"
+        );
+        assert_eq!(
+            trace.scroll_offset(),
+            paused_offset,
+            "crossing the threshold must preserve the exact native offset"
+        );
+    });
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the reasoning body remains visible");
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+        ..Default::default()
+    });
+    redraw(cx);
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            trace.is_following(),
+            "returning to the tail must re-arm follow"
+        );
+        assert!(
+            trace.uses_virtualized_scroll(),
+            "returning to the tail must migrate even when no later delta arrives"
+        );
+        assert!(
+            trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD,
+            "the new virtualized viewport must remain anchored to the tail"
+        );
+    });
 }
 
 /// Streaming reasoning follows the same manual-scroll contract as the main

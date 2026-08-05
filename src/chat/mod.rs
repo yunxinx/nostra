@@ -16,8 +16,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FollowMode,
     InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState, ParentElement as _,
-    Pixels, Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Window, div, list, point, px,
+    Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription, Window, div, list,
+    point, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
@@ -59,30 +59,21 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 /// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
-fn scroll_is_near_bottom(scroll_handle: &ScrollHandle) -> bool {
-    let offset = scroll_handle.offset().y;
-    let max = scroll_handle.max_offset().y;
-    max + offset <= STICK_THRESHOLD
+#[cfg(test)]
+thread_local! {
+    static REASONING_SMOOTH_INVALIDATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
-fn follow_scroll(scroll_handle: &ScrollHandle, follow: bool) {
-    if follow && scroll_is_near_bottom(scroll_handle) {
-        scroll_handle.scroll_to_bottom();
-    }
+#[cfg(test)]
+fn reset_reasoning_smooth_invalidations() {
+    REASONING_SMOOTH_INVALIDATIONS.set(0);
 }
 
-fn update_scroll_follow(
-    follow: &mut bool,
-    scroll_handle: &ScrollHandle,
-    event: &ScrollWheelEvent,
-    window: &Window,
-) {
-    let dy = event.delta.pixel_delta(window.line_height()).y;
-    if dy > px(0.) {
-        *follow = false;
-    } else if dy < px(0.) && scroll_is_near_bottom(scroll_handle) {
-        *follow = true;
-    }
+#[cfg(test)]
+fn reasoning_smooth_invalidations() -> usize {
+    REASONING_SMOOTH_INVALIDATIONS.get()
 }
 
 #[derive(Default)]
@@ -1214,6 +1205,8 @@ impl ChatView {
         let Some(has_remaining) = trace.advance_smooth_scroll() else {
             return;
         };
+        #[cfg(test)]
+        REASONING_SMOOTH_INVALIDATIONS.set(REASONING_SMOOTH_INVALIDATIONS.get().saturating_add(1));
         cx.notify();
         if has_remaining {
             self.schedule_reasoning_scroll_frame(message_ui_id, part_ui_id, window, cx);
@@ -1427,7 +1420,7 @@ fn render_message(
                             let Some(trace) = this.reasoning_trace_mut(message_ui_id, ui_id) else {
                                 return;
                             };
-                            trace.handle_scroll(event, window);
+                            trace.handle_scroll(event, window, cx);
                             if !smooth {
                                 trace.cancel_smooth_scroll();
                                 return;

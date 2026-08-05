@@ -16,7 +16,7 @@ use gpui_component::{
     highlighter::{HighlightTheme, SyntaxHighlighter},
     scroll::{ScrollableMask, Scrollbar, ScrollbarShow},
     text::{
-        InlineFlow, InlineFlowItem, InlineFlowState, MarkdownExtensions, MarkdownNode, TextView,
+        MarkdownExtensions, MarkdownNode, SelectableText, SelectableTextState, TextView,
         TextViewState, TextViewStyle, markdown_ast,
     },
     v_flex,
@@ -27,6 +27,44 @@ use crate::preferences;
 
 const NODE_NAME: &str = "nostra-fenced-code";
 const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MarkdownPerfProbe {
+    pub(crate) text_view_builds: usize,
+    pub(crate) code_block_renders: usize,
+    pub(crate) code_text_elements: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PERF_PROBE: std::cell::Cell<MarkdownPerfProbe> = const {
+        std::cell::Cell::new(MarkdownPerfProbe {
+            text_view_builds: 0,
+            code_block_renders: 0,
+            code_text_elements: 0,
+        })
+    };
+}
+
+#[cfg(test)]
+fn update_perf_probe(update: impl FnOnce(&mut MarkdownPerfProbe)) {
+    PERF_PROBE.with(|probe| {
+        let mut snapshot = probe.get();
+        update(&mut snapshot);
+        probe.set(snapshot);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_perf_probe() {
+    PERF_PROBE.with(|probe| probe.set(MarkdownPerfProbe::default()));
+}
+
+#[cfg(test)]
+pub(crate) fn perf_probe() -> MarkdownPerfProbe {
+    PERF_PROBE.get()
+}
 
 /// A Markdown body and the stable extension registry that renders its fenced
 /// code. Keeping the registry beside the state prevents a new extension
@@ -39,7 +77,7 @@ pub(crate) struct MarkdownBody {
 impl MarkdownBody {
     pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
         Self {
-            state: cx.new(|cx| TextViewState::markdown(source, cx)),
+            state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
             extensions: extensions(owner_id, 0),
         }
     }
@@ -57,10 +95,21 @@ impl MarkdownBody {
     }
 
     pub(crate) fn text_view(&self, style: TextViewStyle) -> TextView {
+        #[cfg(test)]
+        update_perf_probe(|probe| probe.text_view_builds += 1);
+
         TextView::new(&self.state)
             .selectable(true)
             .style(style)
             .markdown_extensions(self.extensions.clone())
+    }
+
+    pub(crate) fn scrollable_text_view(&self, style: TextViewStyle) -> TextView {
+        self.text_view(style).scrollable(true)
+    }
+
+    pub(crate) fn scroll_state(&self, cx: &App) -> gpui::ListState {
+        self.state.read(cx).scroll_state()
     }
 
     #[cfg(test)]
@@ -136,17 +185,11 @@ pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensi
                     .map(Into::into),
                 start,
             };
-            let line_flow_states = code
-                .value
-                .split('\n')
-                .enumerate()
-                .map(|(index, _)| (InlineFlowState::default(), usize::from(index > 0)));
-
             Some(
                 MarkdownNode::new(NODE_NAME, data)
                     .text(code.value.clone())
                     .markdown(source.to_string())
-                    .inline_flow_states_with_breaks(line_flow_states),
+                    .selectable_text_state(SelectableTextState::new(code.value.clone())),
             )
         })
         .block_renderer(NODE_NAME, move |node, window, cx| {
@@ -155,7 +198,7 @@ pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensi
             };
             render(
                 code,
-                node.attached_inline_flow_states(),
+                node.attached_selectable_text_state(),
                 owner_id,
                 window,
                 cx,
@@ -168,7 +211,9 @@ struct HighlightCache {
     code: SharedString,
     language: Option<SharedString>,
     theme: Arc<HighlightTheme>,
-    lines: Arc<[HighlightedLine]>,
+    styles: Arc<[(Range<usize>, HighlightStyle)]>,
+    line_count: usize,
+    line_numbers: SharedString,
 }
 
 impl HighlightCache {
@@ -178,14 +223,23 @@ impl HighlightCache {
         let mut highlighter = SyntaxHighlighter::new(&language);
         let rope = Rope::from(code.code.as_ref());
         highlighter.update(None, &rope, None);
-        let styles = highlighter.styles(&(0..code.code.len()), &theme);
-        let lines = highlighted_lines(&code.code, &styles);
+        let styles: Arc<[(Range<usize>, HighlightStyle)]> =
+            highlighter.styles(&(0..code.code.len()), &theme).into();
+        let line_count = code.code.split('\n').count();
+        let number_width = line_count.max(1).to_string().len();
+        let line_numbers = (1..=line_count)
+            .map(|number| format!("{number:>number_width$}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
 
         Self {
             code: code.code.clone(),
             language: code.language.clone(),
             theme,
-            lines,
+            styles,
+            line_count,
+            line_numbers,
         }
     }
 
@@ -200,8 +254,8 @@ fn normalized_language_id(language: Option<&str>) -> String {
     language.unwrap_or("text").to_ascii_lowercase()
 }
 
+#[cfg(test)]
 struct HighlightedLine {
-    text: SharedString,
     styles: Vec<(Range<usize>, HighlightStyle)>,
 }
 
@@ -220,14 +274,11 @@ impl WrapState {
     }
 }
 
+#[cfg(test)]
 fn highlighted_lines(
     code: &str,
     styles: &[(Range<usize>, HighlightStyle)],
 ) -> Arc<[HighlightedLine]> {
-    // SyntaxHighlighter returns non-overlapping ranges ordered by byte offset.
-    // Advance one monotonic cursor as line starts move forward so every style
-    // is skipped at most once; a per-line scan of the complete style list
-    // would turn ordinary multi-line code into O(lines * styles) render work.
     let mut style_start = 0;
     let mut line_start = 0;
     code.split('\n')
@@ -236,7 +287,6 @@ fn highlighted_lines(
             while style_start < styles.len() && styles[style_start].0.end <= line_start {
                 style_start += 1;
             }
-
             let line_styles = styles
                 .iter()
                 .skip(style_start)
@@ -244,62 +294,61 @@ fn highlighted_lines(
                 .filter_map(|(range, style)| {
                     let clipped_start = range.start.max(line_start);
                     let clipped_end = range.end.min(line_end);
-                    if clipped_start >= clipped_end {
-                        return None;
-                    }
-                    Some((clipped_start - line_start..clipped_end - line_start, *style))
+                    (clipped_start < clipped_end)
+                        .then_some((clipped_start - line_start..clipped_end - line_start, *style))
                 })
                 .collect();
-            let highlighted = HighlightedLine {
-                text: line.to_string().into(),
-                styles: line_styles,
-            };
             line_start = line_end.saturating_add(1);
-            highlighted
+            HighlightedLine {
+                styles: line_styles,
+            }
         })
         .collect()
 }
 
-fn code_line_element(
+fn code_text_element(
     owner_id: u64,
     start: usize,
-    index: usize,
-    line: &HighlightedLine,
-    flow_state: InlineFlowState,
-) -> AnyElement {
-    if line.text.is_empty() {
-        return div()
-            .w_0()
-            .overflow_hidden()
-            .whitespace_nowrap()
-            .child(" ")
-            .into_any_element();
+    state: SelectableTextState,
+    text: SharedString,
+    styles: Arc<[(Range<usize>, HighlightStyle)]>,
+    line_number_gutter: Option<(gpui::Pixels, Hsla)>,
+) -> SelectableText {
+    #[cfg(test)]
+    update_perf_probe(|probe| probe.code_text_elements += 1);
+
+    let text = SelectableText::with_text(
+        format!("markdown-code-text-{owner_id}-{start}"),
+        state,
+        text,
+        styles.iter().cloned(),
+    );
+    if let Some((right_margin, color)) = line_number_gutter {
+        text.line_number_gutter(right_margin, color)
+    } else {
+        text
     }
-    InlineFlow::new(
-        format!("markdown-code-inline-flow-{owner_id}-{start}-{index}"),
-        flow_state,
-        vec![InlineFlowItem::text(line.text.clone()).highlights(line.styles.clone())],
-    )
-    .into_any_element()
 }
 
 fn render(
     code: &FencedCode,
-    attached_flow_states: &[InlineFlowState],
+    attached_text_state: Option<&SelectableTextState>,
     owner_id: u64,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    #[cfg(test)]
+    update_perf_probe(|probe| probe.code_block_renders += 1);
+
     let cache_id: SharedString =
         format!("markdown-code-highlight-{owner_id}-{}", code.start).into();
     let cache = window.use_keyed_state(cache_id, cx, |_, cx| HighlightCache::new(code, cx));
     if !cache.read(cx).matches(code, cx) {
         cache.update(cx, |cache, cx| *cache = HighlightCache::new(code, cx));
     }
-    // Keep an immutable snapshot alive while the element tree is assembled.
-    // Cloning this Arc is constant-time; cloning the former Vec here deep-copied
-    // every line and its token styles on every repaint.
-    let lines = cache.read(cx).lines.clone();
+    let styles = cache.read(cx).styles.clone();
+    let line_count = cache.read(cx).line_count;
+    let line_numbers = cache.read(cx).line_numbers.clone();
 
     let global_wrap = global_wrap_enabled(cx);
     let global_wrap_revision = preferences::get(cx).code_block_wrap_revision;
@@ -315,56 +364,61 @@ fn render(
         global_wrap
     };
     let show_line_numbers = line_numbers_enabled(cx);
-    let line_count = lines.len();
-    let line_flow_states = (0..line_count)
-        .map(|index| attached_flow_states.get(index).cloned().unwrap_or_default())
-        .collect::<Vec<_>>();
     let number_width = line_count.max(1).to_string().len();
+    let text_state = attached_text_state
+        .cloned()
+        .unwrap_or_else(|| SelectableTextState::new(code.code.clone()));
     let line_number_color = cx
         .theme()
         .highlight_theme
         .style
         .editor_line_number
         .unwrap_or(cx.theme().muted_foreground);
+    let gutter_character_width = cx.theme().mono_font_size * 0.62;
+    let gutter_margin = px(12.);
+    let gutter_width = gutter_character_width * number_width + gutter_margin;
 
     let mut has_horizontal_overflow = false;
-    let code_content = if wrap {
-        v_flex()
+    let code_content = if wrap && show_line_numbers {
+        h_flex()
             .w_full()
             .min_w_0()
-            .children(
-                lines
-                    .iter()
-                    .enumerate()
-                    .zip(line_flow_states.iter().cloned())
-                    .map(|((index, line), flow_state)| {
-                        h_flex()
-                            .debug_selector(move || {
-                                format!("markdown-code-line-{owner_id}-{}-{index}", code.start)
-                            })
-                            .w_full()
-                            .min_w_0()
-                            .items_start()
-                            .when(show_line_numbers, |this| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .pr_3()
-                                        .text_color(line_number_color)
-                                        .debug_selector(move || {
-                                            format!(
-                                                "markdown-code-line-number-{owner_id}-{}-{index}",
-                                                code.start
-                                            )
-                                        })
-                                        .child(format!("{:>number_width$}", index + 1)),
-                                )
-                            })
-                            .child(div().flex_1().min_w_0().whitespace_normal().child(
-                                code_line_element(owner_id, code.start, index, line, flow_state),
-                            ))
-                    }),
+            .items_start()
+            .child(div().w(gutter_width).flex_none().debug_selector(move || {
+                format!("markdown-code-line-number-{owner_id}-{}-0", code.start)
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .debug_selector(move || {
+                        format!("markdown-code-line-{owner_id}-{}-0", code.start)
+                    })
+                    .child(code_text_element(
+                        owner_id,
+                        code.start,
+                        text_state.clone(),
+                        code.code.clone(),
+                        styles.clone(),
+                        Some((gutter_margin, line_number_color)),
+                    )),
             )
+            .into_any_element()
+    } else if wrap {
+        div()
+            .w_full()
+            .min_w_0()
+            .whitespace_normal()
+            .debug_selector(move || format!("markdown-code-line-{owner_id}-{}-0", code.start))
+            .child(code_text_element(
+                owner_id,
+                code.start,
+                text_state.clone(),
+                code.code.clone(),
+                styles.clone(),
+                None,
+            ))
             .into_any_element()
     } else {
         let scroll_state_id: SharedString =
@@ -415,25 +469,20 @@ fn render(
                             .overflow_hidden()
                             .track_scroll(&scroll_handle)
                             .child(
-                                v_flex().flex_none().children(
-                                    lines
-                                        .iter()
-                                        .enumerate()
-                                        .zip(line_flow_states.iter().cloned())
-                                        .map(|((index, line), flow_state)| {
-                                            div()
-                                                .debug_selector(move || {
-                                                    format!(
-                                                        "markdown-code-line-{owner_id}-{}-{index}",
-                                                        code.start
-                                                    )
-                                                })
-                                                .whitespace_nowrap()
-                                                .child(code_line_element(
-                                                    owner_id, code.start, index, line, flow_state,
-                                                ))
-                                        }),
-                                ),
+                                div()
+                                    .flex_none()
+                                    .whitespace_nowrap()
+                                    .debug_selector(move || {
+                                        format!("markdown-code-line-{owner_id}-{}-0", code.start)
+                                    })
+                                    .child(code_text_element(
+                                        owner_id,
+                                        code.start,
+                                        text_state,
+                                        code.code.clone(),
+                                        styles,
+                                        None,
+                                    )),
                             ),
                     )
                     // GPUI's native horizontal overflow does not consume wheel
@@ -466,24 +515,15 @@ fn render(
             .items_start()
             .when(show_line_numbers, |this| {
                 this.child(
-                    v_flex()
+                    div()
                         .flex_none()
                         .pr_3()
+                        .whitespace_nowrap()
                         .text_color(line_number_color)
                         .debug_selector(move || {
-                            format!("markdown-code-line-numbers-{owner_id}-{}", code.start)
+                            format!("markdown-code-line-number-{owner_id}-{}-0", code.start)
                         })
-                        .children((1..=line_count).map(|number| {
-                            div()
-                                .debug_selector(move || {
-                                    format!(
-                                        "markdown-code-line-number-{owner_id}-{}-{}",
-                                        code.start,
-                                        number - 1
-                                    )
-                                })
-                                .child(format!("{number:>number_width$}"))
-                        })),
+                        .child(line_numbers),
                 )
             })
             .child(viewport)
@@ -743,10 +783,16 @@ mod tests {
 
     fn assert_fenced_code_drag_copy(cx: &mut TestAppContext, wrap: bool) {
         const OWNER_ID: u64 = 7;
-        const SOURCE: &str = "```text\nfirst\n\nthird\n```";
+        const SOURCE: &str = "```text\nfirst 你好\n\n🙂 third\n```";
+        const CODE: &str = "first 你好\n\n🙂 third";
 
         init_markdown_test(cx);
-        cx.update(|cx| set_global_wrap_in_memory(wrap, cx));
+        cx.update(|cx| {
+            set_global_wrap_in_memory(wrap, cx);
+            preferences::update_in_memory(cx, |prefs| {
+                prefs.code_block_line_numbers = true;
+            });
+        });
         let (_, cx) = cx.add_window_view(|window, cx| {
             let content = cx.new(|cx| CodeSelectionTestRoot {
                 body: MarkdownBody::new(SOURCE, OWNER_ID, cx),
@@ -760,20 +806,17 @@ mod tests {
             let _ = window.draw(cx);
         });
 
-        let first = cx
+        let code = cx
             .debug_bounds("markdown-code-line-7-0-0")
-            .expect("first code line bounds");
-        let empty = cx
-            .debug_bounds("markdown-code-line-7-0-1")
-            .expect("empty code line bounds");
-        let third = cx
-            .debug_bounds("markdown-code-line-7-0-2")
-            .expect("third code line bounds");
-        assert_eq!(empty.size.height, first.size.height);
-        assert_eq!(empty.size.height, third.size.height);
+            .expect("continuous code bounds");
+        let logical_line_height = code.size.height / 3.;
+        assert!(logical_line_height > px(0.));
 
-        let start = point(first.left() + px(1.), first.center().y);
-        let end = point(third.right() - px(1.), third.center().y);
+        let start = point(code.left() + px(1.), code.top() + logical_line_height / 2.);
+        let end = point(
+            code.right() - px(1.),
+            code.bottom() - logical_line_height / 2.,
+        );
         cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
         cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
         cx.update(|window, cx| {
@@ -782,12 +825,13 @@ mod tests {
         cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
 
         let selected = cx.update(|window, cx| window.selected_text(cx));
-        assert_eq!(selected.trim_end_matches('\n'), "first\n\nthird");
+        assert_eq!(selected.trim_end_matches('\n'), CODE);
 
         cx.dispatch_action(gpui_component::input::Copy);
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("first\n\nthird".to_string())
+            Some(CODE.to_string()),
+            "drag-copy must preserve Unicode and empty lines without painted line numbers"
         );
     }
 
