@@ -292,6 +292,14 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     let body = cx
         .debug_bounds("reasoning-body-0")
         .expect("expanded reasoning viewport");
+    let viewport = cx
+        .debug_bounds("reasoning-viewport-0")
+        .expect("virtualized reasoning viewport");
+    assert_eq!(
+        viewport.right(),
+        body.right(),
+        "a long reasoning card containing code must keep its scrollbar host flush"
+    );
     reset_reasoning_smooth_invalidations();
     cx.simulate_event(ScrollWheelEvent {
         position: body.center(),
@@ -4775,6 +4783,59 @@ fn short_reasoning_keeps_its_natural_height(cx: &mut TestAppContext) {
         assert!(!trace.uses_virtualized_scroll());
         assert_eq!(trace.scroll_max_offset(), px(0.));
     });
+}
+
+/// A virtualized reasoning card's scrollbar host must use the card's full
+/// width. Padding belongs inside the scrollable TextView; otherwise the
+/// scrollbar is inset into the content column once the long-document path is
+/// selected, while the short native path remains flush with the card edge.
+#[gpui::test]
+fn virtualized_reasoning_scrollbar_host_reaches_card_edge(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+
+    let source = (0..240)
+        .map(|line| format!("Long reasoning paragraph {line}."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            chat.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: source,
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed long reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("expanded reasoning body");
+    let viewport = cx
+        .debug_bounds("reasoning-viewport-0")
+        .expect("virtualized reasoning viewport");
+    assert_eq!(
+        viewport.right(),
+        body.right(),
+        "the virtualized scrollbar host must reach the card's right edge"
+    );
 }
 
 /// Crossing the large-document threshold must not replace an actively used

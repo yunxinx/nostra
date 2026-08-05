@@ -557,8 +557,13 @@ pub(crate) fn render(
                                 };
                                 this.track_scroll(scroll)
                             })
-                            .px_3()
-                            .py_2()
+                            // The virtualized TextView owns an absolutely
+                            // positioned scrollbar. Keep the padding on that
+                            // element so its scrollbar is measured against the
+                            // full card width, just like the natural path's
+                            // outer viewport. Padding on this parent would
+                            // shrink the TextView's containing block by 12px.
+                            .when(!virtualized, |this| this.px_3().py_2())
                             .text_sm()
                             .text_color(body_foreground)
                             // The card is a scroll container inside the
@@ -572,10 +577,21 @@ pub(crate) fn render(
                                 cx.stop_propagation();
                             })
                             .child(if virtualized {
-                                trace
-                                    .body
-                                    .scrollable_text_view(
-                                        TextViewStyle::default().paragraph_gap(rems(PARAGRAPH_GAP)),
+                                div()
+                                    .size_full()
+                                    .min_w_0()
+                                    .debug_selector(move || {
+                                        block_selector("viewport", content_index)
+                                    })
+                                    .child(
+                                        trace
+                                            .body
+                                            .scrollable_text_view(
+                                                TextViewStyle::default()
+                                                    .paragraph_gap(rems(PARAGRAPH_GAP)),
+                                            )
+                                            .px_3()
+                                            .py_2(),
                                     )
                                     .into_any_element()
                             } else {
