@@ -110,6 +110,10 @@ pub(crate) fn smooth_scrolling_enabled(cx: &App) -> bool {
     crate::preferences::get(cx).smooth_chat_scrolling
 }
 
+fn smooth_scroll_animation_enabled(window: &Window, cx: &App) -> bool {
+    window.is_window_active() && smooth_scrolling_enabled(cx)
+}
+
 pub(crate) fn set_smooth_scrolling(enabled: bool, cx: &mut App) {
     if smooth_scrolling_enabled(cx) == enabled {
         return;
@@ -1116,7 +1120,10 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !smooth_scrolling_enabled(cx) || event.delta.precise() {
+        // Inactive macOS windows may still receive wheel hit-tests, but their
+        // frame delivery is throttled. Keep those events on GPUI's native
+        // path instead of queueing an animation that cannot advance smoothly.
+        if !smooth_scroll_animation_enabled(window, cx) || event.delta.precise() {
             self.smooth_scroll.cancel_motion();
             return;
         }
@@ -1147,7 +1154,10 @@ impl ChatView {
 
     fn advance_smooth_scroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.smooth_scroll.frame_scheduled = false;
-        if !smooth_scrolling_enabled(cx) {
+        // A window can lose activation after the wheel event but before its
+        // scheduled frame. Drop the queued motion rather than invalidating a
+        // throttled, inactive window on every frame.
+        if !smooth_scroll_animation_enabled(window, cx) {
             self.smooth_scroll.cancel_motion();
             return;
         }
@@ -1193,7 +1203,10 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !smooth_scrolling_enabled(cx) {
+        // Reasoning cards share the same inactive-window frame throttling as
+        // the transcript, so cancel pending card easing when focus moves to a
+        // different window.
+        if !smooth_scroll_animation_enabled(window, cx) {
             if let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) {
                 trace.cancel_smooth_scroll_frame();
             }
@@ -1390,7 +1403,7 @@ fn render_message(
                     let ui_id = *ui_id;
                     let content_index = part.content_index();
                     let native_scroll_anchor = trace.current_scroll_offset();
-                    let on_toggle = cx.listener(move |this: &mut ChatView, _, _, cx| {
+                    let on_toggle = cx.listener(move |this: &mut ChatView, _, window, cx| {
                         if let Some(MessagePart::Reasoning {
                             trace: Some(trace), ..
                         }) = this
@@ -1403,7 +1416,23 @@ fn render_message(
                                 })
                             })
                         {
-                            trace.toggle();
+                            if let Some(position) = trace.toggle_with_cx(cx) {
+                                // The first frame gives the retained TextView a
+                                // definite viewport and block-height estimates.
+                                // Restore the reader's relative position on the
+                                // following frame, once its scroll range is real.
+                                cx.on_next_frame(window, move |_, window, cx| {
+                                    cx.on_next_frame(window, move |this, _, cx| {
+                                        if let Some(trace) =
+                                            this.reasoning_trace_mut(message_ui_id, ui_id)
+                                        {
+                                            trace.apply_virtualized_position(position);
+                                            cx.notify();
+                                        }
+                                    });
+                                    cx.notify();
+                                });
+                            }
                             cx.notify();
                         }
                     });
@@ -1416,7 +1445,10 @@ fn render_message(
                             // ownership of the pointer; do not let a previously
                             // queued transcript animation keep moving underneath it.
                             this.smooth_scroll.cancel_motion();
-                            let smooth = smooth_scrolling_enabled(cx) && !event.delta.precise();
+                            // Do not start card easing from an inactive window:
+                            // AppKit throttles its animation frames.
+                            let smooth = smooth_scroll_animation_enabled(window, cx)
+                                && !event.delta.precise();
                             let Some(trace) = this.reasoning_trace_mut(message_ui_id, ui_id) else {
                                 return;
                             };

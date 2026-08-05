@@ -34,8 +34,8 @@ use std::{
 use gpui::{
     AnyElement, App, ElementId, FollowMode, InteractiveElement as _, IntoElement, ListState,
     ParentElement as _, Pixels, Point, ScrollHandle, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
-    rems,
+    StatefulInteractiveElement as _, Styled as _, Window, div, point, prelude::FluentBuilder as _,
+    px, rems,
 };
 use gpui_component::{
     ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
@@ -66,7 +66,7 @@ const PARAGRAPH_GAP: f32 = 0.5;
 
 /// Source-size gate for the retained block-list path. This avoids laying out a
 /// large document merely to decide whether it needs virtualization.
-const VIRTUALIZED_SOURCE_BYTES: usize = 4 * 1024;
+pub(super) const VIRTUALIZED_SOURCE_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
 enum ReasoningScroll {
@@ -214,13 +214,43 @@ impl ReasoningTrace {
         self.expanded = !self.expanded;
     }
 
+    /// Toggle disclosure and migrate a long natural trace when it is opened
+    /// after the reader had scrolled away from the tail.
+    pub(crate) fn toggle_with_cx(&mut self, cx: &mut App) -> Option<f32> {
+        self.toggle();
+        if self.expanded {
+            self.ensure_scroll_mode_for_disclosure(cx)
+        } else {
+            None
+        }
+    }
+
+    /// Apply an offset captured from the natural scroll handle after the
+    /// retained list has completed its first layout.
+    pub(crate) fn apply_virtualized_position(&self, position: f32) {
+        if let ReasoningScroll::Virtualized(scroll) = &self.scroll {
+            let max_offset = scroll.max_offset_for_scrollbar().y;
+            scroll.set_offset_from_scrollbar(point(
+                px(0.),
+                -px(max_offset.as_f32() * position.clamp(0., 1.)),
+            ));
+        }
+    }
+
     /// Apply the terminal message's complete reasoning snapshot while retaining
     /// disclosure, timing, and keyed markdown entity accumulated during
     /// streaming.
     pub(crate) fn set_source(&mut self, source: &str, cx: &mut App) {
         self.body.set_text(source, cx);
         self.source_bytes = source.len();
-        self.ensure_scroll_mode(cx);
+        if self.source_bytes < VIRTUALIZED_SOURCE_BYTES {
+            self.demote_to_natural_scroll();
+        } else {
+            // A terminal snapshot is authoritative and may replace a short
+            // stream with a much larger document. There is no later append or
+            // disclosure boundary guaranteed to repair the scroll mode.
+            self.promote_to_virtualized_scroll(cx, false);
+        }
         self.follow_scroll();
     }
 
@@ -290,16 +320,60 @@ impl ReasoningTrace {
     }
 
     fn ensure_scroll_mode(&mut self, cx: &mut App) {
-        if self.source_bytes >= VIRTUALIZED_SOURCE_BYTES
-            && self.follow
-            && matches!(self.scroll, ReasoningScroll::Natural(_))
-        {
-            self.scroll = ReasoningScroll::Virtualized(self.body.scroll_state(cx));
-            if let ReasoningScroll::Virtualized(scroll) = &self.scroll {
-                scroll.set_follow_mode(FollowMode::Tail);
-            }
-            self.scroll.scroll_to_bottom();
+        if self.source_bytes < VIRTUALIZED_SOURCE_BYTES {
+            self.demote_to_natural_scroll();
+        } else if self.follow {
+            self.promote_to_virtualized_scroll(cx, false);
         }
+    }
+
+    fn ensure_scroll_mode_for_disclosure(&mut self, cx: &mut App) -> Option<f32> {
+        if self.source_bytes >= VIRTUALIZED_SOURCE_BYTES {
+            self.promote_to_virtualized_scroll(cx, true)
+        } else {
+            None
+        }
+    }
+
+    fn promote_to_virtualized_scroll(
+        &mut self,
+        cx: &mut App,
+        preserve_offset: bool,
+    ) -> Option<f32> {
+        if !matches!(self.scroll, ReasoningScroll::Natural(_)) {
+            return None;
+        }
+
+        let natural_offset = self.scroll.offset();
+        let natural_max = self.scroll.max_offset().y;
+        let scroll = self.body.scroll_state(cx);
+        let mut position = None;
+        if self.follow {
+            scroll.set_follow_mode(FollowMode::Tail);
+            scroll.scroll_to_end();
+        } else {
+            scroll.set_follow_mode(FollowMode::Normal);
+            if preserve_offset {
+                let relative_position = if natural_max > Pixels::ZERO {
+                    (-natural_offset.y).as_f32() / natural_max.as_f32()
+                } else {
+                    0.
+                };
+                position = Some(relative_position.clamp(0., 1.));
+            }
+        }
+        self.scroll = ReasoningScroll::Virtualized(scroll);
+        position
+    }
+
+    fn demote_to_natural_scroll(&mut self) {
+        let ReasoningScroll::Virtualized(scroll) = &self.scroll else {
+            return;
+        };
+        let offset = scroll.scroll_px_offset_for_scrollbar();
+        let natural = ScrollHandle::new();
+        natural.set_offset(offset);
+        self.scroll = ReasoningScroll::Natural(natural);
     }
 
     fn scroll_is_near_bottom(&self) -> bool {

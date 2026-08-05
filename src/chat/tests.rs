@@ -16,6 +16,7 @@ use crate::llm::{
 };
 use crate::preferences;
 
+use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
 use super::{
     CONTENT_MAX_WIDTH, ChatEvent, ChatView, Message, MessagePart, ReasoningTrace, Role,
     SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD,
@@ -125,6 +126,12 @@ fn add_chat_window(
         let chat = ChatView::view(window, cx);
         gpui_component::Root::new(chat, window, cx)
     });
+    // Test windows start inactive even though a real main window is activated
+    // during startup. Keep the helper's default aligned with production so
+    // smooth-scroll tests exercise the active path unless they explicitly
+    // call `deactivate_window`.
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
     let chat = root.read_with(cx, |root, _| {
         root.view()
             .clone()
@@ -453,6 +460,228 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     }
 }
 
+/// The production-shaped combined case keeps the long code in the assistant
+/// answer, not inside reasoning: one visible transcript row therefore owns a
+/// retained reasoning viewport and a continuous, very tall code block. Outer
+/// list easing must not bring back per-line work on every frame.
+#[gpui::test]
+fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
+    cx: &mut TestAppContext,
+) {
+    const CODE_LINES: usize = 640;
+    const MAX_TEXT_VIEW_BUILDS_PER_INTERACTION: usize = 2;
+    const MAX_SMOOTH_FRAMES: usize = 24;
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(760.), px(560.)));
+
+    let reasoning = (0..160)
+        .map(|line| format!("Reasoning paragraph {line} remains in its retained viewport."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let code = (0..CODE_LINES)
+        .map(|line| {
+            format!(
+                "let value_{line} = compute_really_long_identifier_{line}({line}, \"payload-{line}\");"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let answer = format!("Answer code:\n\n```rust\n{code}\n```\n\nDone.");
+    let fence_start = answer.find("```rust").expect("fixture fence");
+
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| {
+            prefs.code_block_line_numbers = true;
+            prefs.smooth_chat_scrolling = false;
+        });
+        chat.update(cx, |chat, cx| {
+            for message in [
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "First short question.".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "First short answer.".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Second question requesting long output.".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![
+                        ContentBlock::Reasoning {
+                            reasoning: crate::llm::ReasoningContent {
+                                display: reasoning,
+                                replay: None,
+                            },
+                        },
+                        ContentBlock::Text {
+                            text: answer,
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                    ],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+            ] {
+                chat.messages.push(Message::from_canonical(message, cx));
+            }
+            chat.sync_message_list_count();
+            chat.list_state.scroll_to(ListOffset {
+                item_ix: 3,
+                offset_in_item: px(0.),
+            });
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("combined fixture reasoning trigger");
+    cx.simulate_click(trigger.center(), Modifiers::default());
+    redraw(cx);
+    redraw(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("combined turn");
+        assert!(
+            reasoning_part(turn)
+                .expect("combined reasoning")
+                .uses_virtualized_scroll(),
+            "combined reasoning must use the retained path"
+        );
+        turn.parts
+            .iter()
+            .find_map(|part| match part {
+                MessagePart::Text { ui_id, .. } => Some(*ui_id),
+                _ => None,
+            })
+            .expect("combined answer text")
+    });
+    let selector = |kind: &str| -> &'static str {
+        Box::leak(format!("markdown-code-{kind}-{owner_id}-{fence_start}").into_boxed_str())
+    };
+    let wrap_selector = selector("wrap");
+    let block_selector = selector("block");
+
+    let measure_toggle = |cx: &mut gpui::VisualTestContext| {
+        let wrap = cx.debug_bounds(wrap_selector).expect("answer wrap control");
+        crate::ui::markdown::reset_perf_probe();
+        let started = Instant::now();
+        cx.simulate_click(wrap.center(), Modifiers::default());
+        let (draw, probe) = measured_redraw(cx);
+        (started.elapsed(), draw, probe)
+    };
+
+    let (_, nowrap_to_wrap_draw, nowrap_to_wrap) = measure_toggle(cx);
+    let (_, wrap_to_nowrap_draw, wrap_to_nowrap) = measure_toggle(cx);
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
+    });
+    let (_, combined_wrap_draw, combined_wrap) = measure_toggle(cx);
+
+    cx.update(|_, cx| {
+        chat.read(cx).list_state.scroll_to(ListOffset {
+            item_ix: 3,
+            offset_in_item: px(0.),
+        });
+    });
+    redraw(cx);
+    let block = cx
+        .debug_bounds(block_selector)
+        .expect("wrapped answer code block");
+    let before_scroll = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(block.left() + px(20.), block.top() + px(50.)),
+        delta: ScrollDelta::Lines(point(0., -3.)),
+        ..Default::default()
+    });
+    assert!(
+        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining) > px(0.),
+        "outer transcript input must queue easing in the combined fixture"
+    );
+
+    let mut smooth_draws = Vec::new();
+    let mut smooth_probes = Vec::new();
+    for _ in 0..64 {
+        if cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining) == px(0.) {
+            break;
+        }
+        assert!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+            "queued transcript motion must have a scheduled frame"
+        );
+        let (draw, probe) = measured_redraw(cx);
+        smooth_draws.push(draw);
+        smooth_probes.push(probe);
+    }
+    assert!(
+        !smooth_draws.is_empty() && smooth_draws.len() <= MAX_SMOOTH_FRAMES,
+        "transcript easing must converge with bounded invalidations"
+    );
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining),
+        px(0.),
+        "transcript easing must converge"
+    );
+    let after_scroll = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    assert!(
+        after_scroll.item_ix > before_scroll.item_ix
+            || after_scroll.offset_in_item > before_scroll.offset_in_item,
+        "combined transcript easing must advance the outer list"
+    );
+
+    let smooth_probe = smooth_probes
+        .iter()
+        .copied()
+        .max_by_key(|probe| probe.code_text_elements)
+        .unwrap_or_default();
+    for (operation, probe) in [
+        ("answer wrap", nowrap_to_wrap),
+        ("answer unwrap", wrap_to_nowrap),
+        ("combined answer wrap", combined_wrap),
+        ("combined transcript frame", smooth_probe),
+    ] {
+        assert_eq!(
+            probe.code_text_elements, 1,
+            "{operation} must build one continuous code-text element"
+        );
+        assert_eq!(
+            probe.code_block_renders, 1,
+            "{operation} must render the visible answer code block once"
+        );
+        assert!(
+            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_INTERACTION,
+            "{operation} rebuilt {} text views",
+            probe.text_view_builds
+        );
+    }
+
+    let smooth_p95 = duration_percentile(&smooth_draws, 95);
+    eprintln!(
+        "OUTER_LONG_CONTENT_PERF wrap_draw={nowrap_to_wrap_draw:?} \
+         unwrap_draw={wrap_to_nowrap_draw:?} combined_wrap_draw={combined_wrap_draw:?} \
+         smooth_frames={} smooth_p95={smooth_p95:?}",
+        smooth_draws.len()
+    );
+}
+
 #[gpui::test]
 fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestAppContext) {
     init_app(cx);
@@ -502,6 +731,170 @@ fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestApp
     assert!(
         eased.item_ix > before.item_ix || eased.offset_in_item > before.offset_in_item,
         "an animation frame must advance the deferred wheel distance"
+    );
+}
+
+/// A window behind a focused settings window can still receive macOS wheel
+/// input. It must use the native one-shot scroll path rather than queueing a
+/// custom animation whose inactive-window frame delivery is throttled.
+#[gpui::test]
+fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(420.)));
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
+        chat.update(cx, |chat, cx| {
+            for index in 0..20 {
+                chat.messages.push(Message::from_canonical(
+                    LlmMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: format!("message {index}\n\n{}", "body ".repeat(30)),
+                            provider_metadata: ProviderMetadata::default(),
+                        }],
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                    cx,
+                ));
+            }
+            chat.sync_message_list_count();
+            chat.list_state.scroll_to(ListOffset::default());
+        });
+    });
+    redraw(cx);
+    let before_active = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(320.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., -3.)),
+        ..Default::default()
+    });
+    assert!(
+        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining) > px(0.),
+        "active line-wheel input must queue easing before the focus transition"
+    );
+    cx.deactivate_window();
+    assert!(!cx.update(|window, _| window.is_window_active()));
+
+    cx.update(|window, cx| {
+        assert!(window.simulate_next_frame(cx) > 0);
+    });
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining),
+        px(0.),
+        "a frame delivered after deactivation must cancel pending easing"
+    );
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: point(px(320.), px(100.)),
+        delta: ScrollDelta::Lines(point(0., -3.)),
+        ..Default::default()
+    });
+
+    let after_inactive = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    assert!(
+        after_inactive.item_ix > before_active.item_ix
+            || after_inactive.offset_in_item > before_active.offset_in_item,
+        "inactive wheel input must still use the native transcript scroll path"
+    );
+
+    assert_eq!(
+        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining),
+        px(0.),
+        "inactive chat windows must not queue custom smooth scrolling"
+    );
+}
+
+#[gpui::test]
+fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(420.)));
+    seed_turn(&chat, cx);
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
+        chat.update(cx, |this, cx| {
+            for line in 0..60 {
+                this.append_stream_reasoning(
+                    0,
+                    "inactive-reasoning".into(),
+                    &format!("Reasoning line {line}.\n\n"),
+                    cx,
+                );
+            }
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the reasoning card must be visible");
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Lines(point(0., 3.)),
+        ..Default::default()
+    });
+    assert!(
+        cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            reasoning_part(turn)
+                .expect("reasoning trace")
+                .smooth_scroll_remaining()
+        }) > px(0.),
+        "active card wheel input must queue easing before the focus transition"
+    );
+
+    cx.deactivate_window();
+    assert!(!cx.update(|window, _| window.is_window_active()));
+    cx.update(|window, cx| {
+        assert!(window.simulate_next_frame(cx) > 0);
+    });
+    assert_eq!(
+        cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            reasoning_part(turn)
+                .expect("reasoning trace")
+                .smooth_scroll_remaining()
+        }),
+        px(0.),
+        "a card frame delivered after deactivation must cancel pending easing"
+    );
+
+    let before_inactive = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        reasoning_part(turn)
+            .expect("reasoning trace")
+            .scroll_offset()
+            .y
+    });
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Lines(point(0., 3.)),
+        ..Default::default()
+    });
+
+    let after_inactive = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        reasoning_part(turn)
+            .expect("reasoning trace")
+            .scroll_offset()
+            .y
+    });
+    assert!(
+        after_inactive > before_inactive,
+        "inactive wheel input must still move the native reasoning viewport"
+    );
+
+    assert_eq!(
+        cx.update(|_, cx| {
+            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            reasoning_part(turn)
+                .expect("reasoning trace")
+                .smooth_scroll_remaining()
+        }),
+        px(0.),
+        "inactive reasoning windows must not queue card animation"
     );
 }
 
@@ -4854,7 +5247,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
         .map(|line| format!("Reasoning line {line} has compact source.\n\n"))
         .collect::<String>();
     assert!(
-        initial.len() < 4 * 1024,
+        initial.len() < VIRTUALIZED_SOURCE_BYTES,
         "the first stream segment must remain below the virtualization gate"
     );
     cx.update(|_, cx| {
@@ -4891,7 +5284,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
 
     let threshold_crossing = "Additional retained paragraph content.\n\n".repeat(80);
     assert!(
-        initial.len() + threshold_crossing.len() >= 4 * 1024,
+        initial.len() + threshold_crossing.len() >= VIRTUALIZED_SOURCE_BYTES,
         "the second segment must cross the virtualization gate"
     );
     cx.update(|_, cx| {
@@ -4939,6 +5332,237 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
         assert!(
             trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD,
             "the new virtualized viewport must remain anchored to the tail"
+        );
+    });
+}
+
+#[gpui::test]
+fn finished_scrolled_reasoning_reopens_on_the_virtualized_path(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    let initial = (0..90)
+        .map(|line| format!("Reasoning line {line} has compact source.\n\n"))
+        .collect::<String>();
+    let threshold_crossing = "Additional retained paragraph content.\n\n".repeat(80);
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("the expanded reasoning body was drawn");
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        ..Default::default()
+    });
+    redraw(cx);
+    let paused_offset = cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        reasoning_part(turn)
+            .expect("reasoning trace")
+            .scroll_offset()
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &threshold_crossing, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+    assert!(cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        !trace.is_following() && !trace.uses_virtualized_scroll()
+    }));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| this.finish_reply(None, None, cx));
+    });
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("finished reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.update(|window, cx| {
+        assert!(window.simulate_next_frame(cx) > 0);
+    });
+    redraw(cx);
+    cx.update(|window, cx| {
+        assert!(window.simulate_next_frame(cx) > 0);
+    });
+    redraw(cx);
+
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            trace.uses_virtualized_scroll(),
+            "reopening a finished long stream must not return to full natural Markdown layout"
+        );
+        assert!(
+            trace.scroll_offset().y > -trace.scroll_max().y + px(1.),
+            "migration on disclosure must preserve a non-tail reader position"
+        );
+        assert!(
+            trace.scroll_offset().y < px(-1.),
+            "migration on disclosure must not jump the reader to the top"
+        );
+        assert!(
+            paused_offset.y < px(-1.),
+            "the natural path must have captured a non-zero reader position"
+        );
+    });
+}
+
+#[gpui::test]
+fn authoritative_short_reasoning_returns_to_natural_height(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    let long_source = (0..180)
+        .map(|line| format!("Long reasoning line {line} keeps the retained list active."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let short_source = "The authoritative summary is short.";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &long_source, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+    assert!(cx.update(|_, cx| {
+        reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+            .expect("reasoning trace")
+            .uses_virtualized_scroll()
+    }));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.finish_reply(
+                Some(IndexedMessage::from_message(LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: short_source.into(),
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                })),
+                None,
+                cx,
+            );
+        });
+    });
+    redraw(cx);
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("short terminal reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("short terminal reasoning body");
+    let height_budget = cx.update(|window, _| window.line_height() * 7.);
+    assert!(body.size.height < height_budget);
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(
+            !trace.uses_virtualized_scroll(),
+            "a short authoritative replacement must leave the fixed-height virtual path"
+        );
+        assert_eq!(trace.scroll_max_offset(), px(0.));
+    });
+}
+
+#[gpui::test]
+fn authoritative_long_reasoning_promotes_even_when_the_reader_is_not_following(
+    cx: &mut TestAppContext,
+) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+    seed_turn(&chat, cx);
+
+    let initial = (0..70)
+        .map(|line| format!("Initial reasoning line {line}.\n\n"))
+        .collect::<String>();
+    let authoritative = (0..220)
+        .map(|line| format!("Authoritative reasoning paragraph {line}."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    let body = cx
+        .debug_bounds("reasoning-body-0")
+        .expect("initial reasoning body");
+    cx.simulate_event(ScrollWheelEvent {
+        position: body.center(),
+        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
+        ..Default::default()
+    });
+    redraw(cx);
+    cx.update(|_, cx| {
+        chat.update(cx, |this, _| {
+            let trace = reasoning_part_mut(this.messages.last_mut().expect("assistant turn"))
+                .expect("reasoning trace");
+            assert!(!trace.is_following());
+            // Preserve expansion across the terminal boundary without changing
+            // the final disclosure state.
+            trace.toggle();
+            trace.toggle();
+        });
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.finish_reply(
+                Some(IndexedMessage::from_message(LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: authoritative,
+                            replay: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                })),
+                None,
+                cx,
+            );
+        });
+    });
+    redraw(cx);
+
+    cx.update(|_, cx| {
+        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let trace = reasoning_part(turn).expect("reasoning trace");
+        assert!(trace.is_expanded());
+        assert!(
+            trace.uses_virtualized_scroll(),
+            "a long authoritative replacement must not leave an expanded full-layout path"
         );
     });
 }
