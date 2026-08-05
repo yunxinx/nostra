@@ -6,7 +6,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, Axis, Background, Entity, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement as _, ParentElement as _, Rgba, SharedString,
-    StatefulInteractiveElement as _, Styled as _, StyledText, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, Rope, Sizable as _,
@@ -16,7 +16,8 @@ use gpui_component::{
     highlighter::{HighlightTheme, SyntaxHighlighter},
     scroll::{ScrollableMask, Scrollbar, ScrollbarShow},
     text::{
-        MarkdownExtensions, MarkdownNode, TextView, TextViewState, TextViewStyle, markdown_ast,
+        InlineFlow, InlineFlowItem, InlineFlowState, MarkdownExtensions, MarkdownNode, TextView,
+        TextViewState, TextViewStyle, markdown_ast,
     },
     v_flex,
 };
@@ -135,18 +136,30 @@ pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensi
                     .map(Into::into),
                 start,
             };
+            let line_flow_states = code
+                .value
+                .split('\n')
+                .enumerate()
+                .map(|(index, _)| (InlineFlowState::default(), usize::from(index > 0)));
 
             Some(
                 MarkdownNode::new(NODE_NAME, data)
                     .text(code.value.clone())
-                    .markdown(source.to_string()),
+                    .markdown(source.to_string())
+                    .inline_flow_states_with_breaks(line_flow_states),
             )
         })
         .block_renderer(NODE_NAME, move |node, window, cx| {
             let Some(code) = node.data::<FencedCode>() else {
                 return div().into_any_element();
             };
-            render(code, owner_id, window, cx)
+            render(
+                code,
+                node.attached_inline_flow_states(),
+                owner_id,
+                window,
+                cx,
+            )
         })
 }
 
@@ -247,14 +260,36 @@ fn highlighted_lines(
         .collect()
 }
 
-fn styled_line(line: &HighlightedLine) -> StyledText {
-    // `StyledText` owns its delayed highlights, so each rendered line must
-    // materialize that small Vec. Borrowing the cached projection here avoids
-    // first cloning every line and all of their highlight Vecs on each render.
-    StyledText::new(line.text.clone()).with_highlights(line.styles.iter().cloned())
+fn code_line_element(
+    owner_id: u64,
+    start: usize,
+    index: usize,
+    line: &HighlightedLine,
+    flow_state: InlineFlowState,
+) -> AnyElement {
+    if line.text.is_empty() {
+        return div()
+            .w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(" ")
+            .into_any_element();
+    }
+    InlineFlow::new(
+        format!("markdown-code-inline-flow-{owner_id}-{start}-{index}"),
+        flow_state,
+        vec![InlineFlowItem::text(line.text.clone()).highlights(line.styles.clone())],
+    )
+    .into_any_element()
 }
 
-fn render(code: &FencedCode, owner_id: u64, window: &mut Window, cx: &mut App) -> AnyElement {
+fn render(
+    code: &FencedCode,
+    attached_flow_states: &[InlineFlowState],
+    owner_id: u64,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let cache_id: SharedString =
         format!("markdown-code-highlight-{owner_id}-{}", code.start).into();
     let cache = window.use_keyed_state(cache_id, cx, |_, cx| HighlightCache::new(code, cx));
@@ -281,6 +316,9 @@ fn render(code: &FencedCode, owner_id: u64, window: &mut Window, cx: &mut App) -
     };
     let show_line_numbers = line_numbers_enabled(cx);
     let line_count = lines.len();
+    let line_flow_states = (0..line_count)
+        .map(|index| attached_flow_states.get(index).cloned().unwrap_or_default())
+        .collect::<Vec<_>>();
     let number_width = line_count.max(1).to_string().len();
     let line_number_color = cx
         .theme()
@@ -294,37 +332,39 @@ fn render(code: &FencedCode, owner_id: u64, window: &mut Window, cx: &mut App) -
         v_flex()
             .w_full()
             .min_w_0()
-            .children(lines.iter().enumerate().map(|(index, line)| {
-                h_flex()
-                    .debug_selector(move || {
-                        format!("markdown-code-line-{owner_id}-{}-{index}", code.start)
-                    })
-                    .w_full()
-                    .min_w_0()
-                    .items_start()
-                    .when(show_line_numbers, |this| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .pr_3()
-                                .text_color(line_number_color)
-                                .debug_selector(move || {
-                                    format!(
-                                        "markdown-code-line-number-{owner_id}-{}-{index}",
-                                        code.start
-                                    )
-                                })
-                                .child(format!("{:>number_width$}", index + 1)),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
+            .children(
+                lines
+                    .iter()
+                    .enumerate()
+                    .zip(line_flow_states.iter().cloned())
+                    .map(|((index, line), flow_state)| {
+                        h_flex()
+                            .debug_selector(move || {
+                                format!("markdown-code-line-{owner_id}-{}-{index}", code.start)
+                            })
+                            .w_full()
                             .min_w_0()
-                            .whitespace_normal()
-                            .child(styled_line(line)),
-                    )
-            }))
+                            .items_start()
+                            .when(show_line_numbers, |this| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .pr_3()
+                                        .text_color(line_number_color)
+                                        .debug_selector(move || {
+                                            format!(
+                                                "markdown-code-line-number-{owner_id}-{}-{index}",
+                                                code.start
+                                            )
+                                        })
+                                        .child(format!("{:>number_width$}", index + 1)),
+                                )
+                            })
+                            .child(div().flex_1().min_w_0().whitespace_normal().child(
+                                code_line_element(owner_id, code.start, index, line, flow_state),
+                            ))
+                    }),
+            )
             .into_any_element()
     } else {
         let scroll_state_id: SharedString =
@@ -374,19 +414,27 @@ fn render(code: &FencedCode, owner_id: u64, window: &mut Window, cx: &mut App) -
                             .relative()
                             .overflow_hidden()
                             .track_scroll(&scroll_handle)
-                            .child(v_flex().flex_none().children(lines.iter().enumerate().map(
-                                |(index, line)| {
-                                    div()
-                                        .debug_selector(move || {
-                                            format!(
-                                                "markdown-code-line-{owner_id}-{}-{index}",
-                                                code.start
-                                            )
-                                        })
-                                        .whitespace_nowrap()
-                                        .child(styled_line(line))
-                                },
-                            ))),
+                            .child(
+                                v_flex().flex_none().children(
+                                    lines
+                                        .iter()
+                                        .enumerate()
+                                        .zip(line_flow_states.iter().cloned())
+                                        .map(|((index, line), flow_state)| {
+                                            div()
+                                                .debug_selector(move || {
+                                                    format!(
+                                                        "markdown-code-line-{owner_id}-{}-{index}",
+                                                        code.start
+                                                    )
+                                                })
+                                                .whitespace_nowrap()
+                                                .child(code_line_element(
+                                                    owner_id, code.start, index, line, flow_state,
+                                                ))
+                                        }),
+                                ),
+                            ),
                     )
                     // GPUI's native horizontal overflow does not consume wheel
                     // events, so an outer vertical scroller can reinterpret
@@ -664,10 +712,96 @@ pub(crate) fn set_line_numbers(enabled: bool, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use gpui::TestAppContext;
-    use gpui_component::ActiveTheme as _;
+    use gpui::{
+        Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext,
+        point,
+    };
+    use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
 
     use super::*;
+
+    struct CodeSelectionTestRoot {
+        body: MarkdownBody,
+    }
+
+    impl Render for CodeSelectionTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(480.))
+                .child(self.body.text_view(TextViewStyle::default()))
+        }
+    }
+
+    fn init_markdown_test(cx: &mut TestAppContext) {
+        let prefs = preferences::Preferences::default();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            preferences::init_global(prefs.clone(), cx);
+            crate::appearance::theme::init(&prefs, cx);
+        });
+    }
+
+    fn assert_fenced_code_drag_copy(cx: &mut TestAppContext, wrap: bool) {
+        const OWNER_ID: u64 = 7;
+        const SOURCE: &str = "```text\nfirst\n\nthird\n```";
+
+        init_markdown_test(cx);
+        cx.update(|cx| set_global_wrap_in_memory(wrap, cx));
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|cx| CodeSelectionTestRoot {
+                body: MarkdownBody::new(SOURCE, OWNER_ID, cx),
+            });
+            Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        let first = cx
+            .debug_bounds("markdown-code-line-7-0-0")
+            .expect("first code line bounds");
+        let empty = cx
+            .debug_bounds("markdown-code-line-7-0-1")
+            .expect("empty code line bounds");
+        let third = cx
+            .debug_bounds("markdown-code-line-7-0-2")
+            .expect("third code line bounds");
+        assert_eq!(empty.size.height, first.size.height);
+        assert_eq!(empty.size.height, third.size.height);
+
+        let start = point(first.left() + px(1.), first.center().y);
+        let end = point(third.right() - px(1.), third.center().y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+        let selected = cx.update(|window, cx| window.selected_text(cx));
+        assert_eq!(selected.trim_end_matches('\n'), "first\n\nthird");
+
+        cx.dispatch_action(gpui_component::input::Copy);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("first\n\nthird".to_string())
+        );
+    }
+
+    #[gpui::test]
+    fn nowrap_fenced_code_drag_copy_preserves_lines_and_empty_line_height(cx: &mut TestAppContext) {
+        assert_fenced_code_drag_copy(cx, false);
+    }
+
+    #[gpui::test]
+    fn wrapped_fenced_code_drag_copy_preserves_lines_and_empty_line_height(
+        cx: &mut TestAppContext,
+    ) {
+        assert_fenced_code_drag_copy(cx, true);
+    }
 
     #[gpui::test]
     fn code_block_surfaces_remain_distinct_in_every_theme(cx: &mut TestAppContext) {
