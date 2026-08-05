@@ -5,6 +5,7 @@
 //! is the title-bar model picker. Interaction helpers small enough not to need a
 //! module of their own live directly here.
 
+pub(crate) mod inline_delete_confirmation;
 pub(crate) mod markdown;
 pub(crate) mod math;
 pub(crate) mod model_select;
