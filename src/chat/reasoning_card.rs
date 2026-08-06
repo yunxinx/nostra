@@ -621,10 +621,6 @@ pub(crate) fn render(
                             .when(!virtualized, |this| {
                                 this.max_h(max_height).overflow_y_scroll()
                             })
-                            // This nested viewport must occlude the transcript's
-                            // list hitbox. Otherwise the list's native wheel
-                            // handler runs before this card's bubble handler.
-                            .occlude()
                             .when(!virtualized, |this| {
                                 let ReasoningScroll::Natural(scroll) = &trace.scroll else {
                                     return this;
