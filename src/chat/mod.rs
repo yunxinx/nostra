@@ -8,16 +8,17 @@
 
 mod assistant;
 mod error_card;
+mod hover_reveal;
 mod reasoning_card;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, FollowMode,
-    InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState, ParentElement as _,
-    Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription, Window, div, list,
-    point, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, EventEmitter,
+    FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
+    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
+    Window, div, list, point, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
@@ -39,6 +40,7 @@ use crate::providers;
 use crate::ui::markdown::MarkdownBody;
 
 use self::error_card::TurnError;
+use self::hover_reveal::hover_reveal_copy;
 use self::reasoning_card::ReasoningTrace;
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
@@ -926,6 +928,39 @@ impl ChatView {
         }
     }
 
+    /// The transcript turn with `ui_id`, or `None` once the view is dropped or
+    /// the turn is replaced by a replay.
+    fn message_by_ui_id(&self, ui_id: u64) -> Option<&Message> {
+        self.messages.iter().find(|message| message.ui_id == ui_id)
+    }
+
+    /// The complete prose of the turn with `ui_id`, for the message-level copy
+    /// button. Read from the live message at click time rather than a render
+    /// snapshot, so the clipboard always reflects the latest state.
+    fn copyable_message_text(&self, ui_id: u64) -> Option<SharedString> {
+        self.message_by_ui_id(ui_id).map(copyable_text)
+    }
+
+    /// The reasoning source of the block `reasoning_ui_id` inside the turn
+    /// `message_ui_id`, for the reasoning card's copy button.
+    fn reasoning_copy_source(
+        &self,
+        message_ui_id: u64,
+        reasoning_ui_id: u64,
+    ) -> Option<SharedString> {
+        self.message_by_ui_id(message_ui_id).and_then(|message| {
+            message.parts.iter().find_map(|part| match part {
+                MessagePart::Reasoning {
+                    ui_id,
+                    reasoning,
+                    trace: Some(_),
+                    ..
+                } if *ui_id == reasoning_ui_id => Some(reasoning.display.clone().into()),
+                _ => None,
+            })
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn start_pending_reply_for_test(
         &mut self,
@@ -1478,24 +1513,7 @@ fn render_message(
                     let copy_value = move |_: &mut Window, cx: &mut App| {
                         view.upgrade()
                             .and_then(|view| {
-                        let view = view.read(cx);
-                        match view
-                            .messages
-                            .iter()
-                            .find(|message| message.ui_id == message_ui_id)
-                                    .and_then(|message| {
-                                        message.parts.iter().find(|part| {
-                                            matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
-                                        })
-                                    })
-                                {
-                                    Some(MessagePart::Reasoning {
-                                        reasoning,
-                                        trace: Some(_),
-                                        ..
-                                    }) => Some(reasoning.display.clone().into()),
-                                    _ => None,
-                                }
+                                view.read(cx).reasoning_copy_source(message_ui_id, ui_id)
                             })
                             .unwrap_or_default()
                     };
@@ -1570,13 +1588,111 @@ fn render_message(
             .into_any_element()
     };
 
-    h_flex().w_full().justify_center().px_6().child(
-        div()
-            .debug_selector(move || format!("assistant-message-content-{message_index}"))
+    // A hover-revealed action row beneath the message: a single copy button
+    // right-aligned under user bubbles, left-aligned under assistant content.
+    // `hover_reveal_copy` owns the invisible-until-group-hover wrapper, so
+    // revealing it spends no layout and the bubble's bounds never shift when
+    // the pointer enters.
+    //
+    // Suppressed on assistant turns that failed: the error card already carries
+    // its own "copy raw response" button, and a second message-level copy would
+    // either duplicate it or copy the partial prose above — neither of which is
+    // what a failed turn should offer. Also suppressed while the turn is still
+    // streaming and until it actually has prose: a copy must never freeze a
+    // partial answer mid-stream, and a reasoning- or tool-only stream must not
+    // offer to copy an empty string onto the clipboard.
+    let hover_group: SharedString = format!("turn-message-{message_ui_id}").into();
+    let body_with_actions = if msg.error.is_none() && stream_ended(msg) && has_copyable_text(msg) {
+        // Read the live message at click time rather than capturing a snapshot
+        // from render, so the clipboard always reflects the message's current
+        // state.
+        let view = cx.entity().downgrade();
+        let actions = h_flex()
             .w_full()
-            .max_w(CONTENT_MAX_WIDTH)
-            .child(inner),
+            // Same side the bubble/heading sits on, so the button reads as
+            // belonging to that message rather than floating in the column.
+            .when(is_user, |this| this.justify_end())
+            .mt_1()
+            .child(hover_reveal_copy(
+                ElementId::NamedInteger("turn-message-copy".into(), message_ui_id),
+                hover_group.clone(),
+                t!("chat.copy_message").to_string(),
+                move |_: &mut Window, cx: &mut App| {
+                    view.upgrade()
+                        .and_then(|view| view.read(cx).copyable_message_text(message_ui_id))
+                        .unwrap_or_default()
+                },
+                move || format!("message-copy-{message_index}"),
+            ));
+
+        // Wrap body + actions so both share one hover group: hovering anywhere
+        // over the message — including a nested reasoning card — reveals the
+        // row.
+        v_flex()
+            .w_full()
+            .gap_0()
+            .child(inner)
+            .child(actions)
+            .into_any_element()
+    } else {
+        inner
+    };
+
+    div().group(hover_group).w_full().child(
+        h_flex().w_full().justify_center().px_6().child(
+            div()
+                .debug_selector(move || format!("assistant-message-content-{message_index}"))
+                .w_full()
+                .max_w(CONTENT_MAX_WIDTH)
+                .child(body_with_actions),
+        ),
     )
+}
+
+/// Iterates the non-whitespace text parts of `message` in canonical order. Both
+/// `has_copyable_text` and [`copyable_text`] consume this same iterator, so the
+/// "should the button appear" and "what lands on the clipboard" rules cannot
+/// drift apart.
+fn text_parts(message: &Message) -> impl Iterator<Item = &str> {
+    message.parts.iter().filter_map(|part| match part {
+        MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Whether every streamed block of `message` has ended. User turns, tool
+/// calls, and tool results have no streaming lifecycle and read as ended. The
+/// message-level copy gate uses this so a copy is never offered for a
+/// still-streaming turn.
+fn stream_ended(message: &Message) -> bool {
+    message.parts.iter().all(|part| match part {
+        MessagePart::Text { finished, .. } | MessagePart::Reasoning { finished, .. } => *finished,
+        MessagePart::ToolCall { .. } | MessagePart::ToolResult { .. } => true,
+    })
+}
+
+/// Whether `message` has any prose worth offering a copy of.
+fn has_copyable_text(message: &Message) -> bool {
+    text_parts(message).next().is_some()
+}
+
+/// Plain text a reader would expect on the clipboard for `message`: the
+/// concatenated source of every visible-text part, in canonical order.
+///
+/// The parts carry the raw Markdown the model produced, so the clipboard holds
+/// that source verbatim rather than the rendered prose. Reasoning and tool
+/// blocks are deliberately excluded — reasoning has its own per-card copy
+/// affordance, and tool calls are structured data rather than prose.
+fn copyable_text(message: &Message) -> SharedString {
+    text_parts(message)
+        .fold(String::new(), |mut text, part| {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(part);
+            text
+        })
+        .into()
 }
 
 /// Greeting shown before the first turn.  Takes the composer's *resting*

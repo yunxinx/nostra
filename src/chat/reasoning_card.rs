@@ -38,11 +38,12 @@ use gpui::{
     px, rems,
 };
 use gpui_component::{
-    ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
-    scroll::ScrollableElement as _, text::TextViewStyle, v_flex,
+    ActiveTheme, Sizable as _, button::Button, h_flex, scroll::ScrollableElement as _,
+    text::TextViewStyle, v_flex,
 };
 use rust_i18n::t;
 
+use super::hover_reveal::hover_reveal_copy;
 use crate::ui::markdown::MarkdownBody;
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
@@ -566,30 +567,17 @@ pub(crate) fn render(
                     .on_click(move |event, window, cx| on_toggle(event, window, cx))
                     .debug_selector(move || block_selector("trigger", content_index)),
                 )
-                // Nothing to put on the clipboard until the first delta lands.
-                .when(!source.is_empty(), |this| {
-                    this.child(
-                        // Revealed on group hover rather than conditionally
-                        // rendered, so appearing costs no layout: the row already
-                        // reserves the space. `invisible` also removes the nested
-                        // button from hit testing and keyboard focus while hidden.
-                        //
-                        // `Clipboard` is `RenderOnce` and carries no `Styled`, so
-                        // the group style goes on this wrapper.
-                        div()
-                            .flex_none()
-                            .invisible()
-                            .group_hover(hover_group.clone(), |this| this.visible())
-                            .debug_selector(move || block_selector("copy", content_index))
-                            .child(
-                                Clipboard::new(ElementId::NamedInteger(
-                                    "turn-reasoning-copy".into(),
-                                    ui_id,
-                                ))
-                                .value_fn(move |window, cx| copy_value(window, cx))
-                                .tooltip(t!("chat.reasoning.copy").to_string()),
-                            ),
-                    )
+                // Nothing to put on the clipboard until the block's stream ends:
+                // a copy offered mid-stream would freeze a partial thought, and
+                // whitespace-only source has nothing worth copying.
+                .when(finished && !source.trim().is_empty(), |this| {
+                    this.child(hover_reveal_copy(
+                        ElementId::NamedInteger("turn-reasoning-copy".into(), ui_id),
+                        hover_group.clone(),
+                        t!("chat.reasoning.copy").to_string(),
+                        move |window, cx| copy_value(window, cx),
+                        move || block_selector("copy", content_index),
+                    ))
                 }),
         )
         .when(expanded, |this| {
