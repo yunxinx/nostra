@@ -1082,7 +1082,7 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1482,7 +1482,7 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2356,7 +2356,7 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2425,6 +2425,7 @@ dependencies = [
  "sum_tree",
  "taffy",
  "thiserror 2.0.19",
+ "tracing",
  "ttf-parser",
  "unicode-linebreak",
  "url",
@@ -2436,12 +2437,13 @@ dependencies = [
  "windows 0.61.3",
  "zed-font-kit",
  "zed-scap",
+ "ztracing",
 ]
 
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=96f580a57ef93bc3da7e1fcc16b1a3e8df08975c#96f580a57ef93bc3da7e1fcc16b1a3e8df08975c"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8#aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2526,7 +2528,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=96f580a57ef93bc3da7e1fcc16b1a3e8df08975c#96f580a57ef93bc3da7e1fcc16b1a3e8df08975c"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8#aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2540,7 +2542,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=96f580a57ef93bc3da7e1fcc16b1a3e8df08975c#96f580a57ef93bc3da7e1fcc16b1a3e8df08975c"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8#aaa4e3a041774a0daa9d0ef7e852859c6b44cbd8"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2550,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2602,7 +2604,7 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2651,7 +2653,7 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2662,7 +2664,7 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "console_error_panic_hook",
  "gpui",
@@ -2675,7 +2677,7 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "schemars",
  "serde",
@@ -2685,7 +2687,7 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "log",
@@ -2695,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2718,7 +2720,7 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -2748,7 +2750,7 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -2991,7 +2993,7 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3011,7 +3013,7 @@ dependencies = [
 [[package]]
 name = "http_client_tls"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "rustls",
  "rustls-platform-verifier",
@@ -3863,7 +3865,7 @@ dependencies = [
 [[package]]
 name = "media"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4763,7 +4765,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "collections",
  "serde",
@@ -5683,7 +5685,7 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "derive_refineable",
 ]
@@ -5732,7 +5734,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 [[package]]
 name = "reqwest_client"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6114,7 +6116,7 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "async-task",
  "backtrace",
@@ -6691,7 +6693,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "heapless",
  "log",
@@ -7939,7 +7941,7 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "perf",
  "quote",
@@ -8365,6 +8367,7 @@ dependencies = [
  "thiserror 2.0.19",
  "wgpu-core-deps-apple",
  "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-wasm",
  "wgpu-core-deps-windows-linux-android",
  "wgpu-hal",
  "wgpu-naga-bridge",
@@ -8385,6 +8388,15 @@ name = "wgpu-core-deps-emscripten"
 version = "29.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01e09be551dc939498bdd5f6b2c66e55ab275dad25825267a08605a80fc9f0af"
+dependencies = [
+ "wgpu-hal",
+]
+
+[[package]]
+name = "wgpu-core-deps-wasm"
+version = "29.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af1fb1798be2a912497d4c224f72d39bb0cb34af50e8bcc29865bc339c943059"
 dependencies = [
  "wgpu-hal",
 ]
@@ -9651,7 +9663,7 @@ dependencies = [
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "anyhow",
  "chrono",
@@ -9668,7 +9680,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -9679,7 +9691,7 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/yunxinx/zed.git?rev=c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574#c0dffe2db3b3ed8f20bf5fb2c4ede0f79c014574"
+source = "git+https://github.com/yunxinx/zed.git?rev=84b7229e1841b489b0576646d99f0032c2f6cb87#84b7229e1841b489b0576646d99f0032c2f6cb87"
 
 [[package]]
 name = "zune-core"
