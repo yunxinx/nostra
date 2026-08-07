@@ -6,7 +6,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, Axis, Background, Entity, HighlightStyle, Hsla,
     InteractiveElement as _, IntoElement as _, ParentElement as _, Rgba, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, Rope, Sizable as _,
@@ -28,6 +28,42 @@ use crate::preferences;
 const NODE_NAME: &str = "nostra-fenced-code";
 const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
 
+/// Code blocks at or below this many bytes are highlighted synchronously on
+/// the render path: no perceptible delay and no flash from a placeholder. Larger
+/// blocks defer syntax highlighting to a background thread and render a
+/// plain-text placeholder until the worker finishes.
+const BG_HIGHLIGHT_BYTES: usize = 16 * 1024;
+
+/// Generates a `thread_local!` counter probe and its snapshot-modify-write-back
+/// accessors. `state` is a `thread_local` cell name, `update`/`reset`/`get` the
+/// accessor names, and `ty` the probe struct (which must implement `Copy` and
+/// `Default`). Kept as a macro so the perf and background-highlight probes
+/// share one pattern instead of near-identical copies.
+#[cfg(test)]
+macro_rules! define_probe {
+    ($state:ident, $update:ident, $reset:ident, $get:ident, $ty:ty) => {
+        thread_local! {
+            static $state: std::cell::Cell<$ty> = std::cell::Cell::new(<$ty>::default());
+        }
+
+        fn $update(update: impl FnOnce(&mut $ty)) {
+            $state.with(|probe| {
+                let mut snapshot = probe.get();
+                update(&mut snapshot);
+                probe.set(snapshot);
+            });
+        }
+
+        pub(crate) fn $reset() {
+            $state.with(|probe| probe.set(<$ty>::default()));
+        }
+
+        pub(crate) fn $get() -> $ty {
+            $state.get()
+        }
+    };
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MarkdownPerfProbe {
@@ -37,34 +73,38 @@ pub(crate) struct MarkdownPerfProbe {
 }
 
 #[cfg(test)]
-thread_local! {
-    static PERF_PROBE: std::cell::Cell<MarkdownPerfProbe> = const {
-        std::cell::Cell::new(MarkdownPerfProbe {
-            text_view_builds: 0,
-            code_block_renders: 0,
-            code_text_elements: 0,
-        })
-    };
+define_probe!(
+    PERF_PROBE,
+    update_perf_probe,
+    reset_perf_probe,
+    perf_probe,
+    MarkdownPerfProbe
+);
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BackgroundHighlightProbe {
+    /// Times `render` deferred a long code block to a background highlight
+    /// worker. A short block never increments this; a long block increments it
+    /// exactly once per cache build (the `highlight_task` guard prevents
+    /// re-spawning).
+    pub(crate) background_spawns: usize,
+    /// Times a worker installed styles for the current cache generation.
+    pub(crate) background_installs: usize,
+    /// Number of styles installed by the most recent successful worker.
+    pub(crate) last_style_count: usize,
+    /// Generation carried by the most recent successful worker.
+    pub(crate) last_generation: Option<u64>,
 }
 
 #[cfg(test)]
-fn update_perf_probe(update: impl FnOnce(&mut MarkdownPerfProbe)) {
-    PERF_PROBE.with(|probe| {
-        let mut snapshot = probe.get();
-        update(&mut snapshot);
-        probe.set(snapshot);
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn reset_perf_probe() {
-    PERF_PROBE.with(|probe| probe.set(MarkdownPerfProbe::default()));
-}
-
-#[cfg(test)]
-pub(crate) fn perf_probe() -> MarkdownPerfProbe {
-    PERF_PROBE.get()
-}
+define_probe!(
+    BACKGROUND_PROBE,
+    update_background_probe,
+    reset_background_probe,
+    background_probe,
+    BackgroundHighlightProbe
+);
 
 /// A Markdown body and the stable extension registry that renders its fenced
 /// code. Keeping the registry beside the state prevents a new extension
@@ -206,25 +246,50 @@ pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensi
         })
 }
 
-#[derive(Clone)]
+/// Byte-range → syntax-style mappings for one fenced code block.
+type CodeStyles = Arc<[(Range<usize>, HighlightStyle)]>;
+
 struct HighlightCache {
     code: SharedString,
-    language: Option<SharedString>,
+    /// Normalized syntax language ID used for cache matching and highlighting.
+    language: String,
     theme: Arc<HighlightTheme>,
-    styles: Arc<[(Range<usize>, HighlightStyle)]>,
+    /// Syntax highlight ranges. `None` while a long block is being highlighted
+    /// on a background thread; the render path shows a plain-text placeholder
+    /// (structure/line numbers/controls intact) until the worker finishes.
+    styles: Option<CodeStyles>,
     line_count: usize,
     line_numbers: SharedString,
+    /// Bumped on every rebuild so a stale background result is discarded.
+    generation: u64,
+    /// The in-flight background highlight task. Keeping it here prevents a new
+    /// task from being spawned on every frame. On a cache rebuild this task is
+    /// dropped, which cancels a worker that has not started yet and discards
+    /// the result of one already running (a synchronous tree-sitter parse
+    /// cannot be preempted mid-poll). Either way the new generation immediately
+    /// starts a fresh worker instead of waiting on a stale result.
+    highlight_task: Option<Task<()>>,
+    /// Generation owned by `highlight_task`; prevents a stale callback from
+    /// clearing a task that was started for a newer cache generation.
+    highlight_task_generation: Option<u64>,
 }
 
 impl HighlightCache {
     fn new(code: &FencedCode, cx: &App) -> Self {
         let theme = cx.theme().highlight_theme.clone();
         let language = normalized_language_id(code.language.as_deref());
-        let mut highlighter = SyntaxHighlighter::new(&language);
-        let rope = Rope::from(code.code.as_ref());
-        highlighter.update(None, &rope, None);
-        let styles: Arc<[(Range<usize>, HighlightStyle)]> =
-            highlighter.styles(&(0..code.code.len()), &theme).into();
+        // Short blocks are highlighted synchronously so the first paint is
+        // complete (no flash); long blocks render a placeholder and defer the
+        // work to the background worker started in `render`.
+        let styles = if code.code.len() <= BG_HIGHLIGHT_BYTES {
+            Some(compute_code_styles(
+                code.code.as_ref(),
+                &language,
+                theme.as_ref(),
+            ))
+        } else {
+            None
+        };
         let line_count = code.code.split('\n').count();
         let number_width = line_count.max(1).to_string().len();
         let line_numbers = (1..=line_count)
@@ -235,23 +300,89 @@ impl HighlightCache {
 
         Self {
             code: code.code.clone(),
-            language: code.language.clone(),
+            language,
             theme,
             styles,
             line_count,
             line_numbers,
+            generation: 0,
+            highlight_task: None,
+            highlight_task_generation: None,
         }
     }
 
+    fn replace(&mut self, code: &FencedCode, cx: &App) {
+        let generation = self.generation.wrapping_add(1);
+        // Dropping the previous task cancels a worker that has not started yet
+        // and discards the result of one already running (a synchronous
+        // tree-sitter parse cannot be preempted mid-poll). Either way the
+        // current generation starts a fresh worker on the next render instead
+        // of waiting on (and discarding) a stale result; `generation` still
+        // guards against a stale result that arrives late.
+        *self = Self::new(code, cx);
+        self.generation = generation;
+    }
+
+    /// Install `styles`, but only if they belong to the current generation.
+    /// Returns `false` when `generation` is stale (the result is discarded),
+    /// so callers can skip the repaint that would otherwise be a no-op.
+    fn try_apply_styles(&mut self, generation: u64, styles: CodeStyles) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.styles = Some(styles);
+        true
+    }
+
     fn matches(&self, code: &FencedCode, cx: &App) -> bool {
+        // `language` is already normalized; compare the raw input case-insensitively
+        // to avoid allocating another normalized string on every render.
         self.code == code.code
-            && self.language == code.language
+            && self
+                .language
+                .eq_ignore_ascii_case(code.language.as_deref().unwrap_or("text"))
             && self.theme == cx.theme().highlight_theme
     }
 }
 
 fn normalized_language_id(language: Option<&str>) -> String {
     language.unwrap_or("text").to_ascii_lowercase()
+}
+
+/// Run tree-sitter syntax highlighting for a complete code block. Invoked
+/// synchronously for short blocks in `HighlightCache::new` and on a background
+/// thread for long blocks (see `render`), so it must depend only on the
+/// thread-safe `LanguageRegistry::singleton()` and never on UI-thread state.
+fn compute_code_styles(code: &str, language: &str, theme: &HighlightTheme) -> CodeStyles {
+    parse_code_styles(code, language, theme, |code, language, theme| {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        let rope = Rope::from(code);
+        highlighter.update(None, &rope, None);
+        highlighter.styles(&(0..code.len()), theme).into()
+    })
+}
+
+/// Run `parse` under a panic guard and degrade to an empty style list on panic.
+///
+/// tree-sitter can panic on pathological input in streamed/AI-generated
+/// content. A panic here would otherwise propagate to the caller: for a short
+/// block it would take down the render path, and for a long block it would
+/// cross the background `await` into the foreground task. An empty result
+/// still renders the block as plain text with its structure, line numbers,
+/// and controls intact. `SyntaxHighlighter` is rebuilt per call, so a panicked
+/// parser is never reused.
+fn parse_code_styles(
+    code: &str,
+    language: &str,
+    theme: &HighlightTheme,
+    parse: impl FnOnce(&str, &str, &HighlightTheme) -> CodeStyles,
+) -> CodeStyles {
+    // This closure only receives immutable inputs and no shared mutable state.
+    // Keep that UnwindSafe property if the parser is extended.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parse(code, language, theme)
+    }))
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -344,11 +475,16 @@ fn render(
         format!("markdown-code-highlight-{owner_id}-{}", code.start).into();
     let cache = window.use_keyed_state(cache_id, cx, |_, cx| HighlightCache::new(code, cx));
     if !cache.read(cx).matches(code, cx) {
-        cache.update(cx, |cache, cx| *cache = HighlightCache::new(code, cx));
+        cache.update(cx, |cache, cx| cache.replace(code, cx));
     }
-    let styles = cache.read(cx).styles.clone();
-    let line_count = cache.read(cx).line_count;
-    let line_numbers = cache.read(cx).line_numbers.clone();
+    spawn_background_highlight(&cache, code, window, cx);
+    let (styles, line_count, line_numbers) = cache.read_with(cx, |cache, _| {
+        (
+            cache.styles.as_ref().cloned().unwrap_or_default(),
+            cache.line_count,
+            cache.line_numbers.clone(),
+        )
+    });
 
     let global_wrap = global_wrap_enabled(cx);
     let global_wrap_revision = preferences::get(cx).code_block_wrap_revision;
@@ -622,6 +758,77 @@ fn render(
                 .child(code_content),
         )
         .into_any_element()
+}
+
+/// A long block (styles deferred) is highlighted on a background thread so the
+/// first paint never blocks on tree-sitter. The cached task guards against
+/// spawning a new worker on every frame; `generation` guards against a stale
+/// result overwriting newer content. Placeholder rendering uses an empty style
+/// list until the worker finishes.
+fn spawn_background_highlight(
+    cache: &Entity<HighlightCache>,
+    code: &FencedCode,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (styles_ready, task_ready, generation, theme, language) =
+        cache.read_with(cx, |cache, _| {
+            (
+                cache.styles.is_some(),
+                cache.highlight_task.is_some(),
+                cache.generation,
+                cache.theme.clone(),
+                cache.language.clone(),
+            )
+        });
+    if styles_ready || task_ready {
+        return;
+    }
+    #[cfg(test)]
+    update_background_probe(|probe| probe.background_spawns += 1);
+    let weak_cache = cache.downgrade();
+    let code_text = code.code.clone();
+    let background = cx.background_spawn(async move {
+        compute_code_styles(code_text.as_ref(), &language, theme.as_ref())
+    });
+    // Publish the generation before scheduling the foreground continuation so
+    // an executor that polls a newly spawned task immediately still passes the
+    // stale-result guard below. The task handle is installed after spawn.
+    cache.update(cx, |cache, _| {
+        cache.highlight_task_generation = Some(generation);
+    });
+    let task = window.spawn(cx, async move |async_cx| {
+        let styles = background.await;
+        // The window (and its keyed-state cache) may already be gone; a
+        // dropped result is expected there, so an empty update is fine.
+        let _ = async_cx.update(|_, cx| {
+            let _ = weak_cache.update(cx, |cache, cache_cx| {
+                if cache.highlight_task_generation == Some(generation) {
+                    cache.highlight_task = None;
+                    cache.highlight_task_generation = None;
+                    #[cfg(test)]
+                    let style_count = styles.len();
+                    if cache.try_apply_styles(generation, styles) {
+                        #[cfg(test)]
+                        update_background_probe(|probe| {
+                            probe.background_installs += 1;
+                            probe.last_style_count = style_count;
+                            probe.last_generation = Some(generation);
+                        });
+                        // Only a result that installs styles changes the
+                        // rendered block; a stale result is discarded and
+                        // needs no repaint.
+                        cache_cx.notify();
+                    }
+                }
+            });
+        });
+    });
+    // The generation was registered before spawn; keep the task handle alive so
+    // subsequent frames do not start duplicate workers.
+    cache.update(cx, |cache, _| {
+        cache.highlight_task = Some(task);
+    });
 }
 
 #[derive(Clone, Copy)]
@@ -924,6 +1131,62 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn highlight_cache_matches_language_identifiers_case_insensitively(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        let original = FencedCode {
+            code: "print('hello')".into(),
+            language: Some("Python".into()),
+            start: 0,
+        };
+        let casing_changed = FencedCode {
+            language: Some("PYTHON".into()),
+            ..original.clone()
+        };
+        let cache = cx.update(|cx| HighlightCache::new(&original, cx));
+
+        assert!(cx.update(|cx| cache.matches(&casing_changed, cx)));
+    }
+
+    #[test]
+    fn large_mixed_case_languages_produce_syntax_styles() {
+        let theme = HighlightTheme::default_dark();
+        for (language, line) in [
+            ("PYTHON", "name = 'world'\nprint(name)\n"),
+            ("Rust", "fn main() { let value: usize = 42; }\n"),
+        ] {
+            let code = line.repeat(1000);
+            assert!(code.len() > BG_HIGHLIGHT_BYTES);
+            let styles =
+                compute_code_styles(&code, &normalized_language_id(Some(language)), &theme);
+            assert!(
+                styles.len() > 1,
+                "large {language} code must produce syntax styles"
+            );
+        }
+    }
+
+    /// A panicking highlighter (tree-sitter does panic on pathological streamed
+    /// input) must degrade to an empty style list instead of propagating the
+    /// panic — the block then renders as plain text rather than crashing the
+    /// render path (short block) or the foreground task (long block).
+    #[test]
+    fn compute_code_styles_recovers_from_panicking_highlighter() {
+        let theme = HighlightTheme::default_dark();
+        let styles = parse_code_styles(
+            "fn main() { let value: usize = 42; }",
+            "rust",
+            &theme,
+            |_, _, _| {
+                panic!("tree-sitter panicked on pathological input");
+            },
+        );
+        assert!(
+            styles.is_empty(),
+            "a panicking highlighter must degrade to an empty style list"
+        );
+    }
+
     #[test]
     fn distinguishes_fenced_code_from_indented_code_source() {
         for source in ["```rust\nfn main() {}\n```", "   ~~~py\nprint(1)\n   ~~~"] {
@@ -1006,5 +1269,304 @@ mod tests {
         assert!(lines[1].styles.is_empty());
         assert!(lines[2].styles.is_empty());
         assert_eq!(lines[3].styles, vec![(0..3, last)]);
+    }
+
+    /// P0 spike: prove the syntax-highlighting chain can run on a background
+    /// thread. `SyntaxHighlighter` owns a tree-sitter `Parser` (not `Send`), so
+    /// we must construct it inside the worker thread rather than move it across.
+    /// This test asserts that (a) a fresh highlighter can be built and driven
+    /// purely from the thread-safe `LanguageRegistry::singleton()`, and (b) the
+    /// produced `Vec<(Range, HighlightStyle)>` is `Send` and can cross back.
+    #[test]
+    fn syntax_highlighter_runs_off_thread_and_returns_send_styles() {
+        let code = Rope::from("fn main() -> usize { 42 }");
+        let styles = std::thread::spawn(move || {
+            let mut highlighter = SyntaxHighlighter::new("rust");
+            highlighter.update(None, &code, None);
+            highlighter.styles(&(0..code.len()), &HighlightTheme::default_dark())
+        })
+        .join()
+        .expect("worker thread");
+
+        assert!(
+            !styles.is_empty(),
+            "rust fenced code must yield syntax styles off the main thread"
+        );
+    }
+
+    /// P0 spike: the current theme's `HighlightTheme` is passed from the main
+    /// thread into the background worker (`Arc<HighlightTheme>`), so the whole
+    /// `Arc<HighlightTheme>` must be `Send` (i.e. `HighlightTheme: Send + Sync`).
+    #[test]
+    fn highlighted_theme_arc_is_send_across_threads() {
+        fn assert_send<T: Send>() {}
+        assert_send::<Arc<HighlightTheme>>();
+    }
+
+    /// A short code block (≤ `BG_HIGHLIGHT_BYTES`) is highlighted synchronously:
+    /// the background worker is never spawned, so the first paint is complete
+    /// and there is no placeholder flash.
+    #[gpui::test]
+    fn short_code_block_highlights_synchronously_without_background(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        reset_background_probe();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|cx| CodeSelectionTestRoot {
+                body: MarkdownBody::new("```rust\nlet x = 1;\n```", 7, cx),
+            });
+            Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            background_probe().background_spawns,
+            0,
+            "short code block must highlight synchronously, not on a background thread"
+        );
+    }
+
+    /// The byte threshold is inclusive for synchronous highlighting: a block of
+    /// exactly `BG_HIGHLIGHT_BYTES` renders synchronously, while one byte over
+    /// defers to the background worker. This pins the boundary so a future edit
+    /// cannot silently move it.
+    #[gpui::test]
+    fn background_threshold_boundary_is_inclusive_for_sync(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        let at_threshold = FencedCode {
+            code: "x".repeat(BG_HIGHLIGHT_BYTES).into(),
+            language: Some("text".into()),
+            start: 0,
+        };
+        let over_threshold = FencedCode {
+            code: "x".repeat(BG_HIGHLIGHT_BYTES + 1).into(),
+            language: Some("text".into()),
+            start: 0,
+        };
+        let at_cache = cx.update(|cx| HighlightCache::new(&at_threshold, cx));
+        let over_cache = cx.update(|cx| HighlightCache::new(&over_threshold, cx));
+        assert!(
+            at_cache.styles.is_some(),
+            "a block at exactly the byte threshold must highlight synchronously"
+        );
+        assert!(
+            over_cache.styles.is_none(),
+            "a block one byte over the threshold must defer to the background worker"
+        );
+    }
+
+    /// A long code block (> `BG_HIGHLIGHT_BYTES`) defers highlighting to a
+    /// background worker exactly once; once the worker installs styles, a
+    /// subsequent frame must not spawn any new worker. The uppercase language
+    /// exercises the same normalization used by the background path.
+    #[gpui::test]
+    fn long_code_block_defers_highlight_to_background_once(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        reset_background_probe();
+        // ~38 bytes/line × 1000 lines ≈ 38 KiB > BG_HIGHLIGHT_BYTES.
+        let source = format!(
+            "```PYTHON\n{}\n```",
+            "name = 'world'\nprint(f'hello {name}')\n".repeat(1000)
+        );
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|cx| CodeSelectionTestRoot {
+                body: MarkdownBody::new(&source, 7, cx),
+            });
+            Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            background_probe().background_spawns,
+            1,
+            "long code block must defer to a background highlight worker"
+        );
+
+        // Drive the worker to completion, then re-render: styles are now
+        // present, so no second worker is spawned.
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            background_probe().background_spawns,
+            1,
+            "once background styles are installed, no re-spawn may occur"
+        );
+        let probe = background_probe();
+        assert_eq!(probe.background_installs, 1);
+        assert_eq!(probe.last_generation, Some(0));
+        assert!(
+            probe.last_style_count > 1,
+            "a completed uppercase-Python worker must install syntax styles"
+        );
+    }
+
+    /// Replacing a long block while its worker is in flight drops (cancels)
+    /// the stale task, so the render path spawns a fresh worker for the new
+    /// generation instead of waiting on the old one. A result from the old
+    /// generation is discarded; only the current generation may install.
+    #[gpui::test]
+    fn cache_replacement_drops_stale_task_and_discards_stale_result(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        reset_background_probe();
+        let old_source = FencedCode {
+            code: "fn main() { let value = 0; }".repeat(800).into(),
+            language: Some("Rust".into()),
+            start: 0,
+        };
+        let new_source = FencedCode {
+            code: "fn main() { let value = 1; }".repeat(800).into(),
+            language: Some("Rust".into()),
+            start: 0,
+        };
+        let mut cache = cx.update(|cx| HighlightCache::new(&old_source, cx));
+        cache.highlight_task = Some(Task::ready(()));
+        cache.highlight_task_generation = Some(cache.generation);
+        let old_generation = cache.generation;
+        cx.update(|cx| cache.replace(&new_source, cx));
+
+        assert_eq!(cache.generation, old_generation + 1);
+        // The stale task and its generation guard are dropped on rebuild, so
+        // the next render will spawn a fresh worker for the new generation.
+        assert!(cache.highlight_task.is_none());
+        assert!(cache.highlight_task_generation.is_none());
+        assert!(cache.styles.is_none());
+
+        // A late result from the old generation is discarded by the guard.
+        let stale_styles: CodeStyles = vec![(0..3, HighlightStyle::default())].into();
+        assert!(!cache.try_apply_styles(old_generation, stale_styles));
+        assert!(cache.styles.is_none());
+
+        // A result for the current generation is accepted.
+        let theme = cache.theme.clone();
+        let fresh_styles = compute_code_styles(
+            new_source.code.as_ref(),
+            &normalized_language_id(new_source.language.as_deref()),
+            theme.as_ref(),
+        );
+        assert!(cache.try_apply_styles(cache.generation, fresh_styles));
+        assert!(cache.styles.is_some());
+    }
+
+    /// Streaming growth end to end through the real render path: once a long
+    /// block's content changes, the replaced cache no longer matches, so the
+    /// render path starts a fresh background worker for the new generation and
+    /// installs that generation's styles when it completes, without further
+    /// re-spawning. The drop-on-rebuild semantics of `replace` are asserted
+    /// deterministically by `cache_replacement_drops_stale_task_and_discards_stale_result`;
+    /// this test confirms the integrated render path restarts the worker and
+    /// lets the replacement generation's styles win.
+    #[gpui::test]
+    fn replacing_a_long_block_restarts_the_background_worker_for_the_new_generation(
+        cx: &mut TestAppContext,
+    ) {
+        init_markdown_test(cx);
+        reset_background_probe();
+        const OWNER_ID: u64 = 7;
+        let old_source = format!(
+            "```python\n{}\n```",
+            "name = 'old'\nprint(f'hello {name}')\n".repeat(600)
+        );
+        let new_source = format!(
+            "```python\n{}\n```",
+            "name = 'new'\nprint(f'hello {name}')\n".repeat(600)
+        );
+        let content = cx.update(|cx| {
+            cx.new(|cx| CodeSelectionTestRoot {
+                body: MarkdownBody::new(&old_source, OWNER_ID, cx),
+            })
+        });
+        let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+        let cx: &mut VisualTestContext = cx;
+
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            background_probe().background_spawns,
+            1,
+            "first long block defers to a background worker"
+        );
+
+        // Change the block content (streaming growth): the cache no longer
+        // matches, so the stale worker must be dropped and a fresh worker
+        // started for the new generation. Before this fix the stale task was
+        // retained, so no new worker was spawned here and the block stayed as
+        // a placeholder until a later frame.
+        cx.update(|window, cx| {
+            content.update(cx, |root, cx| root.body.set_text(&new_source, cx));
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            background_probe().background_spawns,
+            2,
+            "a content change must drop the stale worker and spawn a fresh one"
+        );
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let probe = background_probe();
+        assert_eq!(
+            probe.background_spawns, 2,
+            "once the replacement's styles are installed, no further worker may spawn"
+        );
+        assert_eq!(
+            probe.last_generation,
+            Some(1),
+            "the replacement generation installs its styles"
+        );
+        assert!(
+            probe.last_style_count > 1,
+            "the replacement worker must install real syntax styles"
+        );
+    }
+
+    /// Italic comments and bold keywords are present in the configured themes.
+    /// Installing those styles must not change the wrapped code block's bounds
+    /// relative to its plain-text placeholder.
+    #[gpui::test]
+    fn long_wrapped_placeholder_keeps_code_bounds(cx: &mut TestAppContext) {
+        init_markdown_test(cx);
+        reset_background_probe();
+        cx.update(|cx| {
+            set_global_wrap_in_memory(true, cx);
+            preferences::update_in_memory(cx, |prefs| prefs.code_block_line_numbers = true);
+        });
+        let source = format!(
+            "```Rust\n{}\n```",
+            ("// this is a deliberately long comment that exercises wrapped italic text\n")
+                .repeat(600)
+        );
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let content = cx.new(|cx| CodeSelectionTestRoot {
+                body: MarkdownBody::new(&source, 7, cx),
+            });
+            Root::new(content, window, cx)
+        });
+        let cx: &mut VisualTestContext = cx;
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let placeholder = cx
+            .debug_bounds("markdown-code-line-7-0-0")
+            .expect("wrapped code placeholder bounds");
+
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let highlighted = cx
+            .debug_bounds("markdown-code-line-7-0-0")
+            .expect("wrapped highlighted code bounds");
+        assert_eq!(
+            placeholder.size, highlighted.size,
+            "background styles must not change wrapped code layout"
+        );
     }
 }
