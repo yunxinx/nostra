@@ -3,16 +3,21 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::Global;
 
 use super::{
-    InMemorySessionStore, LocalSessionStore, SessionDomain, SessionError, SessionFlushStore,
-    SessionLifecycleStore, SessionStore, SessionTreeStore,
+    CatalogError, CatalogPage, CatalogQuery, InMemorySessionStore, LocalSessionStore,
+    SessionCatalogStore, SessionDomain, SessionError, SessionFlushStore, SessionId,
+    SessionLifecycleStore, SessionStore, SessionSummary, SessionTreeStore,
 };
 
+trait SessionServiceStore: SessionStore + SessionCatalogStore {}
+
+impl<T> SessionServiceStore for T where T: SessionStore + SessionCatalogStore {}
+
 #[derive(Clone)]
-pub struct SharedSessionStore(Rc<RefCell<Box<dyn SessionStore>>>);
+pub struct SharedSessionStore(Rc<RefCell<Box<dyn SessionServiceStore>>>);
 
 impl SharedSessionStore {
     #[must_use]
-    pub fn new(store: impl SessionStore + 'static) -> Self {
+    pub fn new(store: impl SessionStore + SessionCatalogStore + 'static) -> Self {
         Self(Rc::new(RefCell::new(Box::new(store))))
     }
 }
@@ -52,6 +57,23 @@ impl SessionTreeStore for SharedSessionStore {
     }
 }
 
+impl SessionCatalogStore for SharedSessionStore {
+    fn list_sessions(
+        &self,
+        domain: SessionDomain,
+        query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.0.borrow().list_sessions(domain, query)
+    }
+
+    fn get_session_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummary>, CatalogError> {
+        self.0.borrow().get_session_summary(session_id)
+    }
+}
+
 impl SessionFlushStore for SharedSessionStore {
     fn flush(&mut self) -> Result<(), SessionError> {
         self.0.borrow_mut().flush()
@@ -71,7 +93,7 @@ impl Global for SessionStores {}
 
 impl SessionStores {
     #[must_use]
-    pub fn with_chat_store(store: impl SessionStore + 'static) -> Self {
+    pub fn with_chat_store(store: impl SessionStore + SessionCatalogStore + 'static) -> Self {
         Self {
             chat: Some(SharedSessionStore::new(store)),
         }
@@ -90,6 +112,14 @@ impl SessionStores {
 
     #[must_use]
     pub fn chat(&self) -> Option<SharedSessionStore> {
+        self.chat.clone()
+    }
+
+    /// Return the same shared Chat adapter through its catalog capability.
+    /// The future sidebar can page metadata without opening transcripts or
+    /// reaching for a concrete local store.
+    #[must_use]
+    pub fn chat_catalog(&self) -> Option<SharedSessionStore> {
         self.chat.clone()
     }
 

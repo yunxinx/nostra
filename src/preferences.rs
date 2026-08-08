@@ -15,7 +15,10 @@ use std::{
 use gpui::{App, Global, Window};
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{ModelSelection, ProviderProfile};
+use crate::{
+    llm::{ModelSelection, ProviderProfile},
+    session::SessionId,
+};
 
 const FILE_NAME: &str = "preferences.json";
 pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.85;
@@ -32,6 +35,13 @@ pub struct Preferences {
     pub provider_list_width: f32,
     /// Whether the sidebar is collapsed.
     pub sidebar_collapsed: bool,
+    /// Whether startup may lazily restore the last explicitly active Chat
+    /// session. The GUI control and shell behavior are intentionally separate
+    /// from this persisted contract.
+    pub restore_last_chat_on_start: bool,
+    /// Most recent explicitly active Chat session, retained even while
+    /// automatic restoration is disabled.
+    pub last_active_chat_session: Option<SessionId>,
     /// Explicit theme mode override.  `None` means "follow system".
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.
@@ -85,6 +95,8 @@ impl Default for Preferences {
             sidebar_width: default_sidebar_width(),
             provider_list_width: DEFAULT_PROVIDER_LIST_WIDTH,
             sidebar_collapsed: false,
+            restore_last_chat_on_start: false,
+            last_active_chat_session: None,
             theme_mode: None,
             composer_font: ComposerFont::default(),
             user_message_markdown: false,
@@ -414,6 +426,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_smooth_chat_scrolling).is_err());
 
+        let mut missing_restore_last_chat =
+            serde_json::to_value(Preferences::default()).expect("serialize preferences");
+        assert!(
+            missing_restore_last_chat
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("restore_last_chat_on_start")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_restore_last_chat).is_err());
+
         let mut unknown_geometry = serde_json::to_value(Preferences {
             window: Some(WindowGeometry {
                 x: 0.,
@@ -439,6 +462,23 @@ mod tests {
         assert!(!prefs.code_block_wrap);
         assert_eq!(prefs.code_block_wrap_revision, 0);
         assert!(!prefs.code_block_line_numbers);
+        assert!(!prefs.restore_last_chat_on_start);
+        assert!(prefs.last_active_chat_session.is_none());
+    }
+
+    #[test]
+    fn chat_startup_preferences_round_trip_without_enabling_restore() {
+        let session_id = SessionId::new(crate::session::SessionDomain::Chat);
+        let prefs = Preferences {
+            restore_last_chat_on_start: false,
+            last_active_chat_session: Some(session_id.clone()),
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize chat startup preferences");
+        let restored: Preferences =
+            serde_json::from_str(&json).expect("deserialize chat startup preferences");
+        assert!(!restored.restore_last_chat_on_start);
+        assert_eq!(restored.last_active_chat_session, Some(session_id));
     }
 
     #[test]

@@ -1,8 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
+use super::catalog::project_session_summary;
 use super::{
-    EntryId, ResolvedSessionState, SessionDomain, SessionEntry, SessionEntryKind, SessionError,
-    SessionHeader, SessionId, resolve_session, validate_appended_kind,
+    CatalogError, CatalogPage, CatalogQuery, EntryId, ResolvedSessionState, SessionDomain,
+    SessionEntry, SessionEntryKind, SessionError, SessionHeader, SessionId, SessionSummary,
+    resolve_session, validate_appended_kind,
 };
 
 /// Capability boundary shared by the in-memory implementation and local
@@ -35,6 +40,20 @@ pub trait SessionFlushStore {
     fn shutdown(&mut self) -> Result<(), SessionError>;
 }
 
+/// Read-only catalog capability used by product code to page session metadata
+/// without knowing whether the adapter is backed by SQLite or memory.
+pub trait SessionCatalogStore {
+    fn list_sessions(
+        &self,
+        domain: SessionDomain,
+        query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError>;
+    fn get_session_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummary>, CatalogError>;
+}
+
 pub trait SessionStore: SessionLifecycleStore + SessionTreeStore + SessionFlushStore {}
 
 impl<T> SessionStore for T where T: SessionLifecycleStore + SessionTreeStore + SessionFlushStore {}
@@ -64,6 +83,19 @@ impl InMemorySessionStore {
 
     pub fn contains(&self, session_id: &SessionId) -> bool {
         self.sessions.contains_key(session_id)
+    }
+
+    fn summary(session: &MemorySession) -> Result<SessionSummary, CatalogError> {
+        let Some(SessionEntry {
+            kind: SessionEntryKind::Header(header),
+            ..
+        }) = session.entries.first()
+        else {
+            return Err(CatalogError::Corrupt(
+                "in-memory session is missing its header".to_string(),
+            ));
+        };
+        project_session_summary(header, &session.entries, PathBuf::new())
     }
 }
 
@@ -171,6 +203,74 @@ impl SessionTreeStore for InMemorySessionStore {
                 .ok_or(SessionError::MissingHeader)?
         });
         Ok(())
+    }
+}
+
+impl SessionCatalogStore for InMemorySessionStore {
+    fn list_sessions(
+        &self,
+        domain: SessionDomain,
+        query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError> {
+        if let Some(cursor) = &query.cursor
+            && cursor.session_id.domain() != domain
+        {
+            return Err(CatalogError::DomainMismatch {
+                expected: domain,
+                actual: cursor.session_id.domain(),
+            });
+        }
+
+        let mut sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.domain == domain)
+            .map(Self::summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(project_id) = query.project_id.as_deref() {
+            sessions.retain(|summary| {
+                summary
+                    .project
+                    .as_ref()
+                    .is_some_and(|project| project.project_id == project_id)
+            });
+        }
+        sessions.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.session_id.cmp(&left.session_id))
+        });
+        if let Some(cursor) = &query.cursor {
+            sessions.retain(|summary| {
+                summary.created_at < cursor.created_at
+                    || (summary.created_at == cursor.created_at
+                        && summary.session_id < cursor.session_id)
+            });
+        }
+
+        let limit = query.limit.max(1);
+        let has_more = sessions.len() > limit;
+        sessions.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                sessions.last().map(|summary| super::CatalogCursor {
+                    created_at: summary.created_at,
+                    session_id: summary.session_id.clone(),
+                })
+            })
+            .flatten();
+        Ok(CatalogPage {
+            sessions,
+            next_cursor,
+        })
+    }
+
+    fn get_session_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummary>, CatalogError> {
+        self.sessions.get(session_id).map(Self::summary).transpose()
     }
 }
 

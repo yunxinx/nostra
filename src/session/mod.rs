@@ -7,6 +7,7 @@
 
 mod catalog;
 mod chat;
+mod chat_catalog;
 mod domain;
 mod error;
 mod jsonl;
@@ -23,6 +24,9 @@ pub use catalog::{
 pub use chat::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
 };
+pub use chat_catalog::{
+    ChatSessionCatalogController, ChatSessionCatalogError, SelectedChatSession,
+};
 pub use domain::{
     BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, Compaction, ConfigChange, EntryId, Leaf,
     MessageEntry, ProjectIdentity, Reference, SafeError, SafeErrorCategory, SessionDomain,
@@ -32,7 +36,8 @@ pub use error::{DiagnosticKind, JsonlDiagnostic, SessionError};
 pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};
 pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
-    InMemorySessionStore, SessionFlushStore, SessionLifecycleStore, SessionStore, SessionTreeStore,
+    InMemorySessionStore, SessionCatalogStore, SessionFlushStore, SessionLifecycleStore,
+    SessionStore, SessionTreeStore,
 };
 pub use service::{SessionStores, SharedSessionStore};
 pub use tree::{

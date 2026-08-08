@@ -29,6 +29,11 @@ pub enum CatalogError {
     Corrupt(String),
     #[error("unsupported session catalog schema version {0}")]
     UnsupportedVersion(i64),
+    #[error("catalog is scoped to `{expected}`, but request targeted `{actual}`")]
+    DomainMismatch {
+        expected: SessionDomain,
+        actual: SessionDomain,
+    },
     #[error("failed to serialize catalog message: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -76,7 +81,10 @@ pub struct SessionSummary {
     pub total_tokens: u64,
     pub created_at: i64,
     pub updated_at: i64,
-    pub jsonl_path: PathBuf,
+    /// Local implementation detail used to locate the append-only source.
+    /// Product callers restore through a typed store capability rather than
+    /// opening this path themselves.
+    pub(crate) jsonl_path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +316,7 @@ impl Catalog {
 
     pub(crate) fn list(&self, query: &CatalogQuery) -> Result<CatalogPage, CatalogError> {
         let limit = query.limit.max(1);
+        let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
         let mut sql = String::from(
             "SELECT session_id, domain, project_id, canonical_path, display_name,
                     title, preview, model_profile_id, model_id, total_tokens,
@@ -326,7 +335,7 @@ impl Catalog {
             values.push(Box::new(cursor.session_id.to_string()));
         }
         sql.push_str(" ORDER BY created_at DESC, session_id DESC LIMIT ?");
-        values.push(Box::new(limit as i64));
+        values.push(Box::new(fetch_limit as i64));
 
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
@@ -337,7 +346,11 @@ impl Catalog {
         for row in rows {
             sessions.push(row?);
         }
-        let next_cursor = (sessions.len() == limit)
+        let has_more = sessions.len() > limit;
+        if has_more {
+            sessions.pop();
+        }
+        let next_cursor = has_more
             .then(|| {
                 sessions.last().map(|session| CatalogCursor {
                     created_at: session.created_at,
@@ -555,6 +568,29 @@ impl SessionProjection {
             messages,
         })
     }
+
+    fn summary(&self, header: &SessionHeader, jsonl_path: PathBuf) -> SessionSummary {
+        SessionSummary {
+            session_id: header.session_id.clone(),
+            domain: header.domain,
+            project: header.project.clone(),
+            title: self.title.clone(),
+            preview: self.preview.clone(),
+            model: self.model.clone(),
+            total_tokens: self.total_tokens,
+            created_at: header.created_at,
+            updated_at: self.updated_at,
+            jsonl_path,
+        }
+    }
+}
+
+pub(crate) fn project_session_summary(
+    header: &SessionHeader,
+    entries: &[SessionEntry],
+    jsonl_path: PathBuf,
+) -> Result<SessionSummary, CatalogError> {
+    Ok(SessionProjection::from_entries(header, entries)?.summary(header, jsonl_path))
 }
 
 fn record_usage(

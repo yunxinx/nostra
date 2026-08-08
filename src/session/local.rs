@@ -11,9 +11,9 @@ use thiserror::Error;
 use crate::paths;
 
 use super::{
-    CatalogError, EntryId, JsonlLoader, JsonlRecorder, ResolvedSessionState, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader, SessionId,
-    SessionLifecycleStore, SessionSummary, SessionTreeStore,
+    CatalogError, EntryId, JsonlLoader, JsonlRecorder, ResolvedSessionState, SessionCatalogStore,
+    SessionDomain, SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader,
+    SessionId, SessionLifecycleStore, SessionSummary, SessionTreeStore,
     catalog::{Catalog, CatalogPage, CatalogQuery, RepairReport},
     resolve_session,
 };
@@ -476,6 +476,35 @@ impl SessionFlushStore for LocalSessionStore {
         self.flush()?;
         self.handles.clear();
         Ok(())
+    }
+}
+
+impl SessionCatalogStore for LocalSessionStore {
+    fn list_sessions(
+        &self,
+        domain: SessionDomain,
+        query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError> {
+        if domain != self.config.domain {
+            return Err(CatalogError::DomainMismatch {
+                expected: self.config.domain,
+                actual: domain,
+            });
+        }
+        self.catalog.list(&query)
+    }
+
+    fn get_session_summary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<SessionSummary>, CatalogError> {
+        if session_id.domain() != self.config.domain {
+            return Err(CatalogError::DomainMismatch {
+                expected: self.config.domain,
+                actual: session_id.domain(),
+            });
+        }
+        self.catalog.get(session_id)
     }
 }
 
