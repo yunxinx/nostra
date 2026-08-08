@@ -24,6 +24,7 @@ mod i18n;
 pub mod llm;
 pub mod preferences;
 mod providers;
+pub mod session;
 mod settings;
 mod shell;
 mod ui;
