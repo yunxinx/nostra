@@ -14,6 +14,7 @@ mod jsonl;
 mod local;
 mod memory;
 mod recorder;
+mod reference;
 mod service;
 mod tree;
 
@@ -39,6 +40,11 @@ pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
     InMemorySessionStore, ProjectSessionStore, SessionCatalogStore, SessionFlushStore,
     SessionLifecycleStore, SessionStore, SessionTreeStore,
+};
+pub use reference::{
+    AgentChatReferenceTool, ChatMessagePreview, ChatMessageRead, ChatMessageReferenceStore,
+    ChatMessageSearchCursor, ChatMessageSearchPage, ChatMessageSearchQuery, ChatMessageUnavailable,
+    ChatMessageUnavailableReason, ChatReferenceError, ReferencedContentBlock, ReferencedMessage,
 };
 pub use service::{SessionStores, SharedSessionStore};
 pub use tree::{

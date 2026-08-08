@@ -3,15 +3,22 @@ use std::{cell::RefCell, rc::Rc};
 use gpui::Global;
 
 use super::{
-    CatalogError, CatalogPage, CatalogQuery, InMemorySessionStore, LocalSessionStore,
-    ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore,
-    SessionDomain, SessionError, SessionFlushStore, SessionId, SessionLifecycleStore, SessionStore,
-    SessionSummary, SessionTreeSnapshot, SessionTreeStore,
+    CatalogError, CatalogPage, CatalogQuery, ChatMessageRead, ChatMessageReferenceStore,
+    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, InMemorySessionStore,
+    LocalSessionStore, ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot,
+    SessionCatalogStore, SessionDomain, SessionError, SessionFlushStore, SessionId,
+    SessionLifecycleStore, SessionStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
 };
 
-trait SessionServiceStore: SessionStore + SessionCatalogStore + ProjectSessionStore {}
+trait SessionServiceStore:
+    SessionStore + SessionCatalogStore + ProjectSessionStore + ChatMessageReferenceStore
+{
+}
 
-impl<T> SessionServiceStore for T where T: SessionStore + SessionCatalogStore + ProjectSessionStore {}
+impl<T> SessionServiceStore for T where
+    T: SessionStore + SessionCatalogStore + ProjectSessionStore + ChatMessageReferenceStore
+{
+}
 
 #[derive(Clone)]
 pub struct SharedSessionStore(Rc<RefCell<Box<dyn SessionServiceStore>>>);
@@ -19,7 +26,11 @@ pub struct SharedSessionStore(Rc<RefCell<Box<dyn SessionServiceStore>>>);
 impl SharedSessionStore {
     #[must_use]
     pub fn new(
-        store: impl SessionStore + SessionCatalogStore + ProjectSessionStore + 'static,
+        store: impl SessionStore
+        + SessionCatalogStore
+        + ProjectSessionStore
+        + ChatMessageReferenceStore
+        + 'static,
     ) -> Self {
         Self(Rc::new(RefCell::new(Box::new(store))))
     }
@@ -128,6 +139,22 @@ impl ProjectSessionStore for SharedSessionStore {
     }
 }
 
+impl ChatMessageReferenceStore for SharedSessionStore {
+    fn search_chat_messages(
+        &self,
+        query: ChatMessageSearchQuery,
+    ) -> Result<ChatMessageSearchPage, ChatReferenceError> {
+        self.0.borrow().search_chat_messages(query)
+    }
+
+    fn read_chat_message(
+        &self,
+        reference: &super::ChatMessageRef,
+    ) -> Result<ChatMessageRead, ChatReferenceError> {
+        self.0.borrow().read_chat_message(reference)
+    }
+}
+
 impl SessionFlushStore for SharedSessionStore {
     fn flush(&mut self) -> Result<(), SessionError> {
         self.0.borrow_mut().flush()
@@ -149,7 +176,11 @@ impl Global for SessionStores {}
 impl SessionStores {
     #[must_use]
     pub fn with_chat_store(
-        store: impl SessionStore + SessionCatalogStore + ProjectSessionStore + 'static,
+        store: impl SessionStore
+        + SessionCatalogStore
+        + ProjectSessionStore
+        + ChatMessageReferenceStore
+        + 'static,
     ) -> Self {
         Self {
             chat: Some(SharedSessionStore::new(store)),
@@ -159,7 +190,11 @@ impl SessionStores {
 
     #[must_use]
     pub fn with_agent_store(
-        store: impl SessionStore + SessionCatalogStore + ProjectSessionStore + 'static,
+        store: impl SessionStore
+        + SessionCatalogStore
+        + ProjectSessionStore
+        + ChatMessageReferenceStore
+        + 'static,
     ) -> Self {
         Self {
             chat: None,
@@ -169,8 +204,16 @@ impl SessionStores {
 
     #[must_use]
     pub fn with_stores(
-        chat: impl SessionStore + SessionCatalogStore + ProjectSessionStore + 'static,
-        agent: impl SessionStore + SessionCatalogStore + ProjectSessionStore + 'static,
+        chat: impl SessionStore
+        + SessionCatalogStore
+        + ProjectSessionStore
+        + ChatMessageReferenceStore
+        + 'static,
+        agent: impl SessionStore
+        + SessionCatalogStore
+        + ProjectSessionStore
+        + ChatMessageReferenceStore
+        + 'static,
     ) -> Self {
         Self {
             chat: Some(SharedSessionStore::new(chat)),
@@ -212,6 +255,12 @@ impl SessionStores {
     /// reaching for a concrete local store.
     #[must_use]
     pub fn chat_catalog(&self) -> Option<SharedSessionStore> {
+        self.chat.clone()
+    }
+
+    /// Return the only Chat capability a future Agent reference tool needs.
+    #[must_use]
+    pub fn chat_references(&self) -> Option<SharedSessionStore> {
         self.chat.clone()
     }
 

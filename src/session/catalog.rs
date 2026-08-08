@@ -11,13 +11,24 @@ use thiserror::Error;
 
 use crate::llm::{ContentBlock, Message, ModelSelection, Role};
 
+use super::reference::ReferencedMessage;
 use super::tree::message_preview;
 use super::{
     EntryId, ProjectIdentity, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
     SessionId,
 };
 
-pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 2;
+#[derive(Clone, Debug)]
+pub(crate) struct MessageNodeRow {
+    pub session_id: SessionId,
+    pub entry_id: EntryId,
+    pub timestamp: i64,
+    pub message: ReferencedMessage,
+    pub session_title: String,
+    pub session_created_at: i64,
+}
+
+pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 3;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 30;
 
 #[derive(Debug, Error)]
@@ -199,7 +210,7 @@ impl Catalog {
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
                 );
-                PRAGMA user_version = 2;",
+                PRAGMA user_version = 3;",
             )?;
         }
         if domain == SessionDomain::Agent {
@@ -394,6 +405,67 @@ impl Catalog {
             .map_err(CatalogError::from)
     }
 
+    pub(crate) fn search_message_nodes(
+        &self,
+        query: &str,
+        cursor: Option<&super::ChatMessageSearchCursor>,
+        limit: usize,
+    ) -> Result<Vec<MessageNodeRow>, CatalogError> {
+        let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
+        let mut sql = String::from(
+            "SELECT n.session_id, n.entry_id, n.timestamp, n.message_json,
+                    s.title, s.created_at
+             FROM message_nodes n
+             JOIN sessions s ON s.session_id = n.session_id AND s.domain = ?
+             WHERE n.session_id IN (SELECT session_id FROM sessions WHERE domain = ?)
+               AND lower(n.searchable_text) LIKE lower(?)",
+        );
+        let mut values: Vec<Box<dyn ToSql>> = vec![
+            Box::new(self.domain.prefix().to_string()),
+            Box::new(self.domain.prefix().to_string()),
+            Box::new(format!("%{query}%")),
+        ];
+        if let Some(cursor) = cursor {
+            sql.push_str(
+                " AND (n.timestamp < ? OR (n.timestamp = ? AND n.session_id < ?)
+                    OR (n.timestamp = ? AND n.session_id = ? AND n.entry_id < ?))",
+            );
+            values.push(Box::new(cursor.timestamp));
+            values.push(Box::new(cursor.timestamp));
+            values.push(Box::new(cursor.session_id.to_string()));
+            values.push(Box::new(cursor.timestamp));
+            values.push(Box::new(cursor.session_id.to_string()));
+            values.push(Box::new(cursor.entry_id.to_string()));
+        }
+        sql.push_str(" ORDER BY n.timestamp DESC, n.session_id DESC, n.entry_id DESC LIMIT ?");
+        values.push(Box::new(fetch_limit as i64));
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            |row| {
+                let session_id =
+                    SessionId::from_str(&row.get::<_, String>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                    })?;
+                let entry_id = EntryId::from_str(&row.get::<_, String>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+                })?;
+                let message = serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+                })?;
+                Ok(MessageNodeRow {
+                    session_id,
+                    entry_id,
+                    timestamp: row.get(2)?,
+                    message,
+                    session_title: row.get(4)?,
+                    session_created_at: row.get(5)?,
+                })
+            },
+        )?;
+        rows.map(|row| row.map_err(CatalogError::from)).collect()
+    }
+
     pub(crate) fn delete_session(&mut self, session_id: &SessionId) -> Result<(), CatalogError> {
         let tx = self.connection.transaction()?;
         tx.execute(
@@ -535,7 +607,9 @@ impl SessionProjection {
                         role: role_name(message.message.role),
                         preview: text,
                         searchable_text: message_search_text(&message.message),
-                        message_json: serde_json::to_string(&message.message)?,
+                        message_json: serde_json::to_string(&ReferencedMessage::from_message(
+                            &message.message,
+                        ))?,
                     });
                 }
                 SessionEntryKind::TurnResult(result) => {

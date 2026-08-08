@@ -612,7 +612,7 @@ impl TranscriptReplay {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChatMessageRef {
     pub session_id: SessionId,
     pub entry_id: EntryId,

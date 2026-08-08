@@ -5,10 +5,16 @@ use std::{
 
 use super::catalog::project_session_summary;
 use super::{
-    CatalogError, CatalogPage, CatalogQuery, EntryId, ResolvedSessionState, SessionBranchPreview,
-    SessionBranchTreeSnapshot, SessionDomain, SessionEntry, SessionEntryKind, SessionError,
-    SessionHeader, SessionId, SessionSummary, SessionTreeSnapshot, resolve_session,
-    session_branch_preview, session_branch_tree_snapshot, session_tree_snapshot,
+    CatalogError, CatalogPage, CatalogQuery, ChatMessageRead, ChatMessageReferenceStore,
+    ChatMessageSearchCursor, ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError,
+    EntryId, ResolvedSessionState, SessionBranchPreview, SessionBranchTreeSnapshot, SessionDomain,
+    SessionEntry, SessionEntryKind, SessionError, SessionHeader, SessionId, SessionSummary,
+    SessionTreeSnapshot,
+    reference::{
+        ChatMessageUnavailableReason, message_from_entry, preview_from_node, unavailable,
+        validate_reference,
+    },
+    resolve_session, session_branch_preview, session_branch_tree_snapshot, session_tree_snapshot,
     validate_appended_kind,
 };
 
@@ -402,6 +408,99 @@ impl ProjectSessionStore for InMemorySessionStore {
             });
         }
         resolve_session(&session.entries, leaf.or(session.leaf.as_ref()))
+    }
+}
+
+impl ChatMessageReferenceStore for InMemorySessionStore {
+    fn search_chat_messages(
+        &self,
+        query: ChatMessageSearchQuery,
+    ) -> Result<ChatMessageSearchPage, ChatReferenceError> {
+        let mut messages = Vec::new();
+        let limit = query.bounded_limit();
+        for session in self
+            .sessions
+            .values()
+            .filter(|session| session.domain == SessionDomain::Chat)
+        {
+            let summary = Self::summary(session).map_err(ChatReferenceError::Catalog)?;
+            for entry in &session.entries {
+                let SessionEntryKind::Message(message) = &entry.kind else {
+                    continue;
+                };
+                let safe = super::ReferencedMessage::from_message(&message.message);
+                if !safe
+                    .searchable_text()
+                    .to_lowercase()
+                    .contains(&query.text.to_lowercase())
+                {
+                    continue;
+                }
+                messages.push(preview_from_node(
+                    summary.session_id.clone(),
+                    entry.id.clone(),
+                    entry.timestamp,
+                    summary.title.clone(),
+                    summary.created_at,
+                    safe,
+                ));
+            }
+        }
+        messages.sort_by(|left, right| {
+            right
+                .timestamp
+                .cmp(&left.timestamp)
+                .then_with(|| right.reference.session_id.cmp(&left.reference.session_id))
+                .then_with(|| right.reference.entry_id.cmp(&left.reference.entry_id))
+        });
+        if let Some(cursor) = &query.cursor {
+            messages.retain(|message| {
+                message.timestamp < cursor.timestamp
+                    || (message.timestamp == cursor.timestamp
+                        && message.reference.session_id < cursor.session_id)
+                    || (message.timestamp == cursor.timestamp
+                        && message.reference.session_id == cursor.session_id
+                        && message.reference.entry_id < cursor.entry_id)
+            });
+        }
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                messages.last().map(|message| ChatMessageSearchCursor {
+                    timestamp: message.timestamp,
+                    session_id: message.reference.session_id.clone(),
+                    entry_id: message.reference.entry_id.clone(),
+                })
+            })
+            .flatten();
+        Ok(ChatMessageSearchPage {
+            messages,
+            next_cursor,
+        })
+    }
+
+    fn read_chat_message(
+        &self,
+        reference: &super::ChatMessageRef,
+    ) -> Result<ChatMessageRead, ChatReferenceError> {
+        validate_reference(reference)?;
+        let session = self
+            .sessions
+            .get(&reference.session_id)
+            .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::SessionDeleted))?;
+        if session.domain != SessionDomain::Chat {
+            return Err(ChatReferenceError::InvalidReference(
+                SessionError::ReferenceSourceNotChat,
+            ));
+        }
+        let summary = Self::summary(session).map_err(ChatReferenceError::Catalog)?;
+        let entry = session
+            .entries
+            .iter()
+            .find(|entry| entry.id == reference.entry_id)
+            .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::MessageDeleted))?;
+        message_from_entry(reference, &summary, entry)
     }
 }
 

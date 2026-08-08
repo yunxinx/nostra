@@ -11,11 +11,17 @@ use thiserror::Error;
 use crate::paths;
 
 use super::{
-    CatalogError, EntryId, JsonlLoader, JsonlRecorder, ProjectSessionStore, ResolvedSessionState,
-    SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader, SessionId,
-    SessionLifecycleStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
+    CatalogError, ChatMessageRead, ChatMessageReferenceStore, ChatMessageSearchCursor,
+    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, EntryId, JsonlLoader,
+    JsonlRecorder, ProjectSessionStore, ResolvedSessionState, SessionBranchPreview,
+    SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain, SessionEntry, SessionEntryKind,
+    SessionError, SessionFlushStore, SessionHeader, SessionId, SessionLifecycleStore,
+    SessionSummary, SessionTreeSnapshot, SessionTreeStore,
     catalog::{Catalog, CatalogPage, CatalogQuery, RepairReport},
+    reference::{
+        ChatMessageUnavailableReason, message_from_entry, preview_from_node, unavailable,
+        validate_reference,
+    },
     resolve_session, session_branch_preview, session_branch_tree_snapshot, session_tree_snapshot,
 };
 
@@ -598,6 +604,97 @@ impl ProjectSessionStore for LocalSessionStore {
             });
         }
         resolve_session(&entries, leaf)
+    }
+}
+
+impl ChatMessageReferenceStore for LocalSessionStore {
+    fn search_chat_messages(
+        &self,
+        query: ChatMessageSearchQuery,
+    ) -> Result<ChatMessageSearchPage, ChatReferenceError> {
+        if self.config.domain != SessionDomain::Chat {
+            return Err(ChatReferenceError::Catalog(CatalogError::DomainMismatch {
+                expected: SessionDomain::Chat,
+                actual: self.config.domain,
+            }));
+        }
+        let limit = query.bounded_limit();
+        let mut rows = self
+            .catalog
+            .search_message_nodes(&query.text, query.cursor.as_ref(), limit)
+            .map_err(ChatReferenceError::Catalog)?;
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.pop();
+        }
+        let next_cursor = has_more
+            .then(|| {
+                rows.last().map(|row| ChatMessageSearchCursor {
+                    timestamp: row.timestamp,
+                    session_id: row.session_id.clone(),
+                    entry_id: row.entry_id.clone(),
+                })
+            })
+            .flatten();
+        let messages = rows
+            .into_iter()
+            .map(|row| {
+                preview_from_node(
+                    row.session_id,
+                    row.entry_id,
+                    row.timestamp,
+                    row.session_title,
+                    row.session_created_at,
+                    row.message,
+                )
+            })
+            .collect();
+        Ok(ChatMessageSearchPage {
+            messages,
+            next_cursor,
+        })
+    }
+
+    fn read_chat_message(
+        &self,
+        reference: &super::ChatMessageRef,
+    ) -> Result<ChatMessageRead, ChatReferenceError> {
+        validate_reference(reference)?;
+        if self.config.domain != SessionDomain::Chat {
+            return Err(ChatReferenceError::Catalog(CatalogError::DomainMismatch {
+                expected: SessionDomain::Chat,
+                actual: self.config.domain,
+            }));
+        }
+        let summary = self
+            .catalog
+            .get(&reference.session_id)
+            .map_err(ChatReferenceError::Catalog)?
+            .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::SessionDeleted))?;
+        let path = summary.jsonl_path.clone();
+        let loaded = JsonlLoader::load(&path)
+            .map_err(|_| unavailable(reference, ChatMessageUnavailableReason::SourceCorrupt))?;
+        if !loaded.diagnostics.is_empty() || loaded.truncated_tail {
+            return Err(unavailable(
+                reference,
+                ChatMessageUnavailableReason::SourceCorrupt,
+            ));
+        }
+        match loaded.header() {
+            Ok(header) if header.session_id == reference.session_id => {}
+            _ => {
+                return Err(unavailable(
+                    reference,
+                    ChatMessageUnavailableReason::SourceCorrupt,
+                ));
+            }
+        }
+        let entry = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.id == reference.entry_id)
+            .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::MessageDeleted))?;
+        message_from_entry(reference, &summary, entry)
     }
 }
 
