@@ -63,6 +63,14 @@ pub enum SessionError {
     ChatHasProject,
     #[error("agent sessions require a project identity")]
     AgentMissingProject,
+    #[error(
+        "agent session `{session_id}` belongs to project `{actual}`, not requested project `{expected}`"
+    )]
+    ProjectMismatch {
+        session_id: SessionId,
+        expected: String,
+        actual: String,
+    },
     #[error("invalid {kind} `{value}`: {reason}")]
     InvalidIdentifier {
         kind: &'static str,
@@ -79,6 +87,8 @@ pub enum SessionError {
     CycleDetected,
     #[error("entry `{0}` is not a valid leaf")]
     LeafNotFound(EntryId),
+    #[error("entry `{0}` is not a selectable branch root")]
+    BranchNotFound(EntryId),
     #[error("session `{0}` does not exist")]
     SessionNotFound(SessionId),
     #[error("session `{0}` already exists")]
@@ -98,6 +108,8 @@ pub enum SessionError {
     ReferenceOutsideAgent,
     #[error("session entry kind is not allowed in this position")]
     InvalidEntryKind,
+    #[error("invalid transcript replay entry: {0}")]
+    InvalidTranscriptReplay(String),
 }
 
 impl SessionError {

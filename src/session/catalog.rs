@@ -11,6 +11,7 @@ use thiserror::Error;
 
 use crate::llm::{ContentBlock, Message, ModelSelection, Role};
 
+use super::tree::message_preview;
 use super::{
     EntryId, ProjectIdentity, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
     SessionId,
@@ -685,29 +686,6 @@ fn role_name(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
-    }
-}
-
-fn message_preview(message: &Message) -> Option<String> {
-    let mut text = String::new();
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text: value, .. } => text.push_str(value),
-            ContentBlock::Reasoning { reasoning } => text.push_str(&reasoning.display),
-            ContentBlock::ToolCall { tool_call } => {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(&tool_call.name);
-            }
-            ContentBlock::ToolResult { tool_result } => text.push_str(&tool_result.content),
-        }
-    }
-    let text = text.trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.chars().take(512).collect())
     }
 }
 

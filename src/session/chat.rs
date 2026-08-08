@@ -518,7 +518,10 @@ mod tests {
 
     use super::*;
     use crate::llm::{FinishReason, IndexedMessage, Protocol, UsageProvenance};
-    use crate::session::{InMemorySessionStore, LocalSessionStore, LocalStoreConfig};
+    use crate::session::{
+        InMemorySessionStore, LocalSessionStore, LocalStoreConfig, SessionBranchPreview,
+        SessionBranchTreeSnapshot, SessionTreeSnapshot,
+    };
     use crate::session::{SessionFlushStore, SessionLifecycleStore, SessionTreeStore};
 
     fn model(id: &str) -> ModelSelection {
@@ -1034,6 +1037,36 @@ mod tests {
         ) -> Result<(), SessionError> {
             self.inner.set_leaf(session_id, leaf)
         }
+
+        fn load_session_tree(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<SessionTreeSnapshot, SessionError> {
+            self.inner.load_session_tree(session_id)
+        }
+
+        fn load_session_tree_for_leaf(
+            &self,
+            session_id: &SessionId,
+            leaf: &EntryId,
+        ) -> Result<SessionTreeSnapshot, SessionError> {
+            self.inner.load_session_tree_for_leaf(session_id, leaf)
+        }
+
+        fn load_branch_preview(
+            &self,
+            session_id: &SessionId,
+            branch_root: &EntryId,
+        ) -> Result<SessionBranchPreview, SessionError> {
+            self.inner.load_branch_preview(session_id, branch_root)
+        }
+
+        fn load_branch_tree(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+            self.inner.load_branch_tree(session_id)
+        }
     }
 
     impl SessionFlushStore for FailOnceStore {
@@ -1129,6 +1162,36 @@ mod tests {
             leaf: Option<&EntryId>,
         ) -> Result<(), SessionError> {
             self.inner.set_leaf(session_id, leaf)
+        }
+
+        fn load_session_tree(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<SessionTreeSnapshot, SessionError> {
+            self.inner.load_session_tree(session_id)
+        }
+
+        fn load_session_tree_for_leaf(
+            &self,
+            session_id: &SessionId,
+            leaf: &EntryId,
+        ) -> Result<SessionTreeSnapshot, SessionError> {
+            self.inner.load_session_tree_for_leaf(session_id, leaf)
+        }
+
+        fn load_branch_preview(
+            &self,
+            session_id: &SessionId,
+            branch_root: &EntryId,
+        ) -> Result<SessionBranchPreview, SessionError> {
+            self.inner.load_branch_preview(session_id, branch_root)
+        }
+
+        fn load_branch_tree(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+            self.inner.load_branch_tree(session_id)
         }
     }
 

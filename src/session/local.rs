@@ -11,11 +11,12 @@ use thiserror::Error;
 use crate::paths;
 
 use super::{
-    CatalogError, EntryId, JsonlLoader, JsonlRecorder, ResolvedSessionState, SessionCatalogStore,
-    SessionDomain, SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader,
-    SessionId, SessionLifecycleStore, SessionSummary, SessionTreeStore,
+    CatalogError, EntryId, JsonlLoader, JsonlRecorder, ProjectSessionStore, ResolvedSessionState,
+    SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain,
+    SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader, SessionId,
+    SessionLifecycleStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
     catalog::{Catalog, CatalogPage, CatalogQuery, RepairReport},
-    resolve_session,
+    resolve_session, session_branch_preview, session_branch_tree_snapshot, session_tree_snapshot,
 };
 
 #[derive(Debug, Error)]
@@ -285,6 +286,39 @@ impl LocalSessionStore {
         Ok(JsonlLoader::load(path)?.entries)
     }
 
+    fn load_header_and_entries_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
+        let path = self
+            .catalog
+            .path_for(session_id)
+            .map_err(session_io_error)?
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        let loaded = JsonlLoader::load(path)?;
+        let header = loaded.header()?;
+        if header.domain != self.config.domain {
+            return Err(SessionError::DomainMismatch {
+                header: self.config.domain,
+                id: header.domain,
+            });
+        }
+        if header.session_id != *session_id {
+            return Err(SessionError::SessionIdMismatch {
+                expected: session_id.clone(),
+                actual: header.session_id.clone(),
+            });
+        }
+        Ok((header.clone(), loaded.entries))
+    }
+
+    fn load_entries_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        Ok(self.load_header_and_entries_for_session(session_id)?.1)
+    }
+
     fn flush_handle(&mut self, session_id: &SessionId) -> Result<(), LocalStoreError> {
         self.ensure_handle(session_id)?;
         let (header, path, entries) = {
@@ -411,26 +445,7 @@ impl SessionLifecycleStore for LocalSessionStore {
         session_id: &SessionId,
         leaf: Option<&EntryId>,
     ) -> Result<ResolvedSessionState, SessionError> {
-        let path = self
-            .catalog
-            .path_for(session_id)
-            .map_err(session_io_error)?
-            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
-        let loaded = JsonlLoader::load(path)?;
-        let header = loaded.header()?;
-        if header.domain != self.config.domain {
-            return Err(SessionError::DomainMismatch {
-                header: self.config.domain,
-                id: header.domain,
-            });
-        }
-        if header.session_id != session_id.clone() {
-            return Err(SessionError::SessionIdMismatch {
-                expected: session_id.clone(),
-                actual: header.session_id.clone(),
-            });
-        }
-        resolve_session(&loaded.entries, leaf)
+        resolve_session(&self.load_entries_for_session(session_id)?, leaf)
     }
 }
 
@@ -460,6 +475,40 @@ impl SessionTreeStore for LocalSessionStore {
         self.catalog
             .upsert_session(&header, &entries, &path)
             .map_err(session_io_error)
+    }
+
+    fn load_session_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        let entries = self.load_entries_for_session(session_id)?;
+        session_tree_snapshot(&entries, None)
+    }
+
+    fn load_session_tree_for_leaf(
+        &self,
+        session_id: &SessionId,
+        leaf: &EntryId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        let entries = self.load_entries_for_session(session_id)?;
+        session_tree_snapshot(&entries, Some(leaf))
+    }
+
+    fn load_branch_preview(
+        &self,
+        session_id: &SessionId,
+        branch_root: &EntryId,
+    ) -> Result<SessionBranchPreview, SessionError> {
+        let entries = self.load_entries_for_session(session_id)?;
+        session_branch_preview(&entries, branch_root)
+    }
+
+    fn load_branch_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+        let entries = self.load_entries_for_session(session_id)?;
+        session_branch_tree_snapshot(&entries, None)
     }
 }
 
@@ -508,6 +557,50 @@ impl SessionCatalogStore for LocalSessionStore {
     }
 }
 
+impl ProjectSessionStore for LocalSessionStore {
+    fn list_project_sessions(
+        &self,
+        project_id: &str,
+        mut query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError> {
+        if self.config.domain != SessionDomain::Agent {
+            return Err(CatalogError::DomainMismatch {
+                expected: self.config.domain,
+                actual: SessionDomain::Agent,
+            });
+        }
+        query.project_id = Some(project_id.to_string());
+        self.catalog.list(&query)
+    }
+
+    fn load_project_session(
+        &self,
+        project_id: &str,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<ResolvedSessionState, SessionError> {
+        if session_id.domain() != SessionDomain::Agent {
+            return Err(SessionError::DomainMismatch {
+                header: SessionDomain::Agent,
+                id: session_id.domain(),
+            });
+        }
+        let (header, entries) = self.load_header_and_entries_for_session(session_id)?;
+        let actual = header
+            .project
+            .as_ref()
+            .ok_or(SessionError::AgentMissingProject)?;
+        if actual.project_id != project_id {
+            return Err(SessionError::ProjectMismatch {
+                session_id: session_id.clone(),
+                expected: project_id.to_string(),
+                actual: actual.project_id.clone(),
+            });
+        }
+        resolve_session(&entries, leaf)
+    }
+}
+
 fn collect_jsonl_paths(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     let mut pending = vec![root.to_path_buf()];
     let mut result = Vec::new();
@@ -546,7 +639,10 @@ mod tests {
 
     use super::*;
     use crate::llm::{ContentBlock, Message, ModelSelection, Role, Usage};
-    use crate::session::JsonlWriter;
+    use crate::session::{
+        BranchSummary, Compaction, ConfigChange, InMemorySessionStore, JsonlWriter,
+        ProjectIdentity, SessionStore, TranscriptReplay,
+    };
 
     fn message(text: &str) -> SessionEntryKind {
         SessionEntryKind::Message(super::super::MessageEntry {
@@ -585,6 +681,207 @@ mod tests {
                 ..Usage::default()
             },
         })
+    }
+
+    fn exercise_agent_tree_contract<S>(store: &mut S, project: ProjectIdentity) -> SessionId
+    where
+        S: SessionStore + SessionCatalogStore,
+    {
+        let project_id = project.project_id.clone();
+        let mut header = SessionHeader::new(SessionDomain::Agent, Some(project));
+        header.initial_model = Some(ModelSelection {
+            profile_id: "initial-profile".into(),
+            model_id: "initial-model".into(),
+        });
+        let session_id = header.session_id.clone();
+        store.create_session(header).expect("create agent session");
+        store
+            .append(
+                &session_id,
+                vec![SessionEntryKind::ConfigChange(ConfigChange {
+                    model: ModelSelection {
+                        profile_id: "current-profile".into(),
+                        model_id: "current-model".into(),
+                    },
+                    system_prompt: Some("current system".into()),
+                })],
+            )
+            .expect("append config");
+        let root = store
+            .append(&session_id, vec![message("root")])
+            .expect("append root")[0]
+            .clone();
+        let original = store
+            .append(&session_id, vec![message("original")])
+            .expect("append original")[0]
+            .clone();
+        store
+            .set_leaf(&session_id, Some(&root))
+            .expect("select root");
+        store
+            .append(
+                &session_id,
+                vec![SessionEntryKind::BranchSummary(BranchSummary {
+                    from_id: original.clone(),
+                    summary: "summarized original branch".into(),
+                })],
+            )
+            .expect("append branch summary");
+        let replacement = store
+            .append(&session_id, vec![message("replacement")])
+            .expect("append replacement")[0]
+            .clone();
+        store
+            .append(
+                &session_id,
+                vec![SessionEntryKind::TranscriptReplay(
+                    TranscriptReplay::TerminalSnapshot {
+                        terminal_id: "terminal-1".into(),
+                        title: Some("cargo test".into()),
+                        content: "ok".into(),
+                    },
+                )],
+            )
+            .expect("append transcript replay");
+        store
+            .append(
+                &session_id,
+                vec![SessionEntryKind::Compaction(Compaction {
+                    summary: "older work".into(),
+                    first_kept_entry_id: replacement.clone(),
+                    tokens_before: 50,
+                })],
+            )
+            .expect("append compaction");
+
+        let state = store
+            .load_session(&session_id, None)
+            .expect("restore agent");
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.messages[0].entry_id, replacement);
+        assert_eq!(state.transcript_replays.len(), 1);
+        assert_eq!(
+            state.latest_compaction.expect("compaction").tokens_before,
+            50
+        );
+        assert_eq!(
+            state.latest_config.expect("config").model.model_id,
+            "current-model"
+        );
+
+        let tree = store.load_session_tree(&session_id).expect("tree");
+        assert_eq!(tree.rows[0].branch_choices.len(), 2);
+        let branches = store.load_branch_tree(&session_id).expect("branch tree");
+        assert_eq!(branches.nodes.len(), 3);
+        let preview = store
+            .load_branch_preview(&session_id, &original)
+            .expect("branch preview");
+        assert_eq!(preview.common_parent_id, Some(root));
+        assert_eq!(preview.snapshot.rows.len(), 2);
+
+        let page = store
+            .list_sessions(
+                SessionDomain::Agent,
+                CatalogQuery {
+                    project_id: Some(project_id.clone()),
+                    ..CatalogQuery::first_page()
+                },
+            )
+            .expect("project catalog");
+        assert_eq!(page.sessions.len(), 1);
+        assert!(
+            store
+                .list_sessions(
+                    SessionDomain::Agent,
+                    CatalogQuery {
+                        project_id: Some("project-018f0000-0000-7000-8000-000000000000".into()),
+                        ..CatalogQuery::first_page()
+                    },
+                )
+                .expect("unknown project")
+                .sessions
+                .is_empty()
+        );
+        session_id
+    }
+
+    fn assert_project_scoped_restore_isolation<S>(store: &mut S)
+    where
+        S: SessionStore + ProjectSessionStore,
+    {
+        let project_a = ProjectIdentity::new("/tmp/agent-project-a", "Agent Project A");
+        let project_b = ProjectIdentity::new("/tmp/agent-project-b", "Agent Project B");
+        let project_a_id = project_a.project_id.clone();
+        let project_b_id = project_b.project_id.clone();
+
+        let header_a = SessionHeader::new(SessionDomain::Agent, Some(project_a));
+        let session_a = header_a.session_id.clone();
+        store
+            .create_session(header_a)
+            .expect("create project A session");
+        store
+            .append(&session_a, vec![message("project A discussion")])
+            .expect("append project A message");
+
+        let header_b = SessionHeader::new(SessionDomain::Agent, Some(project_b));
+        let session_b = header_b.session_id.clone();
+        store
+            .create_session(header_b)
+            .expect("create project B session");
+
+        let page = store
+            .list_project_sessions(&project_a_id, CatalogQuery::first_page())
+            .expect("list project A sessions");
+        assert_eq!(page.sessions.len(), 1);
+        assert_eq!(page.sessions[0].session_id, session_a);
+
+        let restored = store
+            .load_project_session(&project_a_id, &session_a, None)
+            .expect("restore project A session");
+        assert_eq!(restored.messages.len(), 1);
+        assert!(matches!(
+            store.load_project_session(&project_a_id, &session_b, None),
+            Err(SessionError::ProjectMismatch {
+                expected,
+                actual,
+                ..
+            }) if expected == project_a_id && actual == project_b_id
+        ));
+    }
+
+    #[test]
+    fn memory_and_local_agent_stores_share_tree_and_replay_contracts() {
+        let project = ProjectIdentity::new("/tmp/agent-project", "Agent Project");
+        let mut memory = InMemorySessionStore::new();
+        exercise_agent_tree_contract(&mut memory, project.clone());
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = LocalStoreConfig::new(root.path(), SessionDomain::Agent);
+        let mut local = LocalSessionStore::open(config.clone()).expect("open local agent");
+        let session_id = exercise_agent_tree_contract(&mut local, project.clone());
+        local.shutdown().expect("shutdown local agent");
+
+        let reopened = LocalSessionStore::open(config).expect("reopen local agent");
+        assert_eq!(
+            reopened
+                .load_branch_tree(&session_id)
+                .expect("reloaded branch tree")
+                .nodes
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn project_scoped_restore_rejects_sessions_from_another_project() {
+        let mut memory = InMemorySessionStore::new();
+        assert_project_scoped_restore_isolation(&mut memory);
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut local =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Agent))
+                .expect("open local agent");
+        assert_project_scoped_restore_isolation(&mut local);
     }
 
     #[test]
@@ -823,6 +1120,51 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn agent_project_location_updates_keep_sessions_in_the_same_stable_bucket() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Agent))
+                .expect("open");
+        let first_project = ProjectIdentity::new(root.path().join("first"), "First");
+        let project_id = first_project.project_id.clone();
+        let first_header = SessionHeader::new(SessionDomain::Agent, Some(first_project));
+        store
+            .create_session(first_header)
+            .expect("first agent session");
+
+        let moved_project = ProjectIdentity::from_parts(
+            project_id.clone(),
+            root.path().join("moved"),
+            "Moved project",
+        )
+        .expect("moved project");
+        let second_header = SessionHeader::new(SessionDomain::Agent, Some(moved_project.clone()));
+        store
+            .create_session(second_header)
+            .expect("second agent session");
+        let page = store
+            .list(CatalogQuery {
+                project_id: Some(project_id.clone()),
+                ..CatalogQuery::first_page()
+            })
+            .expect("project page");
+        assert_eq!(page.sessions.len(), 2);
+        assert!(page.sessions.iter().all(|summary| {
+            summary.project.as_ref().map(|project| &project.project_id) == Some(&project_id)
+        }));
+
+        let index = rusqlite::Connection::open(store.catalog_path()).expect("index");
+        let stored_path: String = index
+            .query_row(
+                "SELECT canonical_path FROM projects WHERE project_id = ?1",
+                rusqlite::params![project_id],
+                |row| row.get(0),
+            )
+            .expect("project registry row");
+        assert_eq!(stored_path, moved_project.canonical_path.to_string_lossy());
     }
 
     #[test]

@@ -30,19 +30,23 @@ pub use chat_catalog::{
 pub use domain::{
     BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, Compaction, ConfigChange, EntryId, Leaf,
     MessageEntry, ProjectIdentity, Reference, SafeError, SafeErrorCategory, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionHeader, SessionId, TurnResult, TurnStatus,
+    SessionEntry, SessionEntryKind, SessionHeader, SessionId, TranscriptReplay, TurnResult,
+    TurnStatus,
 };
 pub use error::{DiagnosticKind, JsonlDiagnostic, SessionError};
 pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};
 pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
-    InMemorySessionStore, SessionCatalogStore, SessionFlushStore, SessionLifecycleStore,
-    SessionStore, SessionTreeStore,
+    InMemorySessionStore, ProjectSessionStore, SessionCatalogStore, SessionFlushStore,
+    SessionLifecycleStore, SessionStore, SessionTreeStore,
 };
 pub use service::{SessionStores, SharedSessionStore};
 pub use tree::{
-    ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTurnResult,
-    resolve_session, validate_session_entries,
+    ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,
+    ResolvedTurnResult, SessionBranchPreview, SessionBranchSummary, SessionBranchTreeNode,
+    SessionBranchTreeSnapshot, SessionTreeBranchChoice, SessionTreeRow, SessionTreeRowKind,
+    SessionTreeSnapshot, resolve_session, session_branch_preview, session_branch_tree_snapshot,
+    session_tree_snapshot, validate_session_entries,
 };
 
 pub(crate) use recorder::JsonlRecorder;

@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::{Uuid, Version};
 
 use crate::llm::{FinishReason, Message, ModelSelection, Usage};
@@ -209,6 +210,24 @@ impl ProjectIdentity {
         }
     }
 
+    /// Rehydrate a project identity selected by the caller without changing
+    /// its stable storage bucket. The location fields may change when a
+    /// project is moved or renamed; `project_id` remains its durable owner.
+    pub fn from_parts(
+        project_id: impl Into<String>,
+        canonical_path: impl Into<PathBuf>,
+        display_name: impl Into<String>,
+    ) -> Result<Self, SessionError> {
+        let canonical_path = canonical_path.into();
+        let identity = Self {
+            project_id: project_id.into(),
+            canonical_path: std::fs::canonicalize(&canonical_path).unwrap_or(canonical_path),
+            display_name: display_name.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     pub fn validate(&self) -> Result<(), SessionError> {
         let Some(uuid_text) = self.project_id.strip_prefix("project-") else {
             return Err(SessionError::InvalidIdentifier {
@@ -391,6 +410,7 @@ pub enum SessionEntryKind {
     ConfigChange(ConfigChange),
     Compaction(Compaction),
     BranchSummary(BranchSummary),
+    TranscriptReplay(TranscriptReplay),
     Reference(Reference),
     Leaf(Leaf),
 }
@@ -487,6 +507,109 @@ pub struct Compaction {
 pub struct BranchSummary {
     pub from_id: EntryId,
     pub summary: String,
+}
+
+/// A typed, transcript-only activity snapshot for future Agent tools.
+///
+/// These facts are intentionally plain data rather than handles to a process,
+/// terminal emulator, or tool runtime. They restore visible activity without
+/// making the persistence layer responsible for executing it again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TranscriptReplay {
+    ToolCall {
+        call_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+        #[serde(default)]
+        is_error: bool,
+    },
+    ToolActivity {
+        title: String,
+        #[serde(default)]
+        content: String,
+    },
+    TerminalSnapshot {
+        terminal_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default)]
+        content: String,
+    },
+}
+
+impl TranscriptReplay {
+    pub fn validate(&self) -> Result<(), SessionError> {
+        let invalid = |kind, value, reason| SessionError::InvalidIdentifier {
+            kind,
+            value,
+            reason,
+        };
+        match self {
+            Self::ToolCall {
+                call_id, tool_name, ..
+            } => {
+                if call_id.trim().is_empty() {
+                    return Err(invalid(
+                        "tool call id",
+                        call_id.clone(),
+                        "must not be empty",
+                    ));
+                }
+                if tool_name.trim().is_empty() {
+                    return Err(invalid("tool name", tool_name.clone(), "must not be empty"));
+                }
+            }
+            Self::ToolResult { call_id, .. } if call_id.trim().is_empty() => {
+                return Err(invalid(
+                    "tool call id",
+                    call_id.clone(),
+                    "must not be empty",
+                ));
+            }
+            Self::ToolActivity { title, .. } if title.trim().is_empty() => {
+                return Err(invalid(
+                    "tool activity title",
+                    title.clone(),
+                    "must not be empty",
+                ));
+            }
+            Self::TerminalSnapshot { terminal_id, .. } if terminal_id.trim().is_empty() => {
+                return Err(invalid(
+                    "terminal id",
+                    terminal_id.clone(),
+                    "must not be empty",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn preview(&self) -> String {
+        match self {
+            Self::ToolCall { tool_name, .. } => format!("Tool call: {tool_name}"),
+            Self::ToolResult { content, .. } => content.clone(),
+            Self::ToolActivity { title, content } => {
+                if !content.trim().is_empty() {
+                    content.clone()
+                } else {
+                    title.clone()
+                }
+            }
+            Self::TerminalSnapshot { title, content, .. } => title
+                .as_ref()
+                .filter(|title| !title.trim().is_empty())
+                .cloned()
+                .or_else(|| (!content.trim().is_empty()).then(|| content.clone()))
+                .unwrap_or_else(|| "Terminal activity".to_string()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -630,6 +753,11 @@ mod tests {
                 from_id: EntryId::new(),
                 summary: "branch".into(),
             }),
+            SessionEntryKind::TranscriptReplay(TranscriptReplay::ToolCall {
+                call_id: "call-1".into(),
+                tool_name: "read_file".into(),
+                arguments: json!({"path": "src/lib.rs"}),
+            }),
             SessionEntryKind::Reference(Reference {
                 source: reference,
                 label: Some("discussion".into()),
@@ -650,6 +778,42 @@ mod tests {
         let project_json = serde_json::to_value(project).expect("serialize project");
         assert_eq!(project_json["display_name"], json!("project"));
         assert!(project_json["canonical_path"].is_string());
+    }
+
+    #[test]
+    fn project_identity_reuses_its_stable_id_when_location_changes() {
+        let original = ProjectIdentity::new("/tmp/nostra-project", "Original");
+        let moved = ProjectIdentity::from_parts(
+            original.project_id.clone(),
+            "/tmp/nostra-project-moved",
+            "Renamed",
+        )
+        .expect("stable project identity");
+        assert_eq!(moved.project_id, original.project_id);
+        assert_ne!(moved.canonical_path, original.canonical_path);
+        assert_eq!(moved.display_name, "Renamed");
+    }
+
+    #[test]
+    fn transcript_replay_rejects_missing_runtime_identifiers() {
+        assert!(
+            TranscriptReplay::ToolCall {
+                call_id: "".into(),
+                tool_name: "read_file".into(),
+                arguments: json!({}),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TranscriptReplay::TerminalSnapshot {
+                terminal_id: "".into(),
+                title: None,
+                content: String::new(),
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

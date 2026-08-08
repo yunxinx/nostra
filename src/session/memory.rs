@@ -5,9 +5,11 @@ use std::{
 
 use super::catalog::project_session_summary;
 use super::{
-    CatalogError, CatalogPage, CatalogQuery, EntryId, ResolvedSessionState, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionError, SessionHeader, SessionId, SessionSummary,
-    resolve_session, validate_appended_kind,
+    CatalogError, CatalogPage, CatalogQuery, EntryId, ResolvedSessionState, SessionBranchPreview,
+    SessionBranchTreeSnapshot, SessionDomain, SessionEntry, SessionEntryKind, SessionError,
+    SessionHeader, SessionId, SessionSummary, SessionTreeSnapshot, resolve_session,
+    session_branch_preview, session_branch_tree_snapshot, session_tree_snapshot,
+    validate_appended_kind,
 };
 
 /// Capability boundary shared by the in-memory implementation and local
@@ -33,6 +35,24 @@ pub trait SessionTreeStore {
         session_id: &SessionId,
         leaf: Option<&EntryId>,
     ) -> Result<(), SessionError>;
+    fn load_session_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTreeSnapshot, SessionError>;
+    fn load_session_tree_for_leaf(
+        &self,
+        session_id: &SessionId,
+        leaf: &EntryId,
+    ) -> Result<SessionTreeSnapshot, SessionError>;
+    fn load_branch_preview(
+        &self,
+        session_id: &SessionId,
+        branch_root: &EntryId,
+    ) -> Result<SessionBranchPreview, SessionError>;
+    fn load_branch_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionBranchTreeSnapshot, SessionError>;
 }
 
 pub trait SessionFlushStore {
@@ -52,6 +72,23 @@ pub trait SessionCatalogStore {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<SessionSummary>, CatalogError>;
+}
+
+/// Agent callers use this capability instead of an unscoped session id. It
+/// keeps a stable project identity as a restore boundary while leaving Chat
+/// sessions project-free.
+pub trait ProjectSessionStore {
+    fn list_project_sessions(
+        &self,
+        project_id: &str,
+        query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError>;
+    fn load_project_session(
+        &self,
+        project_id: &str,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<ResolvedSessionState, SessionError>;
 }
 
 pub trait SessionStore: SessionLifecycleStore + SessionTreeStore + SessionFlushStore {}
@@ -204,6 +241,52 @@ impl SessionTreeStore for InMemorySessionStore {
         });
         Ok(())
     }
+
+    fn load_session_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        session_tree_snapshot(&session.entries, session.leaf.as_ref())
+    }
+
+    fn load_session_tree_for_leaf(
+        &self,
+        session_id: &SessionId,
+        leaf: &EntryId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        session_tree_snapshot(&session.entries, Some(leaf))
+    }
+
+    fn load_branch_preview(
+        &self,
+        session_id: &SessionId,
+        branch_root: &EntryId,
+    ) -> Result<SessionBranchPreview, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        session_branch_preview(&session.entries, branch_root)
+    }
+
+    fn load_branch_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        session_branch_tree_snapshot(&session.entries, session.leaf.as_ref())
+    }
 }
 
 impl SessionCatalogStore for InMemorySessionStore {
@@ -271,6 +354,54 @@ impl SessionCatalogStore for InMemorySessionStore {
         session_id: &SessionId,
     ) -> Result<Option<SessionSummary>, CatalogError> {
         self.sessions.get(session_id).map(Self::summary).transpose()
+    }
+}
+
+impl ProjectSessionStore for InMemorySessionStore {
+    fn list_project_sessions(
+        &self,
+        project_id: &str,
+        mut query: CatalogQuery,
+    ) -> Result<CatalogPage, CatalogError> {
+        query.project_id = Some(project_id.to_string());
+        self.list_sessions(SessionDomain::Agent, query)
+    }
+
+    fn load_project_session(
+        &self,
+        project_id: &str,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<ResolvedSessionState, SessionError> {
+        if session_id.domain() != SessionDomain::Agent {
+            return Err(SessionError::DomainMismatch {
+                header: SessionDomain::Agent,
+                id: session_id.domain(),
+            });
+        }
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        let Some(SessionEntry {
+            kind: SessionEntryKind::Header(header),
+            ..
+        }) = session.entries.first()
+        else {
+            return Err(SessionError::MissingHeader);
+        };
+        let actual = header
+            .project
+            .as_ref()
+            .ok_or(SessionError::AgentMissingProject)?;
+        if actual.project_id != project_id {
+            return Err(SessionError::ProjectMismatch {
+                session_id: session_id.clone(),
+                expected: project_id.to_string(),
+                actual: actual.project_id.clone(),
+            });
+        }
+        resolve_session(&session.entries, leaf.or(session.leaf.as_ref()))
     }
 }
 
