@@ -202,6 +202,62 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
     });
 }
 
+#[gpui::test]
+fn terminal_persistence_failure_unblocks_chat_and_notifies_the_user(cx: &mut TestAppContext) {
+    init_app(cx);
+    cx.update(|cx| {
+        let mut store = InMemorySessionStore::new();
+        // begin_turn writes the user message first; fail the terminal batch.
+        store.fail_append_at_for_test(2);
+        cx.set_global(SessionStores::with_chat_store(store));
+    });
+
+    let (chat, cx) = add_chat_window(cx);
+    let selection = ModelSelection {
+        profile_id: "profile".into(),
+        model_id: "model-a".into(),
+    };
+    let user = LlmMessage {
+        role: crate::llm::Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".into(),
+            provider_metadata: ProviderMetadata::default(),
+        }],
+        provider_metadata: ProviderMetadata::default(),
+    };
+    let turn_id = "turn-1".to_string();
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let start = this
+                .session_controller
+                .as_mut()
+                .expect("controller")
+                .begin_turn(user.clone(), selection, turn_id.clone())
+                .expect("begin");
+            this.conversation_id = start.session_id.to_string();
+            this.pending = true;
+            this.pending_turn_id = Some(turn_id);
+            this.messages.push(Message::from_canonical(user, cx));
+            this.messages.push(Message::empty(Role::Assistant));
+            this.finish_reply_with_terminal(None, ChatTurnTerminal::cancelled(), None, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        chat.read_with(cx, |this, _| {
+            assert!(!this.pending);
+            assert!(this.pending_turn_id.is_none());
+            assert!(this.pending_terminal.is_some());
+        });
+        let notifications = gpui_component::Root::read(window, cx)
+            .notification
+            .read(cx)
+            .notifications();
+        assert_eq!(notifications.len(), 1);
+    });
+}
+
 fn redraw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
     cx.update(|window, cx| {

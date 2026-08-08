@@ -372,6 +372,7 @@ pub fn session_branch_tree_snapshot(
         .collect::<HashSet<_>>();
     let branch_root_ids = branch_root_ids(entries, &by_id, &visible_entries, &visible_ids)?;
     let root_set = branch_root_ids.iter().cloned().collect::<HashSet<_>>();
+    let branch_stats = branch_stats(entries, &by_id, &visible_ids, &root_set)?;
     let current_branch_root_id = active_path
         .iter()
         .rev()
@@ -384,12 +385,15 @@ pub fn session_branch_tree_snapshot(
             .get(&root_id)
             .copied()
             .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
-        let latest_row = latest_visible_descendant(entries, &by_id, &visible_ids, &root_id)?;
-        let subtree_leaf = latest_non_leaf_descendant(entries, &by_id, &root_id)?;
-        let row_count = visible_entries
-            .iter()
-            .filter(|entry| is_descendant(entry, &root_id, &by_id))
-            .count();
+        let stats = branch_stats
+            .get(&root_id)
+            .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
+        let latest_row = stats
+            .latest_row
+            .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
+        let subtree_leaf = stats
+            .subtree_leaf
+            .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
         let parent_branch_root_id = nearest_branch_parent(root, &by_id, &visible_ids, &root_set)?;
         nodes.push(SessionBranchTreeNode {
             parent_branch_root_id,
@@ -400,7 +404,7 @@ pub fn session_branch_tree_snapshot(
                 preview: row_preview(latest_row),
                 is_current: current_branch_root_id.as_ref() == Some(&root_id)
                     || active_ids.contains(&root_id) && current_branch_root_id.is_none(),
-                row_count,
+                row_count: stats.row_count,
                 created_at: root.timestamp,
                 updated_at: latest_row.timestamp,
             },
@@ -511,6 +515,8 @@ fn branch_choices_by_parent(
     active_ids: &HashSet<EntryId>,
 ) -> Result<HashMap<EntryId, Vec<SessionTreeBranchChoice>>, SessionError> {
     let branch_root_ids = branch_root_ids(entries, by_id, visible_entries, visible_ids)?;
+    let root_set = branch_root_ids.iter().cloned().collect::<HashSet<_>>();
+    let branch_stats = branch_stats(entries, by_id, visible_ids, &root_set)?;
     let mut by_parent = HashMap::<EntryId, Vec<EntryId>>::new();
     for root_id in branch_root_ids {
         let root = by_id
@@ -535,12 +541,15 @@ fn branch_choices_by_parent(
                     .get(&root_id)
                     .copied()
                     .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
-                let latest_row = latest_visible_descendant(entries, by_id, visible_ids, &root_id)?;
-                let subtree_leaf = latest_non_leaf_descendant(entries, by_id, &root_id)?;
-                let row_count = visible_entries
-                    .iter()
-                    .filter(|entry| is_descendant(entry, &root_id, by_id))
-                    .count();
+                let stats = branch_stats
+                    .get(&root_id)
+                    .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
+                let latest_row = stats
+                    .latest_row
+                    .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
+                let subtree_leaf = stats
+                    .subtree_leaf
+                    .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))?;
                 Ok(SessionTreeBranchChoice {
                     branch: SessionBranchSummary {
                         branch_root_id: root_id.clone(),
@@ -548,7 +557,7 @@ fn branch_choices_by_parent(
                         latest_row_id: latest_row.id.clone(),
                         preview: row_preview(latest_row),
                         is_current: active_ids.contains(&root_id),
-                        row_count,
+                        row_count: stats.row_count,
                         created_at: root.timestamp,
                         updated_at: latest_row.timestamp,
                     },
@@ -636,56 +645,52 @@ fn nearest_branch_parent(
     Ok(None)
 }
 
-fn latest_visible_descendant<'a>(
+#[derive(Default)]
+struct BranchStats<'a> {
+    latest_row: Option<&'a SessionEntry>,
+    subtree_leaf: Option<&'a SessionEntry>,
+    row_count: usize,
+}
+
+fn branch_stats<'a>(
     entries: &'a [SessionEntry],
     by_id: &HashMap<EntryId, &'a SessionEntry>,
     visible_ids: &HashSet<EntryId>,
-    root_id: &EntryId,
-) -> Result<&'a SessionEntry, SessionError> {
-    entries
+    branch_root_ids: &HashSet<EntryId>,
+) -> Result<HashMap<EntryId, BranchStats<'a>>, SessionError> {
+    let mut stats = branch_root_ids
         .iter()
-        .rev()
-        .find(|entry| visible_ids.contains(&entry.id) && is_descendant(entry, root_id, by_id))
-        .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))
-}
-
-fn latest_non_leaf_descendant<'a>(
-    entries: &'a [SessionEntry],
-    by_id: &HashMap<EntryId, &'a SessionEntry>,
-    root_id: &EntryId,
-) -> Result<&'a SessionEntry, SessionError> {
-    entries
-        .iter()
-        .rev()
-        .find(|entry| {
-            !matches!(entry.kind, SessionEntryKind::Leaf(_)) && is_descendant(entry, root_id, by_id)
-        })
-        .ok_or_else(|| SessionError::BranchNotFound(root_id.clone()))
-}
-
-fn is_descendant(
-    entry: &SessionEntry,
-    root_id: &EntryId,
-    by_id: &HashMap<EntryId, &SessionEntry>,
-) -> bool {
-    if entry.id == *root_id {
-        return true;
-    }
-    let mut current = entry.parent_id.clone();
-    let mut seen = HashSet::new();
-    while let Some(id) = current {
-        if id == *root_id {
-            return true;
+        .cloned()
+        .map(|root_id| (root_id, BranchStats::default()))
+        .collect::<HashMap<_, _>>();
+    for entry in entries {
+        let mut current = Some(entry.id.clone());
+        let mut seen = HashSet::new();
+        while let Some(id) = current {
+            if !seen.insert(id.clone()) {
+                return Err(SessionError::CycleDetected);
+            }
+            if branch_root_ids.contains(&id) {
+                let branch = stats
+                    .get_mut(&id)
+                    .ok_or_else(|| SessionError::BranchNotFound(id.clone()))?;
+                if visible_ids.contains(&entry.id) {
+                    branch.latest_row = Some(entry);
+                    branch.row_count = branch.row_count.saturating_add(1);
+                }
+                if !matches!(entry.kind, SessionEntryKind::Leaf(_)) {
+                    branch.subtree_leaf = Some(entry);
+                }
+            }
+            current = by_id
+                .get(&id)
+                .copied()
+                .ok_or_else(|| SessionError::DanglingParent(id.clone()))?
+                .parent_id
+                .clone();
         }
-        if !seen.insert(id.clone()) {
-            return false;
-        }
-        let Some(parent) = by_id.get(&id).copied() else {
-            return false;
-        };
-        current = parent.parent_id.clone();
     }
-    false
+    Ok(stats)
 }
 
 pub fn resolve_session(

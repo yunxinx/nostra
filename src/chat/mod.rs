@@ -15,16 +15,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, ElementId, Entity, EventEmitter,
-    FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
-    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Window, div, list, point, px,
+    AnyElement, AnyWindowHandle, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
+    EventEmitter, FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset,
+    ListState, ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _,
+    Subscription, Window, div, list, point, px,
 };
 use gpui_component::{
     ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
+    WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, RopeExt as _},
+    notification::NotificationType,
     scroll::ScrollableElement as _,
     text::{TextView, TextViewStyle},
     v_flex,
@@ -417,6 +419,7 @@ pub enum ChatEvent {
 }
 
 pub struct ChatView {
+    window_handle: AnyWindowHandle,
     messages: Vec<Message>,
     input: Entity<InputState>,
     /// Placeholder text currently installed in the input state.  Compared
@@ -446,6 +449,9 @@ pub struct ChatView {
     session_controller: Option<ChatSessionControllerHandle>,
     /// Active turn id retained until the durable terminal write settles.
     pending_turn_id: Option<String>,
+    /// Terminal fact retained for an automatic retry on the next submit after
+    /// a transient catalog/JSONL failure.
+    pending_terminal: Option<(String, ChatTurnTerminal)>,
     conversation_id: String,
     next_turn_id: u64,
     _subscriptions: Vec<Subscription>,
@@ -474,7 +480,7 @@ impl ChatView {
                 |this, input, event, window, cx| match event {
                     InputEvent::PressEnter { shift, .. } if !shift => {
                         let text = input.read(cx).value().trim().to_string();
-                        if this.submit(text, cx) {
+                        if this.submit(text, window, cx) {
                             this.input_empty = true;
                             input.update(cx, |state, cx| state.set_value("", window, cx));
                         }
@@ -513,6 +519,7 @@ impl ChatView {
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
         Self {
+            window_handle: window.window_handle(),
             messages: Vec::new(),
             input,
             placeholder,
@@ -531,6 +538,7 @@ impl ChatView {
                 .and_then(|stores| stores.chat())
                 .map(ChatSessionController::new),
             pending_turn_id: None,
+            pending_terminal: None,
             conversation_id: format!(
                 "conversation-{}",
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
@@ -563,7 +571,28 @@ impl ChatView {
     /// Submit a non-empty message when no reply is already in flight.
     /// Returns whether the message was accepted so callers only clear the
     /// composer after a successful submission.
-    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+    fn submit(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some((turn_id, terminal)) = self.pending_terminal.clone()
+            && let Some(controller) = self.session_controller.as_mut()
+        {
+            match controller.finish_turn(&turn_id, &terminal) {
+                Ok(()) => {
+                    self.pending_terminal = None;
+                    self.pending_turn_id = None;
+                }
+                Err(error) => {
+                    eprintln!("failed to retry chat turn `{turn_id}`: {error:?}");
+                    window.push_notification(
+                        (
+                            NotificationType::Error,
+                            t!("chat.error.persistence_retry_failed").to_string(),
+                        ),
+                        cx,
+                    );
+                    return false;
+                }
+            }
+        }
         self.sync_selection_availability(cx);
         if self.pending
             || text.is_empty()
@@ -596,6 +625,14 @@ impl ChatView {
                 Ok(start) => start,
                 Err(error) => {
                     eprintln!("failed to start chat turn `{turn_id}`: {error:?}");
+                    window.push_notification(
+                        (
+                            NotificationType::Error,
+                            t!("chat.error.persistence_start_failed").to_string(),
+                        ),
+                        cx,
+                    );
+                    cx.notify();
                     return false;
                 }
             };
@@ -680,13 +717,33 @@ impl ChatView {
         {
             match controller.finish_turn(&turn_id, &terminal) {
                 Ok(()) => persisted = true,
-                Err(error) => eprintln!("failed to persist chat turn `{turn_id}`: {error:?}"),
+                Err(error) => {
+                    eprintln!("failed to persist chat turn `{turn_id}`: {error:?}");
+                    // Keep the exact terminal fact for a retry on the next
+                    // submit. This avoids losing the turn while the visible
+                    // error card still tells the user what happened.
+                    self.pending_terminal = Some((turn_id, terminal.clone()));
+                    self.pending_turn_id = None;
+                    self.notify_persistence_failure(cx);
+                    cx.notify();
+                }
             }
         }
         if persisted {
             self.pending_turn_id = None;
+            self.pending_terminal = None;
         }
         self.finish_reply_visual(message, error, cx);
+    }
+
+    fn notify_persistence_failure(&self, cx: &mut Context<Self>) {
+        let window_handle = self.window_handle;
+        let message = t!("chat.error.persistence_finish_failed").to_string();
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                window.push_notification((NotificationType::Error, message), cx);
+            });
+        });
     }
 
     fn finish_reply_visual(
@@ -1091,7 +1148,7 @@ impl ChatView {
 
     fn on_send_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.input.read(cx).value().trim().to_string();
-        if self.submit(text, cx) {
+        if self.submit(text, window, cx) {
             self.input_empty = true;
             self.input
                 .update(cx, |state, cx| state.set_value("", window, cx));

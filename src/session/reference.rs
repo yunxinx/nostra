@@ -11,6 +11,8 @@ use super::{
 };
 
 pub const DEFAULT_REFERENCE_PAGE_SIZE: usize = 30;
+pub const MAX_REFERENCE_MESSAGE_BYTES: usize = 50 * 1024;
+const MAX_REFERENCE_MESSAGE_CHARS: usize = 50 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessageSearchCursor {
@@ -198,6 +200,8 @@ pub enum ChatReferenceError {
     Catalog(#[from] CatalogError),
     #[error("Chat reference read failed: {0}")]
     Storage(#[source] SessionError),
+    #[error("Chat message exceeds the {limit}-byte reference limit")]
+    TooLarge { limit: usize },
 }
 
 pub trait ChatMessageReferenceStore {
@@ -286,12 +290,28 @@ pub(crate) fn message_from_entry(
             ChatMessageUnavailableReason::MessageDeleted,
         ));
     };
+    let safe_message = ReferencedMessage::from_message(&message.message);
+    let encoded_size = serde_json::to_vec(&safe_message)
+        .map_err(|error| {
+            ChatReferenceError::Storage(SessionError::io(std::io::Error::other(error)))
+        })?
+        .len();
+    if encoded_size > MAX_REFERENCE_MESSAGE_BYTES {
+        return Err(ChatReferenceError::TooLarge {
+            limit: MAX_REFERENCE_MESSAGE_BYTES,
+        });
+    }
+    if safe_message.searchable_text().chars().count() > MAX_REFERENCE_MESSAGE_CHARS {
+        return Err(ChatReferenceError::TooLarge {
+            limit: MAX_REFERENCE_MESSAGE_BYTES,
+        });
+    }
     Ok(ChatMessageRead {
         reference: reference.clone(),
         session_title: summary.title.clone(),
         session_created_at: summary.created_at,
         timestamp: entry.timestamp,
-        message: ReferencedMessage::from_message(&message.message),
+        message: safe_message,
     })
 }
 
@@ -456,6 +476,86 @@ mod tests {
             LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
                 .expect("open local Chat store"),
         );
+    }
+
+    fn exercise_active_leaf_search<S>(mut store: S)
+    where
+        S: SessionStore + ChatMessageReferenceStore,
+    {
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let session_id = header.session_id.clone();
+        store.create_session(header).expect("create session");
+        let kept = store
+            .append(&session_id, vec![sensitive_message("kept")])
+            .expect("append kept")[0]
+            .clone();
+        let hidden = store
+            .append(&session_id, vec![sensitive_message("stale secret")])
+            .expect("append hidden")[0]
+            .clone();
+        store
+            .set_leaf(&session_id, Some(&kept))
+            .expect("rewind active leaf");
+
+        assert!(
+            store
+                .search_chat_messages(ChatMessageSearchQuery::new("stale secret"))
+                .expect("search active path")
+                .messages
+                .is_empty()
+        );
+        let hidden_reference = ChatMessageRef::new(session_id, hidden).expect("reference");
+        assert!(matches!(
+            store.read_chat_message(&hidden_reference),
+            Err(ChatReferenceError::Unavailable(ChatMessageUnavailable {
+                reason: ChatMessageUnavailableReason::MessageDeleted,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn search_and_read_follow_the_active_leaf() {
+        exercise_active_leaf_search(InMemorySessionStore::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        exercise_active_leaf_search(
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open local Chat store"),
+        );
+    }
+
+    #[test]
+    fn local_and_memory_search_use_unicode_case_insensitive_matching() {
+        fn exercise<S>(mut store: S)
+        where
+            S: SessionStore + ChatMessageReferenceStore,
+        {
+            let (session_id, _) = create_chat(&mut store, "МОСКВА");
+            let page = store
+                .search_chat_messages(ChatMessageSearchQuery::new("москва"))
+                .expect("unicode search");
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].reference.session_id, session_id);
+        }
+
+        exercise(InMemorySessionStore::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        exercise(
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open local Chat store"),
+        );
+    }
+
+    #[test]
+    fn oversized_reference_reads_are_rejected() {
+        let mut store = InMemorySessionStore::new();
+        let (session_id, entry_id) =
+            create_chat(&mut store, &"x".repeat(MAX_REFERENCE_MESSAGE_BYTES));
+        let reference = ChatMessageRef::new(session_id, entry_id).expect("reference");
+        assert!(matches!(
+            store.read_chat_message(&reference),
+            Err(ChatReferenceError::TooLarge { .. })
+        ));
     }
 
     #[test]

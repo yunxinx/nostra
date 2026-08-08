@@ -44,9 +44,10 @@ pub use memory::{
 pub use reference::{
     AgentChatReferenceTool, ChatMessagePreview, ChatMessageRead, ChatMessageReferenceStore,
     ChatMessageSearchCursor, ChatMessageSearchPage, ChatMessageSearchQuery, ChatMessageUnavailable,
-    ChatMessageUnavailableReason, ChatReferenceError, ReferencedContentBlock, ReferencedMessage,
+    ChatMessageUnavailableReason, ChatReferenceError, MAX_REFERENCE_MESSAGE_BYTES,
+    ReferencedContentBlock, ReferencedMessage,
 };
-pub use service::{SessionStores, SharedSessionStore};
+pub use service::{SessionStores, SessionStoresError, SharedSessionStore};
 pub use tree::{
     ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,
     ResolvedTurnResult, SessionBranchPreview, SessionBranchSummary, SessionBranchTreeNode,

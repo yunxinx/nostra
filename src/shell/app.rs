@@ -166,7 +166,9 @@ impl ChatApp {
     /// shutdown; gpui awaits the returned task before exiting.
     fn register_save_on_quit(&self, cx: &mut Context<Self>) {
         cx.on_app_quit(|this, cx| {
-            if let Err(error) = cx.global_mut::<SessionStores>().flush() {
+            if let Some(mut stores) = cx.try_global::<SessionStores>().cloned()
+                && let Err(error) = stores.flush()
+            {
                 eprintln!("failed to flush session store before exit: {error:?}");
             }
             let sidebar_width = this.sidebar_width.as_f32();

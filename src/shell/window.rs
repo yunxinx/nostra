@@ -70,7 +70,15 @@ const MIN_SIZE: Size<Pixels> = Size {
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
-    cx.set_global(SessionStores::open_default());
+    let stores = match SessionStores::open_default() {
+        Ok(stores) => stores,
+        Err(error) => {
+            eprintln!("failed to open persistent session stores: {error}");
+            cx.quit();
+            return;
+        }
+    };
+    cx.set_global(stores);
 
     cx.spawn(async move |cx| -> Result<()> {
         let options = WindowOptions {

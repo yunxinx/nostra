@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +16,7 @@ use super::{
     SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain, SessionEntry, SessionEntryKind,
     SessionError, SessionFlushStore, SessionHeader, SessionId, SessionLifecycleStore,
     SessionSummary, SessionTreeSnapshot, SessionTreeStore,
-    catalog::{Catalog, CatalogPage, CatalogQuery, RepairReport},
+    catalog::{Catalog, CatalogPage, CatalogQuery, RepairReport, SessionProjection},
     reference::{
         ChatMessageUnavailableReason, message_from_entry, preview_from_node, unavailable,
         validate_reference,
@@ -36,8 +35,6 @@ pub enum LocalStoreError {
     },
     #[error("session `{0}` does not exist in the local store")]
     SessionNotFound(SessionId),
-    #[error("session operation lock is poisoned")]
-    OperationPoisoned,
     #[error("session operation failed: {0}")]
     Session(#[from] SessionError),
     #[error("session catalog operation failed: {0}")]
@@ -95,8 +92,13 @@ struct LocalHandle {
     path: PathBuf,
     recorder: JsonlRecorder,
     entries: Vec<SessionEntry>,
+    projection: SessionProjection,
+    /// A JSONL commit can succeed while its SQLite transaction fails. The
+    /// next write must replace the entire disposable projection before using
+    /// incremental node insertion again.
+    catalog_dirty: bool,
+    source_stamp: Option<(u64, SystemTime)>,
     last_used: u64,
-    operation_lock: Mutex<()>,
 }
 
 pub struct LocalSessionStore {
@@ -122,6 +124,14 @@ impl LocalSessionStore {
         Self::open(LocalStoreConfig::default_for(domain)?)
     }
 
+    pub fn repair_if_needed(&mut self) -> Result<bool, LocalStoreError> {
+        if !self.catalog.needs_repair() {
+            return Ok(false);
+        }
+        self.repair()?;
+        Ok(true)
+    }
+
     #[must_use]
     pub fn config(&self) -> &LocalStoreConfig {
         &self.config
@@ -135,6 +145,11 @@ impl LocalSessionStore {
     #[must_use]
     pub fn open_handle_count(&self) -> usize {
         self.handles.len()
+    }
+
+    #[cfg(test)]
+    fn projection_write_counts(&self) -> (u64, u64) {
+        self.catalog.projection_write_counts()
     }
 
     pub fn list(&self, query: CatalogQuery) -> Result<CatalogPage, LocalStoreError> {
@@ -203,6 +218,7 @@ impl LocalSessionStore {
         }
         report.removed = self.catalog.remove_stale(&valid_ids)?;
         self.catalog.mark_repair(&now_millis().to_string())?;
+        self.catalog.clear_repair_needed();
         Ok(report)
     }
 
@@ -233,6 +249,9 @@ impl LocalSessionStore {
             let header = loaded.header()?.clone();
             self.validate_header(session_id, &header)?;
             let recorder = JsonlRecorder::open(&path)?;
+            let projection = SessionProjection::from_entries(&header, &loaded.entries)
+                .map_err(session_io_error)?;
+            let source_stamp = source_stamp(&path);
             self.handles.insert(
                 session_id.clone(),
                 LocalHandle {
@@ -240,10 +259,41 @@ impl LocalSessionStore {
                     path,
                     recorder,
                     entries: loaded.entries,
+                    projection,
+                    // A handle may be opened after an external writer changed
+                    // the source while this process had no handle. Reconcile
+                    // its disposable projection on the first mutation.
+                    catalog_dirty: true,
+                    source_stamp,
                     last_used: 0,
-                    operation_lock: Mutex::new(()),
                 },
             );
+        }
+        // An external writer may have advanced the source since this handle
+        // was opened. Flush any local pending batch, then reopen from the
+        // source so subsequent writes use a fresh parent graph.
+        let stale = self
+            .handles
+            .get(session_id)
+            .is_some_and(|handle| source_stamp(&handle.path) != handle.source_stamp);
+        if stale {
+            if self
+                .handles
+                .get(session_id)
+                .is_some_and(|handle| handle.recorder.has_pending())
+            {
+                let handle = self
+                    .handles
+                    .get_mut(session_id)
+                    .ok_or_else(|| LocalStoreError::SessionNotFound(session_id.clone()))?;
+                // Finish the local queue before replacing the writer with a
+                // snapshot that includes an external append. This keeps the
+                // recorder's ordering contract while avoiding a stale parent
+                // graph on the next write.
+                handle.recorder.flush()?;
+            }
+            self.handles.remove(session_id);
+            return self.ensure_handle(session_id);
         }
         self.access_counter = self.access_counter.saturating_add(1);
         if let Some(handle) = self.handles.get_mut(session_id) {
@@ -296,6 +346,11 @@ impl LocalSessionStore {
         &self,
         session_id: &SessionId,
     ) -> Result<(SessionHeader, Vec<SessionEntry>), SessionError> {
+        if let Some(handle) = self.handles.get(session_id) {
+            if source_stamp(&handle.path) == handle.source_stamp {
+                return Ok((handle.header.clone(), handle.entries.clone()));
+            }
+        }
         let path = self
             .catalog
             .path_for(session_id)
@@ -327,24 +382,19 @@ impl LocalSessionStore {
 
     fn flush_handle(&mut self, session_id: &SessionId) -> Result<(), LocalStoreError> {
         self.ensure_handle(session_id)?;
-        let (header, path, entries) = {
-            let handle = self
-                .handles
-                .get_mut(session_id)
-                .ok_or_else(|| LocalStoreError::SessionNotFound(session_id.clone()))?;
-            let _operation = handle
-                .operation_lock
-                .lock()
-                .map_err(|_| LocalStoreError::OperationPoisoned)?;
-            handle.recorder.flush()?;
-            handle.entries = Self::reload_entries(&handle.path)?;
-            (
-                handle.header.clone(),
-                handle.path.clone(),
-                handle.entries.clone(),
-            )
-        };
-        self.catalog.upsert_session(&header, &entries, &path)?;
+        let catalog = &mut self.catalog;
+        let handle = self
+            .handles
+            .get_mut(session_id)
+            .ok_or_else(|| LocalStoreError::SessionNotFound(session_id.clone()))?;
+        handle.recorder.flush()?;
+        handle.entries = Self::reload_entries(&handle.path)?;
+        handle.projection = SessionProjection::from_entries(&handle.header, &handle.entries)
+            .map_err(session_io_error)?;
+        handle.source_stamp = source_stamp(&handle.path);
+        let result = catalog.upsert_projection(&handle.header, &handle.projection, &handle.path);
+        handle.catalog_dirty = result.is_err();
+        result?;
         Ok(())
     }
 
@@ -388,7 +438,7 @@ impl SessionLifecycleStore for LocalSessionStore {
         }
         let path = self.source_path_for_header(&header);
         let recorder = JsonlRecorder::create(&path, header.clone())?;
-        let initial_entries = JsonlLoader::load(&path).map_err(session_io_error)?.entries;
+        let initial_entries = JsonlLoader::load(&path)?.entries;
         self.handles.insert(
             header.session_id.clone(),
             LocalHandle {
@@ -396,15 +446,26 @@ impl SessionLifecycleStore for LocalSessionStore {
                 path: path.clone(),
                 recorder,
                 entries: initial_entries.clone(),
+                projection: SessionProjection::from_entries(&header, &initial_entries)
+                    .map_err(session_io_error)?,
+                catalog_dirty: true,
+                source_stamp: source_stamp(&path),
                 last_used: 0,
-                operation_lock: Mutex::new(()),
             },
         );
-        let result = self
-            .catalog
-            .upsert_session(&header, &initial_entries, &path)
-            .map_err(session_io_error);
-        result?;
+        let projection = self
+            .handles
+            .get(&header.session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(header.session_id.clone()))?
+            .projection
+            .clone();
+        let result = self.catalog.upsert_projection(&header, &projection, &path);
+        if result.is_ok()
+            && let Some(handle) = self.handles.get_mut(&header.session_id)
+        {
+            handle.catalog_dirty = false;
+        }
+        result.map_err(session_io_error)?;
         self.evict_handles();
         Ok(header.session_id)
     }
@@ -418,31 +479,70 @@ impl SessionLifecycleStore for LocalSessionStore {
             return Ok(Vec::new());
         }
         self.ensure_handle(session_id).map_err(session_io_error)?;
-        let (ids, header, path, committed_entries) = {
-            let handle = self
-                .handles
-                .get_mut(session_id)
-                .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
-            let _operation = handle.operation_lock.lock().map_err(|_| SessionError::Io {
-                source: std::io::Error::other("session operation lock is poisoned"),
-            })?;
-            let ids = match handle.recorder.append_batch(entries.clone()) {
-                Ok(ids) => ids,
-                Err(error) => {
-                    return Err(error);
+        let requested_count = entries.len();
+        let catalog = &mut self.catalog;
+        let handle = self
+            .handles
+            .get_mut(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        let appended = match handle.recorder.append_batch(entries) {
+            Ok(appended) => appended,
+            Err(error) => {
+                // Retrying an older pending batch can commit it before the
+                // current batch fails. Re-read the source on this exceptional
+                // path so the handle and catalog do not omit facts that are
+                // already durable.
+                handle.catalog_dirty = true;
+                if let Ok(reloaded) = Self::reload_entries(&handle.path)
+                    && let Ok(projection) =
+                        SessionProjection::from_entries(&handle.header, &reloaded)
+                {
+                    handle.entries = reloaded;
+                    handle.projection = projection;
+                    handle.source_stamp = source_stamp(&handle.path);
+                    let result =
+                        catalog.upsert_projection(&handle.header, &handle.projection, &handle.path);
+                    handle.catalog_dirty = result.is_err();
                 }
-            };
-            handle.entries = Self::reload_entries(&handle.path).map_err(session_io_error)?;
-            (
-                ids,
-                handle.header.clone(),
-                handle.path.clone(),
-                handle.entries.clone(),
-            )
+                return Err(error);
+            }
         };
-        self.catalog
-            .upsert_session(&header, &committed_entries, &path)
-            .map_err(session_io_error)?;
+        let current_batch_start = appended.len().checked_sub(requested_count).ok_or_else(|| {
+            SessionError::io(std::io::Error::other(
+                "session recorder returned fewer entries than requested",
+            ))
+        })?;
+        let ids = appended[current_batch_start..]
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let has_leaf_change = appended
+            .iter()
+            .any(|entry| matches!(entry.kind, SessionEntryKind::Leaf(_)));
+        handle.entries.extend(appended.iter().cloned());
+        handle.source_stamp = source_stamp(&handle.path);
+
+        let catalog_result = if handle.catalog_dirty || has_leaf_change {
+            match SessionProjection::from_entries(&handle.header, &handle.entries) {
+                Ok(projection) => {
+                    handle.projection = projection;
+                    catalog.upsert_projection(&handle.header, &handle.projection, &handle.path)
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            match handle.projection.append_entries(&appended) {
+                Ok(appended_messages) => catalog.append_projection(
+                    &handle.header,
+                    &handle.projection,
+                    &appended_messages,
+                    &handle.path,
+                ),
+                Err(error) => Err(error),
+            }
+        };
+        handle.catalog_dirty = catalog_result.is_err();
+        catalog_result.map_err(session_io_error)?;
         Ok(ids)
     }
 
@@ -462,25 +562,19 @@ impl SessionTreeStore for LocalSessionStore {
         leaf: Option<&EntryId>,
     ) -> Result<(), SessionError> {
         self.ensure_handle(session_id).map_err(session_io_error)?;
-        let (header, path, entries) = {
-            let handle = self
-                .handles
-                .get_mut(session_id)
-                .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
-            let _operation = handle.operation_lock.lock().map_err(|_| SessionError::Io {
-                source: std::io::Error::other("session operation lock is poisoned"),
-            })?;
-            handle.recorder.set_leaf(leaf)?;
-            handle.entries = Self::reload_entries(&handle.path).map_err(session_io_error)?;
-            (
-                handle.header.clone(),
-                handle.path.clone(),
-                handle.entries.clone(),
-            )
-        };
-        self.catalog
-            .upsert_session(&header, &entries, &path)
-            .map_err(session_io_error)
+        let catalog = &mut self.catalog;
+        let handle = self
+            .handles
+            .get_mut(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        handle.recorder.set_leaf(leaf)?;
+        handle.entries = Self::reload_entries(&handle.path).map_err(session_io_error)?;
+        handle.projection = SessionProjection::from_entries(&handle.header, &handle.entries)
+            .map_err(session_io_error)?;
+        handle.source_stamp = source_stamp(&handle.path);
+        let result = catalog.upsert_projection(&handle.header, &handle.projection, &handle.path);
+        handle.catalog_dirty = result.is_err();
+        result.map_err(session_io_error)
     }
 
     fn load_session_tree(
@@ -619,14 +713,13 @@ impl ChatMessageReferenceStore for LocalSessionStore {
             }));
         }
         let limit = query.bounded_limit();
+        let folded_query = query.text.to_lowercase();
         let mut rows = self
             .catalog
-            .search_message_nodes(&query.text, query.cursor.as_ref(), limit)
+            .search_message_nodes(&folded_query, query.cursor.as_ref(), limit)
             .map_err(ChatReferenceError::Catalog)?;
         let has_more = rows.len() > limit;
-        if has_more {
-            rows.pop();
-        }
+        rows.truncate(limit);
         let next_cursor = has_more
             .then(|| {
                 rows.last().map(|row| ChatMessageSearchCursor {
@@ -693,6 +786,14 @@ impl ChatMessageReferenceStore for LocalSessionStore {
                 ));
             }
         }
+        let active = resolve_session(&loaded.entries, None)
+            .map_err(|_| unavailable(reference, ChatMessageUnavailableReason::SourceCorrupt))?;
+        if !active.path.iter().any(|id| id == &reference.entry_id) {
+            return Err(unavailable(
+                reference,
+                ChatMessageUnavailableReason::MessageDeleted,
+            ));
+        }
         let entry = loaded
             .entries
             .iter()
@@ -721,9 +822,14 @@ fn collect_jsonl_paths(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     Ok(result)
 }
 
-fn session_io_error(error: impl std::fmt::Display) -> SessionError {
+fn session_io_error<E>(error: E) -> SessionError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
     SessionError::Io {
-        source: std::io::Error::other(error.to_string()),
+        // Keep the typed catalog/store error as the io::Error source instead
+        // of flattening it to a diagnostic string at the trait boundary.
+        source: std::io::Error::other(error),
     }
 }
 
@@ -734,6 +840,11 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+fn source_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -742,7 +853,7 @@ mod tests {
     use crate::llm::{ContentBlock, Message, ModelSelection, Role, Usage};
     use crate::session::{
         BranchSummary, Compaction, ConfigChange, InMemorySessionStore, JsonlWriter,
-        ProjectIdentity, SessionStore, TranscriptReplay,
+        ProjectIdentity, SessionStore, TranscriptReplay, TurnResult, TurnStatus,
     };
 
     fn message(text: &str) -> SessionEntryKind {
@@ -1224,6 +1335,35 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_append_updates_catalog_incrementally() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open");
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        let (full_before, incremental_before) = store.projection_write_counts();
+        for index in 0..500 {
+            store
+                .append(&id, vec![message(&format!("message-{index}"))])
+                .expect("append");
+        }
+        let (full_after, incremental_after) = store.projection_write_counts();
+        assert_eq!(full_after, full_before);
+        assert_eq!(incremental_after.saturating_sub(incremental_before), 500);
+        assert_eq!(
+            store
+                .get_summary(&id)
+                .expect("summary")
+                .expect("row")
+                .preview
+                .as_deref(),
+            Some("message-499")
+        );
+    }
+
+    #[test]
     fn agent_project_location_updates_keep_sessions_in_the_same_stable_bucket() {
         let root = tempfile::tempdir().expect("tempdir");
         let mut store =
@@ -1386,6 +1526,43 @@ mod tests {
     }
 
     #[test]
+    fn partial_sqlite_schema_is_treated_as_a_rebuildable_projection() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = LocalStoreConfig::new(root.path(), SessionDomain::Chat);
+        let mut store = LocalSessionStore::open(config.clone()).expect("open");
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        let source = store
+            .get_summary(&id)
+            .expect("summary")
+            .expect("row")
+            .jsonl_path;
+        store.shutdown().expect("shutdown");
+
+        let connection = rusqlite::Connection::open(config.index_path()).expect("index");
+        connection
+            .execute_batch(
+                "DROP TABLE message_nodes;
+                 CREATE TABLE message_nodes (session_id TEXT PRIMARY KEY NOT NULL);",
+            )
+            .expect("partial schema");
+        drop(connection);
+
+        let mut reopened = LocalSessionStore::open(config).expect("reopen");
+        assert!(source.exists());
+        assert!(reopened.repair_if_needed().expect("repair if needed"));
+        assert_eq!(
+            reopened
+                .list(CatalogQuery::first_page())
+                .expect("list")
+                .sessions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn handle_cache_is_bounded_and_delete_closes_active_handle() {
         let root = tempfile::tempdir().expect("tempdir");
         let config =
@@ -1427,6 +1604,106 @@ mod tests {
         );
         store.shutdown().expect("shutdown");
         assert_eq!(store.open_handle_count(), 0);
+    }
+
+    #[test]
+    fn append_after_failure_persists_pending_and_current_batches_but_returns_current_ids() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open");
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        store.fail_next_append_for_test(&id);
+        assert!(store.append(&id, vec![message("pending")]).is_err());
+
+        let returned = store
+            .append(&id, vec![message("current")])
+            .expect("retry pending before current");
+        assert_eq!(returned.len(), 1);
+        let resolved = store.load_session(&id, None).expect("load");
+        assert_eq!(resolved.messages.len(), 2);
+        assert_eq!(returned[0], resolved.messages[1].entry_id);
+        assert_eq!(
+            store
+                .get_summary(&id)
+                .expect("summary")
+                .expect("row")
+                .preview
+                .as_deref(),
+            Some("current")
+        );
+    }
+
+    #[test]
+    fn append_failure_reconciles_a_pending_batch_committed_before_the_current_failure() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open");
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let id = header.session_id.clone();
+        store.create_session(header).expect("create");
+
+        store.fail_next_append_for_test(&id);
+        assert!(store.append(&id, vec![message("first")]).is_err());
+        store.fail_next_append_for_test(&id);
+        assert!(store.append(&id, vec![message("second")]).is_err());
+
+        let returned = store
+            .append(&id, vec![message("third")])
+            .expect("retry second before third");
+        let resolved = store.load_session(&id, None).expect("load");
+        assert_eq!(resolved.messages.len(), 3);
+        assert_eq!(returned.len(), 1);
+        assert_eq!(returned[0], resolved.messages[2].entry_id);
+        assert_eq!(
+            store
+                .get_summary(&id)
+                .expect("summary")
+                .expect("row")
+                .preview
+                .as_deref(),
+            Some("third")
+        );
+    }
+
+    #[test]
+    fn incremental_projection_deduplicates_usage_across_batches() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut store =
+            LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+                .expect("open");
+        let header = SessionHeader::new(SessionDomain::Chat, None);
+        let id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        store
+            .append(&id, vec![message_with_metadata("first", None, 7)])
+            .expect("message usage");
+        store
+            .append(
+                &id,
+                vec![SessionEntryKind::TurnResult(TurnResult {
+                    turn_id: Some("turn-1".into()),
+                    status: TurnStatus::Completed,
+                    finish_reason: None,
+                    error: None,
+                    usage: Usage {
+                        total_tokens: 11,
+                        ..Usage::default()
+                    },
+                })],
+            )
+            .expect("terminal usage");
+        assert_eq!(
+            store
+                .get_summary(&id)
+                .expect("summary")
+                .expect("row")
+                .total_tokens,
+            11
+        );
     }
 
     fn exercise_store_contract(store: &mut dyn super::super::SessionStore) {

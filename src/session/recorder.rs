@@ -12,18 +12,20 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
-use super::{EntryId, JsonlWriter, SessionEntryKind, SessionError};
+use super::{EntryId, JsonlWriter, SessionEntry, SessionEntryKind, SessionError};
 
 const COMMAND_CAPACITY: usize = 64;
+const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Response<T> = SyncSender<Result<T, SessionError>>;
 
 enum RecorderCommand {
     Append {
         kinds: Vec<SessionEntryKind>,
-        response: Response<Vec<EntryId>>,
+        response: Response<Vec<SessionEntry>>,
     },
     SetLeaf {
         target: Option<EntryId>,
@@ -81,7 +83,7 @@ impl JsonlRecorder {
     pub(crate) fn append_batch(
         &self,
         kinds: Vec<SessionEntryKind>,
-    ) -> Result<Vec<EntryId>, SessionError> {
+    ) -> Result<Vec<SessionEntry>, SessionError> {
         let (response, receiver) = self.command_response();
         self.sender
             .send(RecorderCommand::Append { kinds, response })
@@ -140,15 +142,30 @@ impl Drop for JsonlRecorder {
         let Some(worker) = self.worker.take() else {
             return;
         };
-        let (response, receiver) = mpsc::sync_channel(1);
-        if self
-            .sender
-            .send(RecorderCommand::Shutdown { response })
-            .is_ok()
-        {
-            let _ = receiver.recv();
+        let sender = self.sender.clone();
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let helper = thread::Builder::new()
+            .name("nostra-session-recorder-shutdown".to_string())
+            .spawn(move || {
+                let (response, receiver) = mpsc::sync_channel(1);
+                let result = sender
+                    .send(RecorderCommand::Shutdown { response })
+                    .ok()
+                    .and_then(|()| receiver.recv().ok())
+                    .and_then(Result::ok);
+                let _ = worker.join();
+                let _ = done_tx.send(result);
+            });
+        if helper.is_err() {
+            // Dropping the worker handle detaches it. The sender/receiver
+            // lifetime then lets the recorder finish queued work or exit
+            // naturally without turning teardown into a panic.
+            return;
         }
-        let _ = worker.join();
+        // A recorder is dropped from UI-adjacent paths. Never make teardown
+        // wait forever on a blocked filesystem operation. The helper thread
+        // remains responsible for joining a worker that outlives the timeout.
+        let _ = done_rx.recv_timeout(DROP_SHUTDOWN_TIMEOUT);
     }
 }
 
@@ -164,11 +181,18 @@ fn run_worker(
     while let Ok(command) = receiver.recv() {
         match command {
             RecorderCommand::Append { kinds, response } => {
-                let result = if let Err(error) =
-                    persist_pending(&mut writer, &mut pending, &pending_state)
+                let recovered = match persist_pending(&mut writer, &mut pending, &pending_state) {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        // The new batch must remain pending too. It has not been
+                        // attempted and is part of the exact durable work queue.
+                        pending.extend(kinds);
+                        pending_state.store(true, Ordering::Release);
+                        let _ = response.send(Err(error));
+                        continue;
+                    }
+                };
                 {
-                    Err(error)
-                } else {
                     #[cfg(test)]
                     if fail_next_append {
                         fail_next_append = false;
@@ -179,30 +203,34 @@ fn run_worker(
                         ))));
                         continue;
                     }
-                    match writer.append_batch(kinds.clone()) {
-                        Ok(ids) => Ok(ids),
+                    let result = match writer.append_batch_entries(kinds.clone()) {
+                        Ok(entries) => {
+                            let mut all = recovered;
+                            all.extend(entries);
+                            Ok(all)
+                        }
                         Err(error) => {
                             pending = kinds;
                             pending_state.store(true, Ordering::Release);
                             Err(error)
                         }
-                    }
-                };
-                let _ = response.send(result);
+                    };
+                    let _ = response.send(result);
+                }
             }
             RecorderCommand::SetLeaf { target, response } => {
                 let result = persist_pending(&mut writer, &mut pending, &pending_state)
-                    .and_then(|()| writer.set_leaf(target.as_ref()));
+                    .and_then(|_| writer.set_leaf(target.as_ref()));
                 let _ = response.send(result);
             }
             RecorderCommand::Flush { response } => {
                 let result = persist_pending(&mut writer, &mut pending, &pending_state)
-                    .and_then(|()| writer.flush());
+                    .and_then(|_| writer.flush());
                 let _ = response.send(result);
             }
             RecorderCommand::Shutdown { response } => {
                 let result = persist_pending(&mut writer, &mut pending, &pending_state)
-                    .and_then(|()| writer.flush());
+                    .and_then(|_| writer.flush());
                 let _ = response.send(result);
                 return;
             }
@@ -221,16 +249,16 @@ fn persist_pending(
     writer: &mut JsonlWriter,
     pending: &mut Vec<SessionEntryKind>,
     pending_state: &AtomicBool,
-) -> Result<(), SessionError> {
+) -> Result<Vec<SessionEntry>, SessionError> {
     if pending.is_empty() {
         pending_state.store(false, Ordering::Release);
-        return Ok(());
+        return Ok(Vec::new());
     }
     let batch = std::mem::take(pending);
-    match writer.append_batch(batch.clone()) {
-        Ok(_) => {
+    match writer.append_batch_entries(batch.clone()) {
+        Ok(entries) => {
             pending_state.store(false, Ordering::Release);
-            Ok(())
+            Ok(entries)
         }
         Err(error) => {
             *pending = batch;

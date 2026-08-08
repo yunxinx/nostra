@@ -230,6 +230,17 @@ impl JsonlWriter {
         &mut self,
         kinds: Vec<SessionEntryKind>,
     ) -> Result<Vec<EntryId>, SessionError> {
+        Ok(self
+            .append_batch_entries(kinds)?
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect())
+    }
+
+    pub fn append_batch_entries(
+        &mut self,
+        kinds: Vec<SessionEntryKind>,
+    ) -> Result<Vec<SessionEntry>, SessionError> {
         if kinds.is_empty() {
             return Ok(Vec::new());
         }
@@ -248,13 +259,9 @@ impl JsonlWriter {
             };
             entries.push(entry);
         }
-        let ids = entries
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect::<Vec<_>>();
         self.write_entries(&entries)?;
         self.leaf = parent;
-        Ok(ids)
+        Ok(entries)
     }
 
     pub fn set_leaf(&mut self, target: Option<&EntryId>) -> Result<EntryId, SessionError> {

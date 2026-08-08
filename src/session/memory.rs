@@ -110,6 +110,10 @@ struct MemorySession {
 #[derive(Default)]
 pub struct InMemorySessionStore {
     sessions: HashMap<SessionId, MemorySession>,
+    #[cfg(test)]
+    append_calls: usize,
+    #[cfg(test)]
+    fail_append_at: Option<usize>,
 }
 
 impl InMemorySessionStore {
@@ -126,6 +130,11 @@ impl InMemorySessionStore {
 
     pub fn contains(&self, session_id: &SessionId) -> bool {
         self.sessions.contains_key(session_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_append_at_for_test(&mut self, call: usize) {
+        self.fail_append_at = Some(call.max(1));
     }
 
     fn summary(session: &MemorySession) -> Result<SessionSummary, CatalogError> {
@@ -168,6 +177,16 @@ impl SessionLifecycleStore for InMemorySessionStore {
         session_id: &SessionId,
         entries: Vec<SessionEntryKind>,
     ) -> Result<Vec<EntryId>, SessionError> {
+        #[cfg(test)]
+        {
+            self.append_calls = self.append_calls.saturating_add(1);
+            if self.fail_append_at == Some(self.append_calls) {
+                self.fail_append_at = None;
+                return Err(SessionError::io(std::io::Error::other(
+                    "injected in-memory append failure",
+                )));
+            }
+        }
         let session = self
             .sessions
             .get_mut(session_id)
@@ -424,7 +443,15 @@ impl ChatMessageReferenceStore for InMemorySessionStore {
             .filter(|session| session.domain == SessionDomain::Chat)
         {
             let summary = Self::summary(session).map_err(ChatReferenceError::Catalog)?;
+            let active_ids = resolve_session(&session.entries, session.leaf.as_ref())
+                .map_err(ChatReferenceError::Storage)?
+                .path
+                .into_iter()
+                .collect::<HashSet<_>>();
             for entry in &session.entries {
+                if !active_ids.contains(&entry.id) {
+                    continue;
+                }
                 let SessionEntryKind::Message(message) = &entry.kind else {
                     continue;
                 };
@@ -500,6 +527,14 @@ impl ChatMessageReferenceStore for InMemorySessionStore {
             .iter()
             .find(|entry| entry.id == reference.entry_id)
             .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::MessageDeleted))?;
+        let active = resolve_session(&session.entries, session.leaf.as_ref())
+            .map_err(ChatReferenceError::Storage)?;
+        if !active.path.iter().any(|id| id == &reference.entry_id) {
+            return Err(unavailable(
+                reference,
+                ChatMessageUnavailableReason::MessageDeleted,
+            ));
+        }
         message_from_entry(reference, &summary, entry)
     }
 }

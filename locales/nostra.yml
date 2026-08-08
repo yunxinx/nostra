@@ -107,6 +107,15 @@ chat:
       en: Copy reasoning
       zh-CN: 复制思考过程
   error:
+    persistence_start_failed:
+      en: The message could not be saved. Check local storage and try again.
+      zh-CN: 消息无法保存，请检查本地存储后重试。
+    persistence_finish_failed:
+      en: The reply is visible but not saved yet. Sending again will retry it first.
+      zh-CN: 回复目前可见但尚未保存；下次发送时会先重试保存。
+    persistence_retry_failed:
+      en: The previous reply is still not saved. Check local storage and try again.
+      zh-CN: 上一条回复仍未保存，请检查本地存储后重试。
     markdown:
       en: Nostra could not safely render this Markdown content.
       zh-CN: Nostra 无法安全渲染这段 Markdown 内容。

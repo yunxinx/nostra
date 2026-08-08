@@ -4,8 +4,8 @@ use gpui::Global;
 
 use super::{
     CatalogError, CatalogPage, CatalogQuery, ChatMessageRead, ChatMessageReferenceStore,
-    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, InMemorySessionStore,
-    LocalSessionStore, ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot,
+    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, LocalSessionStore,
+    LocalStoreError, ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot,
     SessionCatalogStore, SessionDomain, SessionError, SessionFlushStore, SessionId,
     SessionLifecycleStore, SessionStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
 };
@@ -173,6 +173,14 @@ pub struct SessionStores {
 
 impl Global for SessionStores {}
 
+#[derive(Debug, thiserror::Error)]
+pub enum SessionStoresError {
+    #[error("failed to open persistent Chat store: {0}")]
+    Chat(#[source] LocalStoreError),
+    #[error("failed to open persistent Agent store: {0}")]
+    Agent(#[source] LocalStoreError),
+}
+
 impl SessionStores {
     #[must_use]
     pub fn with_chat_store(
@@ -221,28 +229,23 @@ impl SessionStores {
         }
     }
 
-    #[must_use]
-    pub fn open_default() -> Self {
-        let chat = match LocalSessionStore::open_default(SessionDomain::Chat) {
-            Ok(store) => SharedSessionStore::new(store),
-            Err(error) => {
-                eprintln!("failed to open persistent chat store, using memory fallback: {error:?}");
-                SharedSessionStore::new(InMemorySessionStore::new())
-            }
-        };
-        let agent = match LocalSessionStore::open_default(SessionDomain::Agent) {
-            Ok(store) => SharedSessionStore::new(store),
-            Err(error) => {
-                eprintln!(
-                    "failed to open persistent agent store, using memory fallback: {error:?}"
-                );
-                SharedSessionStore::new(InMemorySessionStore::new())
-            }
-        };
-        Self {
+    pub fn open_default() -> Result<Self, SessionStoresError> {
+        let mut chat_store = LocalSessionStore::open_default(SessionDomain::Chat)
+            .map_err(SessionStoresError::Chat)?;
+        chat_store
+            .repair_if_needed()
+            .map_err(SessionStoresError::Chat)?;
+        let mut agent_store = LocalSessionStore::open_default(SessionDomain::Agent)
+            .map_err(SessionStoresError::Agent)?;
+        agent_store
+            .repair_if_needed()
+            .map_err(SessionStoresError::Agent)?;
+        let chat = SharedSessionStore::new(chat_store);
+        let agent = SharedSessionStore::new(agent_store);
+        Ok(Self {
             chat: Some(chat),
             agent: Some(agent),
-        }
+        })
     }
 
     #[must_use]
@@ -298,7 +301,7 @@ impl SessionStores {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{ProjectIdentity, SessionHeader};
+    use crate::session::{InMemorySessionStore, ProjectIdentity, SessionHeader};
 
     #[test]
     fn shared_agent_store_keeps_project_scoped_restore_capability() {

@@ -9,10 +9,10 @@ use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter, t
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::llm::{ContentBlock, Message, ModelSelection, Role};
+use crate::llm::{ModelSelection, Role};
 
 use super::reference::ReferencedMessage;
-use super::tree::message_preview;
+use super::tree::{message_preview, resolve_session};
 use super::{
     EntryId, ProjectIdentity, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
     SessionId,
@@ -28,7 +28,7 @@ pub(crate) struct MessageNodeRow {
     pub session_created_at: i64,
 }
 
-pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 3;
+pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 4;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 30;
 
 #[derive(Debug, Error)]
@@ -118,6 +118,11 @@ pub(crate) struct Catalog {
     path: PathBuf,
     domain: SessionDomain,
     connection: Connection,
+    needs_repair: bool,
+    #[cfg(test)]
+    full_projection_writes: u64,
+    #[cfg(test)]
+    incremental_projection_writes: u64,
 }
 
 impl Catalog {
@@ -125,14 +130,18 @@ impl Catalog {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if path.exists() && !has_sqlite_header(&path) {
+        let invalid_header = path.exists() && !has_sqlite_header(&path);
+        if invalid_header {
             remove_sqlite_sidecars(&path);
         }
 
         match Self::open_connection(&path)
             .and_then(|connection| Self::initialize(connection, path.clone(), domain))
         {
-            Ok(catalog) => Ok(catalog),
+            Ok(mut catalog) => {
+                catalog.needs_repair = invalid_header;
+                Ok(catalog)
+            }
             Err(first_error) => {
                 // The index is disposable. Preserve a corrupt file for
                 // diagnosis, then rebuild an empty catalog from the source log.
@@ -142,11 +151,21 @@ impl Catalog {
                     let _ = std::fs::remove_file(&backup);
                     std::fs::rename(&path, backup)?;
                 }
-                Self::open_connection(&path)
+                let mut catalog = Self::open_connection(&path)
                     .and_then(|connection| Self::initialize(connection, path, domain))
-                    .map_err(|_| first_error)
+                    .map_err(|_| first_error)?;
+                catalog.needs_repair = true;
+                Ok(catalog)
             }
         }
+    }
+
+    pub(crate) fn needs_repair(&self) -> bool {
+        self.needs_repair
+    }
+
+    pub(crate) fn clear_repair_needed(&mut self) {
+        self.needs_repair = false;
     }
 
     fn open_connection(path: &Path) -> Result<Connection, CatalogError> {
@@ -171,7 +190,15 @@ impl Catalog {
             return Err(CatalogError::UnsupportedVersion(version));
         }
         if version == 0 {
-            connection.execute_batch(
+            if has_table(&connection, "sessions")?
+                || has_table(&connection, "message_nodes")?
+                || has_table(&connection, "repair_state")?
+            {
+                return Err(CatalogError::Corrupt(
+                    "schema version 0 contains an existing catalog table".to_string(),
+                ));
+            }
+            let schema_sql = format!(
                 "CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY NOT NULL,
                     domain TEXT NOT NULL,
@@ -199,19 +226,28 @@ impl Catalog {
                     role TEXT NOT NULL,
                     preview TEXT,
                     searchable_text TEXT NOT NULL,
+                    searchable_folded TEXT NOT NULL,
                     message_json TEXT NOT NULL,
                     PRIMARY KEY(session_id, entry_id)
                 );
                 CREATE INDEX IF NOT EXISTS message_nodes_session_timestamp
                     ON message_nodes(session_id, timestamp, entry_id);
                 CREATE INDEX IF NOT EXISTS message_nodes_search
-                    ON message_nodes(session_id, searchable_text);
+                    ON message_nodes(session_id, searchable_folded);
                 CREATE TABLE IF NOT EXISTS repair_state (
                     key TEXT PRIMARY KEY NOT NULL,
                     value TEXT NOT NULL
                 );
-                PRAGMA user_version = 3;",
-            )?;
+                PRAGMA user_version = {CATALOG_SCHEMA_VERSION};"
+            );
+            connection.execute_batch(&schema_sql)?;
+        }
+        if version == CATALOG_SCHEMA_VERSION
+            && !has_column(&connection, "message_nodes", "searchable_folded")?
+        {
+            return Err(CatalogError::Corrupt(
+                "catalog message_nodes table is missing searchable_folded".to_string(),
+            ));
         }
         if domain == SessionDomain::Agent {
             connection.execute_batch(
@@ -227,11 +263,24 @@ impl Catalog {
             path,
             domain,
             connection,
+            needs_repair: false,
+            #[cfg(test)]
+            full_projection_writes: 0,
+            #[cfg(test)]
+            incremental_projection_writes: 0,
         })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_write_counts(&self) -> (u64, u64) {
+        (
+            self.full_projection_writes,
+            self.incremental_projection_writes,
+        )
     }
 
     pub(crate) fn upsert_session(
@@ -241,6 +290,36 @@ impl Catalog {
         jsonl_path: &Path,
     ) -> Result<(), CatalogError> {
         let projection = SessionProjection::from_entries(header, entries)?;
+        self.upsert_projection(header, &projection, jsonl_path)
+    }
+
+    pub(crate) fn upsert_projection(
+        &mut self,
+        header: &SessionHeader,
+        projection: &SessionProjection,
+        jsonl_path: &Path,
+    ) -> Result<(), CatalogError> {
+        self.write_projection(header, projection, &projection.messages, jsonl_path, true)
+    }
+
+    pub(crate) fn append_projection(
+        &mut self,
+        header: &SessionHeader,
+        projection: &SessionProjection,
+        appended_messages: &[MessageNodeProjection],
+        jsonl_path: &Path,
+    ) -> Result<(), CatalogError> {
+        self.write_projection(header, projection, appended_messages, jsonl_path, false)
+    }
+
+    fn write_projection(
+        &mut self,
+        header: &SessionHeader,
+        projection: &SessionProjection,
+        messages: &[MessageNodeProjection],
+        jsonl_path: &Path,
+        replace_messages: bool,
+    ) -> Result<(), CatalogError> {
         let tx = self.connection.transaction()?;
         tx.execute(
             "INSERT INTO sessions (
@@ -264,11 +343,11 @@ impl Catalog {
             params![
                 header.session_id.to_string(),
                 header.domain.prefix(),
-                projection.project_id,
-                projection.canonical_path,
-                projection.display_name,
-                projection.title,
-                projection.preview,
+                projection.project_id.as_deref(),
+                projection.canonical_path.as_deref(),
+                projection.display_name.as_deref(),
+                projection.catalog_title(),
+                projection.preview.as_deref(),
                 projection
                     .model
                     .as_ref()
@@ -284,25 +363,36 @@ impl Catalog {
             ],
         )?;
 
-        tx.execute(
-            "DELETE FROM message_nodes WHERE session_id = ?1",
-            params![header.session_id.to_string()],
-        )?;
-        for node in projection.messages {
+        if replace_messages {
+            tx.execute(
+                "DELETE FROM message_nodes WHERE session_id = ?1",
+                params![header.session_id.to_string()],
+            )?;
+        }
+        for node in messages {
             tx.execute(
                 "INSERT INTO message_nodes (
                     session_id, entry_id, parent_id, timestamp, role, preview,
-                    searchable_text, message_json
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    searchable_text, searchable_folded, message_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(session_id, entry_id) DO UPDATE SET
+                    parent_id = excluded.parent_id,
+                    timestamp = excluded.timestamp,
+                    role = excluded.role,
+                    preview = excluded.preview,
+                    searchable_text = excluded.searchable_text,
+                    searchable_folded = excluded.searchable_folded,
+                    message_json = excluded.message_json",
                 params![
                     header.session_id.to_string(),
                     node.entry_id.to_string(),
-                    node.parent_id.map(|id| id.to_string()),
+                    node.parent_id.as_ref().map(ToString::to_string),
                     node.timestamp,
                     node.role,
-                    node.preview,
-                    node.searchable_text,
-                    node.message_json,
+                    node.preview.as_deref(),
+                    node.searchable_text.as_str(),
+                    node.searchable_folded.as_str(),
+                    node.message_json.as_str(),
                 ],
             )?;
         }
@@ -323,6 +413,13 @@ impl Catalog {
             )?;
         }
         tx.commit()?;
+        #[cfg(test)]
+        if replace_messages {
+            self.full_projection_writes = self.full_projection_writes.saturating_add(1);
+        } else {
+            self.incremental_projection_writes =
+                self.incremental_projection_writes.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -407,27 +504,21 @@ impl Catalog {
 
     pub(crate) fn search_message_nodes(
         &self,
-        query: &str,
+        folded_query: &str,
         cursor: Option<&super::ChatMessageSearchCursor>,
         limit: usize,
     ) -> Result<Vec<MessageNodeRow>, CatalogError> {
         let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
-        let escaped_query = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
         let mut sql = String::from(
             "SELECT n.session_id, n.entry_id, n.timestamp, n.message_json,
                     s.title, s.created_at
              FROM message_nodes n
              JOIN sessions s ON s.session_id = n.session_id AND s.domain = ?
-             WHERE n.session_id IN (SELECT session_id FROM sessions WHERE domain = ?)
-               AND lower(n.searchable_text) LIKE lower(?) ESCAPE '\\'",
+             WHERE instr(n.searchable_folded, ?) > 0",
         );
         let mut values: Vec<Box<dyn ToSql>> = vec![
             Box::new(self.domain.prefix().to_string()),
-            Box::new(self.domain.prefix().to_string()),
-            Box::new(format!("%{escaped_query}%")),
+            Box::new(folded_query.to_string()),
         ];
         if let Some(cursor) = cursor {
             sql.push_str(
@@ -548,104 +639,158 @@ fn has_sqlite_header(path: &Path) -> bool {
     std::io::Read::read_exact(&mut file, &mut header).is_ok() && header == *b"SQLite format 3\0"
 }
 
-#[derive(Debug)]
-struct SessionProjection {
+fn has_table(connection: &Connection, table: &str) -> Result<bool, CatalogError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+            )",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(CatalogError::from)
+}
+
+fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, CatalogError> {
+    let pragma = match table {
+        "message_nodes" => "SELECT name FROM pragma_table_info('message_nodes')",
+        "sessions" => "SELECT name FROM pragma_table_info('sessions')",
+        "repair_state" => "SELECT name FROM pragma_table_info('repair_state')",
+        _ => return Ok(false),
+    };
+    let mut statement = connection.prepare(pragma)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(0)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SessionProjection {
     project_id: Option<String>,
     canonical_path: Option<String>,
     display_name: Option<String>,
-    title: String,
+    title: Option<String>,
     preview: Option<String>,
     model: Option<ModelSelection>,
     total_tokens: u64,
+    tokens_by_turn: HashMap<String, u64>,
     updated_at: i64,
     messages: Vec<MessageNodeProjection>,
 }
 
-#[derive(Debug)]
-struct MessageNodeProjection {
+#[derive(Clone, Debug)]
+pub(crate) struct MessageNodeProjection {
     entry_id: EntryId,
     parent_id: Option<EntryId>,
     timestamp: i64,
     role: &'static str,
     preview: Option<String>,
     searchable_text: String,
+    searchable_folded: String,
     message_json: String,
 }
 
 impl SessionProjection {
-    fn from_entries(
+    pub(crate) fn from_entries(
         header: &SessionHeader,
         entries: &[SessionEntry],
     ) -> Result<Self, CatalogError> {
-        let mut title = None;
-        let mut preview = None;
-        let mut model = header.initial_model.clone();
-        let mut total_tokens = 0_u64;
-        let mut tokens_by_turn = HashMap::new();
-        let mut updated_at = header.created_at;
-        let mut messages = Vec::new();
-        for entry in entries {
-            updated_at = updated_at.max(entry.timestamp);
-            match &entry.kind {
-                SessionEntryKind::Message(message) => {
-                    let text = message_preview(&message.message);
-                    if title.is_none() && message.message.role == Role::User {
-                        title = text.clone();
-                    }
-                    if text.is_some() {
-                        preview = text.clone();
-                    }
-                    record_usage(
-                        &mut total_tokens,
-                        &mut tokens_by_turn,
-                        message.turn_id.as_deref(),
-                        message.usage.total_tokens,
-                    );
-                    if let Some(selection) = &message.model {
-                        model = Some(selection.clone());
-                    }
-                    messages.push(MessageNodeProjection {
-                        entry_id: entry.id.clone(),
-                        parent_id: entry.parent_id.clone(),
-                        timestamp: entry.timestamp,
-                        role: role_name(message.message.role),
-                        preview: text,
-                        searchable_text: message_search_text(&message.message),
-                        message_json: serde_json::to_string(&ReferencedMessage::from_message(
-                            &message.message,
-                        ))?,
-                    });
-                }
-                SessionEntryKind::TurnResult(result) => {
-                    record_usage(
-                        &mut total_tokens,
-                        &mut tokens_by_turn,
-                        result.turn_id.as_deref(),
-                        result.usage.total_tokens,
-                    );
-                }
-                SessionEntryKind::ConfigChange(change) => {
-                    model = Some(change.model.clone());
-                }
-                _ => {}
-            }
-        }
-        total_tokens = tokens_by_turn
-            .values()
-            .fold(total_tokens, |total, tokens| total.saturating_add(*tokens));
+        let active_ids = resolve_session(entries, None)
+            .map_err(|error| CatalogError::Corrupt(error.to_string()))?
+            .path
+            .into_iter()
+            .collect::<HashSet<_>>();
         let project = header.project.as_ref();
-        Ok(Self {
+        let mut projection = Self {
             project_id: project.map(|project| project.project_id.clone()),
             canonical_path: project
                 .map(|project| project.canonical_path.to_string_lossy().into_owned()),
             display_name: project.map(|project| project.display_name.clone()),
-            title: title.unwrap_or_else(|| "Untitled session".to_string()),
-            preview,
-            model,
-            total_tokens,
-            updated_at,
-            messages,
-        })
+            title: None,
+            preview: None,
+            model: header.initial_model.clone(),
+            total_tokens: 0,
+            tokens_by_turn: HashMap::new(),
+            updated_at: header.created_at,
+            messages: Vec::new(),
+        };
+        for entry in entries {
+            projection.apply_entry_metadata(entry);
+            if active_ids.contains(&entry.id)
+                && let Some(node) = message_node(entry)?
+            {
+                projection.messages.push(node);
+            }
+        }
+        Ok(projection)
+    }
+
+    pub(crate) fn append_entries(
+        &mut self,
+        entries: &[SessionEntry],
+    ) -> Result<Vec<MessageNodeProjection>, CatalogError> {
+        debug_assert!(
+            entries
+                .iter()
+                .all(|entry| !matches!(entry.kind, SessionEntryKind::Leaf(_))),
+            "leaf changes must rebuild the active message projection"
+        );
+        let appended_messages = entries
+            .iter()
+            .map(message_node)
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for entry in entries {
+            self.apply_entry_metadata(entry);
+        }
+        self.messages.extend(appended_messages.iter().cloned());
+        Ok(appended_messages)
+    }
+
+    fn apply_entry_metadata(&mut self, entry: &SessionEntry) {
+        self.updated_at = self.updated_at.max(entry.timestamp);
+        match &entry.kind {
+            SessionEntryKind::Message(message) => {
+                let text = message_preview(&message.message);
+                if self.title.is_none() && message.message.role == Role::User {
+                    self.title = text.clone();
+                }
+                if text.is_some() {
+                    self.preview = text.clone();
+                }
+                record_usage(
+                    &mut self.total_tokens,
+                    &mut self.tokens_by_turn,
+                    message.turn_id.as_deref(),
+                    message.usage.total_tokens,
+                );
+                if let Some(selection) = &message.model {
+                    self.model = Some(selection.clone());
+                }
+            }
+            SessionEntryKind::TurnResult(result) => {
+                record_usage(
+                    &mut self.total_tokens,
+                    &mut self.tokens_by_turn,
+                    result.turn_id.as_deref(),
+                    result.usage.total_tokens,
+                );
+            }
+            SessionEntryKind::ConfigChange(change) => {
+                self.model = Some(change.model.clone());
+            }
+            _ => {}
+        }
+    }
+
+    fn catalog_title(&self) -> &str {
+        self.title.as_deref().unwrap_or("Untitled session")
     }
 
     fn summary(&self, header: &SessionHeader, jsonl_path: PathBuf) -> SessionSummary {
@@ -653,7 +798,7 @@ impl SessionProjection {
             session_id: header.session_id.clone(),
             domain: header.domain,
             project: header.project.clone(),
-            title: self.title.clone(),
+            title: self.catalog_title().to_string(),
             preview: self.preview.clone(),
             model: self.model.clone(),
             total_tokens: self.total_tokens,
@@ -662,6 +807,24 @@ impl SessionProjection {
             jsonl_path,
         }
     }
+}
+
+fn message_node(entry: &SessionEntry) -> Result<Option<MessageNodeProjection>, CatalogError> {
+    let SessionEntryKind::Message(message) = &entry.kind else {
+        return Ok(None);
+    };
+    let safe_message = ReferencedMessage::from_message(&message.message);
+    let searchable_text = safe_message.searchable_text();
+    Ok(Some(MessageNodeProjection {
+        entry_id: entry.id.clone(),
+        parent_id: entry.parent_id.clone(),
+        timestamp: entry.timestamp,
+        role: role_name(message.message.role),
+        preview: message_preview(&message.message),
+        searchable_folded: searchable_text.to_lowercase(),
+        searchable_text,
+        message_json: serde_json::to_string(&safe_message)?,
+    }))
 }
 
 pub(crate) fn project_session_summary(
@@ -673,7 +836,7 @@ pub(crate) fn project_session_summary(
 }
 
 fn record_usage(
-    unkeyed_total: &mut u64,
+    total: &mut u64,
     tokens_by_turn: &mut HashMap<String, u64>,
     turn_id: Option<&str>,
     tokens: u64,
@@ -681,10 +844,18 @@ fn record_usage(
     if let Some(turn_id) = turn_id {
         tokens_by_turn
             .entry(turn_id.to_string())
-            .and_modify(|current| *current = (*current).max(tokens))
-            .or_insert(tokens);
+            .and_modify(|current| {
+                if tokens > *current {
+                    *total = total.saturating_add(tokens.saturating_sub(*current));
+                    *current = tokens;
+                }
+            })
+            .or_insert_with(|| {
+                *total = total.saturating_add(tokens);
+                tokens
+            });
     } else {
-        *unkeyed_total = unkeyed_total.saturating_add(tokens);
+        *total = total.saturating_add(tokens);
     }
 }
 
@@ -765,26 +936,4 @@ fn role_name(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     }
-}
-
-fn message_search_text(message: &Message) -> String {
-    let mut text = String::new();
-    for block in &message.content {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        match block {
-            ContentBlock::Text { text: value, .. } => text.push_str(value),
-            ContentBlock::Reasoning { reasoning } => text.push_str(&reasoning.display),
-            ContentBlock::ToolCall { tool_call } => {
-                text.push_str(&tool_call.name);
-                if !tool_call.raw_arguments.is_empty() {
-                    text.push('\n');
-                    text.push_str(&tool_call.raw_arguments);
-                }
-            }
-            ContentBlock::ToolResult { tool_result } => text.push_str(&tool_result.content),
-        }
-    }
-    text.chars().take(16_384).collect()
 }
