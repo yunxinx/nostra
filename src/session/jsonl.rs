@@ -283,6 +283,12 @@ impl JsonlWriter {
         &self.path
     }
 
+    /// Flush buffered bytes and force the source log to stable storage.
+    pub fn flush(&mut self) -> Result<(), SessionError> {
+        self.file.flush().map_err(SessionError::io)?;
+        self.file.get_ref().sync_all().map_err(SessionError::io)
+    }
+
     fn write_entries(&mut self, entries: &[SessionEntry]) -> Result<(), SessionError> {
         let mut batch_ids = self.known_ids.clone();
         for entry in entries {
@@ -315,8 +321,7 @@ impl JsonlWriter {
                 .map_err(SessionError::io)?;
             self.file.write_all(b"\n").map_err(SessionError::io)?;
         }
-        self.file.flush().map_err(SessionError::io)?;
-        self.file.get_ref().sync_all().map_err(SessionError::io)?;
+        self.flush()?;
         self.known_ids = batch_ids;
         Ok(())
     }

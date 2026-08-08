@@ -1,7 +1,7 @@
 //! Persistent user preferences (sidebar, theme, language, window geometry).
 //!
-//! Prefs are written to a platform-specific config directory and read back on
-//! startup. Any invalid current-schema document falls back to
+//! Prefs are written to the unified `~/.config/nostra` directory and read back
+//! on startup. Any invalid current-schema document falls back to
 //! `Preferences::default`. At runtime the current values live in the [`Prefs`]
 //! app-global;
 //! mutations go through [`update`], which persists synchronously and atomically
@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::{ModelSelection, ProviderProfile};
 
-/// Directory name inside the platform config root.
-const APP_DIRNAME: &str = "nostra";
 const FILE_NAME: &str = "preferences.json";
 pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.85;
 
@@ -311,7 +309,7 @@ pub fn snapshot_with(cx: &mut App, f: impl FnOnce(&mut Preferences)) -> Preferen
 /// Full path where preferences are stored.  `None` on platforms where no
 /// standard config directory can be resolved from the environment.
 pub fn path() -> Option<PathBuf> {
-    config_dir().map(|d| d.join(APP_DIRNAME).join(FILE_NAME))
+    crate::paths::nostra_config_dir().map(|d| d.join(FILE_NAME))
 }
 
 /// Load preferences, or return defaults if the file is missing / corrupt.
@@ -354,25 +352,6 @@ fn save_to_path(path: &Path, prefs: &Preferences) -> anyhow::Result<()> {
     std::fs::File::open(parent)?.sync_all()?;
 
     Ok(())
-}
-
-/// Base config directory for the current platform.
-fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("APPDATA").map(PathBuf::from)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-    }
 }
 
 #[cfg(test)]

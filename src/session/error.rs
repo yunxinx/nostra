@@ -83,6 +83,11 @@ pub enum SessionError {
     SessionNotFound(SessionId),
     #[error("session `{0}` already exists")]
     SessionAlreadyExists(SessionId),
+    #[error("session file header id `{actual}` does not match requested session `{expected}`")]
+    SessionIdMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
     #[error("compaction references invalid first kept entry `{0}`")]
     InvalidCompactionTarget(EntryId),
     #[error("branch summary references invalid source entry `{0}`")]

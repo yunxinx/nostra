@@ -34,6 +34,7 @@ tempfile = "3"
 uuid = { version = "1", features = ["serde", "v7"] }
 futures = "0.3"
 async-io = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
 markdown = "1.0.0"
 unicode-segmentation = "1.12"

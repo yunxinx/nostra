@@ -22,6 +22,7 @@ mod assets;
 mod chat;
 mod i18n;
 pub mod llm;
+mod paths;
 pub mod preferences;
 mod providers;
 pub mod session;
