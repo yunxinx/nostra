@@ -11,10 +11,11 @@ use gpui::{
 use gpui_component::input::InputEvent;
 
 use crate::llm::{
-    ContentBlock, IndexedContentBlock, IndexedMessage, Message as LlmMessage, ProviderMetadata,
-    ResponsesReplayMetadata,
+    ContentBlock, IndexedContentBlock, IndexedMessage, Message as LlmMessage, ModelSelection,
+    ProviderMetadata, ResponsesReplayMetadata,
 };
 use crate::preferences;
+use crate::session::{ChatTurnTerminal, InMemorySessionStore, SessionStores, TurnStatus};
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
 use super::{
@@ -139,6 +140,66 @@ fn add_chat_window(
             .expect("Root must contain the ChatView")
     });
     (chat, cx)
+}
+
+#[gpui::test]
+fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext) {
+    init_app(cx);
+    cx.update(|cx| {
+        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
+    });
+
+    let (chat, cx) = add_chat_window(cx);
+    let selection = ModelSelection {
+        profile_id: "profile".into(),
+        model_id: "model-a".into(),
+    };
+    let user = LlmMessage {
+        role: crate::llm::Role::User,
+        content: vec![ContentBlock::Text {
+            text: "hello".into(),
+            provider_metadata: ProviderMetadata::default(),
+        }],
+        provider_metadata: ProviderMetadata::default(),
+    };
+    let turn_id = "turn-1".to_string();
+    let start = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let start = this
+                .session_controller
+                .as_mut()
+                .expect("controller")
+                .begin_turn(user.clone(), selection.clone(), turn_id.clone())
+                .expect("begin");
+            this.conversation_id = start.session_id.to_string();
+            this.pending = true;
+            this.pending_turn_id = Some(turn_id.clone());
+            this.messages.push(Message::from_canonical(user, cx));
+            this.messages.push(Message::empty(Role::Assistant));
+            start
+        })
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.finish_reply_with_terminal(None, ChatTurnTerminal::cancelled(), None, cx);
+        });
+    });
+
+    cx.update(|_, cx| {
+        let state = chat.update(cx, |this, _cx| {
+            assert!(!this.pending);
+            assert!(this.pending_turn_id.is_none());
+            this.session_controller
+                .as_mut()
+                .expect("controller")
+                .restore(&start.session_id)
+                .expect("restore")
+        });
+        assert_eq!(state.messages.len(), 1);
+        assert_eq!(state.turn_results.len(), 1);
+        assert_eq!(state.turn_results[0].result.status, TurnStatus::Cancelled);
+    });
 }
 
 fn redraw(cx: &mut gpui::VisualTestContext) {

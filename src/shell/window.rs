@@ -16,6 +16,7 @@ use rust_i18n::t;
 
 use crate::appearance::glass;
 use crate::preferences::{Preferences, WindowGeometry};
+use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
 
@@ -69,6 +70,7 @@ const MIN_SIZE: Size<Pixels> = Size {
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
+    cx.set_global(SessionStores::open_default());
 
     cx.spawn(async move |cx| -> Result<()> {
         let options = WindowOptions {

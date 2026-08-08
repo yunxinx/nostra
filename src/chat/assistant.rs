@@ -24,6 +24,7 @@ use crate::{
         InMemoryMetrics, Message as LlmMessage, ModelSelection, OutcomeStatus,
     },
     providers,
+    session::ChatTurnTerminal,
 };
 
 fn metrics() -> Arc<InMemoryMetrics> {
@@ -505,7 +506,7 @@ pub fn stream_reply(
             Err(error) => {
                 // Same card as an upstream failure. There is no response body to
                 // show — the request never left — so it renders headline-only.
-                view.update(cx, |chat, cx| chat.finish_reply(None, Some(error), cx))
+                view.update(cx, |chat, cx| chat.finish_reply_request_failed(error, cx))
                     .ok();
                 return;
             }
@@ -538,10 +539,15 @@ pub fn stream_reply(
             cx.background_executor().timer(interval).await;
         }
 
-        let failure = terminal_failure(outcome.status, outcome.error, outcome.request_id);
+        let terminal = ChatTurnTerminal::from_generation(&outcome);
+        let failure = terminal_failure(
+            outcome.status,
+            outcome.error.clone(),
+            outcome.request_id.clone(),
+        );
         view.update(cx, |chat, cx| {
             chat.follow_stream();
-            chat.finish_reply(outcome.message, failure, cx);
+            chat.finish_reply_with_terminal(outcome.message, terminal, failure, cx);
         })
         .ok();
     });

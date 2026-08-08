@@ -37,6 +37,7 @@ use crate::llm::{
     ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
+use crate::session::{ChatSessionController, ChatTurnTerminal, SessionStores, SharedSessionStore};
 use crate::ui::markdown::MarkdownBody;
 
 use self::error_card::TurnError;
@@ -127,6 +128,8 @@ pub(crate) fn set_smooth_scrolling(enabled: bool, cx: &mut App) {
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_UI_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
+
+type ChatSessionControllerHandle = ChatSessionController<SharedSessionStore>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -440,6 +443,9 @@ pub struct ChatView {
     provider_catalog_revision: u64,
     pending: bool,
     reply_task: Option<assistant::ReplyTask>,
+    session_controller: Option<ChatSessionControllerHandle>,
+    /// Active turn id retained until the durable terminal write settles.
+    pending_turn_id: Option<String>,
     conversation_id: String,
     next_turn_id: u64,
     _subscriptions: Vec<Subscription>,
@@ -520,6 +526,11 @@ impl ChatView {
             provider_catalog_revision: providers::catalog_revision(),
             pending: false,
             reply_task: None,
+            session_controller: cx
+                .try_global::<SessionStores>()
+                .and_then(|stores| stores.chat())
+                .map(ChatSessionController::new),
+            pending_turn_id: None,
             conversation_id: format!(
                 "conversation-{}",
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
@@ -554,31 +565,61 @@ impl ChatView {
     /// composer after a successful submission.
     fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         self.sync_selection_availability(cx);
-        if self.pending || text.is_empty() || !self.selection_available {
+        if self.pending
+            || text.is_empty()
+            || !self.selection_available
+            || (self.pending_turn_id.is_some() && !self.pending)
+        {
             return false;
         }
+
+        let Some(selection) = self.selection.clone() else {
+            return false;
+        };
+
+        let turn_id = format!("turn-{}", self.next_turn_id);
+        let user_message = LlmMessage {
+            role: crate::llm::Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.clone(),
+                provider_metadata: ProviderMetadata::default(),
+            }],
+            provider_metadata: ProviderMetadata::default(),
+        };
+
+        let session_id = if let Some(controller) = self.session_controller.as_mut() {
+            let start = match controller.begin_turn(
+                user_message.clone(),
+                selection.clone(),
+                turn_id.clone(),
+            ) {
+                Ok(start) => start,
+                Err(error) => {
+                    eprintln!("failed to start chat turn `{turn_id}`: {error:?}");
+                    return false;
+                }
+            };
+            Some(start.session_id)
+        } else {
+            None
+        };
 
         if self.messages.is_empty() {
             cx.emit(ChatEvent::TitleChanged(derive_title(&text)));
         }
 
         let old_len = self.messages.len();
-        self.messages.push(Message::from_canonical(
-            LlmMessage {
-                role: crate::llm::Role::User,
-                content: vec![ContentBlock::Text {
-                    text,
-                    provider_metadata: ProviderMetadata::default(),
-                }],
-                provider_metadata: ProviderMetadata::default(),
-            },
-            cx,
-        ));
+        self.messages
+            .push(Message::from_canonical(user_message, cx));
 
         self.messages.push(Message::empty(Role::Assistant));
         self.list_state.splice(old_len..old_len, 2);
 
         self.pending = true;
+        self.pending_turn_id = Some(turn_id.clone());
+        if let Some(session_id) = session_id {
+            self.conversation_id = session_id.to_string();
+        }
         let history = self
             .messages
             .iter()
@@ -586,11 +627,10 @@ impl ChatView {
             .map(Message::canonical)
             .filter(is_replayable)
             .collect();
-        let turn_id = format!("turn-{}", self.next_turn_id);
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.reply_task = Some(assistant::stream_reply(
             history,
-            self.selection.clone(),
+            Some(selection),
             self.conversation_id.clone(),
             turn_id,
             cx,
@@ -603,7 +643,53 @@ impl ChatView {
     /// Finish the turn in flight and attach its terminal error, if any. The
     /// error card's state is built here, outside render, and all terminal state
     /// changes are published with one notification.
+    #[allow(dead_code)]
     pub fn finish_reply(
+        &mut self,
+        message: Option<IndexedMessage>,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_reply_visual(message, error, cx);
+        self.pending_turn_id = None;
+    }
+
+    pub(crate) fn finish_reply_request_failed(
+        &mut self,
+        error: GatewayError,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_reply_with_terminal(
+            None,
+            ChatTurnTerminal::request_failed(&error),
+            Some(error),
+            cx,
+        );
+    }
+
+    pub(crate) fn finish_reply_with_terminal(
+        &mut self,
+        message: Option<IndexedMessage>,
+        terminal: ChatTurnTerminal,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut persisted = self.session_controller.is_none();
+        if let Some(turn_id) = self.pending_turn_id.clone()
+            && let Some(controller) = self.session_controller.as_mut()
+        {
+            match controller.finish_turn(&turn_id, &terminal) {
+                Ok(()) => persisted = true,
+                Err(error) => eprintln!("failed to persist chat turn `{turn_id}`: {error:?}"),
+            }
+        }
+        if persisted {
+            self.pending_turn_id = None;
+        }
+        self.finish_reply_visual(message, error, cx);
+    }
+
+    fn finish_reply_visual(
         &mut self,
         message: Option<IndexedMessage>,
         error: Option<GatewayError>,

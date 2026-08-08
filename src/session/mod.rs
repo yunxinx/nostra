@@ -13,6 +13,7 @@ mod jsonl;
 mod local;
 mod memory;
 mod recorder;
+mod service;
 mod tree;
 
 pub use crate::llm::{FinishReason, Usage};
@@ -33,6 +34,7 @@ pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
     InMemorySessionStore, SessionFlushStore, SessionLifecycleStore, SessionStore, SessionTreeStore,
 };
+pub use service::{SessionStores, SharedSessionStore};
 pub use tree::{
     ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTurnResult,
     resolve_session, validate_session_entries,

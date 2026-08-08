@@ -26,6 +26,7 @@ use crate::appearance::{glass, theme};
 use crate::chat::{ChatEvent, ChatView};
 use crate::llm::ModelSelection;
 use crate::preferences::{self, Preferences, WindowGeometry};
+use crate::session::SessionStores;
 use crate::shell::actions::{OpenSettings, ToggleTheme};
 use crate::ui::{
     self,
@@ -165,6 +166,9 @@ impl ChatApp {
     /// shutdown; gpui awaits the returned task before exiting.
     fn register_save_on_quit(&self, cx: &mut Context<Self>) {
         cx.on_app_quit(|this, cx| {
+            if let Err(error) = cx.global_mut::<SessionStores>().flush() {
+                eprintln!("failed to flush session store before exit: {error:?}");
+            }
             let sidebar_width = this.sidebar_width.as_f32();
             let sidebar_collapsed = this.collapsed;
             let window = this.window_geometry;
