@@ -5,8 +5,8 @@ use super::{
     SessionHeader, SessionId, resolve_session, validate_appended_kind,
 };
 
-/// Capability boundary shared by the in-memory implementation and future local
-/// JSONL/SQLite stores.  This first version is deliberately synchronous: the
+/// Capability boundary shared by the in-memory implementation and local
+/// JSONL/SQLite stores. This interface is deliberately synchronous: the
 /// GPUI adapter can schedule these operations off the render thread later.
 pub trait SessionLifecycleStore {
     fn create_session(&mut self, header: SessionHeader) -> Result<SessionId, SessionError>;

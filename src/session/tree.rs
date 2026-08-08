@@ -1,16 +1,25 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::llm::Message;
+use crate::llm::{Message, ModelSelection, Usage};
 
 use super::{
     Compaction, ConfigChange, EntryId, Reference, SessionDomain, SessionEntry, SessionEntryKind,
-    SessionError, SessionHeader,
+    SessionError, SessionHeader, TurnResult,
 };
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedMessage {
     pub entry_id: EntryId,
     pub message: Message,
+    pub turn_id: Option<String>,
+    pub model: Option<ModelSelection>,
+    pub usage: Usage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTurnResult {
+    pub entry_id: EntryId,
+    pub result: TurnResult,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +41,7 @@ pub struct ResolvedSessionState {
     pub path: Vec<EntryId>,
     pub context: Vec<ResolvedContextItem>,
     pub messages: Vec<ResolvedMessage>,
+    pub turn_results: Vec<ResolvedTurnResult>,
     pub latest_config: Option<ConfigChange>,
     pub latest_compaction: Option<Compaction>,
 }
@@ -208,6 +218,16 @@ pub fn resolve_session(
 
     let mut context = Vec::new();
     let mut messages = Vec::new();
+    let turn_results = path
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            SessionEntryKind::TurnResult(result) => Some(ResolvedTurnResult {
+                entry_id: entry.id.clone(),
+                result: result.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
     if let Some(compaction) = &compaction {
         let compaction_id = path
             .iter()
@@ -227,6 +247,9 @@ pub fn resolve_session(
                 messages.push(ResolvedMessage {
                     entry_id: entry.id.clone(),
                     message: message.message.clone(),
+                    turn_id: message.turn_id.clone(),
+                    model: message.model.clone(),
+                    usage: message.usage.clone(),
                 });
             }
             SessionEntryKind::Reference(reference) => {
@@ -253,6 +276,7 @@ pub fn resolve_session(
         path: path.into_iter().map(|entry| entry.id).collect(),
         context,
         messages,
+        turn_results,
         latest_config,
         latest_compaction: compaction,
     })
@@ -272,7 +296,7 @@ mod tests {
         llm::{ContentBlock, Message, Role, Usage},
         session::{
             BranchSummary, EntryId, MessageEntry, ProjectIdentity, SessionDomain, SessionEntry,
-            SessionHeader,
+            SessionHeader, TurnResult, TurnStatus,
         },
     };
 
@@ -314,9 +338,23 @@ mod tests {
         let header = SessionEntry::header(SessionHeader::new(SessionDomain::Chat, None));
         let first = message("first", Some(header.id.clone()));
         let second = message("second", Some(first.id.clone()));
-        let compaction = SessionEntry::new(
+        let terminal = SessionEntry::new(
             EntryId::new(),
             Some(second.id.clone()),
+            SessionEntryKind::TurnResult(TurnResult {
+                turn_id: Some("turn-1".into()),
+                status: TurnStatus::Completed,
+                finish_reason: None,
+                error: None,
+                usage: Usage {
+                    total_tokens: 10,
+                    ..Usage::default()
+                },
+            }),
+        );
+        let compaction = SessionEntry::new(
+            EntryId::new(),
+            Some(terminal.id.clone()),
             SessionEntryKind::Compaction(Compaction {
                 summary: "old context".into(),
                 first_kept_entry_id: second.id.clone(),
@@ -324,9 +362,17 @@ mod tests {
             }),
         );
         let third = message("third", Some(compaction.id.clone()));
-        let state = resolve_session(&[header, first, second.clone(), compaction, third], None)
-            .expect("compaction resolves");
+        let state = resolve_session(
+            &[header, first, second.clone(), terminal, compaction, third],
+            None,
+        )
+        .expect("compaction resolves");
         assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.turn_results.len(), 1);
+        assert_eq!(
+            state.turn_results[0].result.turn_id.as_deref(),
+            Some("turn-1")
+        );
         assert!(matches!(
             state.context[0],
             ResolvedContextItem::Summary { .. }
@@ -365,6 +411,57 @@ mod tests {
             )
         }));
         assert_eq!(state.messages[0].entry_id, root.id);
+    }
+
+    #[test]
+    fn restore_projection_keeps_message_metadata_and_terminal_results() {
+        let header = SessionEntry::header(SessionHeader::new(SessionDomain::Chat, None));
+        let message_id = EntryId::new();
+        let turn_id = "turn-1".to_string();
+        let model = crate::llm::ModelSelection {
+            profile_id: "profile".into(),
+            model_id: "model".into(),
+        };
+        let message = SessionEntry::new(
+            message_id.clone(),
+            Some(header.id.clone()),
+            SessionEntryKind::Message(MessageEntry {
+                message: Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "hello".into(),
+                        provider_metadata: Default::default(),
+                    }],
+                    provider_metadata: Default::default(),
+                },
+                turn_id: Some(turn_id.clone()),
+                model: Some(model.clone()),
+                usage: Usage {
+                    total_tokens: 3,
+                    ..Usage::default()
+                },
+            }),
+        );
+        let result = SessionEntry::new(
+            EntryId::new(),
+            Some(message_id.clone()),
+            SessionEntryKind::TurnResult(TurnResult {
+                turn_id: Some(turn_id),
+                status: TurnStatus::Cancelled,
+                finish_reason: None,
+                error: None,
+                usage: Usage {
+                    total_tokens: 3,
+                    ..Usage::default()
+                },
+            }),
+        );
+        let state = resolve_session(&[header, message, result.clone()], None).expect("resolve");
+        assert_eq!(state.messages[0].entry_id, message_id);
+        assert_eq!(state.messages[0].model, Some(model));
+        assert_eq!(state.messages[0].usage.total_tokens, 3);
+        assert_eq!(state.turn_results[0].entry_id, result.id);
+        assert_eq!(state.turn_results[0].result.status, TurnStatus::Cancelled);
     }
 
     #[test]

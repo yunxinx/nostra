@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -491,6 +491,7 @@ impl SessionProjection {
         let mut preview = None;
         let mut model = header.initial_model.clone();
         let mut total_tokens = 0_u64;
+        let mut tokens_by_turn = HashMap::new();
         let mut updated_at = header.created_at;
         let mut messages = Vec::new();
         for entry in entries {
@@ -504,7 +505,12 @@ impl SessionProjection {
                     if text.is_some() {
                         preview = text.clone();
                     }
-                    total_tokens = total_tokens.saturating_add(message.usage.total_tokens);
+                    record_usage(
+                        &mut total_tokens,
+                        &mut tokens_by_turn,
+                        message.turn_id.as_deref(),
+                        message.usage.total_tokens,
+                    );
                     if let Some(selection) = &message.model {
                         model = Some(selection.clone());
                     }
@@ -519,7 +525,12 @@ impl SessionProjection {
                     });
                 }
                 SessionEntryKind::TurnResult(result) => {
-                    total_tokens = total_tokens.saturating_add(result.usage.total_tokens);
+                    record_usage(
+                        &mut total_tokens,
+                        &mut tokens_by_turn,
+                        result.turn_id.as_deref(),
+                        result.usage.total_tokens,
+                    );
                 }
                 SessionEntryKind::ConfigChange(change) => {
                     model = Some(change.model.clone());
@@ -527,6 +538,9 @@ impl SessionProjection {
                 _ => {}
             }
         }
+        total_tokens = tokens_by_turn
+            .values()
+            .fold(total_tokens, |total, tokens| total.saturating_add(*tokens));
         let project = header.project.as_ref();
         Ok(Self {
             project_id: project.map(|project| project.project_id.clone()),
@@ -540,6 +554,22 @@ impl SessionProjection {
             updated_at,
             messages,
         })
+    }
+}
+
+fn record_usage(
+    unkeyed_total: &mut u64,
+    tokens_by_turn: &mut HashMap<String, u64>,
+    turn_id: Option<&str>,
+    tokens: u64,
+) {
+    if let Some(turn_id) = turn_id {
+        tokens_by_turn
+            .entry(turn_id.to_string())
+            .and_modify(|current| *current = (*current).max(tokens))
+            .or_insert(tokens);
+    } else {
+        *unkeyed_total = unkeyed_total.saturating_add(tokens);
     }
 }
 

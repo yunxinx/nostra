@@ -6,6 +6,7 @@
 //! remains usable by the in-memory implementation and future adapters.
 
 mod catalog;
+mod chat;
 mod domain;
 mod error;
 mod jsonl;
@@ -17,6 +18,9 @@ mod tree;
 pub use crate::llm::{FinishReason, Usage};
 pub use catalog::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, RepairReport, SessionSummary,
+};
+pub use chat::{
+    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
 };
 pub use domain::{
     BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, Compaction, ConfigChange, EntryId, Leaf,
@@ -30,8 +34,8 @@ pub use memory::{
     InMemorySessionStore, SessionFlushStore, SessionLifecycleStore, SessionStore, SessionTreeStore,
 };
 pub use tree::{
-    ResolvedContextItem, ResolvedMessage, ResolvedSessionState, resolve_session,
-    validate_session_entries,
+    ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTurnResult,
+    resolve_session, validate_session_entries,
 };
 
 pub(crate) use recorder::JsonlRecorder;
