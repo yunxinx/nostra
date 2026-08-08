@@ -672,8 +672,12 @@ impl ChatMessageReferenceStore for LocalSessionStore {
             .map_err(ChatReferenceError::Catalog)?
             .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::SessionDeleted))?;
         let path = summary.jsonl_path.clone();
-        let loaded = JsonlLoader::load(&path)
-            .map_err(|_| unavailable(reference, ChatMessageUnavailableReason::SourceCorrupt))?;
+        let loaded = JsonlLoader::load(&path).map_err(|error| match error {
+            SessionError::Io { source } if source.kind() == std::io::ErrorKind::NotFound => {
+                unavailable(reference, ChatMessageUnavailableReason::SessionDeleted)
+            }
+            _ => unavailable(reference, ChatMessageUnavailableReason::SourceCorrupt),
+        })?;
         if !loaded.diagnostics.is_empty() || loaded.truncated_tail {
             return Err(unavailable(
                 reference,

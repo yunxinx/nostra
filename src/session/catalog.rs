@@ -412,18 +412,22 @@ impl Catalog {
         limit: usize,
     ) -> Result<Vec<MessageNodeRow>, CatalogError> {
         let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
+        let escaped_query = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let mut sql = String::from(
             "SELECT n.session_id, n.entry_id, n.timestamp, n.message_json,
                     s.title, s.created_at
              FROM message_nodes n
              JOIN sessions s ON s.session_id = n.session_id AND s.domain = ?
              WHERE n.session_id IN (SELECT session_id FROM sessions WHERE domain = ?)
-               AND lower(n.searchable_text) LIKE lower(?)",
+               AND lower(n.searchable_text) LIKE lower(?) ESCAPE '\\'",
         );
         let mut values: Vec<Box<dyn ToSql>> = vec![
             Box::new(self.domain.prefix().to_string()),
             Box::new(self.domain.prefix().to_string()),
-            Box::new(format!("%{query}%")),
+            Box::new(format!("%{escaped_query}%")),
         ];
         if let Some(cursor) = cursor {
             sql.push_str(

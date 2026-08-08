@@ -48,13 +48,13 @@ impl ChatMessageSearchQuery {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessageSearchPage {
     pub messages: Vec<ChatMessagePreview>,
     pub next_cursor: Option<ChatMessageSearchCursor>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessagePreview {
     pub reference: ChatMessageRef,
     pub session_title: String,
@@ -146,7 +146,7 @@ impl ReferencedMessage {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessageRead {
     pub reference: ChatMessageRef,
     pub session_title: String,
@@ -155,7 +155,7 @@ pub struct ChatMessageRead {
     pub message: ReferencedMessage,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatMessageUnavailableReason {
     SessionDeleted,
     MessageDeleted,
@@ -172,7 +172,7 @@ impl fmt::Display for ChatMessageUnavailableReason {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessageUnavailable {
     pub reference: ChatMessageRef,
     pub reason: ChatMessageUnavailableReason,
