@@ -20,6 +20,7 @@ path = "src/main.rs"
 # Cargo.lock pins the exact commits so every contributor gets the same build.
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rust-embed = { version = "8.7", features = [
     "interpolate-folder-path",
     "include-exclude",
@@ -34,6 +35,7 @@ tempfile = "3"
 uuid = { version = "1", features = ["serde", "v7"] }
 futures = "0.3"
 async-io = "2"
+fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
 markdown = "1.0.0"

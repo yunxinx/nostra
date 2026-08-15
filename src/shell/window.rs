@@ -5,11 +5,9 @@
 //! native menu bar (macOS), startup activation/focus, quit-on-last-window,
 //! and restoring the previous session's window geometry.
 
-use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext as _, Bounds, Context, Focusable as _, Global, Menu, MenuItem, Pixels, Size,
-    Styled as _, TaskExt as _, WeakEntity, Window, WindowBounds, WindowKind, WindowOptions, point,
-    px, size,
+    Styled as _, WeakEntity, Window, WindowBounds, WindowKind, WindowOptions, point, px, size,
 };
 use gpui_component::{ActiveTheme, Root, TitleBar};
 use rust_i18n::t;
@@ -42,6 +40,22 @@ pub fn toggle_sidebar(cx: &mut App) {
     update_main(cx, |app, _, cx| app.toggle_sidebar(cx));
 }
 
+/// Finish durable session and preference work before asking GPUI to enter its
+/// short final quit phase. Native window-close still has the app-scoped quit
+/// observer as a bounded fallback when no view action can run first.
+pub fn request_quit(cx: &mut App) {
+    let Some(view) = cx
+        .try_global::<MainView>()
+        .and_then(|state| state.0.clone())
+    else {
+        cx.quit();
+        return;
+    };
+    if view.update(cx, |app, cx| app.request_quit(cx)).is_err() {
+        cx.quit();
+    }
+}
+
 fn update_main(
     cx: &mut App,
     update: impl FnOnce(&mut ChatApp, &mut Window, &mut Context<ChatApp>),
@@ -70,17 +84,14 @@ const MIN_SIZE: Size<Pixels> = Size {
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(prefs: Preferences, cx: &mut App) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
-    let stores = match SessionStores::open_default() {
-        Ok(stores) => stores,
-        Err(error) => {
-            eprintln!("failed to open persistent session stores: {error}");
-            cx.quit();
-            return;
-        }
-    };
-    cx.set_global(stores);
+    // Opening SQLite catalogs and replaying a pending repair can scan every
+    // source file. Keep that work off the application thread before the first
+    // window and its ChatView are constructed.
+    let stores = cx.background_spawn(async { SessionStores::open_default() });
 
-    cx.spawn(async move |cx| -> Result<()> {
+    cx.spawn(async move |cx| {
+        let stores = stores.await;
+        cx.update(|cx| cx.set_global(stores));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
@@ -99,37 +110,46 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
             ..Default::default()
         };
 
-        let window = cx
-            .open_window(options, |window, cx| {
-                let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
-                cx.set_global(MainView(Some(app_view.downgrade())));
+        let window = match cx.open_window(options, |window, cx| {
+            let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+            cx.set_global(MainView(Some(app_view.downgrade())));
 
-                // Default focus to the app root so global keybindings dispatch to it
-                // before any input steals focus.
-                let focus_handle = app_view.focus_handle(cx);
-                window.defer(cx, move |window, cx| {
-                    if window.focused(cx).is_none() {
-                        focus_handle.focus(window, cx);
-                    }
-                });
+            // Default focus to the app root so global keybindings dispatch to it
+            // before any input steals focus.
+            let focus_handle = app_view.focus_handle(cx);
+            window.defer(cx, move |window, cx| {
+                if window.focused(cx).is_none() {
+                    focus_handle.focus(window, cx);
+                }
+            });
 
-                cx.new(|cx| {
-                    Root::new(app_view, window, cx)
-                        .bg(glass::root_background(cx.theme().background))
-                })
+            cx.new(|cx| {
+                Root::new(app_view, window, cx).bg(glass::root_background(cx.theme().background))
             })
-            .context("failed to open main window")?;
+        }) {
+            Ok(window) => window,
+            Err(error) => {
+                crate::logging::error(
+                    "shell.window",
+                    format_args!("failed to open main window: {error:?}"),
+                );
+                return;
+            }
+        };
 
-        window.update(cx, |_, window, cx| {
+        if let Err(error) = window.update(cx, |_, window, cx| {
             window.activate_window();
             window.set_window_title("Nostra");
             // Quit the process when the main window closes.
             cx.on_release(|_, cx| cx.quit()).detach();
-        })?;
-
-        Ok(())
+        }) {
+            crate::logging::error(
+                "shell.window",
+                format_args!("failed to finish main-window setup: {error:?}"),
+            );
+        }
     })
-    .detach_and_log_err(cx);
+    .detach();
 }
 
 /// Install (or re-install after a language change) the macOS native menu

@@ -39,7 +39,7 @@ pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};
 pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
     InMemorySessionStore, ProjectSessionStore, SessionCatalogStore, SessionFlushStore,
-    SessionLifecycleStore, SessionStore, SessionTreeStore,
+    SessionLifecycleStore, SessionReadStore, SessionStore, SessionTreeStore,
 };
 pub use reference::{
     AgentChatReferenceTool, ChatMessagePreview, ChatMessageRead, ChatMessageReferenceStore,
@@ -47,7 +47,10 @@ pub use reference::{
     ChatMessageUnavailableReason, ChatReferenceError, MAX_REFERENCE_MESSAGE_BYTES,
     ReferencedContentBlock, ReferencedMessage,
 };
-pub use service::{SessionStores, SessionStoresError, SharedSessionStore};
+pub use service::{
+    SessionStores, SessionStoresError, SharedAgentProjectStore, SharedChatReferenceStore,
+    SharedSessionCatalog, SharedSessionStore,
+};
 pub use tree::{
     ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,
     ResolvedTurnResult, SessionBranchPreview, SessionBranchSummary, SessionBranchTreeNode,
@@ -57,4 +60,5 @@ pub use tree::{
 };
 
 pub(crate) use recorder::JsonlRecorder;
-pub(crate) use tree::validate_appended_kind;
+pub(crate) use service::SessionOperationGuard;
+pub(crate) use tree::AppendValidationState;

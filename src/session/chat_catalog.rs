@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use super::{
     CatalogCursor, CatalogError, CatalogQuery, ResolvedSessionState, SessionCatalogStore,
-    SessionDomain, SessionError, SessionId, SessionLifecycleStore, SessionSummary,
+    SessionDomain, SessionError, SessionId, SessionReadStore, SessionSummary,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -43,7 +43,7 @@ pub struct ChatSessionCatalogController<S> {
 
 impl<S> ChatSessionCatalogController<S>
 where
-    S: SessionCatalogStore + SessionLifecycleStore,
+    S: SessionCatalogStore + SessionReadStore,
 {
     #[must_use]
     pub fn new(store: S) -> Self {
@@ -173,7 +173,8 @@ mod tests {
         llm::{ContentBlock, Message, ProviderMetadata, Role, Usage},
         session::{
             InMemorySessionStore, LocalSessionStore, LocalStoreConfig, MessageEntry,
-            ProjectIdentity, SessionEntryKind, SessionFlushStore, SessionStore, SessionStores,
+            ProjectIdentity, SessionEntryKind, SessionFlushStore, SessionLifecycleStore,
+            SessionStore, SessionStores,
         },
     };
 

@@ -116,6 +116,9 @@ chat:
     persistence_retry_failed:
       en: The previous reply is still not saved. Check local storage and try again.
       zh-CN: 上一条回复仍未保存，请检查本地存储后重试。
+    persistence_delete_failed:
+      en: The chat could not be permanently deleted. Check local storage and try again.
+      zh-CN: 聊天无法永久删除，请检查本地存储后重试。
     markdown:
       en: Nostra could not safely render this Markdown content.
       zh-CN: Nostra 无法安全渲染这段 Markdown 内容。
@@ -206,6 +209,12 @@ settings:
   language_desc:
     en: Language used across the app UI.
     zh-CN: 应用界面所使用的语言。
+  detailed_logging:
+    en: Detailed diagnostic logs
+    zh-CN: 详细诊断日志
+  detailed_logging_desc:
+    en: By default Nostra records warnings and errors only. Enable this to also record sparse lifecycle information; prompts, API keys, and provider response bodies are never logged.
+    zh-CN: Nostra 默认只记录警告和错误。开启后会额外记录少量生命周期信息；提示词、API 密钥和供应商响应正文永远不会写入日志。
   theme_mode:
     en: Theme mode
     zh-CN: 主题模式

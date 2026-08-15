@@ -56,6 +56,9 @@ pub struct Preferences {
     pub glass_tint_opacity: f32,
     /// Whether settings omit the buttons that reveal explanatory text.
     pub hide_settings_info_buttons: bool,
+    /// Whether the diagnostic file includes sparse informational lifecycle
+    /// events. When false, the logger records warnings and errors only.
+    pub detailed_logging: bool,
     /// Global fenced-code wrap value applied whenever the setting changes.
     pub code_block_wrap: bool,
     /// Monotonic reset generation for per-block wrap controls.
@@ -104,6 +107,7 @@ impl Default for Preferences {
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             hide_settings_info_buttons: false,
+            detailed_logging: false,
             code_block_wrap: false,
             code_block_wrap_revision: 0,
             code_block_line_numbers: false,
@@ -298,7 +302,10 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
     let snapshot = prefs.preferences.clone();
     let result = save(&snapshot);
     if let Err(e) = result {
-        eprintln!("failed to save preferences: {e:?}");
+        crate::logging::error(
+            "preferences",
+            format_args!("failed to save preferences: {e:?}"),
+        );
     }
 }
 
@@ -393,6 +400,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_current_field).is_err());
 
+        let mut missing_detailed_logging =
+            serde_json::to_value(Preferences::default()).expect("serialize");
+        assert!(
+            missing_detailed_logging
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("detailed_logging")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_detailed_logging).is_err());
+
         let mut missing_wrap_revision =
             serde_json::to_value(Preferences::default()).expect("serialize");
         assert!(
@@ -457,6 +475,7 @@ mod tests {
         assert!(!prefs.glass_effect);
         assert_eq!(prefs.glass_tint_opacity, DEFAULT_GLASS_TINT_OPACITY);
         assert!(!prefs.hide_settings_info_buttons);
+        assert!(!prefs.detailed_logging);
         assert!(!prefs.user_message_markdown);
         assert!(!prefs.smooth_chat_scrolling);
         assert!(!prefs.code_block_wrap);
@@ -498,6 +517,19 @@ mod tests {
         assert!(back.code_block_line_numbers);
         assert!(back.user_message_markdown);
         assert!(back.smooth_chat_scrolling);
+    }
+
+    #[test]
+    fn detailed_logging_round_trips_without_changing_the_safe_default() {
+        assert!(!Preferences::default().detailed_logging);
+        let prefs = Preferences {
+            detailed_logging: true,
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize diagnostics preference");
+        let back: Preferences =
+            serde_json::from_str(&json).expect("deserialize diagnostics preference");
+        assert!(back.detailed_logging);
     }
 
     /// Both split geometries are plain widths, and both must survive a round
