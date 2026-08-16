@@ -29,6 +29,7 @@ pub(super) fn render(cx: &App) -> AnyElement {
                 cx,
             ),
             detailed_logging_row(cx),
+            restore_last_chat_row(cx),
         ],
         cx,
     )
@@ -52,6 +53,23 @@ fn detailed_logging_row(cx: &App) -> AnyElement {
     )
 }
 
+fn restore_last_chat_row(cx: &App) -> AnyElement {
+    ui::row(
+        "restore-last-chat",
+        t!("settings.restore_last_chat").to_string(),
+        Some(t!("settings.restore_last_chat_desc").to_string()),
+        Switch::new("restore-last-chat-switch")
+            .small()
+            .checked(preferences::get(cx).restore_last_chat_on_start)
+            .on_click(|enabled, _, cx| {
+                preferences::update(cx, |prefs| prefs.restore_last_chat_on_start = *enabled);
+                cx.refresh_windows();
+            })
+            .into_any_element(),
+        cx,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +80,8 @@ mod tests {
             for key in [
                 "settings.detailed_logging",
                 "settings.detailed_logging_desc",
+                "settings.restore_last_chat",
+                "settings.restore_last_chat_desc",
             ] {
                 let resolved = t!(key, locale = locale).to_string();
                 assert!(!resolved.contains(key), "{key} unresolved for {locale}");

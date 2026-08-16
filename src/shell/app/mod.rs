@@ -1,5 +1,6 @@
 //! Root `ChatApp` view: hosts conversations, top bar(s), and the fixed sidebar.
 
+mod history_sidebar;
 mod render;
 
 use std::{
@@ -14,11 +15,10 @@ use std::{
 use futures::future;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Anchor, AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, EmptyView, Entity,
-    FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement as _, Pixels, Render, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowControlArea,
-    div, px,
+    AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, EmptyView, Entity,
+    FocusHandle, Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, Window, WindowControlArea, div, px,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
@@ -27,7 +27,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::DialogButtonProps,
     h_flex,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::DropdownMenu as _,
     sidebar::SidebarToggleButton,
     v_flex,
 };
@@ -42,9 +42,7 @@ use crate::session::{
 };
 use crate::shell::actions::{OpenSettings, ToggleTheme};
 use crate::ui::{
-    self,
-    inline_delete_confirmation::{InlineDeleteConfirmation, InlineDeleteConfirmationHandle},
-    model_select::ModelPicker,
+    inline_delete_confirmation::InlineDeleteConfirmationHandle, model_select::ModelPicker,
 };
 
 /// Minimum sidebar width when the user drags the right edge inward.
@@ -109,13 +107,30 @@ pub struct ChatApp {
     /// observer and persisted on quit.
     window_geometry: Option<WindowGeometry>,
     model_picker: Entity<ModelPicker>,
-    /// Conversation whose row the pointer is over, so its actions button can
-    /// appear.  Matches `Conversation::view.entity_id()`.
-    hovered: Option<gpui::EntityId>,
-    /// Conversation awaiting inline delete confirmation.  While set, its row
+    /// Sidebar row the pointer is over, so its actions button can appear.
+    /// Matches a draft view entity or a catalog session id.
+    hovered: Option<SidebarTarget>,
+    /// Sidebar row awaiting inline delete confirmation.  While set, its row
     /// shows a Popover confirm card anchored to the actions button.
-    confirming: Option<gpui::EntityId>,
+    confirming: Option<SidebarTarget>,
     delete_confirmation: InlineDeleteConfirmationHandle,
+    /// Catalog snapshot, pagination cursor, and load state for the history
+    /// sidebar.  Render only reads this; every mutation comes from a background
+    /// load completion.
+    history: ChatHistorySidebar,
+    /// Background task owning the initial catalog page load.  Dropping it
+    /// cancels the work.
+    _catalog_initial_task: Option<Task<()>>,
+    /// Background task owning a load-more page.  Dropping it cancels the work.
+    _catalog_load_more_task: Option<Task<()>>,
+    /// Background task refreshing a single session summary after a durable
+    /// begin binds a new session.
+    _summary_refresh_task: Option<Task<()>>,
+    /// Background task permanently deleting an unopened catalog session.
+    _history_delete_task: Option<Task<()>>,
+    /// True once startup restore has been attempted after the first catalog
+    /// frame.  Prevents repeated restore attempts on later reloads.
+    startup_restore_attempted: bool,
     shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -123,6 +138,17 @@ pub struct ChatApp {
 }
 
 type PreferenceSaver = Arc<dyn Fn(Preferences) -> anyhow::Result<()> + Send + Sync>;
+
+/// Identity of a sidebar row.  Drafts (unbound views) are addressed by their
+/// view entity; persisted catalog rows are addressed by their session id so the
+/// row stays stable whether or not the session is currently opened.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum SidebarTarget {
+    View(gpui::EntityId),
+    Session(SessionId),
+}
+
+use history_sidebar::ChatHistorySidebar;
 
 struct ExitWork {
     stores: Option<SessionStores>,
@@ -203,6 +229,12 @@ impl ChatApp {
             hovered: None,
             confirming: None,
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
+            history: ChatHistorySidebar::new(),
+            _catalog_initial_task: None,
+            _catalog_load_more_task: None,
+            _summary_refresh_task: None,
+            _history_delete_task: None,
+            startup_restore_attempted: false,
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),
@@ -212,6 +244,7 @@ impl ChatApp {
         this.track_system_appearance(window, cx);
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
+        this.start_catalog_initial_load(window, cx);
         this
     }
 
@@ -423,9 +456,14 @@ impl ChatApp {
             return;
         }
         conversation.session_id = Some(session_id.clone());
-        self.opened_session_index.insert(session_id, target);
+        self.opened_session_index.insert(session_id.clone(), target);
+        // A brand-new durable session is not yet in the catalog snapshot; a
+        // restored session already is.  Refreshing in the background covers
+        // both without a full reload and without blocking the UI.
+        self.refresh_history_summary(session_id.clone(), cx);
+        self.record_active_session(&session_id, cx);
         cx.notify();
-        let _ = (window, cx);
+        let _ = window;
     }
 
     /// Select the conversation at `index`.  Only switches the active target;
@@ -473,7 +511,6 @@ impl ChatApp {
     /// opened, just switch the active target.  Otherwise spawn a background
     /// catalog/select + hydrate cycle guarded by a monotonic generation so a
     /// stale result cannot overwrite a newer active target.
-    #[allow(dead_code)]
     fn select_session(
         &mut self,
         session_id: SessionId,
@@ -539,7 +576,6 @@ impl ChatApp {
     /// Apply a background-resolved session state to the workspace.  Stale
     /// generations are discarded so a slow load cannot replace a newer active
     /// target the user has since chosen.
-    #[allow(dead_code)]
     fn apply_session_restore(
         &mut self,
         generation: u64,
@@ -594,9 +630,10 @@ impl ChatApp {
             session_id: Some(session_id.clone()),
             _subscription: sub,
         });
-        self.opened_session_index.insert(session_id, target);
+        self.opened_session_index.insert(session_id.clone(), target);
         self.active = Some(target);
         self.sync_model_picker_to_active(window, cx);
+        self.record_active_session(&session_id, cx);
         cx.notify();
     }
 
@@ -694,11 +731,11 @@ impl ChatApp {
         });
     }
 
-    /// Arm inline delete confirmation for a conversation.  The row's actions
+    /// Arm inline delete confirmation for a sidebar row.  The row's actions
     /// button becomes a Popover trigger showing a confirm card anchored to it.
     fn begin_delete_confirmation(
         &mut self,
-        target: gpui::EntityId,
+        target: SidebarTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -707,13 +744,34 @@ impl ChatApp {
         cx.notify();
     }
 
+    /// Resolve a confirmed inline deletion.  Drafts and opened catalog rows go
+    /// through the existing view durability path; unopened catalog rows are
+    /// deleted directly from the store.
+    fn confirm_delete_target(
+        &mut self,
+        target: SidebarTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target {
+            SidebarTarget::View(entity) => self.delete_conversation(entity, window, cx),
+            SidebarTarget::Session(session_id) => {
+                if let Some(&entity) = self.opened_session_index.get(&session_id) {
+                    self.delete_conversation(entity, window, cx);
+                } else {
+                    self.delete_unopened_session(session_id, window, cx);
+                }
+            }
+        }
+    }
+
     fn delete_conversation(
         &mut self,
         target: gpui::EntityId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_confirming = self.confirming == Some(target);
+        let was_confirming = self.confirming == Some(SidebarTarget::View(target));
         if was_confirming {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
@@ -752,11 +810,14 @@ impl ChatApp {
         let removed = self.conversations.remove(index);
         if let Some(session_id) = &removed.session_id {
             self.opened_session_index.remove(session_id);
+            // Keep the catalog snapshot in sync so the row disappears even when
+            // the deletion came from the opened-view durability path.
+            self.history.remove(session_id);
         }
-        if self.hovered == Some(target) {
+        if self.hovered == Some(SidebarTarget::View(target)) {
             self.hovered = None;
         }
-        if self.confirming == Some(target) {
+        if self.confirming == Some(SidebarTarget::View(target)) {
             self.confirming = None;
         }
         if self.active == Some(target) {

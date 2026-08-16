@@ -27,6 +27,27 @@ sidebar:
   more_actions:
     en: More actions
     zh-CN: 更多操作
+  load_more:
+    en: Load more
+    zh-CN: 加载更多
+  loading_chats:
+    en: Loading…
+    zh-CN: 加载中…
+  empty:
+    en: No conversations yet
+    zh-CN: 还没有会话
+  empty_hint:
+    en: Click "New chat" to start one.
+    zh-CN: 点击“新建聊天”开始一个会话。
+  load_failed:
+    en: Failed to load conversations
+    zh-CN: 加载会话失败
+  retry:
+    en: Retry
+    zh-CN: 重试
+  generating:
+    en: Generating…
+    zh-CN: 生成中…
 account:
   settings:
     en: Settings…
@@ -221,6 +242,12 @@ settings:
   detailed_logging_desc:
     en: By default Nostra records warnings and errors only. Enable this to also record sparse lifecycle information; prompts, API keys, and provider response bodies are never logged.
     zh-CN: Nostra 默认只记录警告和错误。开启后会额外记录少量生命周期信息；提示词、API 密钥和供应商响应正文永远不会写入日志。
+  restore_last_chat:
+    en: Restore last chat on start
+    zh-CN: 启动时恢复上次聊天
+  restore_last_chat_desc:
+    en: Reopen the most recently active conversation when Nostra launches. The first catalog frame is never blocked; a missing or invalid session falls back to the empty workspace.
+    zh-CN: 启动 Nostra 时重新打开最近活动的会话。首帧目录不会被阻塞；会话缺失或无效时回退到空工作区。
   theme_mode:
     en: Theme mode
     zh-CN: 主题模式

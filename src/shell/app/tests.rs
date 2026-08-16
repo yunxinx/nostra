@@ -435,7 +435,10 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     click(cx, actions);
     cx.simulate_keystrokes("down enter");
     redraw(cx);
-    assert_eq!(app.read_with(cx, |this, _| this.confirming), Some(target));
+    assert_eq!(
+        app.read_with(cx, |this, _| this.confirming.clone()),
+        Some(SidebarTarget::View(target))
+    );
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {

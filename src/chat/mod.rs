@@ -723,6 +723,13 @@ impl ChatView {
         self.selection.clone()
     }
 
+    /// Whether this view is currently streaming a provider reply.  Used by the
+    /// workspace sidebar to annotate the row without deriving other row data
+    /// from the view.
+    pub(crate) fn is_generating(&self) -> bool {
+        self.pending
+    }
+
     fn sync_selection_availability(&mut self, cx: &App) {
         let revision = providers::catalog_revision();
         if self.provider_catalog_revision == revision {
