@@ -897,6 +897,25 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let transcript = self.render_agent_transcript(cx);
+        // The draft composer stays installed in Agent mode; it owns the `$`
+        // Chat reference picker but no send or tool runtime.
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(div().flex_1().min_h_0().child(transcript))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(self.agent_composer.clone()),
+            )
+            .into_any_element()
+    }
+
+    fn render_agent_transcript(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(state) = self.agent.session_state() else {
             return self.render_agent_main_empty(cx).into_any_element();
         };
@@ -1066,22 +1085,29 @@ impl ChatApp {
             .child(Tab::new().label(t!("sidebar.chats").to_string()))
             .child(Tab::new().label(t!("agent.mode").to_string()))
             .selected_index(selected)
-            .on_click(cx.listener(|this, index: &usize, _, cx| {
+            .on_click(cx.listener(|this, index: &usize, window, cx| {
                 let mode = match index {
                     0 => super::WorkspaceMode::Chat,
                     _ => super::WorkspaceMode::Agent,
                 };
-                this.switch_workspace_mode(mode, cx);
+                this.switch_workspace_mode(mode, window, cx);
             }))
     }
 
     pub(super) fn switch_workspace_mode(
         &mut self,
         mode: super::WorkspaceMode,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.workspace_mode == mode {
             return;
+        }
+        if matches!(self.workspace_mode, super::WorkspaceMode::Agent) {
+            // Leaving Agent mode unmounts the composer; close any open
+            // reference picker so its overlay cannot linger over Chat.
+            self.agent_composer
+                .update(cx, |composer, cx| composer.dismiss_picker(window, cx));
         }
         self.workspace_mode = mode;
         if matches!(mode, super::WorkspaceMode::Agent)

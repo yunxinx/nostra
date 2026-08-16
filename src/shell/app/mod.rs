@@ -42,6 +42,7 @@ use crate::session::{
     ChatSessionCatalogController, ResolvedSessionState, SessionId, SessionStores,
 };
 use crate::shell::actions::{OpenSettings, ToggleTheme};
+use crate::ui::reference_picker::ChatReferenceComposer;
 use crate::ui::{
     inline_delete_confirmation::InlineDeleteConfirmationHandle, model_select::ModelPicker,
 };
@@ -137,6 +138,9 @@ pub struct ChatApp {
     /// Agent project workspace snapshot.  Render only reads this; every
     /// mutation comes from a background load completion.
     agent: AgentWorkspace,
+    /// Agent draft composer hosting the `$` Chat reference picker.  Created
+    /// once here so render never builds entities.
+    agent_composer: Entity<ChatReferenceComposer>,
     /// Background task owning the Agent project catalog load.
     _agent_projects_task: Option<Task<()>>,
     /// Background task owning the Agent session list load.
@@ -258,6 +262,7 @@ impl ChatApp {
             startup_restore_attempted: false,
             workspace_mode: WorkspaceMode::Chat,
             agent: AgentWorkspace::new(),
+            agent_composer: cx.new(|cx| ChatReferenceComposer::new(window, cx)),
             _agent_projects_task: None,
             _agent_sessions_task: None,
             _agent_session_task: None,

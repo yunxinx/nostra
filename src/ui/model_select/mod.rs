@@ -4,19 +4,21 @@
 //! conversation. `IndexPath` is only the list's temporary keyboard cursor, so
 //! filtering and regrouping can never invalidate the committed value.
 
-use std::{cell::RefCell, rc::Rc};
+use std::rc::Rc;
 
 use gpui::{
     App, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement as _, Pixels,
-    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div,
+    Render, SharedString, Styled as _, Subscription, Task, Window, div,
     prelude::FluentBuilder as _, px,
 };
+#[cfg(test)]
+use gpui_component::popover::PopoverState;
 use gpui_component::{
     ActiveTheme as _, IconName, IndexPath, Sizable as _, Size, StyleSized as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     list::{List, ListDelegate, ListState},
-    popover::{Popover, PopoverState},
+    popover::Popover,
     searchable_list::SearchableListItemElement,
     v_flex,
 };
@@ -25,42 +27,9 @@ use rust_i18n::t;
 use crate::llm::ModelSelection;
 use crate::preferences;
 use crate::providers::{self, SelectableModel};
+use crate::ui::popover::PopoverDismissHandle;
 
 type ConfirmHandler = Rc<dyn Fn(ModelSelection, &mut App) -> bool>;
-
-#[derive(Clone, Default)]
-struct PopoverDismissHandle(Rc<RefCell<Option<WeakEntity<PopoverState>>>>);
-
-impl PopoverDismissHandle {
-    fn bind(&self, state: WeakEntity<PopoverState>) {
-        *self.0.borrow_mut() = Some(state);
-    }
-
-    fn dismiss(&self, window: &mut Window, cx: &mut App) -> bool {
-        let Some(state) = self.0.borrow().as_ref().and_then(WeakEntity::upgrade) else {
-            return false;
-        };
-        window.defer(cx, move |window, cx| {
-            state.update(cx, |state, cx| state.dismiss(window, cx));
-        });
-        true
-    }
-
-    fn dismiss_then(
-        &self,
-        window: &mut Window,
-        cx: &mut App,
-        after: impl FnOnce(&mut Window, &mut App) + 'static,
-    ) {
-        let state = self.0.borrow().as_ref().and_then(WeakEntity::upgrade);
-        window.defer(cx, move |window, cx| {
-            if let Some(state) = state {
-                state.update(cx, |state, cx| state.dismiss(window, cx));
-            }
-            after(window, cx);
-        });
-    }
-}
 
 /// Width at which the pill stops growing and the model name truncates.  Longer
 /// model ids were clipping noticeably at the previous 280px, so this buys ~20%

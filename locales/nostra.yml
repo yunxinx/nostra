@@ -550,3 +550,58 @@ agent:
   tool_result:
     en: "[Tool result]"
     zh-CN: "[工具结果]"
+reference_picker:
+  composer_placeholder:
+    en: "Ask the agent…  Type $ to reference a chat message."
+    zh-CN: "向智能体提问…输入 $ 引用聊天消息。"
+  trigger_tooltip:
+    en: "Reference a chat message ($)"
+    zh-CN: "引用聊天消息（$）"
+  search_placeholder:
+    en: Search chat messages
+    zh-CN: 搜索聊天消息
+  initial_hint:
+    en: Type to search your chat history
+    zh-CN: 输入关键词搜索聊天记录
+  empty:
+    en: No matching messages
+    zh-CN: 没有匹配的消息
+  error_search:
+    en: Failed to search chat history
+    zh-CN: 搜索聊天记录失败
+  error_read:
+    en: Failed to read the selected message
+    zh-CN: 读取所选消息失败
+  error_too_large:
+    en: "This message is too large to reference (limit %{limit} bytes)"
+    zh-CN: "这条消息过大，无法引用（上限 %{limit} 字节）"
+  error_unavailable_session:
+    en: The source chat was deleted
+    zh-CN: 原聊天已被删除
+  error_unavailable_message:
+    en: The source message is no longer available
+    zh-CN: 原消息已不可用
+  error_unavailable_corrupt:
+    en: The source chat transcript is unavailable
+    zh-CN: 原聊天记录无法读取
+  remove:
+    en: Remove reference
+    zh-CN: 移除引用
+  untitled_chat:
+    en: Untitled chat
+    zh-CN: 未命名聊天
+  role_user:
+    en: User
+    zh-CN: 用户
+  role_assistant:
+    en: Assistant
+    zh-CN: 助手
+  role_system:
+    en: System
+    zh-CN: 系统
+  role_developer:
+    en: Developer
+    zh-CN: 开发者
+  role_tool:
+    en: Tool
+    zh-CN: 工具
