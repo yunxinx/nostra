@@ -20,7 +20,8 @@ mod tree;
 
 pub use crate::llm::{FinishReason, Usage};
 pub use catalog::{
-    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, RepairReport, SessionSummary,
+    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
+    ProjectCatalogPage, ProjectCatalogQuery, ProjectSummary, RepairReport, SessionSummary,
 };
 pub use chat::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,

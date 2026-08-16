@@ -116,6 +116,14 @@ pub trait ProjectSessionStore {
         &self,
         project_id: &str,
     ) -> Result<Option<super::ProjectIdentity>, CatalogError>;
+    /// Page over persisted Agent projects in stable `(updated_at DESC,
+    /// project_id DESC)` order.  The catalog derives counts and last-updated
+    /// timestamps from session rows; callers never read JSONL or the
+    /// `projects` table directly.
+    fn list_projects(
+        &self,
+        query: super::ProjectCatalogQuery,
+    ) -> Result<super::ProjectCatalogPage, CatalogError>;
 }
 
 pub trait SessionStore: SessionLifecycleStore + SessionTreeStore + SessionFlushStore {}
@@ -571,6 +579,89 @@ impl ProjectSessionStore for InMemorySessionStore {
             }
         }
         Ok(winner.map(|(_, _, project)| project))
+    }
+
+    fn list_projects(
+        &self,
+        query: super::ProjectCatalogQuery,
+    ) -> Result<super::ProjectCatalogPage, CatalogError> {
+        use std::collections::HashMap as StdHashMap;
+
+        // Aggregate per project: latest (updated_at, session_id) wins the
+        // identity fields, matching the catalog's keyset order.
+        let mut by_project: StdHashMap<String, (i64, SessionId, super::ProjectSummary)> =
+            StdHashMap::new();
+        for (session_id, session) in &self.sessions {
+            if session.domain != SessionDomain::Agent {
+                continue;
+            }
+            let summary = Self::summary(session)?;
+            let Some(project) = summary.project else {
+                continue;
+            };
+            match by_project.get_mut(&project.project_id) {
+                Some((best_updated, best_id, existing)) => {
+                    existing.session_count = existing.session_count.saturating_add(1);
+                    if (summary.updated_at, session_id) > (*best_updated, best_id) {
+                        *best_updated = summary.updated_at;
+                        *best_id = session_id.clone();
+                        existing.display_name = project.display_name.clone();
+                        existing.canonical_path = project.canonical_path.clone();
+                        existing.last_updated_at = summary.updated_at;
+                    }
+                }
+                None => {
+                    by_project.insert(
+                        project.project_id.clone(),
+                        (
+                            summary.updated_at,
+                            session_id.clone(),
+                            super::ProjectSummary {
+                                project_id: project.project_id.clone(),
+                                display_name: project.display_name.clone(),
+                                canonical_path: project.canonical_path.clone(),
+                                session_count: 1,
+                                last_updated_at: summary.updated_at,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+
+        let mut projects: Vec<super::ProjectSummary> = by_project
+            .into_values()
+            .map(|(_, _, summary)| summary)
+            .collect();
+        projects.sort_by(|left, right| {
+            right
+                .last_updated_at
+                .cmp(&left.last_updated_at)
+                .then_with(|| right.project_id.cmp(&left.project_id))
+        });
+        if let Some(cursor) = &query.cursor {
+            projects.retain(|summary| {
+                summary.last_updated_at < cursor.updated_at
+                    || (summary.last_updated_at == cursor.updated_at
+                        && summary.project_id < cursor.project_id)
+            });
+        }
+
+        let limit = query.limit.max(1);
+        let has_more = projects.len() > limit;
+        projects.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                projects.last().map(|summary| super::ProjectCatalogCursor {
+                    updated_at: summary.last_updated_at,
+                    project_id: summary.project_id.clone(),
+                })
+            })
+            .flatten();
+        Ok(super::ProjectCatalogPage {
+            projects,
+            next_cursor,
+        })
     }
 }
 

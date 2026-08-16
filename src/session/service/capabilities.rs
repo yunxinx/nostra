@@ -320,4 +320,11 @@ impl ProjectSessionStore for SharedAgentProjectStore {
     ) -> Result<Option<ProjectIdentity>, CatalogError> {
         self.0.lock_catalog()?.get_project_identity(project_id)
     }
+
+    fn list_projects(
+        &self,
+        query: super::super::ProjectCatalogQuery,
+    ) -> Result<super::super::ProjectCatalogPage, CatalogError> {
+        self.0.lock_catalog()?.list_projects(query)
+    }
 }

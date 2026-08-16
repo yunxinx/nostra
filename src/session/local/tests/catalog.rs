@@ -417,3 +417,82 @@ fn project_registry_is_order_independent_and_promotes_after_delete() {
         Some(expected_fallback)
     );
 }
+
+#[test]
+fn list_projects_pages_agent_projects_with_counts_and_stable_order() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Agent))
+            .expect("open");
+
+    let mut project_ids = Vec::new();
+    for index in 0..3 {
+        let project = ProjectIdentity::new(
+            root.path().join(format!("project-{index}")),
+            format!("Project {index}"),
+        );
+        project_ids.push(project.project_id.clone());
+        let header = SessionHeader::new(SessionDomain::Agent, Some(project));
+        let session_id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        store
+            .append(&session_id, vec![message("x")])
+            .expect("append");
+    }
+
+    // Add a second session to project 0 so session_count distinguishes it.
+    let project_0 = ProjectIdentity::from_parts(
+        project_ids[0].clone(),
+        root.path().join("project-0-moved"),
+        "Project 0 Moved",
+    )
+    .expect("moved identity");
+    let second_header = SessionHeader::new(SessionDomain::Agent, Some(project_0));
+    store
+        .create_session(second_header)
+        .expect("second session in project 0");
+
+    let first = store
+        .list_projects(ProjectCatalogQuery::with_limit(2))
+        .expect("first page");
+    assert_eq!(first.projects.len(), 2);
+    let cursor = first.next_cursor.expect("has more");
+    let second = store
+        .list_projects(ProjectCatalogQuery {
+            cursor: Some(cursor),
+            limit: 2,
+        })
+        .expect("second page");
+    assert_eq!(second.projects.len(), 1);
+    assert!(second.next_cursor.is_none());
+
+    let mut all = first.projects;
+    all.extend(second.projects);
+    assert_eq!(all.len(), 3);
+    let seen: HashSet<String> = all.iter().map(|p| p.project_id.clone()).collect();
+    assert_eq!(seen.len(), 3);
+    for summary in &all {
+        if summary.project_id == project_ids[0] {
+            assert_eq!(summary.session_count, 2);
+        } else {
+            assert_eq!(summary.session_count, 1);
+        }
+    }
+    // Ordering is stable by (updated_at DESC, project_id DESC).
+    assert!(all[0].last_updated_at >= all[1].last_updated_at);
+    assert!(all[1].last_updated_at >= all[2].last_updated_at);
+}
+
+#[test]
+fn list_projects_rejects_chat_domain() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let store = LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+        .expect("open");
+    assert!(matches!(
+        store.list_projects(ProjectCatalogQuery::first_page()),
+        Err(CatalogError::DomainMismatch {
+            expected: SessionDomain::Agent,
+            actual: SessionDomain::Chat,
+        })
+    ));
+}

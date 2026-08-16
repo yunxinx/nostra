@@ -342,6 +342,19 @@ impl ProjectSessionStore for LocalSessionStore {
         }
         self.catalog.get_project_identity(project_id)
     }
+
+    fn list_projects(
+        &self,
+        query: super::ProjectCatalogQuery,
+    ) -> Result<super::ProjectCatalogPage, CatalogError> {
+        if self.config.domain != SessionDomain::Agent {
+            return Err(CatalogError::DomainMismatch {
+                expected: SessionDomain::Agent,
+                actual: self.config.domain,
+            });
+        }
+        self.catalog.list_projects(query)
+    }
 }
 
 impl ChatMessageReferenceStore for LocalSessionStore {

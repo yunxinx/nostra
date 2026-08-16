@@ -6,6 +6,7 @@ use crate::session::{
     ConfigChange, InMemorySessionStore, JsonlWriter, ProjectIdentity, SessionStore,
     TranscriptReplay, TurnResult, TurnStatus,
 };
+use std::collections::HashSet;
 use std::io::Write;
 
 fn message(text: &str) -> SessionEntryKind {

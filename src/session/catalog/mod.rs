@@ -29,7 +29,8 @@ use projection::{
 };
 use recovery::clear_replacement_marker;
 pub use types::{
-    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, RepairReport, SessionSummary,
+    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
+    ProjectCatalogPage, ProjectCatalogQuery, ProjectSummary, RepairReport, SessionSummary,
 };
 pub(crate) use types::{MessageNodeRow, ProjectionIntent};
 
@@ -508,6 +509,83 @@ impl Catalog {
             )
             .optional()
             .map_err(CatalogError::from)
+    }
+
+    pub(crate) fn list_projects(
+        &self,
+        query: ProjectCatalogQuery,
+    ) -> Result<ProjectCatalogPage, CatalogError> {
+        let limit = query.limit.max(1);
+        let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
+        // The `projects` table holds one row per project with the display
+        // fields; `sessions` provides the per-project count and the
+        // latest most-recent updated_at.  A LEFT JOIN keeps a project with
+        // zero remaining sessions visible with count 0 and the
+        // `projects.updated_at` fallback.
+        let mut sql = String::from(
+            "SELECT p.project_id, p.display_name, p.canonical_path,
+                    COALESCE(s.session_count, 0) AS session_count,
+                    COALESCE(s.last_updated_at, p.updated_at) AS last_updated_at
+             FROM projects p
+             LEFT JOIN (
+                 SELECT project_id,
+                        COUNT(*) AS session_count,
+                        MAX(updated_at) AS last_updated_at
+                 FROM sessions
+                 WHERE domain = 'agent' AND project_id IS NOT NULL
+                 GROUP BY project_id
+             ) s ON s.project_id = p.project_id",
+        );
+        let mut values: Vec<Box<dyn ToSql>> = Vec::new();
+        if let Some(cursor) = &query.cursor {
+            sql.push_str(
+                " WHERE (last_updated_at < ? OR (last_updated_at = ? AND p.project_id < ?))",
+            );
+            values.push(Box::new(cursor.updated_at));
+            values.push(Box::new(cursor.updated_at));
+            values.push(Box::new(cursor.project_id.clone()));
+        }
+        sql.push_str(" ORDER BY last_updated_at DESC, p.project_id DESC LIMIT ?");
+        values.push(Box::new(fetch_limit as i64));
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            |row| {
+                let project_id: String = row.get(0)?;
+                let display_name: String = row.get(1)?;
+                let canonical_path: String = row.get(2)?;
+                let session_count: i64 = row.get(3)?;
+                let last_updated_at: i64 = row.get(4)?;
+                Ok(ProjectSummary {
+                    project_id,
+                    display_name,
+                    canonical_path: PathBuf::from(canonical_path),
+                    session_count: session_count.max(0) as usize,
+                    last_updated_at,
+                })
+            },
+        )?;
+        let mut projects = Vec::new();
+        for row in rows {
+            projects.push(row?);
+        }
+        let has_more = projects.len() > limit;
+        if has_more {
+            projects.pop();
+        }
+        let next_cursor = has_more
+            .then(|| {
+                projects.last().map(|project| ProjectCatalogCursor {
+                    updated_at: project.last_updated_at,
+                    project_id: project.project_id.clone(),
+                })
+            })
+            .flatten();
+        Ok(ProjectCatalogPage {
+            projects,
+            next_cursor,
+        })
     }
 
     pub(crate) fn search_message_nodes(

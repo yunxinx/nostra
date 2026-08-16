@@ -1,5 +1,6 @@
 //! Root `ChatApp` view: hosts conversations, top bar(s), and the fixed sidebar.
 
+mod agent_workspace;
 mod history_sidebar;
 mod render;
 
@@ -131,6 +132,17 @@ pub struct ChatApp {
     /// True once startup restore has been attempted after the first catalog
     /// frame.  Prevents repeated restore attempts on later reloads.
     startup_restore_attempted: bool,
+    /// Current workspace mode (Chat or Agent).
+    workspace_mode: WorkspaceMode,
+    /// Agent project workspace snapshot.  Render only reads this; every
+    /// mutation comes from a background load completion.
+    agent: AgentWorkspace,
+    /// Background task owning the Agent project catalog load.
+    _agent_projects_task: Option<Task<()>>,
+    /// Background task owning the Agent session list load.
+    _agent_sessions_task: Option<Task<()>>,
+    /// Background task owning the Agent session detail load.
+    _agent_session_task: Option<Task<()>>,
     shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -148,6 +160,15 @@ pub(super) enum SidebarTarget {
     Session(SessionId),
 }
 
+/// Top-level workspace mode: Chat (interactive conversations) or Agent
+/// (read-only browsing of persisted agent projects and sessions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkspaceMode {
+    Chat,
+    Agent,
+}
+
+use agent_workspace::AgentWorkspace;
 use history_sidebar::ChatHistorySidebar;
 
 struct ExitWork {
@@ -235,6 +256,11 @@ impl ChatApp {
             _summary_refresh_task: None,
             _history_delete_task: None,
             startup_restore_attempted: false,
+            workspace_mode: WorkspaceMode::Chat,
+            agent: AgentWorkspace::new(),
+            _agent_projects_task: None,
+            _agent_sessions_task: None,
+            _agent_session_task: None,
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),

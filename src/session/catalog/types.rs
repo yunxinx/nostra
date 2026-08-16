@@ -119,6 +119,61 @@ pub struct CatalogPage {
     pub next_cursor: Option<CatalogCursor>,
 }
 
+/// Keyset cursor for project enumeration.  Projects are ordered by
+/// `(updated_at DESC, project_id DESC)` so a cursor names the last project
+/// already returned on the previous page.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCatalogCursor {
+    pub updated_at: i64,
+    pub project_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectCatalogQuery {
+    pub cursor: Option<ProjectCatalogCursor>,
+    pub limit: usize,
+}
+
+impl ProjectCatalogQuery {
+    #[must_use]
+    pub fn first_page() -> Self {
+        Self {
+            cursor: None,
+            limit: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    #[must_use]
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            ..Self::first_page()
+        }
+    }
+}
+
+/// Read-only summary of one persisted Agent project.  The catalog derives
+/// `session_count` and `last_updated_at` from the project's session rows;
+/// the GUI never reads JSONL or the `projects` table directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSummary {
+    pub project_id: String,
+    pub display_name: String,
+    pub canonical_path: PathBuf,
+    /// Number of Agent sessions currently bound to this project.  A project
+    /// with zero sessions remains listed until its durable facts are gone.
+    pub session_count: usize,
+    /// Most recent `updated_at` across the project's sessions, or the
+    /// project row's own `updated_at` when no session remains.
+    pub last_updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectCatalogPage {
+    pub projects: Vec<ProjectSummary>,
+    pub next_cursor: Option<ProjectCatalogCursor>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepairReport {
     pub scanned: usize,

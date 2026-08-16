@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     llm::{ContentBlock, Message, ModelSelection, Role, Usage},
-    session::{Compaction, ConfigChange, MessageEntry, SessionDomain},
+    session::{
+        Compaction, ConfigChange, MessageEntry, ProjectCatalogQuery, ProjectIdentity,
+        ProjectSummary, SessionDomain,
+    },
 };
 
 fn message(text: &str) -> SessionEntryKind {
@@ -137,4 +140,114 @@ fn compaction_admission_requires_an_active_message_target() {
     let restored = store.load_session(&id, None).expect("restored session");
     assert_eq!(restored.messages.len(), 1);
     assert_eq!(restored.messages[0].entry_id, continuation);
+}
+
+fn agent_header(project: ProjectIdentity, created_at: i64) -> SessionHeader {
+    let mut header = SessionHeader::new(SessionDomain::Agent, Some(project));
+    header.created_at = created_at;
+    header
+}
+
+#[test]
+fn list_projects_aggregates_counts_and_orders_by_updated_at_desc() {
+    let mut store = InMemorySessionStore::new();
+    let project_a = ProjectIdentity::new(PathBuf::from("/tmp/a"), "Alpha");
+    let project_b = ProjectIdentity::new(PathBuf::from("/tmp/b"), "Beta");
+    let project_a_id = project_a.project_id.clone();
+    let project_b_id = project_b.project_id.clone();
+
+    let header_a1 = agent_header(project_a.clone(), 100);
+    let a1_id = header_a1.session_id.clone();
+    store.create_session(header_a1).expect("create a1");
+    store
+        .append(&a1_id, vec![message("a1")])
+        .expect("append a1");
+
+    let header_b1 = agent_header(project_b.clone(), 200);
+    let b1_id = header_b1.session_id.clone();
+    store.create_session(header_b1).expect("create b1");
+    store
+        .append(&b1_id, vec![message("b1")])
+        .expect("append b1");
+
+    let header_a2 = agent_header(project_a.clone(), 300);
+    let a2_id = header_a2.session_id.clone();
+    store.create_session(header_a2).expect("create a2");
+    store
+        .append(&a2_id, vec![message("a2")])
+        .expect("append a2");
+
+    let page = store
+        .list_projects(ProjectCatalogQuery::first_page())
+        .expect("list projects");
+    assert_eq!(page.projects.len(), 2);
+    let by_id: HashMap<String, ProjectSummary> = page
+        .projects
+        .iter()
+        .cloned()
+        .map(|summary| (summary.project_id.clone(), summary))
+        .collect();
+    assert_eq!(by_id[&project_a_id].session_count, 2);
+    assert_eq!(by_id[&project_b_id].session_count, 1);
+    assert!(page.projects[0].last_updated_at >= page.projects[1].last_updated_at);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn list_projects_keyset_pagination_does_not_duplicate_or_rewind() {
+    let mut store = InMemorySessionStore::new();
+    let mut project_ids = Vec::new();
+    for index in 0..5 {
+        let project = ProjectIdentity::new(
+            PathBuf::from(format!("/tmp/project-{index}")),
+            format!("Project {index}"),
+        );
+        project_ids.push(project.project_id.clone());
+        let header = agent_header(project, 100 + index as i64);
+        let session_id = header.session_id.clone();
+        store.create_session(header).expect("create");
+        store
+            .append(&session_id, vec![message("x")])
+            .expect("append");
+    }
+
+    let first = store
+        .list_projects(ProjectCatalogQuery::with_limit(2))
+        .expect("first page");
+    assert_eq!(first.projects.len(), 2);
+    let cursor = first.next_cursor.expect("cursor");
+    let second = store
+        .list_projects(ProjectCatalogQuery {
+            cursor: Some(cursor),
+            limit: 2,
+        })
+        .expect("second page");
+    assert_eq!(second.projects.len(), 2);
+    let cursor = second.next_cursor.expect("cursor");
+    let third = store
+        .list_projects(ProjectCatalogQuery {
+            cursor: Some(cursor),
+            limit: 2,
+        })
+        .expect("third page");
+    assert_eq!(third.projects.len(), 1);
+    assert!(third.next_cursor.is_none());
+
+    let mut all = first.projects;
+    all.extend(second.projects);
+    all.extend(third.projects);
+    assert_eq!(all.len(), 5);
+    let seen: HashSet<String> = all.iter().map(|p| p.project_id.clone()).collect();
+    assert_eq!(seen.len(), 5);
+}
+
+#[test]
+fn list_projects_ignores_chat_sessions() {
+    let mut store = InMemorySessionStore::new();
+    let chat_header = SessionHeader::new(SessionDomain::Chat, None);
+    store.create_session(chat_header).expect("chat");
+    let page = store
+        .list_projects(ProjectCatalogQuery::first_page())
+        .expect("list");
+    assert!(page.projects.is_empty());
 }

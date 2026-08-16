@@ -15,10 +15,11 @@ use crate::paths;
 use super::{
     CatalogError, ChatMessageRead, ChatMessageReferenceStore, ChatMessageSearchCursor,
     ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, EntryId, JsonlLoader,
-    JsonlRecorder, ProjectIdentity, ProjectSessionStore, ResolvedSessionState,
-    SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader, SessionId,
-    SessionLifecycleStore, SessionReadStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
+    JsonlRecorder, ProjectCatalogPage, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
+    ResolvedSessionState, SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore,
+    SessionDomain, SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader,
+    SessionId, SessionLifecycleStore, SessionReadStore, SessionSummary, SessionTreeSnapshot,
+    SessionTreeStore,
     catalog::{
         Catalog, CatalogPage, CatalogQuery, CatalogRepairProjection, ProjectionIntent,
         RepairReport, SessionProjection,

@@ -9,9 +9,9 @@ use std::{
 };
 
 use crate::session::{
-    CatalogError, CatalogQuery, InMemorySessionStore, ProjectIdentity, ProjectSessionStore,
-    SessionCatalogStore, SessionDomain, SessionError, SessionHeader, SessionId,
-    SessionLifecycleStore, SessionReadStore,
+    CatalogError, CatalogQuery, InMemorySessionStore, ProjectCatalogQuery, ProjectIdentity,
+    ProjectSessionStore, ProjectSummary, SessionCatalogStore, SessionDomain, SessionError,
+    SessionHeader, SessionId, SessionLifecycleStore, SessionReadStore,
 };
 
 fn assert_send_sync<T: Send + Sync>() {}
@@ -486,5 +486,62 @@ fn shared_agent_project_capability_keeps_project_restore_scoped() {
             actual,
             ..
         }) if expected == project_a_id && actual == project_b_id
+    ));
+}
+
+#[test]
+fn shared_agent_project_capability_lists_projects_through_the_backing_store() {
+    let project_a = ProjectIdentity::new("/tmp/nostra-service-list-a", "Service Alpha");
+    let project_b = ProjectIdentity::new("/tmp/nostra-service-list-b", "Service Beta");
+    let project_a_id = project_a.project_id.clone();
+    let project_b_id = project_b.project_id.clone();
+
+    let mut backing = InMemorySessionStore::new();
+    backing
+        .create_session(SessionHeader::new(
+            SessionDomain::Agent,
+            Some(project_a.clone()),
+        ))
+        .expect("create a1");
+    backing
+        .create_session(SessionHeader::new(
+            SessionDomain::Agent,
+            Some(project_b.clone()),
+        ))
+        .expect("create b1");
+    backing
+        .create_session(SessionHeader::new(SessionDomain::Agent, Some(project_a)))
+        .expect("create a2");
+
+    let stores = SessionStores::with_agent_store(backing);
+    let projects = stores.agent_projects().expect("Agent project capability");
+
+    let page = projects
+        .list_projects(ProjectCatalogQuery::first_page())
+        .expect("list projects through shared capability");
+    assert_eq!(page.projects.len(), 2);
+
+    let by_id: std::collections::HashMap<String, ProjectSummary> = page
+        .projects
+        .iter()
+        .cloned()
+        .map(|summary| (summary.project_id.clone(), summary))
+        .collect();
+    assert_eq!(by_id[&project_a_id].session_count, 2);
+    assert_eq!(by_id[&project_b_id].session_count, 1);
+    assert!(page.next_cursor.is_none());
+}
+
+#[test]
+fn shared_agent_project_capability_list_projects_survives_a_poisoned_backing_store() {
+    let stores = SessionStores::with_agent_store(InMemorySessionStore::new());
+    let DomainStoreState::Ready(core) = &stores.agent else {
+        panic!("Agent store should be ready");
+    };
+    poison(core);
+    let projects = stores.agent_projects().expect("Agent project capability");
+    assert!(matches!(
+        projects.list_projects(ProjectCatalogQuery::first_page()),
+        Err(CatalogError::StorePoisoned)
     ));
 }

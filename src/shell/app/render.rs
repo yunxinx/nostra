@@ -67,7 +67,17 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        self.render_history_content(window, cx)
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .px_2()
+            .pt_1()
+            .gap_1()
+            .child(self.render_workspace_mode_tabs(cx))
+            .child(match self.workspace_mode {
+                WorkspaceMode::Chat => self.render_history_content(window, cx),
+                WorkspaceMode::Agent => self.render_agent_content(window, cx),
+            })
     }
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -199,6 +209,16 @@ impl Render for ChatApp {
         // Keep the title row in normal layout flow with an opaque background.
         // The model pill is positioned over this reserved row, while message
         // content and its scrollbar remain entirely below it.
+        let main_content: AnyElement = match self.workspace_mode {
+            WorkspaceMode::Chat => div()
+                .flex_1()
+                .min_h_0()
+                .when_some(active_view, |this, view| this.child(view))
+                .when(!has_active, |this| this.child(render_empty_workspace(cx)))
+                .into_any_element(),
+            WorkspaceMode::Agent => self.render_agent_main(window, cx),
+        };
+
         let main_column = v_flex()
             .flex_1()
             .min_w_0()
@@ -210,13 +230,7 @@ impl Render for ChatApp {
                     .flex_shrink_0()
                     .bg(cx.theme().background),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .when_some(active_view, |this, view| this.child(view))
-                    .when(!has_active, |this| this.child(render_empty_workspace(cx))),
-            );
+            .child(main_content);
 
         // ---------- Fixed top-left overlay: never moves ----------
         //
@@ -271,7 +285,10 @@ impl Render for ChatApp {
             .flex()
             .items_center()
             .occlude()
-            .when(has_active, |this| this.child(self.model_picker.clone()));
+            .when(
+                has_active && matches!(self.workspace_mode, WorkspaceMode::Chat),
+                |this| this.child(self.model_picker.clone()),
+            );
 
         // AppKit otherwise treats every point in a transparent native
         // titlebar as draggable, including controls. This layer sits behind
