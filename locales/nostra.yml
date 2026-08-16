@@ -158,6 +158,12 @@ chat:
   empty_hint:
     en: "Ask me anything.  Enter to send, Shift+Enter for newline."
     zh-CN: "随便问点什么。Enter 发送，Shift+Enter 换行。"
+  workspace_empty_title:
+    en: No conversation open
+    zh-CN: 没有打开的会话
+  workspace_empty_hint:
+    en: Click "New chat" to start a conversation.
+    zh-CN: 点击“新建聊天”开始对话。
 menu:
   file:
     en: File

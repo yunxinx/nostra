@@ -19,7 +19,8 @@ use crate::llm::{
 use crate::preferences;
 use crate::session::{
     CatalogQuery, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore, LocalStoreConfig,
-    SessionCatalogStore, SessionDomain, SessionReadStore, SessionStores, TurnStatus,
+    ResolvedSessionState, SessionCatalogStore, SessionDomain, SessionId, SessionReadStore,
+    SessionStores, TurnStatus,
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;

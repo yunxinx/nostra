@@ -341,6 +341,7 @@ impl ChatView {
         self.pending = true;
         self.pending_turn_id = Some(request.turn_id.clone());
         self.conversation_id = start.session_id.to_string();
+        cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
         let history = self
             .messages
             .iter()

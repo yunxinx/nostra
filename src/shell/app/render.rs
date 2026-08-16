@@ -43,18 +43,13 @@ impl ChatApp {
 
     // ---------- Sidebar rendering ----------
 
-    fn render_sidebar_panel(
-        &self,
-        active: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_sidebar_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
             .bg(glass::background(cx.theme().sidebar, cx))
             .text_color(cx.theme().sidebar_foreground)
             .child(self.render_sidebar_top_row(cx))
-            .child(self.render_sidebar_content(active, window, cx))
+            .child(self.render_sidebar_content(window, cx))
             .child(self.render_sidebar_footer(cx))
             .into_any_element()
     }
@@ -69,10 +64,10 @@ impl ChatApp {
 
     fn render_sidebar_content(
         &self,
-        active: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let active_target = self.active;
         let items = self
             .conversations
             .iter()
@@ -80,7 +75,7 @@ impl ChatApp {
             .map(|(i, conversation)| {
                 let title = conversation.title.clone();
                 let target = conversation.view.entity_id();
-                let is_active = i == active;
+                let is_active = active_target == Some(target);
                 let id: ElementId = ("conv", target).into();
                 let focus_handle = window
                     .use_keyed_state(id.clone(), cx, |_, cx| cx.focus_handle())
@@ -327,11 +322,7 @@ impl Focusable for ChatApp {
 
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.active;
-        let active_view = self
-            .conversations
-            .get(active)
-            .map(|conversation| conversation.view.clone());
+        let active_view = self.active_view();
         let has_active = active_view.is_some();
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
@@ -351,7 +342,7 @@ impl Render for ChatApp {
             .w(sidebar_width)
             .h_full()
             .relative()
-            .child(self.render_sidebar_panel(active, window, cx))
+            .child(self.render_sidebar_panel(window, cx))
             .child(self.render_resize_handle(cx));
 
         let (from_w, to_w) = if self.collapsed {
@@ -399,7 +390,8 @@ impl Render for ChatApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .when_some(active_view, |this, view| this.child(view)),
+                    .when_some(active_view, |this, view| this.child(view))
+                    .when(!has_active, |this| this.child(render_empty_workspace(cx))),
             );
 
         // ---------- Fixed top-left overlay: never moves ----------
@@ -427,9 +419,7 @@ impl Render for ChatApp {
                     .small()
                     .icon(Icon::default().path("icons/square-pen.svg"))
                     .tooltip(t!("sidebar.new_chat").to_string())
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.spawn_conversation(window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _, window, cx| this.spawn_draft(window, cx))),
             );
 
         // ---------- Floating model pill (animated left position) ----------
@@ -532,3 +522,29 @@ impl Render for ChatApp {
 /// handler that this drag is ours.
 #[derive(Clone)]
 struct SidebarResize;
+
+/// Rendered in the main column when the workspace has no opened conversation
+/// (startup state or after the last conversation is closed).  Distinct from
+/// `ChatView`'s in-conversation empty state, which shows while a draft view
+/// exists but has not yet received its first message.
+fn render_empty_workspace(cx: &mut Context<ChatApp>) -> impl IntoElement {
+    let theme = cx.theme();
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(
+            div()
+                .text_2xl()
+                .font_semibold()
+                .text_color(theme.foreground)
+                .child(t!("chat.workspace_empty_title").to_string()),
+        )
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(t!("chat.workspace_empty_hint").to_string()),
+        )
+}

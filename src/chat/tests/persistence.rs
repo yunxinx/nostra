@@ -172,8 +172,107 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
             .notification
             .read(cx)
             .notifications();
-        assert!(notifications.is_empty());
+        assert!(
+            notifications.is_empty(),
+            "a deleted durable begin must not surface a persistence failure notification"
+        );
     });
+}
+
+#[gpui::test]
+fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    cx.update(|cx| cx.set_global(stores));
+    let (chat, cx) = add_chat_window(cx);
+
+    let session_id = cx.update(|_, cx| {
+        chat.update(cx, |this, _cx| {
+            let controller = this
+                .session_controller
+                .as_ref()
+                .expect("controller")
+                .clone();
+            let mut guard = controller.lock().expect("lock");
+            let user_message = LlmMessage {
+                role: crate::llm::Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "persisted turn-1".into(),
+                    provider_metadata: ProviderMetadata::default(),
+                }],
+                provider_metadata: ProviderMetadata::default(),
+            };
+            let selection = ModelSelection {
+                profile_id: "fixture-profile".into(),
+                model_id: "fixture-model".into(),
+            };
+            let start = guard
+                .begin_turn(user_message, selection, "turn-1")
+                .expect("begin");
+            guard
+                .finish_turn("turn-1", &ChatTurnTerminal::cancelled())
+                .expect("finish");
+            start.session_id
+        })
+    });
+
+    let state = catalog
+        .load_session(&session_id, None)
+        .expect("load resolved state");
+    assert_eq!(state.messages.len(), 1);
+
+    let (other, cx) = add_chat_window(cx);
+    let restored = cx.update(|_, cx| {
+        other.update(cx, |this, cx| {
+            this.restore_from_session(&session_id, &state, cx)
+        })
+    });
+    assert!(restored.is_ok(), "restore should succeed on an idle view");
+    cx.update(|_, cx| {
+        other.read_with(cx, |this, _| {
+            assert_eq!(this.messages.len(), 1);
+            assert_eq!(this.conversation_id, session_id.to_string());
+            assert!(
+                this.next_turn_id >= 2,
+                "turn id must advance past the persisted turn-1"
+            );
+        });
+    });
+}
+
+#[gpui::test]
+fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppContext) {
+    init_app(cx);
+    cx.update(|cx| {
+        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
+    });
+    let (chat, cx) = add_chat_window(cx);
+    let dropped = Rc::new(std::cell::Cell::new(false));
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_pending_reply_for_test(dropped, cx);
+        });
+    });
+    let session_id: SessionId = "chat-01923f5e-7f4a-7f4a-8f4a-0123456789ab"
+        .parse()
+        .expect("valid session id");
+    let state = ResolvedSessionState {
+        leaf_id: crate::session::EntryId::new(),
+        path: Vec::new(),
+        context: Vec::new(),
+        messages: Vec::new(),
+        transcript_replays: Vec::new(),
+        turn_results: Vec::new(),
+        latest_config: None,
+        latest_compaction: None,
+    };
+    let result = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.restore_from_session(&session_id, &state, cx)
+        })
+    });
+    assert!(result.is_err(), "restore must reject a streaming view");
 }
 
 #[gpui::test]

@@ -3,6 +3,7 @@
 mod render;
 
 use std::{
+    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -16,7 +17,8 @@ use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, EmptyView, Entity,
     FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, ParentElement as _, Pixels, Render, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Window, WindowControlArea, div, px,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, WindowControlArea,
+    div, px,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
@@ -32,10 +34,12 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::appearance::{glass, theme};
-use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView};
+use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
 use crate::llm::ModelSelection;
 use crate::preferences::{self, Preferences, WindowGeometry};
-use crate::session::SessionStores;
+use crate::session::{
+    ChatSessionCatalogController, ResolvedSessionState, SessionId, SessionStores,
+};
 use crate::shell::actions::{OpenSettings, ToggleTheme};
 use crate::ui::{
     self,
@@ -73,7 +77,20 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 pub struct ChatApp {
     focus_handle: FocusHandle,
     conversations: Vec<Conversation>,
-    active: usize,
+    /// Quick lookup from a persisted session id to the entity id of its opened
+    /// `ChatView`.  A draft view never appears here until its first durable
+    /// turn begin binds a session id.
+    opened_session_index: HashMap<SessionId, gpui::EntityId>,
+    /// Entity id of the currently displayed conversation, or `None` when the
+    /// workspace is showing the empty detail state.
+    active: Option<gpui::EntityId>,
+    /// Monotonic counter guarding against stale background session selections
+    /// overwriting a newer active target.
+    #[allow(dead_code)]
+    selection_generation: u64,
+    /// Background task owning an in-flight catalog/select + hydrate cycle.
+    /// Dropping it cancels the work.
+    _selection_task: Option<Task<()>>,
     collapsed: bool,
     /// True once the user has toggled the sidebar at least once.  Prevents an
     /// unwanted slide-in on the very first render.
@@ -117,6 +134,9 @@ struct Conversation {
     view: Entity<ChatView>,
     title: SharedString,
     selection: Option<ModelSelection>,
+    /// `None` while this view is an unbound draft; `Some` once a durable turn
+    /// begin or a successful restore has bound it to a persisted session.
+    session_id: Option<SessionId>,
     _subscription: Subscription,
 }
 
@@ -169,7 +189,10 @@ impl ChatApp {
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             conversations: Vec::new(),
-            active: 0,
+            opened_session_index: HashMap::new(),
+            active: None,
+            selection_generation: 0,
+            _selection_task: None,
             collapsed: prefs.sidebar_collapsed,
             has_toggled: false,
             sidebar_width,
@@ -187,7 +210,6 @@ impl ChatApp {
         };
         this.track_window_geometry(window, cx);
         this.track_system_appearance(window, cx);
-        this.spawn_conversation(window, cx);
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
         this
@@ -315,18 +337,39 @@ impl ChatApp {
         }));
     }
 
-    fn spawn_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Create a fresh draft conversation with no persisted session id.  The
+    /// session id is bound only after the first durable turn begin succeeds
+    /// (see [`Self::handle_session_bound`]).
+    fn spawn_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
         let view = ChatView::view(window, cx);
-        let sub = cx.subscribe_in(&view, window, |this, view, event, window, cx| {
+        let sub = self.subscribe_conversation(&view, window, cx);
+        let selection = view.read(cx).selection();
+        self.conversations.push(Conversation {
+            view,
+            title,
+            selection,
+            session_id: None,
+            _subscription: sub,
+        });
+        self.active = self.conversations.last().map(|c| c.view.entity_id());
+        self.sync_model_picker_to_active(window, cx);
+        cx.notify();
+    }
+
+    /// Wire up the [`ChatEvent`] subscription for a conversation view.  Kept as
+    /// a helper so both draft creation and restore use the same wiring.
+    fn subscribe_conversation(
+        &mut self,
+        view: &Entity<ChatView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(view, window, |this, view, event, window, cx| {
             let target = view.entity_id();
-            let Some(index) = this
-                .conversations
-                .iter()
-                .position(|conversation| conversation.view.entity_id() == target)
-            else {
+            let Some(index) = this.conversation_index(target) else {
                 return;
             };
             match event {
@@ -341,11 +384,14 @@ impl ChatApp {
                     let conversation = &mut this.conversations[index];
                     if conversation.selection.as_ref() != Some(selection) {
                         conversation.selection = Some(selection.clone());
-                        if index == this.active {
+                        if this.active == Some(target) {
                             this.sync_model_picker_to_active(window, cx);
                         }
                         cx.notify();
                     }
+                }
+                ChatEvent::SessionBound(session_id) => {
+                    this.handle_session_bound(target, session_id.clone(), window, cx);
                 }
                 ChatEvent::DeleteCompleted => {
                     // The subscription belongs to the conversation being
@@ -357,31 +403,212 @@ impl ChatApp {
                     });
                 }
             }
-        });
-        let selection = view.read(cx).selection();
-        self.conversations.push(Conversation {
-            view,
-            title,
-            selection,
-            _subscription: sub,
-        });
-        self.active = self.conversations.len() - 1;
+        })
+    }
+
+    /// Record that a conversation view has bound a persisted session id, either
+    /// via a durable turn begin or via [`ChatView::restore_from_session`].
+    fn handle_session_bound(
+        &mut self,
+        target: gpui::EntityId,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.conversation_index(target) else {
+            return;
+        };
+        let conversation = &mut self.conversations[index];
+        if conversation.session_id.as_ref() == Some(&session_id) {
+            return;
+        }
+        conversation.session_id = Some(session_id.clone());
+        self.opened_session_index.insert(session_id, target);
+        cx.notify();
+        let _ = (window, cx);
+    }
+
+    /// Select the conversation at `index`.  Only switches the active target;
+    /// never drops or cancels another conversation's streaming task.
+    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix < self.conversations.len() {
+            let target = self.conversations[ix].view.entity_id();
+            if self.active != Some(target) {
+                self.model_picker
+                    .update(cx, |picker, cx| picker.dismiss(window, cx));
+                self.active = Some(target);
+                self.sync_model_picker_to_active(window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Select a conversation by its view entity id.  Used by render callbacks
+    /// that already carry the entity id.
+    #[allow(dead_code)]
+    fn select_target(
+        &mut self,
+        target: gpui::EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active == Some(target) {
+            return;
+        }
+        if !self
+            .conversations
+            .iter()
+            .any(|c| c.view.entity_id() == target)
+        {
+            return;
+        }
+        self.model_picker
+            .update(cx, |picker, cx| picker.dismiss(window, cx));
+        self.active = Some(target);
         self.sync_model_picker_to_active(window, cx);
         cx.notify();
     }
 
-    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix < self.conversations.len() && ix != self.active {
-            self.model_picker
-                .update(cx, |picker, cx| picker.dismiss(window, cx));
-            self.active = ix;
-            self.sync_model_picker_to_active(window, cx);
-            cx.notify();
+    /// Lazily select a persisted Chat session.  If the session is already
+    /// opened, just switch the active target.  Otherwise spawn a background
+    /// catalog/select + hydrate cycle guarded by a monotonic generation so a
+    /// stale result cannot overwrite a newer active target.
+    #[allow(dead_code)]
+    fn select_session(
+        &mut self,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(&target) = self.opened_session_index.get(&session_id) {
+            self.select_target(target, window, cx);
+            return;
         }
+
+        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
+            return;
+        };
+        let catalog_store = match stores.chat_catalog() {
+            Ok(store) => store,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.workspace",
+                    format_args!("cannot select session: {error}"),
+                );
+                return;
+            }
+        };
+
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        let generation = self.selection_generation;
+        let app = cx.entity();
+        let window_handle = window.window_handle();
+        let task = cx.spawn(async move |_this, cx| {
+            let select_session_id = session_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut controller = ChatSessionCatalogController::new(catalog_store);
+                    controller.load_initial().and_then(|_| {
+                        controller
+                            .select(&select_session_id)
+                            .map(|selected| selected.state)
+                    })
+                })
+                .await;
+            let state = match result {
+                Ok(state) => state,
+                Err(error) => {
+                    crate::logging::error(
+                        "chat.workspace",
+                        format_args!("failed to load session {session_id}: {error}"),
+                    );
+                    return;
+                }
+            };
+            let _ = window_handle.update(cx, |_, window, cx| {
+                app.update(cx, |this, cx| {
+                    this.apply_session_restore(generation, session_id, state, window, cx);
+                });
+            });
+        });
+        self._selection_task = Some(task);
+        cx.notify();
+    }
+
+    /// Apply a background-resolved session state to the workspace.  Stale
+    /// generations are discarded so a slow load cannot replace a newer active
+    /// target the user has since chosen.
+    #[allow(dead_code)]
+    fn apply_session_restore(
+        &mut self,
+        generation: u64,
+        session_id: SessionId,
+        state: ResolvedSessionState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.selection_generation {
+            return;
+        }
+        if let Some(&target) = self.opened_session_index.get(&session_id) {
+            self.select_target(target, window, cx);
+            return;
+        }
+
+        let title: SharedString = state
+            .messages
+            .iter()
+            .find(|message| message.message.role == crate::llm::Role::User)
+            .and_then(|message| {
+                message
+                    .message
+                    .content
+                    .iter()
+                    .find_map(|block| match block {
+                        crate::llm::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                            Some(derive_chat_title(text))
+                        }
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| t!("chat.default_title").to_string().into());
+        let view = ChatView::view(window, cx);
+        let restore_result = view.update(cx, |chat, cx| {
+            chat.restore_from_session(&session_id, &state, cx)
+        });
+        if let Err(error) = restore_result {
+            crate::logging::error(
+                "chat.workspace",
+                format_args!("failed to hydrate session {session_id}: {error}"),
+            );
+            return;
+        }
+        let sub = self.subscribe_conversation(&view, window, cx);
+        let selection = view.read(cx).selection();
+        let target = view.entity_id();
+        self.conversations.push(Conversation {
+            view,
+            title,
+            selection,
+            session_id: Some(session_id.clone()),
+            _subscription: sub,
+        });
+        self.opened_session_index.insert(session_id, target);
+        self.active = Some(target);
+        self.sync_model_picker_to_active(window, cx);
+        cx.notify();
     }
 
     fn sync_model_picker_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conversation) = self.conversations.get(self.active) else {
+        let Some(target) = self.active else {
+            return;
+        };
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|c| c.view.entity_id() == target)
+        else {
             return;
         };
         let selection = conversation.selection.clone();
@@ -395,7 +622,14 @@ impl ChatApp {
         selection: ModelSelection,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(conversation) = self.conversations.get(self.active) else {
+        let Some(target) = self.active else {
+            return false;
+        };
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|c| c.view.entity_id() == target)
+        else {
             return false;
         };
         let view = conversation.view.clone();
@@ -410,15 +644,22 @@ impl ChatApp {
     }
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_conversation(window, cx);
+        self.spawn_draft(window, cx);
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(conversation) = self.conversations.get(self.active) else {
+        let Some(target) = self.active else {
             return;
         };
-        let target = conversation.view.entity_id();
-        self.request_delete_conversation(target, conversation.title.clone(), window, cx);
+        let Some(conversation) = self
+            .conversations
+            .iter()
+            .find(|c| c.view.entity_id() == target)
+        else {
+            return;
+        };
+        let title = conversation.title.clone();
+        self.request_delete_conversation(target, title, window, cx);
     }
 
     fn request_delete_conversation(
@@ -478,11 +719,7 @@ impl ChatApp {
             self.confirming = None;
         }
 
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.view.entity_id() == target)
-        else {
+        let Some(index) = self.conversation_index(target) else {
             if was_confirming {
                 cx.notify();
             }
@@ -508,31 +745,58 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.view.entity_id() == target)
-        else {
+        let Some(index) = self.conversation_index(target) else {
             return;
         };
 
-        self.conversations.remove(index);
+        let removed = self.conversations.remove(index);
+        if let Some(session_id) = &removed.session_id {
+            self.opened_session_index.remove(session_id);
+        }
         if self.hovered == Some(target) {
             self.hovered = None;
         }
+        if self.confirming == Some(target) {
+            self.confirming = None;
+        }
+        if self.active == Some(target) {
+            // Keep the active position stable: prefer the conversation now at
+            // the same index, fall back to the previous one, then to none.
+            self.active = self
+                .conversations
+                .get(index)
+                .map(|c| c.view.entity_id())
+                .or_else(|| {
+                    index
+                        .checked_sub(1)
+                        .and_then(|i| self.conversations.get(i).map(|c| c.view.entity_id()))
+                });
+        }
+
         if self.conversations.is_empty() {
-            self.active = 0;
-            self.spawn_conversation(window, cx);
+            self.active = None;
+            self.sync_model_picker_to_active(window, cx);
+            cx.notify();
             return;
         }
 
-        if index < self.active {
-            self.active -= 1;
-        } else if index == self.active {
-            self.active = index.min(self.conversations.len() - 1);
-        }
         self.sync_model_picker_to_active(window, cx);
         cx.notify();
+    }
+
+    fn conversation_index(&self, target: gpui::EntityId) -> Option<usize> {
+        self.conversations
+            .iter()
+            .position(|conversation| conversation.view.entity_id() == target)
+    }
+
+    fn active_view(&self) -> Option<Entity<ChatView>> {
+        self.active.and_then(|target| {
+            self.conversations
+                .iter()
+                .find(|c| c.view.entity_id() == target)
+                .map(|c| c.view.clone())
+        })
     }
 }
 

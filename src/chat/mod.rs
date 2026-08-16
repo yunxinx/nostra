@@ -47,7 +47,7 @@ use crate::llm::{
 };
 use crate::providers;
 use crate::session::{
-    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
+    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal, SessionId,
     SessionOperationGuard, SessionStores, SharedSessionStore,
 };
 use crate::ui::markdown::MarkdownBody;
@@ -89,6 +89,9 @@ type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSession
 pub enum ChatEvent {
     TitleChanged(SharedString),
     SelectionChanged(ModelSelection),
+    /// Emitted once a durable turn begin has bound a persisted session id to
+    /// this view.  Carries the session id now authoritative for the view.
+    SessionBound(SessionId),
     DeleteCompleted,
 }
 
@@ -665,7 +668,10 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub(crate) fn persist_session_for_test(&mut self) -> crate::session::SessionId {
+    pub(crate) fn persist_session_for_test(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> crate::session::SessionId {
         let user_message = LlmMessage {
             role: crate::llm::Role::User,
             content: vec![ContentBlock::Text {
@@ -690,6 +696,7 @@ impl ChatView {
             .finish_turn("fixture-turn", &ChatTurnTerminal::cancelled())
             .expect("persist test terminal");
         self.conversation_id = start.session_id.to_string();
+        cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
         start.session_id
     }
 
@@ -751,6 +758,14 @@ fn derive_title(text: &str) -> SharedString {
     } else {
         cleaned.into()
     }
+}
+
+/// Derive a sidebar title from the first user message text.  Exported so the
+/// workspace can compute a title from a [`ResolvedSessionState`] before the
+/// hydrated view's first event callback fires.
+#[allow(dead_code)]
+pub(crate) fn derive_chat_title(text: &str) -> SharedString {
+    derive_title(text)
 }
 
 #[cfg(test)]

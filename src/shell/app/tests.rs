@@ -152,6 +152,7 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
             assert!(this.conversations[0].view.update(cx, |chat, cx| {
                 chat.start_durable_pending_reply_for_test(Rc::clone(&dropped), window, cx)
             }));
@@ -191,12 +192,13 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let (app, cx) = add_app_window_with_stores(cx, Some(stores));
-    let (target, session_id) = cx.update(|_, cx| {
+    let (target, session_id) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
             let conversation = &this.conversations[0];
             let session_id = conversation
                 .view
-                .update(cx, |chat, _| chat.persist_session_for_test());
+                .update(cx, |chat, cx| chat.persist_session_for_test(cx));
             (conversation.view.entity_id(), session_id)
         })
     });
@@ -246,8 +248,9 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
 
     let first_removed = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
             for _ in 1..20 {
-                this.spawn_conversation(window, cx);
+                this.spawn_draft(window, cx);
             }
             assert_eq!(this.conversations.len(), 20);
 
@@ -259,7 +262,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
                 this.delete_conversation(target, window, cx);
             }
             assert_eq!(this.conversations.len(), 1);
-            assert_eq!(this.active, 0);
+            assert!(this.active.is_some());
             assert_eq!(
                 this.conversations
                     .iter()
@@ -279,7 +282,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     let second_removed = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             for _ in 1..20 {
-                this.spawn_conversation(window, cx);
+                this.spawn_draft(window, cx);
             }
             let mut removed = Vec::new();
             while this.conversations.len() > 1 {
@@ -289,12 +292,32 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
                 this.delete_conversation(target, window, cx);
             }
             assert_eq!(this.conversations.len(), 1);
-            assert_eq!(this.active, 0);
+            assert!(this.active.is_some());
             removed
         })
     });
     cx.run_until_parked();
     assert!(second_removed.iter().all(|view| view.upgrade().is_none()));
+
+    let third_removed = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            for _ in 1..20 {
+                this.spawn_draft(window, cx);
+            }
+            let mut removed = Vec::new();
+            while this.conversations.len() > 1 {
+                let view = this.conversations[0].view.downgrade();
+                let target = this.conversations[0].view.entity_id();
+                removed.push(view);
+                this.delete_conversation(target, window, cx);
+            }
+            assert_eq!(this.conversations.len(), 1);
+            assert!(this.active.is_some());
+            removed
+        })
+    });
+    cx.run_until_parked();
+    assert!(third_removed.iter().all(|view| view.upgrade().is_none()));
 }
 
 #[gpui::test]
@@ -302,26 +325,27 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
     let (app, cx) = add_app_window(cx);
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_conversation(window, cx);
-            this.spawn_conversation(window, cx);
-            this.active = 1;
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.active = Some(this.conversations[1].view.entity_id());
             let next = this.conversations[2].view.entity_id();
             let middle = this.conversations[1].view.entity_id();
             this.delete_conversation(middle, window, cx);
-            assert_eq!(this.active, 1);
-            assert_eq!(this.conversations[this.active].view.entity_id(), next);
+            assert_eq!(this.active, Some(next));
+            assert_eq!(this.active_view().expect("active view").entity_id(), next);
 
-            let before = this.conversations[this.active].view.entity_id();
+            let before = this.active_view().expect("active view").entity_id();
             let non_active = this.conversations[0].view.entity_id();
             this.delete_conversation(non_active, window, cx);
-            assert_eq!(this.active, 0);
-            assert_eq!(this.conversations[0].view.entity_id(), before);
+            assert_eq!(this.active, Some(before));
+            assert_eq!(this.active_view().expect("active view").entity_id(), before);
 
-            let only = this.conversations[0].view.downgrade();
-            let only_id = this.conversations[0].view.entity_id();
+            let only = this.active_view().expect("active view").downgrade();
+            let only_id = this.active_view().expect("active view").entity_id();
             this.delete_conversation(only_id, window, cx);
-            assert_eq!(this.conversations.len(), 1);
-            assert_ne!(this.conversations[0].view.entity_id(), only_id);
+            assert!(this.conversations.is_empty());
+            assert!(this.active.is_none());
             drop(only);
         });
     });
@@ -333,8 +357,9 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
 ) {
     let (app, cx) = add_app_window(cx);
     let dropped = Rc::new(Cell::new(false));
-    let (target, weak) = cx.update(|_, cx| {
+    let (target, weak) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
             let conversation = &this.conversations[0];
             conversation.view.update(cx, |chat, cx| {
                 chat.start_pending_reply_for_test(dropped.clone(), cx)
@@ -352,7 +377,7 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
 
     assert!(dropped.get());
     assert!(weak.upgrade().is_none());
-    assert_eq!(app.read_with(cx, |this, _| this.conversations.len()), 1);
+    assert_eq!(app.read_with(cx, |this, _| this.conversations.len()), 0);
 }
 
 #[gpui::test]
@@ -360,9 +385,10 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
     let (app, cx) = add_app_window(cx);
     let (target, selected) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_conversation(window, cx);
-            this.spawn_conversation(window, cx);
-            this.active = 0;
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.active = Some(this.conversations[0].view.entity_id());
             let target = this.conversations[0].view.entity_id();
             let title = this.conversations[0].title.clone();
             let selected = this.conversations[2].view.entity_id();
@@ -385,7 +411,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
                 .iter()
                 .all(|conversation| conversation.view.entity_id() != target)
         );
-        assert_eq!(this.conversations[this.active].view.entity_id(), selected);
+        assert_eq!(this.active, Some(selected));
     });
 }
 
@@ -394,9 +420,10 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     let (app, cx) = add_app_window(cx);
     let (target, selected) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_conversation(window, cx);
-            this.spawn_conversation(window, cx);
-            this.active = 0;
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            this.active = Some(this.conversations[0].view.entity_id());
             let target = this.conversations[0].view.entity_id();
             let selected = this.conversations[2].view.entity_id();
             (target, selected)
@@ -429,7 +456,7 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
                 .iter()
                 .all(|conversation| conversation.view.entity_id() != target)
         );
-        assert_eq!(this.conversations[this.active].view.entity_id(), selected);
+        assert_eq!(this.active, Some(selected));
         assert_eq!(this.confirming, None);
     });
 }
@@ -457,4 +484,125 @@ fn delete_chat_labels_resolve_in_every_locale() {
             .contains("fixture")
         );
     }
+}
+
+#[gpui::test]
+fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    app.read_with(cx, |this, _| {
+        assert!(this.conversations.is_empty(), "no draft on startup");
+        assert!(this.active.is_none(), "no active target on startup");
+        assert!(this.opened_session_index.is_empty());
+    });
+}
+
+#[gpui::test]
+fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+        });
+    });
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.conversations.len(), 1);
+        assert!(
+            this.conversations[0].session_id.is_none(),
+            "draft has no session id"
+        );
+        assert!(this.active.is_some());
+        assert!(this.opened_session_index.is_empty());
+    });
+}
+
+#[gpui::test]
+fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    let dropped = Rc::new(Cell::new(false));
+    let (first, _second) = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+            let first = this.conversations[0].view.clone();
+            let second = this.conversations[1].view.clone();
+            first.update(cx, |chat, cx| {
+                chat.start_pending_reply_for_test(Rc::clone(&dropped), cx)
+            });
+            this.active = Some(second.entity_id());
+            (first.entity_id(), second.entity_id())
+        })
+    });
+    cx.run_until_parked();
+    assert!(!dropped.get(), "first stream must still be running");
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_target(first, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        !dropped.get(),
+        "switching back must not cancel the first stream"
+    );
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.active, Some(first));
+        assert_eq!(this.conversations.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn deleting_the_last_conversation_returnss_to_empty_workspace(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            let target = this.conversations[0].view.entity_id();
+            this.delete_conversation(target, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |this, _| {
+        assert!(this.conversations.is_empty());
+        assert!(this.active.is_none());
+    });
+}
+
+#[gpui::test]
+fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let session_id = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.conversations[0]
+                .view
+                .update(cx, |chat, cx| chat.persist_session_for_test(cx))
+        })
+    });
+    cx.run_until_parked();
+    let opened_target = app.read_with(cx, |this, _| {
+        assert_eq!(this.opened_session_index.len(), 1);
+        *this
+            .opened_session_index
+            .get(&session_id)
+            .expect("session bound")
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.select_session(session_id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |this, _| {
+        assert_eq!(
+            this.active,
+            Some(opened_target),
+            "reuse without spawning a new view"
+        );
+        assert_eq!(this.conversations.len(), 2);
+    });
 }

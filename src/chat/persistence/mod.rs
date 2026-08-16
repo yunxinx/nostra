@@ -1,4 +1,5 @@
 mod lifecycle;
+pub(crate) mod restore;
 
 use super::*;
 

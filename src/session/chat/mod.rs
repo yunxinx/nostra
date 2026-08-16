@@ -194,6 +194,14 @@ where
             .map(|pending| pending.turn_id.as_str())
     }
 
+    /// The model most recently applied to this controller's session, either by
+    /// a durable turn or by [`Self::restore`].  `None` for a fresh controller
+    /// that has not yet begun or restored a turn.
+    #[must_use]
+    pub fn current_model(&self) -> Option<&ModelSelection> {
+        self.current_model.as_ref()
+    }
+
     pub fn begin_turn(
         &mut self,
         user_message: Message,
