@@ -33,27 +33,67 @@ fn page(
     }
 }
 
-fn cursor_for(row: &ChatMessagePreview) -> ChatMessageSearchCursor {
-    ChatMessageSearchCursor {
-        timestamp: row.timestamp,
-        session_id: row.reference.session_id.clone(),
-        entry_id: row.reference.entry_id.clone(),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Trigger rule
+// Token parsing
 // ---------------------------------------------------------------------------
 
 #[test]
-fn dollar_opens_picker_once_per_insertion() {
-    assert!(dollar_newly_present(false, "look at $ this"));
-    assert!(!dollar_newly_present(true, "another $"));
-    assert!(!dollar_newly_present(false, "no trigger"));
-    assert!(!dollar_newly_present(true, ""));
-    // Removing every `$` re-arms the trigger.
-    assert!(!dollar_newly_present(true, "gone"));
-    assert!(dollar_newly_present(false, "back $"));
+fn token_activates_after_dollar_at_word_boundary() {
+    let token = active_dollar_token("look at $needle", "look at $needle".len());
+    assert_eq!(
+        token,
+        Some(ActiveToken {
+            start: 8,
+            end: 15,
+            query: "needle".to_string(),
+        })
+    );
+
+    // Bare `$` right after typing it: active with a blank query.
+    let token = active_dollar_token("$", 1);
+    assert_eq!(
+        token,
+        Some(ActiveToken {
+            start: 0,
+            end: 1,
+            query: String::new(),
+        })
+    );
+
+    // Line start and newline boundaries both count.
+    assert!(active_dollar_token("$q", 2).is_some());
+    assert!(active_dollar_token("one\ntwo $q", 9).is_some());
+}
+
+#[test]
+fn token_rejects_mid_word_and_separated_dollars() {
+    // `$` glued to a word is ordinary text (prices, shell hints).
+    assert!(active_dollar_token("cost$5", 6).is_none());
+    assert!(active_dollar_token("a$b", 3).is_none());
+    // `$$` is not a token start.
+    assert!(active_dollar_token("$$", 2).is_none());
+    // Whitespace after `$` closes the token.
+    assert!(active_dollar_token("$ needle", 8).is_none());
+    // Cursor before the `$` sees nothing.
+    assert!(active_dollar_token("$q", 0).is_none());
+    // Absurdly long queries are treated as ordinary text.
+    assert!(active_dollar_token(&format!("${}", "x".repeat(100)), 101).is_none());
+}
+
+#[test]
+fn token_tracks_the_cursor_inside_the_query() {
+    let text = "$needle and more";
+    // Caret still inside the query: token ends at the caret.
+    let token = active_dollar_token(text, 4).unwrap();
+    assert_eq!(token.query, "nee");
+    assert_eq!(token.end, 4);
+    // Caret after a space: no active token even though a `$` exists.
+    assert!(active_dollar_token(text, 9).is_none());
+    // Multibyte characters before the token do not corrupt offsets.
+    let text = "你好 $引用";
+    let token = active_dollar_token(text, text.len()).unwrap();
+    assert_eq!(token.query, "引用");
+    assert_eq!(&text[token.start..token.end], "$引用");
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +113,7 @@ fn blank_query_resets_without_a_request() {
         generation,
         page(vec![preview(chat_reference(), None, 5)], None)
     ));
-    assert!(search.begin("   ").is_none());
+    assert!(search.begin("").is_none());
     assert!(search.results.is_empty());
 }
 
@@ -104,66 +144,6 @@ fn failed_generation_is_guarded() {
     let fresh = search.generation;
     assert!(search.fail(fresh));
     assert_eq!(search.status, ReferenceSearchStatus::Failed);
-}
-
-#[test]
-fn load_more_requires_ready_page_and_cursor() {
-    let mut search = ReferenceSearch::new();
-    assert!(search.begin_load_more().is_none());
-
-    let generation = search.begin("needle").unwrap().0;
-    assert!(search.begin_load_more().is_none(), "still searching");
-
-    assert!(search.apply_search(
-        generation,
-        page(vec![preview(chat_reference(), None, 5)], None)
-    ));
-    assert!(!search.has_more());
-    assert!(search.begin_load_more().is_none(), "no cursor");
-
-    let row = preview(chat_reference(), None, 4);
-    let cursor = cursor_for(&row);
-    assert!(search.apply_search(generation, page(vec![row], Some(cursor))));
-    assert!(search.has_more());
-
-    let (load_generation, request) = search.begin_load_more().unwrap();
-    assert_eq!(request.text, "needle");
-    assert!(request.cursor.is_some());
-    assert_eq!(search.status, ReferenceSearchStatus::Searching);
-    assert!(!search.has_more(), "no re-entry while loading");
-    let _ = load_generation;
-}
-
-#[test]
-fn load_more_appends_deduplicated_rows() {
-    let mut search = ReferenceSearch::new();
-    let generation = search.begin("needle").unwrap().0;
-    let first = preview(chat_reference(), None, 5);
-    let cursor = cursor_for(&first);
-    assert!(search.apply_search(generation, page(vec![first.clone()], Some(cursor))));
-
-    let (load_generation, _) = search.begin_load_more().unwrap();
-    let second = preview(chat_reference(), None, 4);
-    // The page repeats the boundary row and adds one new row.
-    assert!(search.apply_load_more(load_generation, page(vec![first, second], None)));
-    assert_eq!(search.results.len(), 2);
-    assert_eq!(search.status, ReferenceSearchStatus::Ready);
-    assert!(!search.has_more());
-}
-
-#[test]
-fn load_more_failure_keeps_rows_for_retry() {
-    let mut search = ReferenceSearch::new();
-    let generation = search.begin("needle").unwrap().0;
-    let row = preview(chat_reference(), None, 5);
-    let cursor = cursor_for(&row);
-    assert!(search.apply_search(generation, page(vec![row], Some(cursor))));
-
-    let (load_generation, _) = search.begin_load_more().unwrap();
-    assert!(search.fail_load_more(load_generation));
-    assert_eq!(search.status, ReferenceSearchStatus::Ready);
-    assert_eq!(search.results.len(), 1);
-    assert!(search.has_more(), "cursor retained so scrolling retries");
 }
 
 #[test]
@@ -207,8 +187,7 @@ fn draft_keeps_reference_and_bounded_label_only() {
     assert_eq!(draft.timestamp, 42);
     assert_eq!(draft.chip_label().as_ref(), "first line…");
 
-    // Untitled sessions fall back to the localized placeholder rather than a
-    // stored default title; an empty body exercises that path.
+    // An empty body falls back to the localized placeholder title.
     let mut empty_body = sample_read(chat_reference(), None);
     empty_body.message = ReferencedMessage {
         role: Role::User,
@@ -296,7 +275,7 @@ fn confirm_error_maps_typed_store_errors() {
 
 #[test]
 fn reference_time_uses_time_for_now_and_date_for_old_years() {
-    let now = 1_750_000_000_000_i64; // well inside the supported range
+    let now = 1_750_000_000_000_i64;
     assert_eq!(format_reference_time(now, now).len(), 5);
     assert!(format_reference_time(now, now).contains(':'));
 
@@ -353,95 +332,104 @@ fn seed_chat_message(store: &mut InMemorySessionStore, text: &str) -> crate::ses
 fn seed_global_stores(cx: &mut TestAppContext, seed: impl FnOnce(&mut InMemorySessionStore)) {
     cx.update(|cx| {
         gpui_component::init(cx);
+        crate::appearance::fonts::init(Default::default(), cx);
         let mut memory = InMemorySessionStore::new();
         seed(&mut memory);
         cx.set_global(SessionStores::with_chat_store(memory));
     });
 }
 
-#[gpui::test]
-fn dollar_trigger_opens_the_picker_once_per_insertion(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |_| {});
-    let cx = cx.add_empty_window();
-    let composer = cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)));
-    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+fn new_composer(cx: &mut gpui::VisualTestContext) -> gpui::Entity<ChatReferenceComposer> {
+    cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)))
+}
 
-    // `set_value` suppresses change events, so drive the same path real
-    // typing takes: `replace_all` emits `InputEvent::Change`.
-    let set_value = |cx: &mut gpui::VisualTestContext, value: &str| {
-        cx.update(|window, cx| {
-            input.update(cx, |state, cx| state.replace_all(value, window, cx));
-        });
-        cx.run_until_parked();
-    };
-
-    set_value(cx, "look at $");
-    cx.update(|_, cx| assert!(composer.read(cx).open));
-
-    // Dismiss (Escape / outside click path) while the `$` is still present.
+/// `set_value` suppresses change events, so drive the same path real typing
+/// takes: `replace_all` emits `InputEvent::Change`.  Multi-line `replace_all`
+/// rewinds the caret to 0; real typing leaves it after the inserted text, so
+/// park it there.
+fn set_input_value(
+    cx: &mut gpui::VisualTestContext,
+    input: &gpui::Entity<InputState>,
+    value: &str,
+) {
     cx.update(|window, cx| {
-        composer.update(cx, |composer, cx| composer.set_open(false, window, cx));
+        input.update(cx, |state, cx| {
+            state.replace_all(value, window, cx);
+            state.set_selected_range(value.len()..value.len(), cx);
+        });
     });
-    cx.update(|_, cx| assert!(!composer.read(cx).open));
-
-    // More `$` insertions do not reopen until every `$` is removed.
-    set_value(cx, "another $");
-    cx.update(|_, cx| assert!(!composer.read(cx).open));
-    set_value(cx, "no trigger");
-    cx.update(|_, cx| assert!(!composer.read(cx).open));
-    set_value(cx, "back $");
-    cx.update(|_, cx| assert!(composer.read(cx).open));
+    cx.run_until_parked();
 }
 
 #[gpui::test]
-fn picker_searches_confirms_and_removes_references(cx: &mut TestAppContext) {
+fn dollar_token_drives_inline_completion(cx: &mut TestAppContext) {
     seed_global_stores(cx, |memory| {
         seed_chat_message(memory, "the unique needle message");
         seed_chat_message(memory, "an unrelated conversation");
     });
     let cx = cx.add_empty_window();
-    let composer = cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)));
-
-    // Open the picker via the `$` trigger, then search the catalog.
+    let composer = new_composer(cx);
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
-    cx.update(|window, cx| {
-        input.update(cx, |state, cx| state.replace_all("note $", window, cx));
-    });
-    cx.run_until_parked();
-    let list = cx.update(|_, cx| composer.read(cx).list.clone());
-    let search = |cx: &mut gpui::VisualTestContext, query: &str| {
-        cx.update(|window, cx| {
-            let task = list.update(cx, |list, cx| {
-                list.delegate_mut().perform_search(query, window, cx)
-            });
-            task.detach();
-        });
-        cx.run_until_parked();
-    };
-    search(cx, "unique needle");
 
+    set_input_value(cx, &input, "note the $ne");
     cx.update(|_, cx| {
-        let delegate = list.read(cx).delegate();
-        assert_eq!(delegate.search.results.len(), 1);
+        let composer = composer.read(cx);
+        assert!(composer.is_completion_open());
+        assert_eq!(composer.completion.search.results.len(), 1);
         assert_eq!(
-            delegate.search.results[0].preview.as_deref(),
+            composer.completion.search.results[0].preview.as_deref(),
             Some("the unique needle message")
         );
     });
 
-    // Confirm the row twice: the second confirm is deduplicated.
-    let confirm_first = |cx: &mut gpui::VisualTestContext| {
+    // A space after the token closes the popup without a store request.
+    set_input_value(cx, &input, "note the $ne and more");
+    cx.update(|_, cx| {
+        assert!(!composer.read(cx).is_completion_open());
+    });
+
+    // Escape dismissed state: retyping the token reopens it.
+    set_input_value(cx, &input, "note the $ne");
+    cx.update(|window, cx| {
+        composer.update(cx, |composer, cx| composer.dismiss_completion(cx));
+        let _ = window;
+    });
+    cx.update(|_, cx| {
+        assert!(!composer.read(cx).is_completion_open());
+    });
+    set_input_value(cx, &input, "note the $");
+    cx.update(|_, cx| {
+        // Bare `$` shows the hint state without querying the store.
+        let composer = composer.read(cx);
+        assert!(composer.is_completion_open());
+        assert_eq!(
+            composer.completion.search.status,
+            ReferenceSearchStatus::Idle
+        );
+        assert!(composer.completion.search.results.is_empty());
+    });
+}
+
+#[gpui::test]
+fn confirming_completion_removes_token_and_adds_chip(cx: &mut TestAppContext) {
+    seed_global_stores(cx, |memory| {
+        seed_chat_message(memory, "the unique needle message");
+    });
+    let cx = cx.add_empty_window();
+    let composer = new_composer(cx);
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+
+    set_input_value(cx, &input, "note the $needle");
+
+    // Confirm twice: the second pass deduplicates the reference.
+    let confirm = |cx: &mut gpui::VisualTestContext| {
         cx.update(|window, cx| {
-            list.update(cx, |list, cx| {
-                list.delegate_mut()
-                    .set_selected_index(Some(IndexPath::default()), window, cx);
-                list.delegate_mut().confirm(false, window, cx);
-            });
+            composer.update(cx, |composer, cx| composer.confirm_completion(window, cx));
         });
         cx.run_until_parked();
     };
-    confirm_first(cx);
-    confirm_first(cx);
+    confirm(cx);
+    confirm(cx);
 
     cx.update(|_, cx| {
         let composer = composer.read(cx);
@@ -452,15 +440,14 @@ fn picker_searches_confirms_and_removes_references(cx: &mut TestAppContext) {
                 .as_ref()
                 .contains("the unique needle message")
         );
-        assert!(
-            composer
-                .selected
-                .borrow()
-                .contains(&composer.drafts[0].reference)
-        );
+        assert!(composer.selected.contains(&composer.drafts[0].reference));
+        // The `$needle` token was removed from the draft text.
+        assert_eq!(input.read(cx).value().as_ref(), "note the ");
+        // Completion closed with the token gone.
+        assert!(!composer.is_completion_open());
     });
 
-    // Removing the chip only touches draft state; the source stays readable.
+    // Removing the chip only touches draft state.
     let reference = cx.update(|_, cx| composer.read(cx).drafts[0].reference.clone());
     cx.update(|_, cx| {
         composer.update(cx, |composer, cx| {
@@ -470,7 +457,43 @@ fn picker_searches_confirms_and_removes_references(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let composer = composer.read(cx);
         assert!(composer.drafts.is_empty());
-        assert!(!composer.selected.borrow().contains(&reference));
+        assert!(!composer.selected.contains(&reference));
+    });
+}
+
+#[gpui::test]
+fn popup_cursor_moves_within_results(cx: &mut TestAppContext) {
+    seed_global_stores(cx, |memory| {
+        seed_chat_message(memory, "needle alpha");
+        seed_chat_message(memory, "needle beta");
+    });
+    let cx = cx.add_empty_window();
+    let composer = new_composer(cx);
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+    set_input_value(cx, &input, "$needle");
+
+    cx.update(|_, cx| {
+        assert_eq!(composer.read(cx).completion.search.results.len(), 2);
+    });
+    cx.update(|_, cx| {
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
+    });
+    cx.update(|_, cx| {
+        assert_eq!(composer.read(cx).completion.cursor, 1);
+    });
+    // Clamped at both ends.
+    cx.update(|_, cx| {
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
+    });
+    cx.update(|_, cx| {
+        assert_eq!(composer.read(cx).completion.cursor, 1);
+    });
+    cx.update(|_, cx| {
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(-5, cx));
+    });
+    cx.update(|_, cx| {
+        assert_eq!(composer.read(cx).completion.cursor, 0);
     });
 }
 
@@ -480,20 +503,9 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
         seed_chat_message(memory, "soon deleted needle");
     });
     let cx = cx.add_empty_window();
-    let composer = cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)));
-
-    let list = cx.update(|_, cx| composer.read(cx).list.clone());
-    cx.update(|window, cx| {
-        composer.update(cx, |composer, cx| composer.set_open(true, window, cx));
-    });
-    cx.update(|window, cx| {
-        let task = list.update(cx, |list, cx| {
-            list.delegate_mut()
-                .perform_search("soon deleted", window, cx)
-        });
-        task.detach();
-    });
-    cx.run_until_parked();
+    let composer = new_composer(cx);
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+    set_input_value(cx, &input, "$soon");
 
     // Delete the source session between search and confirm.
     cx.update(|_, cx| {
@@ -502,7 +514,7 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
             .clone()
             .chat()
             .expect("Chat lifecycle capability");
-        let session_id = list.read(cx).delegate().search.results[0]
+        let session_id = composer.read(cx).completion.search.results[0]
             .reference
             .session_id
             .clone();
@@ -512,11 +524,7 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
     });
 
     cx.update(|window, cx| {
-        list.update(cx, |list, cx| {
-            list.delegate_mut()
-                .set_selected_index(Some(IndexPath::default()), window, cx);
-            list.delegate_mut().confirm(false, window, cx);
-        });
+        composer.update(cx, |composer, cx| composer.confirm_completion(window, cx));
     });
     cx.run_until_parked();
 
@@ -539,27 +547,12 @@ fn confirm_reports_oversized_messages(cx: &mut TestAppContext) {
         seed_chat_message(memory, &oversized);
     });
     let cx = cx.add_empty_window();
-    let composer = cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)));
-
-    let list = cx.update(|_, cx| composer.read(cx).list.clone());
-    cx.update(|window, cx| {
-        composer.update(cx, |composer, cx| composer.set_open(true, window, cx));
-    });
-    cx.update(|window, cx| {
-        let task = list.update(cx, |list, cx| {
-            list.delegate_mut()
-                .perform_search("giant needle", window, cx)
-        });
-        task.detach();
-    });
-    cx.run_until_parked();
+    let composer = new_composer(cx);
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+    set_input_value(cx, &input, "$giant");
 
     cx.update(|window, cx| {
-        list.update(cx, |list, cx| {
-            list.delegate_mut()
-                .set_selected_index(Some(IndexPath::default()), window, cx);
-            list.delegate_mut().confirm(false, window, cx);
-        });
+        composer.update(cx, |composer, cx| composer.confirm_completion(window, cx));
     });
     cx.run_until_parked();
 
@@ -574,3 +567,88 @@ fn confirm_reports_oversized_messages(cx: &mut TestAppContext) {
         assert!(composer.drafts.is_empty());
     });
 }
+
+/// Renders the composer as a window root so keystroke dispatch reaches the
+/// real listener tree (wrapper `on_key_down`, input keymap context).
+struct ComposerHost(gpui::Entity<ChatReferenceComposer>);
+
+impl gpui::Render for ComposerHost {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.0.clone())
+    }
+}
+
+/// Dispatch a keystroke as an action-only key event.  `simulate_keystrokes`
+/// routes through `dispatch_keystroke`, whose simulated-IME tail inserts the
+/// parsed `key_char` (e.g. "\n" for "enter") after the action propagates;
+/// real platform events never take that tail.
+fn press_key(cx: &mut gpui::VisualTestContext, key: &str, control: bool) {
+    let keystroke = gpui::Keystroke {
+        key: key.to_string(),
+        key_char: None,
+        modifiers: gpui::Modifiers {
+            control,
+            ..Default::default()
+        },
+    };
+    cx.simulate_event(gpui::KeyDownEvent {
+        keystroke: keystroke.clone(),
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_event(gpui::KeyUpEvent { keystroke });
+}
+
+#[gpui::test]
+fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
+    seed_global_stores(cx, |memory| {
+        seed_chat_message(memory, "needle alpha");
+        seed_chat_message(memory, "needle beta");
+    });
+    let composer_cell: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let cell = composer_cell.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        composer.update(cx, |composer, cx| composer.focus_input(window, cx));
+        *cell.borrow_mut() = Some(composer.clone());
+        let host = cx.new(|_| ComposerHost(composer));
+        gpui_component::Root::new(host, window, cx)
+    });
+    let composer = composer_cell
+        .borrow()
+        .clone()
+        .expect("composer built with the window root");
+
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+    set_input_value(cx, &input, "$needle");
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+
+    // ctrl-n / ctrl-p move the popup cursor through the wrapper listener.
+    press_key(cx, "n", true);
+    cx.update(|_, cx| assert_eq!(composer.read(cx).completion.cursor, 1));
+    press_key(cx, "p", true);
+    cx.update(|_, cx| assert_eq!(composer.read(cx).completion.cursor, 0));
+
+    // Enter arrives as PressEnter and confirms the selected row.
+    press_key(cx, "enter", false);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let state = composer.read(cx);
+        assert_eq!(state.drafts.len(), 1);
+        assert!(!state.is_completion_open());
+        assert_eq!(input.read(cx).value().as_ref(), "");
+    });
+
+    // Escape closes a reopened popup through the wrapper listener.
+    set_input_value(cx, &input, "$nee");
+    cx.update(|_, cx| assert!(composer.read(cx).is_completion_open()));
+    press_key(cx, "escape", false);
+    cx.update(|_, cx| {
+        assert!(!composer.read(cx).is_completion_open());
+    });
+}
+// temporary probe appended into picker tests

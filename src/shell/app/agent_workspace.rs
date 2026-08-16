@@ -13,7 +13,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     spinner::Spinner,
@@ -32,6 +32,9 @@ use crate::session::{
 use super::ChatApp;
 
 const AGENT_ROW_HEIGHT: Pixels = px(32.);
+/// Column width cap for the Agent conversation area, matching the chat
+/// transcript's content column.
+const AGENT_CONTENT_MAX_WIDTH: Pixels = px(760.);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum AgentLoadState {
@@ -266,6 +269,42 @@ impl AgentWorkspace {
         self.session_state = None;
         self.session_load_state = AgentLoadState::Unloaded;
     }
+
+    /// Start a fresh Agent conversation draft for the selected project.  No
+    /// session id exists until a future send runtime persists the first turn,
+    /// so this only clears the session selection.
+    pub(super) fn new_agent_draft(&mut self) {
+        self.selected_session_id = None;
+        self.session_state = None;
+        self.session_load_state = AgentLoadState::Unloaded;
+    }
+}
+
+/// Merge persisted (folder-opened, still session-less) projects into the
+/// store catalog snapshot.  A persisted record is skipped once any merged
+/// project — store or earlier record — already owns its id or its canonical
+/// path; the store row stays authoritative.
+pub(super) fn merge_persisted_projects(
+    store_projects: &[ProjectSummary],
+    persisted: &[crate::preferences::AgentProjectRecord],
+) -> Vec<ProjectSummary> {
+    let mut merged = store_projects.to_vec();
+    for record in persisted {
+        let covered = merged.iter().any(|project| {
+            project.project_id == record.project_id
+                || project.canonical_path == record.canonical_path
+        });
+        if !covered {
+            merged.push(ProjectSummary {
+                project_id: record.project_id.clone(),
+                display_name: record.display_name.clone(),
+                canonical_path: record.canonical_path.clone(),
+                session_count: 0,
+                last_updated_at: 0,
+            });
+        }
+    }
+    merged
 }
 
 fn dedup_projects(projects: Vec<ProjectSummary>) -> Vec<ProjectSummary> {
@@ -594,27 +633,46 @@ impl ChatApp {
     fn render_agent_projects_list(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut children: Vec<AnyElement> = Vec::new();
 
+        // Header doubles as the open-folder affordance: a local project can
+        // exist before the store registers one with its first Agent session.
         children.push(
-            div()
+            h_flex()
                 .px_2()
                 .h(px(24.))
-                .flex()
                 .items_center()
+                .gap_1()
                 .text_xs()
                 .text_color(cx.theme().sidebar_foreground.opacity(0.6))
-                .child(t!("agent.projects").to_string())
+                .child(div().flex_1().child(t!("agent.projects").to_string()))
+                .child(
+                    Button::new("agent-open-folder")
+                        .ghost()
+                        .small()
+                        .icon(IconName::FolderOpen)
+                        .tooltip(t!("agent.open_folder").to_string())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_project_folder(cx);
+                        })),
+                )
                 .into_any_element(),
         );
 
+        // Folder-opened projects without a session yet live only in
+        // preferences; merge them under the store catalog rows.
+        let projects = merge_persisted_projects(
+            self.agent.projects(),
+            &crate::preferences::get(cx).agent_projects,
+        );
+
         let loading_and_empty = matches!(self.agent.projects_load_state, AgentLoadState::Loading)
-            && self.agent.projects.is_empty();
+            && projects.is_empty();
 
         if loading_and_empty {
             children.push(self.render_agent_loading_state(cx).into_any_element());
         }
 
         let selected_project = self.agent.selected_project_id();
-        for project in self.agent.projects() {
+        for project in &projects {
             children.push(
                 self.render_agent_project_row(project, selected_project, cx)
                     .into_any_element(),
@@ -623,8 +681,8 @@ impl ChatApp {
 
         let ready = matches!(self.agent.projects_load_state, AgentLoadState::Ready);
         let error_and_empty = matches!(self.agent.projects_load_state, AgentLoadState::Error(_))
-            && self.agent.projects.is_empty();
-        let no_rows = self.agent.projects.is_empty();
+            && projects.is_empty();
+        let no_rows = projects.is_empty();
 
         if error_and_empty {
             children.push(self.render_agent_error_state(cx).into_any_element());
@@ -897,9 +955,16 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Without a project there is nothing to converse about yet: show the
+        // folder guide instead of a composer.
+        if self.agent.selected_project_id().is_none() {
+            return self.render_agent_folder_guide(cx).into_any_element();
+        }
+
         let transcript = self.render_agent_transcript(cx);
-        // The draft composer stays installed in Agent mode; it owns the `$`
-        // Chat reference picker but no send or tool runtime.
+        // Chat-style column: transcript scrolls on top, the draft composer
+        // card sits below. The composer owns the `$` Chat reference
+        // completion but no send or tool runtime.
         v_flex()
             .flex_1()
             .min_h_0()
@@ -907,10 +972,54 @@ impl ChatApp {
             .child(
                 h_flex()
                     .flex_shrink_0()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .bg(cx.theme().background)
-                    .child(self.agent_composer.clone()),
+                    .justify_center()
+                    .px_6()
+                    .pt_2()
+                    .pb_3()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .max_w(AGENT_CONTENT_MAX_WIDTH)
+                            .child(self.agent_composer.clone()),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Full-area guide shown in Agent mode before any folder is opened.
+    fn render_agent_folder_guide(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Icon::new(IconName::FolderOpen)
+                    .size_10()
+                    .text_color(theme.muted_foreground.opacity(0.5)),
+            )
+            .child(
+                div()
+                    .text_xl()
+                    .font_semibold()
+                    .text_color(theme.foreground)
+                    .child(t!("agent.guide_title").to_string()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("agent.guide_hint").to_string()),
+            )
+            .child(
+                Button::new("agent-guide-open-folder")
+                    .primary()
+                    .label(t!("agent.open_folder").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_project_folder(cx);
+                    })),
             )
             .into_any_element()
     }
@@ -996,6 +1105,8 @@ impl ChatApp {
                 .into_any_element();
         }
 
+        // A selected project without a selected session is a fresh draft
+        // conversation; greet it like the chat workspace greets a new chat.
         v_flex()
             .size_full()
             .items_center()
@@ -1006,13 +1117,13 @@ impl ChatApp {
                     .text_2xl()
                     .font_semibold()
                     .text_color(theme.foreground)
-                    .child(t!("agent.workspace_empty_title").to_string()),
+                    .child(t!("agent.welcome_title").to_string()),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(t!("agent.workspace_empty_hint").to_string()),
+                    .child(t!("agent.welcome_hint").to_string()),
             )
             .into_any_element()
     }
@@ -1082,8 +1193,9 @@ impl ChatApp {
 
         TabBar::new("workspace-mode")
             .segmented()
-            .child(Tab::new().label(t!("sidebar.chats").to_string()))
-            .child(Tab::new().label(t!("agent.mode").to_string()))
+            .w_full()
+            .child(Tab::new().flex_1().label(t!("sidebar.chats").to_string()))
+            .child(Tab::new().flex_1().label(t!("agent.mode").to_string()))
             .selected_index(selected)
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 let mode = match index {
@@ -1097,7 +1209,7 @@ impl ChatApp {
     pub(super) fn switch_workspace_mode(
         &mut self,
         mode: super::WorkspaceMode,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.workspace_mode == mode {
@@ -1105,9 +1217,9 @@ impl ChatApp {
         }
         if matches!(self.workspace_mode, super::WorkspaceMode::Agent) {
             // Leaving Agent mode unmounts the composer; close any open
-            // reference picker so its overlay cannot linger over Chat.
+            // completion popup so it cannot linger over Chat.
             self.agent_composer
-                .update(cx, |composer, cx| composer.dismiss_picker(window, cx));
+                .update(cx, |composer, cx| composer.dismiss_completion(cx));
         }
         self.workspace_mode = mode;
         if matches!(mode, super::WorkspaceMode::Agent)
@@ -1217,6 +1329,45 @@ mod tests {
             workspace.session_load_state,
             AgentLoadState::Unloaded
         ));
+    }
+
+    fn record(id: &str, path: &str, name: &str) -> crate::preferences::AgentProjectRecord {
+        crate::preferences::AgentProjectRecord {
+            project_id: id.to_string(),
+            canonical_path: std::path::PathBuf::from(path),
+            display_name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn persisted_projects_merge_below_store_rows() {
+        let store = vec![sample_project("project-a")];
+        let persisted = vec![
+            // Same id as a store row: the store row wins, no duplicate.
+            record("project-a", "/tmp/dup", "Dup"),
+            // Same canonical path as a store row under a different id: the
+            // store stays authoritative for that path.
+            record("project-b", "/tmp/project-a", "Shadow"),
+            // A genuinely new folder: appears with zero sessions.
+            record("project-c", "/tmp/c", "New Folder"),
+        ];
+        let merged = merge_persisted_projects(&store, &persisted);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].project_id, "project-a");
+        assert_eq!(merged[1].project_id, "project-c");
+        assert_eq!(merged[1].session_count, 0);
+        assert_eq!(merged[1].display_name, "New Folder");
+    }
+
+    #[test]
+    fn persisted_records_deduplicate_each_other_by_path() {
+        let persisted = vec![
+            record("project-x", "/tmp/x", "First"),
+            record("project-y", "/tmp/x", "Second"),
+        ];
+        let merged = merge_persisted_projects(&[], &persisted);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].project_id, "project-x");
     }
 
     #[test]

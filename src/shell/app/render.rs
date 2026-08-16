@@ -256,8 +256,12 @@ impl Render for ChatApp {
                     .ghost()
                     .small()
                     .icon(Icon::default().path("icons/square-pen.svg"))
-                    .tooltip(t!("sidebar.new_chat").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| this.spawn_draft(window, cx))),
+                    .tooltip(if matches!(self.workspace_mode, WorkspaceMode::Chat) {
+                        t!("sidebar.new_chat").to_string()
+                    } else {
+                        t!("agent.new_session").to_string()
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
             );
 
         // ---------- Floating model pill (animated left position) ----------

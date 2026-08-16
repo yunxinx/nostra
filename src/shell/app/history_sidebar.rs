@@ -487,19 +487,6 @@ impl ChatApp {
     ) -> AnyElement {
         let mut children: Vec<AnyElement> = Vec::new();
 
-        // Section header.
-        children.push(
-            div()
-                .px_2()
-                .h(px(24.))
-                .flex()
-                .items_center()
-                .text_xs()
-                .text_color(cx.theme().sidebar_foreground.opacity(0.6))
-                .child(t!("sidebar.chats").to_string())
-                .into_any_element(),
-        );
-
         let drafts: Vec<&Conversation> = self
             .conversations
             .iter()

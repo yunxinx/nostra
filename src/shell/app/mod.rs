@@ -147,6 +147,9 @@ pub struct ChatApp {
     _agent_sessions_task: Option<Task<()>>,
     /// Background task owning the Agent session detail load.
     _agent_session_task: Option<Task<()>>,
+    /// Background task resolving the native folder picker for a new Agent
+    /// work project.
+    _folder_task: Option<Task<()>>,
     shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -266,6 +269,7 @@ impl ChatApp {
             _agent_projects_task: None,
             _agent_sessions_task: None,
             _agent_session_task: None,
+            _folder_task: None,
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),
@@ -712,7 +716,94 @@ impl ChatApp {
     }
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.spawn_draft(window, cx);
+        match self.workspace_mode {
+            WorkspaceMode::Chat => self.spawn_draft(window, cx),
+            WorkspaceMode::Agent => self.agent_new_conversation(window, cx),
+        }
+    }
+
+    /// Agent-mode counterpart of the new-chat button: with a selected
+    /// project, start a fresh conversation draft; without one, guide the
+    /// user through opening a folder first.
+    fn agent_new_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent.selected_project_id().is_some() {
+            self.agent.new_agent_draft();
+            self.agent_composer
+                .update(cx, |composer, cx| composer.focus_input(window, cx));
+            cx.notify();
+        } else {
+            self.open_project_folder(cx);
+        }
+    }
+
+    /// Open the native folder picker and register the chosen folder as the
+    /// active Agent work project.
+    fn open_project_folder(&mut self, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(t!("agent.open_folder_prompt").to_string().into()),
+        });
+        let app = cx.entity();
+        let task = cx.spawn(async move |_this, cx| {
+            let picked = match prompt.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                _ => None,
+            };
+            let Some(path) = picked else {
+                return;
+            };
+            // The dialog returns the displayed path; canonicalize when the
+            // entry still resolves so identity survives symlinked mounts.
+            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+            app.update(cx, |this, cx| this.register_agent_project(canonical, cx));
+        });
+        self._folder_task = Some(task);
+    }
+
+    /// Adopt `canonical` as the active project: reuse an existing project
+    /// identity for the same path (store row or persisted record), otherwise
+    /// mint one and persist it so the folder survives restarts.
+    fn register_agent_project(&mut self, canonical: std::path::PathBuf, cx: &mut Context<Self>) {
+        let existing_id = self
+            .agent
+            .projects()
+            .iter()
+            .find(|project| project.canonical_path == canonical)
+            .map(|project| project.project_id.clone())
+            .or_else(|| {
+                crate::preferences::get(cx)
+                    .agent_projects
+                    .iter()
+                    .find(|record| record.canonical_path == canonical)
+                    .map(|record| record.project_id.clone())
+            });
+
+        let project_id = existing_id.unwrap_or_else(|| {
+            let display_name = canonical
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
+            let identity =
+                crate::session::ProjectIdentity::new(canonical.clone(), display_name.clone());
+            preferences::update(cx, |prefs| {
+                prefs
+                    .agent_projects
+                    .push(crate::preferences::AgentProjectRecord {
+                        project_id: identity.project_id.clone(),
+                        canonical_path: canonical.clone(),
+                        display_name,
+                    });
+            });
+            identity.project_id
+        });
+
+        self.agent.select_project(project_id);
+        self.agent.new_agent_draft();
+        self.start_agent_sessions_load(cx);
+        cx.notify();
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {

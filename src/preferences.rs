@@ -82,6 +82,24 @@ pub struct Preferences {
     pub provider_profiles: Vec<ProviderProfile>,
     /// Selection inherited by newly-created conversations.
     pub last_model_selection: Option<ModelSelection>,
+    /// Folders the user opened as Agent work projects.  These exist in the UI
+    /// before the store registers a project row with its first Agent session;
+    /// the store catalog stays authoritative once a session exists.
+    pub agent_projects: Vec<AgentProjectRecord>,
+}
+
+/// One user-opened Agent work project, persisted so the folder reappears in
+/// the Agent sidebar after a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProjectRecord {
+    /// Stable `project-<uuid-v7>` identity.  Reused when the same canonical
+    /// path is opened again.
+    pub project_id: String,
+    /// Canonical absolute path of the folder.
+    pub canonical_path: PathBuf,
+    /// Folder name shown in the sidebar.
+    pub display_name: String,
 }
 
 fn default_sidebar_width() -> f32 {
@@ -118,6 +136,7 @@ impl Default for Preferences {
             settings_window: None,
             provider_profiles: Vec::new(),
             last_model_selection: None,
+            agent_projects: Vec::new(),
         }
     }
 }
@@ -483,6 +502,35 @@ mod tests {
         assert!(!prefs.code_block_line_numbers);
         assert!(!prefs.restore_last_chat_on_start);
         assert!(prefs.last_active_chat_session.is_none());
+    }
+
+    #[test]
+    fn agent_projects_default_empty_and_round_trip() {
+        assert!(Preferences::default().agent_projects.is_empty());
+
+        let prefs = Preferences {
+            agent_projects: vec![AgentProjectRecord {
+                project_id: "project-018f6b2e-9d4a-7b3c-8e5f-1a2b3c4d5e6f".to_string(),
+                canonical_path: PathBuf::from("/tmp/work"),
+                display_name: "work".to_string(),
+            }],
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize agent projects");
+        let restored: Preferences =
+            serde_json::from_str(&json).expect("deserialize agent projects");
+        assert_eq!(restored.agent_projects, prefs.agent_projects);
+
+        // A missing field rejects the document under the strict schema.
+        let mut missing = serde_json::to_value(&prefs).expect("serialize");
+        assert!(
+            missing
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("agent_projects")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing).is_err());
     }
 
     #[test]

@@ -481,6 +481,30 @@ agent:
   mode:
     en: Agent
     zh-CN: 智能体
+  new_session:
+    en: New session
+    zh-CN: 新建会话
+  open_folder:
+    en: Open Folder…
+    zh-CN: 打开文件夹…
+  open_folder_prompt:
+    en: Choose a folder for the Agent project
+    zh-CN: 选择智能体工作项目文件夹
+  guide_title:
+    en: Open a folder to get started
+    zh-CN: 打开一个文件夹开始
+  guide_hint:
+    en: The folder becomes the Agent work project that your sessions belong to.
+    zh-CN: 该文件夹将作为智能体的工作项目，会话归属于它。
+  welcome_title:
+    en: What are we working on?
+    zh-CN: 这个项目要做什么？
+  welcome_hint:
+    en: "Type below to draft the conversation.  Enter $ to reference a chat message."
+    zh-CN: "在下方输入内容草拟对话。输入 $ 可引用聊天消息。"
+  send_disabled_tooltip:
+    en: The agent runtime is not connected yet
+    zh-CN: 智能体运行时尚未接入
   projects:
     en: Projects
     zh-CN: 项目
@@ -520,12 +544,6 @@ agent:
   empty_session:
     en: This session has no messages.
     zh-CN: 此会话没有消息。
-  workspace_empty_title:
-    en: No session selected
-    zh-CN: 未选择会话
-  workspace_empty_hint:
-    en: Select a project and session to browse.
-    zh-CN: 选择一个项目和会话来浏览。
   role_user:
     en: User
     zh-CN: 用户
@@ -557,12 +575,12 @@ reference_picker:
   trigger_tooltip:
     en: "Reference a chat message ($)"
     zh-CN: "引用聊天消息（$）"
-  search_placeholder:
-    en: Search chat messages
-    zh-CN: 搜索聊天消息
-  initial_hint:
+  hint:
     en: Type to search your chat history
     zh-CN: 输入关键词搜索聊天记录
+  popup_hint:
+    en: "Enter to confirm · Ctrl-N/P to select · Esc to dismiss"
+    zh-CN: "Enter 确认 · Ctrl-N/P 选择 · Esc 关闭"
   empty:
     en: No matching messages
     zh-CN: 没有匹配的消息

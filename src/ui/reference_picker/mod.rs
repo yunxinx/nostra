@@ -1,32 +1,34 @@
-//! Reusable `$` Chat message reference composer.
+//! Agent draft composer with in-input `$` Chat reference completion.
 //!
-//! The composer owns an Agent draft's Chat references: typing (or clicking)
-//! `$` opens a searchable popover over the Chat history catalog. Selection
-//! state is a typed [`ChatMessageRef`] plus discardable presentation metadata
-//! only — message bodies live in the Chat store and are resolved by a future
-//! Agent runtime through the reference capability, never copied here.
+//! The composer mirrors the chat input card: a floating card holding the
+//! reference chips, a multi-line input, and a toolbar row. Typing a `$` token
+//! (`$` at a word boundary followed by non-whitespace query characters) opens
+//! a completion popup directly above the card; results come from the
+//! read-only Chat reference capability on the background executor, guarded by
+//! a query generation so stale pages cannot land. Confirming a row removes the
+//! `$token` text, validates the reference with a background exact read, and
+//! adds a removable chip — the draft never copies message bodies.
 //!
-//! All catalog search and exact reads run on the background executor through
-//! the read-only [`SharedChatReferenceStore`] capability; render only reads
-//! snapshots, and every asynchronous apply is guarded by a query generation so
-//! stale results cannot overwrite newer state.
+//! Key routing follows gpui's dispatch order: the input's bound `up`/`down`
+//! actions consume those keystrokes, so popup navigation uses `ctrl-n`/`ctrl-p`
+//! (unbound, reaching this view's `on_key_down`). Enter arrives as
+//! `InputEvent::PressEnter`, Escape propagates from the input's handler.
 
-use std::{cell::RefCell, collections::HashSet, rc::Rc};
+use std::collections::HashSet;
 
 use chrono::{Datelike as _, TimeZone as _};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Anchor, App, AppContext as _, Context, ElementId, Entity, Focusable as _,
-    InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Render, RenderOnce,
-    SharedString, Styled as _, Subscription, Task, Window, div, px,
+    App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
+    KeyDownEvent, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, IndexPath, Selectable, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
-    list::{List, ListDelegate, ListState},
-    popover::Popover,
+    spinner::Spinner,
     tag::Tag,
     v_flex,
 };
@@ -38,16 +40,15 @@ use crate::session::{
     ChatMessageSearchCursor, ChatMessageSearchPage, ChatMessageSearchQuery,
     ChatMessageUnavailableReason, ChatReferenceError, SharedChatReferenceStore,
 };
-use crate::ui::popover::PopoverDismissHandle;
 
-/// Width of the reference picker popover.
-const PICKER_WIDTH: Pixels = px(400.);
-/// Height of the reference picker popover; results scroll inside it.
-const PICKER_HEIGHT: Pixels = px(340.);
-/// Character shown on the trigger button and used to open the picker.
+/// Width of the completion popup above the input card.
+const POPUP_WIDTH: Pixels = px(440.);
+/// Max height of the popup result list; rows scroll inside it.
+const POPUP_MAX_HEIGHT: Pixels = px(288.);
+/// Trigger character and toolbar affordance.
 const TRIGGER_CHARACTER: char = '$';
-
-type SelectHandler = Rc<dyn Fn(&ChatMessagePreview, &mut App)>;
+/// A query longer than this is treated as ordinary text (no completion).
+const MAX_QUERY_CHARS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Draft state
@@ -55,7 +56,7 @@ type SelectHandler = Rc<dyn Fn(&ChatMessagePreview, &mut App)>;
 
 /// A Chat reference held by an Agent draft.
 ///
-/// This is presentation metadata only: the durable part is the typed
+/// Presentation metadata only: the durable part is the typed
 /// [`ChatMessageRef`]; the label fields are disposable display copies bounded
 /// by the catalog projection. The canonical message body is never retained.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +123,7 @@ enum ReferenceConfirmError {
 impl ReferenceConfirmError {
     /// Map a typed store error to its displayable form. Transport and
     /// projection details collapse into the generic read failure so hidden
-    /// branches never leak into the picker.
+    /// branches never leak into the composer.
     fn from_store(error: &ChatReferenceError) -> Self {
         match error {
             ChatReferenceError::TooLarge { limit } => Self::TooLarge { limit: *limit },
@@ -156,7 +157,7 @@ impl ReferenceConfirmError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReferenceSearchStatus {
-    /// No query yet (or blank query): nothing has been requested.
+    /// No query yet (blank token): nothing has been requested.
     Idle,
     /// A request for the current generation is in flight.
     Searching,
@@ -166,7 +167,7 @@ enum ReferenceSearchStatus {
     Failed,
 }
 
-/// UI-independent snapshot of the picker's search: query, keyset pagination,
+/// UI-independent snapshot of the completion search: query, keyset pagination,
 /// and a generation counter that invalidates results from older requests.
 #[derive(Debug)]
 struct ReferenceSearch {
@@ -211,52 +212,12 @@ impl ReferenceSearch {
         Some((generation, ChatMessageSearchQuery::new(query.to_string())))
     }
 
-    /// Begin loading the next keyset page. Returns `None` unless the previous
-    /// page succeeded and offered a cursor.
-    fn begin_load_more(&mut self) -> Option<(u64, ChatMessageSearchQuery)> {
-        if self.status != ReferenceSearchStatus::Ready {
-            return None;
-        }
-        let cursor = self.next_cursor.clone()?;
-        let generation = self.next_generation();
-        self.status = ReferenceSearchStatus::Searching;
-        Some((
-            generation,
-            ChatMessageSearchQuery {
-                cursor: Some(cursor),
-                ..ChatMessageSearchQuery::new(self.query.clone())
-            },
-        ))
-    }
-
     /// Apply a fresh search page. Stale generations are ignored.
     fn apply_search(&mut self, generation: u64, page: ChatMessageSearchPage) -> bool {
         if generation != self.generation {
             return false;
         }
         self.results = dedup_previews(page.messages);
-        self.next_cursor = page.next_cursor;
-        self.status = ReferenceSearchStatus::Ready;
-        true
-    }
-
-    /// Append a load-more page. Stale generations are ignored; rows already
-    /// present are not re-inserted.
-    fn apply_load_more(&mut self, generation: u64, page: ChatMessageSearchPage) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        let fresh: Vec<ChatMessagePreview> = page
-            .messages
-            .into_iter()
-            .filter(|row| {
-                !self
-                    .results
-                    .iter()
-                    .any(|existing| existing.reference == row.reference)
-            })
-            .collect();
-        self.results.extend(fresh);
         self.next_cursor = page.next_cursor;
         self.status = ReferenceSearchStatus::Ready;
         true
@@ -271,26 +232,8 @@ impl ReferenceSearch {
         true
     }
 
-    /// Mark an in-flight load-more failed. Rows stay so scrolling can retry;
-    /// stale generations are ignored.
-    fn fail_load_more(&mut self, generation: u64) -> bool {
-        if generation != self.generation {
-            return false;
-        }
-        self.status = ReferenceSearchStatus::Ready;
-        true
-    }
-
-    fn item(&self, ix: IndexPath) -> Option<&ChatMessagePreview> {
-        self.results.get(ix.row)
-    }
-
     fn is_loading(&self) -> bool {
         self.status == ReferenceSearchStatus::Searching && self.results.is_empty()
-    }
-
-    fn has_more(&self) -> bool {
-        self.status == ReferenceSearchStatus::Ready && self.next_cursor.is_some()
     }
 }
 
@@ -302,10 +245,53 @@ fn dedup_previews(previews: Vec<ChatMessagePreview>) -> Vec<ChatMessagePreview> 
         .collect()
 }
 
-/// A `$` opens the picker once per insertion: reopening requires the draft
-/// value to first drop every `$`.
-fn dollar_newly_present(previous: bool, value: &str) -> bool {
-    !previous && value.contains(TRIGGER_CHARACTER)
+// ---------------------------------------------------------------------------
+// $ token parsing
+// ---------------------------------------------------------------------------
+
+/// The `$query` token the caret currently sits in. Offsets are byte indexes
+/// into the input value; `start` points at the `$`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActiveToken {
+    start: usize,
+    end: usize,
+    query: String,
+}
+
+/// Parse the completion token at `cursor` (a byte offset). A token is active
+/// when the text back to the nearest `$` contains no whitespace, and the `$`
+/// itself sits at a word boundary (text start or after whitespace).
+fn active_dollar_token(text: &str, cursor: usize) -> Option<ActiveToken> {
+    let cursor = cursor.min(text.len());
+    let before = &text[..cursor];
+    let mut tail_start = cursor;
+    for (index, ch) in before.char_indices().rev() {
+        if ch.is_whitespace() || ch == TRIGGER_CHARACTER {
+            break;
+        }
+        tail_start = index;
+    }
+    if tail_start == 0 {
+        return None;
+    }
+    let dollar_at = tail_start - 1;
+    if before.as_bytes().get(dollar_at) != Some(&b'$') {
+        return None;
+    }
+    let head = &before[..dollar_at];
+    let at_boundary = head.is_empty() || head.chars().next_back().is_some_and(char::is_whitespace);
+    if !at_boundary {
+        return None;
+    }
+    let query = &before[tail_start..cursor];
+    if query.chars().count() > MAX_QUERY_CHARS {
+        return None;
+    }
+    Some(ActiveToken {
+        start: dollar_at,
+        end: cursor,
+        query: query.to_string(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -345,137 +331,6 @@ fn role_label(role: Role) -> SharedString {
     .into()
 }
 
-// ---------------------------------------------------------------------------
-// List row element
-// ---------------------------------------------------------------------------
-
-/// One search result row: role, source session title, local time, and the
-/// bounded catalog snippet. `checked` marks an already-referenced message.
-#[derive(IntoElement)]
-struct ReferenceRow {
-    id: ElementId,
-    selected: bool,
-    checked: bool,
-    role: Role,
-    title: SharedString,
-    snippet: Option<SharedString>,
-    time: String,
-}
-
-impl Selectable for ReferenceRow {
-    fn selected(mut self, selected: bool) -> Self {
-        self.selected = selected;
-        self
-    }
-
-    fn is_selected(&self) -> bool {
-        self.selected
-    }
-}
-
-impl RenderOnce for ReferenceRow {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let theme = cx.theme();
-        let role_tag = match self.role {
-            Role::User => Tag::primary(),
-            _ => Tag::secondary(),
-        }
-        .small()
-        .rounded_full()
-        .child(role_label(self.role));
-
-        div()
-            .id(self.id)
-            .relative()
-            .px_2()
-            .py_1p5()
-            .rounded(theme.radius)
-            .when(!self.selected, |this| {
-                this.hover(|this| this.bg(theme.accent.opacity(0.7)))
-            })
-            .when(self.selected, |this| this.bg(theme.accent))
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(role_tag)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_color(theme.foreground)
-                                    .child(self.title),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(self.time),
-                            )
-                            .when(self.checked, |this| {
-                                this.child(
-                                    Icon::new(IconName::Check)
-                                        .size_4()
-                                        .text_color(theme.primary),
-                                )
-                            }),
-                    )
-                    .child(h_flex().min_w_0().items_center().when_some(
-                        self.snippet,
-                        |this, snippet| {
-                            this.child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(snippet),
-                            )
-                        },
-                    )),
-            )
-    }
-}
-
-// ---------------------------------------------------------------------------
-// List delegate
-// ---------------------------------------------------------------------------
-
-/// Searchable-list delegate backing the reference picker. Search and
-/// pagination run on the background executor through the shared read-only
-/// capability; results land only when their query generation is current.
-struct ChatReferenceListDelegate {
-    search: ReferenceSearch,
-    cursor: Option<IndexPath>,
-    /// References already held by the composer's draft, shared so confirm
-    /// checks render without moving state across entities.
-    selected: Rc<RefCell<HashSet<ChatMessageRef>>>,
-    on_select: SelectHandler,
-}
-
-impl ChatReferenceListDelegate {
-    fn new(selected: Rc<RefCell<HashSet<ChatMessageRef>>>, on_select: SelectHandler) -> Self {
-        Self {
-            search: ReferenceSearch::new(),
-            cursor: None,
-            selected,
-            on_select,
-        }
-    }
-
-    fn initial_index(&self) -> Option<IndexPath> {
-        (!self.search.results.is_empty()).then(IndexPath::default)
-    }
-}
-
 fn chat_reference_store(cx: &App) -> Option<SharedChatReferenceStore> {
     cx.try_global::<crate::session::SessionStores>()
         .cloned()?
@@ -483,219 +338,36 @@ fn chat_reference_store(cx: &App) -> Option<SharedChatReferenceStore> {
         .ok()
 }
 
-impl ListDelegate for ChatReferenceListDelegate {
-    type Item = ReferenceRow;
-
-    fn sections_count(&self, _: &App) -> usize {
-        1
-    }
-
-    fn items_count(&self, _: usize, _: &App) -> usize {
-        self.search.results.len()
-    }
-
-    fn perform_search(
-        &mut self,
-        query: &str,
-        window: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Task<()> {
-        let Some((generation, request)) = self.search.begin(query) else {
-            cx.notify();
-            return Task::ready(());
-        };
-        let Some(store) = chat_reference_store(cx) else {
-            self.search.fail(generation);
-            cx.notify();
-            return Task::ready(());
-        };
-        let search = cx
-            .background_executor()
-            .spawn(async move { store.search_chat_messages(request) });
-        cx.spawn_in(window, async move |list, window| {
-            let result = search.await;
-            _ = list.update_in(window, |list, window, cx| {
-                let delegate = list.delegate_mut();
-                match result {
-                    Ok(page) => {
-                        delegate.search.apply_search(generation, page);
-                    }
-                    Err(error) => {
-                        crate::logging::error(
-                            "reference.picker",
-                            format_args!("chat reference search failed: {error}"),
-                        );
-                        delegate.search.fail(generation);
-                    }
-                }
-                let cursor = delegate.initial_index();
-                list.set_selected_index(cursor, window, cx);
-                cx.notify();
-            });
-        })
-    }
-
-    fn has_more(&self, _: &App) -> bool {
-        self.search.has_more()
-    }
-
-    fn load_more(&mut self, window: &mut Window, cx: &mut Context<ListState<Self>>) {
-        let Some((generation, request)) = self.search.begin_load_more() else {
-            return;
-        };
-        let Some(store) = chat_reference_store(cx) else {
-            self.search.fail_load_more(generation);
-            cx.notify();
-            return;
-        };
-        let search = cx
-            .background_executor()
-            .spawn(async move { store.search_chat_messages(request) });
-        // The list invokes `load_more` fire-and-forget, so this continuation
-        // outlives the call. It is generation-guarded and idempotent, so a
-        // detached apply cannot corrupt a newer query's snapshot.
-        cx.spawn_in(window, async move |list, window| {
-            let result = search.await;
-            _ = list.update_in(window, |list, _, cx| {
-                let delegate = list.delegate_mut();
-                match result {
-                    Ok(page) => {
-                        delegate.search.apply_load_more(generation, page);
-                    }
-                    Err(error) => {
-                        crate::logging::error(
-                            "reference.picker",
-                            format_args!("chat reference load more failed: {error}"),
-                        );
-                        delegate.search.fail_load_more(generation);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn render_item(
-        &mut self,
-        ix: IndexPath,
-        _: &mut Window,
-        _: &mut Context<ListState<Self>>,
-    ) -> Option<Self::Item> {
-        let row = self.search.item(ix)?;
-        let checked = self.selected.borrow().contains(&row.reference);
-        let title: SharedString = row
-            .session_title
-            .as_deref()
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .map_or_else(
-                || t!("reference_picker.untitled_chat").to_string(),
-                ToOwned::to_owned,
-            )
-            .into();
-        Some(ReferenceRow {
-            id: ElementId::Name(SharedString::from(format!("reference-row-{}", ix.row))),
-            selected: false,
-            checked,
-            role: row.role,
-            title,
-            snippet: row.preview.clone().map(SharedString::from),
-            time: format_reference_time(chrono::Local::now().timestamp_millis(), row.timestamp),
-        })
-    }
-
-    fn render_initial(
-        &mut self,
-        _: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> Option<gpui::AnyElement> {
-        Some(
-            v_flex()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .px_2()
-                .text_color(cx.theme().muted_foreground)
-                .child(Icon::new(IconName::Inbox).size_8())
-                .child(
-                    div()
-                        .text_xs()
-                        .child(t!("reference_picker.initial_hint").to_string()),
-                )
-                .into_any_element(),
-        )
-    }
-
-    fn render_empty(
-        &mut self,
-        _: &mut Window,
-        cx: &mut Context<ListState<Self>>,
-    ) -> impl IntoElement {
-        let failed = self.search.status == ReferenceSearchStatus::Failed;
-        v_flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .px_2()
-            .text_color(cx.theme().muted_foreground)
-            .child(Icon::new(IconName::Search).size_8())
-            .child(div().text_xs().child(if failed {
-                t!("reference_picker.error_search").to_string()
-            } else {
-                t!("reference_picker.empty").to_string()
-            }))
-    }
-
-    fn loading(&self, _: &App) -> bool {
-        self.search.is_loading()
-    }
-
-    fn set_selected_index(
-        &mut self,
-        ix: Option<IndexPath>,
-        _: &mut Window,
-        _: &mut Context<ListState<Self>>,
-    ) {
-        self.cursor = ix;
-    }
-
-    fn confirm(&mut self, _: bool, _: &mut Window, cx: &mut Context<ListState<Self>>) {
-        let Some(row) = self.cursor.and_then(|ix| self.search.item(ix)) else {
-            return;
-        };
-        // The composer owns the draft: route the typed reference there and let
-        // its background read decide between adding the draft or surfacing a
-        // typed error. The popover stays open for further selections.
-        (self.on_select)(row, cx);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Composer
 // ---------------------------------------------------------------------------
 
-/// Composer hosting the `$` reference picker: a draft input, the popover, and
-/// the removable chip row of confirmed references.
+/// Live state of the `$` completion popup.
+#[derive(Debug)]
+struct CompletionState {
+    token: Option<ActiveToken>,
+    search: ReferenceSearch,
+    cursor: usize,
+}
+
+/// Chat-style draft composer for the Agent workspace: reference chips, a
+/// multi-line input, a toolbar row, and the `$` completion popup that floats
+/// above the card while the caret is inside a `$token`.
 ///
-/// Entities are created only in event handlers (`new`, `open_picker`) — never
-/// in render. Store I/O always runs on the background executor.
+/// Entities are created only in the constructor — never in render. All store
+/// I/O runs on the background executor; each search task is stored so a newer
+/// token drops (cancels) the previous request, and a query generation guards
+/// late results on top of that.
 pub(crate) struct ChatReferenceComposer {
     input: Entity<InputState>,
-    list: Entity<ListState<ChatReferenceListDelegate>>,
-    open: bool,
-    /// Whether the draft value currently contains a `$`; suppresses reopening
-    /// until every `$` has been removed.
-    dollar_present: bool,
+    completion: CompletionState,
     drafts: Vec<ChatReferenceDraft>,
-    selected: Rc<RefCell<HashSet<ChatMessageRef>>>,
+    selected: HashSet<ChatMessageRef>,
     /// References with an in-flight exact read, so quick re-confirms cannot
     /// enqueue duplicate work.
     pending: HashSet<ChatMessageRef>,
     confirm_error: Option<ReferenceConfirmError>,
-    popover: PopoverDismissHandle,
+    _search_task: Option<Task<()>>,
     /// In-flight exact reads. Stored so dropping the composer cancels them;
     /// completed handles are cheap to retain until the next confirm.
     _read_tasks: Vec<Task<()>>,
@@ -707,73 +379,206 @@ impl ChatReferenceComposer {
         let placeholder: SharedString = t!("reference_picker.composer_placeholder")
             .to_string()
             .into();
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
-        let subscription = cx.subscribe_in(&input, window, |this, input, event, window, cx| {
-            if !matches!(event, InputEvent::Change) {
-                return;
-            }
-            let value = input.read(cx).value();
-            if dollar_newly_present(this.dollar_present, value.as_ref()) {
-                this.open_picker(window, cx);
-            }
-            this.dollar_present = value.contains(TRIGGER_CHARACTER);
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(1, 8)
+                .submit_on_enter(true)
+                .placeholder(placeholder)
         });
-
-        let selected = Rc::new(RefCell::new(HashSet::new()));
-        let list = new_reference_list(selected.clone(), select_handler(cx), window, cx);
+        let subscription =
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::Change => this.sync_completion_with_input(input, window, cx),
+                    InputEvent::PressEnter { shift: false, .. } if this.completion.is_open() => {
+                        this.confirm_completion(window, cx);
+                    }
+                    _ => {}
+                },
+            );
 
         Self {
             input,
-            list,
-            open: false,
-            dollar_present: false,
+            completion: CompletionState {
+                token: None,
+                search: ReferenceSearch::new(),
+                cursor: 0,
+            },
             drafts: Vec::new(),
-            selected,
+            selected: HashSet::new(),
             pending: HashSet::new(),
             confirm_error: None,
-            popover: PopoverDismissHandle::default(),
+            _search_task: None,
             _read_tasks: Vec::new(),
             _input_subscription: subscription,
         }
     }
 
-    /// Programmatically close the picker (e.g. when leaving the workspace).
-    pub(crate) fn dismiss_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open {
-            self.open = false;
-            self.popover.dismiss(window, cx);
+    /// True while the completion popup should render.
+    pub(crate) fn is_completion_open(&self) -> bool {
+        self.completion.is_open()
+    }
+
+    /// Focus the draft input (e.g. after starting a new conversation draft).
+    pub(crate) fn focus_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |state, cx| state.focus(window, cx));
+    }
+
+    /// Programmatically close the popup (e.g. when leaving the workspace).
+    pub(crate) fn dismiss_completion(&mut self, cx: &mut Context<Self>) {
+        if self.completion.token.take().is_some() {
             cx.notify();
         }
     }
 
-    /// Open the picker with a fresh search session.
-    fn open_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let list = new_reference_list(Rc::clone(&self.selected), select_handler(cx), window, cx);
-        defer_reference_list_focus(list.clone(), window, cx);
-        self.list = list;
-        self.confirm_error = None;
-        self.open = true;
+    /// Insert the `$` trigger at the caret so the toolbar button opens the
+    /// same completion flow as typing the character.
+    pub(crate) fn insert_trigger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |state, cx| {
+            state.insert(TRIGGER_CHARACTER.to_string(), window, cx);
+            state.focus(window, cx);
+        });
+    }
+
+    // ----- completion flow -----
+
+    fn sync_completion_with_input(
+        &mut self,
+        input: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (value, cursor) = {
+            let state = input.read(cx);
+            (state.value(), state.cursor())
+        };
+        let token = active_dollar_token(&value, cursor);
+        let changed = self.completion.token != token;
+        self.completion.token = token.clone();
+        if !changed {
+            return;
+        }
+        self.completion.cursor = 0;
+        match token {
+            None => {
+                self._search_task = None;
+            }
+            Some(_) => {
+                // `begin` resets the snapshot for the new token and decides
+                // whether a store request is warranted (blank query → hint).
+                self.start_search(window, cx);
+            }
+        }
         cx.notify();
     }
 
-    fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if open {
-            if !self.open {
-                self.open_picker(window, cx);
-            }
-        } else if self.open {
-            self.open = false;
+    fn start_search(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(token) = self.completion.token.clone() else {
+            return;
+        };
+        let Some((generation, request)) = self.completion.search.begin(&token.query) else {
+            // Blank query: no store call; the popup shows the typing hint.
+            return;
+        };
+        let Some(store) = chat_reference_store(cx) else {
+            self.completion.search.fail(generation);
+            cx.notify();
+            return;
+        };
+        self._search_task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { store.search_chat_messages(request) })
+                .await;
+            _ = this.update(cx, |composer, cx| {
+                match result {
+                    Ok(page) => {
+                        composer.completion.search.apply_search(generation, page);
+                    }
+                    Err(error) => {
+                        crate::logging::error(
+                            "reference.picker",
+                            format_args!("chat reference search failed: {error}"),
+                        );
+                        composer.completion.search.fail(generation);
+                    }
+                }
+                if composer.completion.token.is_some() {
+                    composer.completion.cursor = 0;
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Move the popup cursor by `delta`, clamped to the current result rows.
+    fn move_completion_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if !self.completion.is_open() {
+            return;
+        }
+        let len = self.completion.search.results.len();
+        if len == 0 {
+            return;
+        }
+        let current = self.completion.cursor.min(len - 1) as isize;
+        let next = (current + delta).clamp(0, len as isize - 1) as usize;
+        if next != self.completion.cursor {
+            self.completion.cursor = next;
             cx.notify();
         }
     }
 
-    /// A row was confirmed in the picker. The typed reference is validated by
-    /// a background exact read before it joins the draft, so unavailable and
-    /// oversized sources surface as typed errors instead of ghost chips.
+    /// Confirm the row under the popup cursor (Enter). Removes the `$token`
+    /// text and routes the typed reference through the background read.
+    fn confirm_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .completion
+            .search
+            .results
+            .get(self.completion.cursor)
+            .cloned();
+        let Some(row) = row else {
+            return;
+        };
+        self.complete_row(&row, window, cx);
+    }
+
+    fn complete_row(
+        &mut self,
+        row: &ChatMessagePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (value, cursor) = {
+            let state = self.input.read(cx);
+            (state.value(), state.cursor())
+        };
+        // Re-parse at confirm time: the stored token may predate the last
+        // edit if a click raced a keystroke.
+        if let Some(token) = active_dollar_token(&value, cursor) {
+            let cursor_after_removal = token.start;
+            let mut new_value = String::with_capacity(value.len());
+            new_value.push_str(&value[..token.start]);
+            new_value.push_str(&value[token.end..]);
+            self.input.update(cx, |state, cx| {
+                state.replace_all(new_value, window, cx);
+                // Multi-line `replace_all` rewinds the caret to the start;
+                // park it where the token used to begin instead.
+                state.set_selected_range(cursor_after_removal..cursor_after_removal, cx);
+            });
+        }
+        self.handle_select(row, cx);
+    }
+
+    // ----- reference selection -----
+
+    /// A row was confirmed. The typed reference is validated by a background
+    /// exact read before it joins the draft, so unavailable and oversized
+    /// sources surface as typed errors instead of ghost chips.
     fn handle_select(&mut self, row: &ChatMessagePreview, cx: &mut Context<Self>) {
         self.confirm_error = None;
-        if self.selected.borrow().contains(&row.reference) || self.pending.contains(&row.reference)
-        {
+        if self.selected.contains(&row.reference) || self.pending.contains(&row.reference) {
             return;
         }
         let Some(store) = chat_reference_store(cx) else {
@@ -807,7 +612,7 @@ impl ChatReferenceComposer {
         match result {
             Ok(read) => {
                 let draft = ChatReferenceDraft::from_read(read);
-                if self.selected.borrow_mut().insert(draft.reference.clone()) {
+                if self.selected.insert(draft.reference.clone()) {
                     self.drafts.push(draft);
                 }
             }
@@ -827,14 +632,18 @@ impl ChatReferenceComposer {
     fn remove_draft(&mut self, reference: ChatMessageRef, cx: &mut Context<Self>) {
         self.pending.remove(&reference);
         self.drafts.retain(|draft| draft.reference != reference);
-        self.selected.borrow_mut().remove(&reference);
+        self.selected.remove(&reference);
         cx.notify();
     }
+
+    // ----- rendering -----
 
     fn render_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .flex_wrap()
             .gap_1()
+            .px_1p5()
+            .pt_1()
             .children(self.drafts.iter().enumerate().map(|(index, draft)| {
                 let reference = draft.reference.clone();
                 Tag::secondary()
@@ -864,112 +673,286 @@ impl ChatReferenceComposer {
                     )
             }))
     }
+
+    fn render_completion_row(
+        &self,
+        index: usize,
+        row: &ChatMessagePreview,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let title: SharedString = row
+            .session_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || t!("reference_picker.untitled_chat").to_string(),
+                ToOwned::to_owned,
+            )
+            .into();
+        let role_tag = match row.role {
+            Role::User => Tag::primary(),
+            _ => Tag::secondary(),
+        }
+        .small()
+        .rounded_full()
+        .child(role_label(row.role));
+        let checked = self.selected.contains(&row.reference);
+        let selected = index == self.completion.cursor;
+        let time = format_reference_time(chrono::Local::now().timestamp_millis(), row.timestamp);
+
+        div()
+            .id(SharedString::from(format!("reference-row-{index}")))
+            .px_2()
+            .py_1p5()
+            .rounded(theme.radius)
+            .when(!selected, |this| {
+                this.hover(|this| this.bg(theme.accent.opacity(0.7)))
+            })
+            .when(selected, |this| this.bg(theme.accent))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                let row = this.completion.search.results.get(index).cloned();
+                if let Some(row) = row {
+                    this.completion.cursor = index;
+                    this.complete_row(&row, window, cx);
+                }
+            }))
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap_1p5()
+                            .child(role_tag)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_color(theme.foreground)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(time),
+                            )
+                            .when(checked, |this| {
+                                this.child(
+                                    Icon::new(IconName::Check)
+                                        .size_4()
+                                        .text_color(theme.primary),
+                                )
+                            }),
+                    )
+                    .child(
+                        h_flex().min_w_0().items_center().child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(row.preview.clone().unwrap_or_default()),
+                        ),
+                    ),
+            )
+    }
+
+    fn render_completion_popup(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let search = &self.completion.search;
+
+        let body: Vec<gpui::AnyElement> = if search.is_loading() {
+            vec![
+                h_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .py_4()
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().small())
+                    .into_any_element(),
+            ]
+        } else if search.results.is_empty() {
+            let (icon, message) = match search.status {
+                ReferenceSearchStatus::Failed => (
+                    IconName::Info,
+                    t!("reference_picker.error_search").to_string(),
+                ),
+                ReferenceSearchStatus::Idle => {
+                    (IconName::Search, t!("reference_picker.hint").to_string())
+                }
+                _ => (IconName::Search, t!("reference_picker.empty").to_string()),
+            };
+            vec![
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .py_4()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(icon).size_6())
+                    .child(div().text_xs().child(message))
+                    .into_any_element(),
+            ]
+        } else {
+            search
+                .results
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    self.render_completion_row(index, row, cx)
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        v_flex()
+            .id("reference-completion")
+            .min_w(POPUP_WIDTH)
+            .max_h(POPUP_MAX_HEIGHT)
+            .overflow_y_scroll()
+            .p_1()
+            .child(v_flex().children(body))
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t!("reference_picker.popup_hint").to_string()),
+            )
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        h_flex()
+            .px_1p5()
+            .items_center()
+            .gap_1()
+            .child(
+                Button::new("reference-trigger")
+                    .ghost()
+                    .small()
+                    .label(TRIGGER_CHARACTER.to_string())
+                    .tooltip(t!("reference_picker.trigger_tooltip").to_string())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.insert_trigger(window, cx);
+                    })),
+            )
+            .when_some(self.confirm_error.as_ref(), |this, error| {
+                this.child(
+                    h_flex()
+                        .min_w_0()
+                        .flex_1()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Icon::new(IconName::Info)
+                                .size_3p5()
+                                .text_color(theme.warning_foreground),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(error.localized()),
+                        ),
+                )
+            })
+            .child(div().flex_1())
+            .child(
+                Button::new("agent-send")
+                    .primary()
+                    .small()
+                    .icon(IconName::ArrowUp)
+                    .disabled(true)
+                    .tooltip(t!("agent.send_disabled_tooltip").to_string()),
+            )
+    }
 }
 
-fn select_handler(cx: &mut Context<ChatReferenceComposer>) -> SelectHandler {
-    let this = cx.entity().downgrade();
-    Rc::new(move |row: &ChatMessagePreview, cx: &mut App| {
-        _ = this.update(cx, |composer, cx| composer.handle_select(row, cx));
-    })
-}
-
-fn new_reference_list(
-    selected: Rc<RefCell<HashSet<ChatMessageRef>>>,
-    on_select: SelectHandler,
-    window: &mut Window,
-    cx: &mut App,
-) -> Entity<ListState<ChatReferenceListDelegate>> {
-    cx.new(|cx| {
-        ListState::new(
-            ChatReferenceListDelegate::new(selected, on_select),
-            window,
-            cx,
-        )
-        .searchable(true)
-    })
-}
-
-fn defer_reference_list_focus(
-    list: Entity<ListState<ChatReferenceListDelegate>>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    window.defer(cx, move |window, cx| {
-        list.update(cx, |list, cx| list.focus(window, cx));
-    });
+impl CompletionState {
+    fn is_open(&self) -> bool {
+        self.token.is_some()
+    }
 }
 
 impl Render for ChatReferenceComposer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let list = self.list.clone();
-        let popover = self.popover.clone();
-        let confirm_error = self.confirm_error.clone();
+        let completion_open = self.is_completion_open();
+        let (background, border, radius_lg) = {
+            let theme = cx.theme();
+            (theme.background, theme.border, theme.radius_lg)
+        };
 
-        let picker =
-            Popover::new("chat-reference-picker")
-                .p_0()
-                .text_sm()
-                .anchor(Anchor::BottomLeft)
-                .open(self.open)
-                .on_open_change(cx.listener(|this, open, window, cx| {
-                    this.set_open(*open, window, cx);
-                }))
-                .trigger(
-                    Button::new("reference-trigger")
-                        .ghost()
-                        .small()
-                        .label(TRIGGER_CHARACTER.to_string())
-                        .tooltip(t!("reference_picker.trigger_tooltip").to_string()),
+        div()
+            .id("agent-composer")
+            .relative()
+            .w_full()
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !this.is_completion_open() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                let control = event.keystroke.modifiers.control;
+                if key == "escape" {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.dismiss_completion(cx);
+                } else if control && key == "n" {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.move_completion_cursor(1, cx);
+                } else if control && key == "p" {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    this.move_completion_cursor(-1, cx);
+                }
+            }))
+            .when(completion_open, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom_full()
+                        .left_0()
+                        .mb_2()
+                        .popover_style(cx)
+                        .shadow_md()
+                        .child(self.render_completion_popup(cx)),
                 )
-                .track_focus(&self.list.focus_handle(cx))
-                .content(move |_, _, cx| {
-                    popover.bind(cx.weak_entity());
-                    v_flex()
-                        .size_full()
-                        .min_h_0()
-                        .child(List::new(&list).small().p_1().search_placeholder(
-                            t!("reference_picker.search_placeholder").to_string(),
-                        ))
-                        .when_some(confirm_error.clone(), |this, error| {
-                            this.child(
-                                h_flex()
-                                    .items_start()
-                                    .gap_1p5()
-                                    .border_t_1()
-                                    .border_color(cx.theme().border)
-                                    .px_2p5()
-                                    .py_1p5()
-                                    .child(
-                                        Icon::new(IconName::Info)
-                                            .size_4()
-                                            .text_color(cx.theme().warning_foreground),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(cx.theme().foreground)
-                                            .child(error.localized()),
-                                    ),
-                            )
-                        })
-                })
-                .w(PICKER_WIDTH)
-                .h(PICKER_HEIGHT);
-
-        v_flex()
-            .gap_1()
-            .when(!self.drafts.is_empty(), |this| {
-                this.child(self.render_chips(cx))
             })
             .child(
-                h_flex()
-                    .min_w_0()
-                    .items_center()
-                    .gap_1()
-                    .child(picker)
-                    .child(Input::new(&self.input).appearance(false).flex_1().min_w_0()),
+                v_flex()
+                    .w_full()
+                    .gap_0p5()
+                    .bg(background)
+                    .border_1()
+                    .border_color(border)
+                    .rounded(radius_lg)
+                    .shadow_md()
+                    .py_1()
+                    .when(!self.drafts.is_empty(), |this| {
+                        this.child(self.render_chips(cx))
+                    })
+                    .child(
+                        Input::new(&self.input)
+                            .appearance(false)
+                            .font_family(crate::appearance::fonts::active(cx).family())
+                            .pr(px(8.)),
+                    )
+                    .child(self.render_toolbar(cx)),
             )
     }
 }
