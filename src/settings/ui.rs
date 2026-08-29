@@ -45,7 +45,7 @@ pub(super) fn icon_button(
         .size(size)
         .p_0()
         .icon(Icon::new(icon))
-        .aria_label(aria_label.clone())
+        .accessibility_label(aria_label.clone())
         .tooltip(aria_label)
 }
 

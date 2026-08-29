@@ -386,7 +386,7 @@ fn new_composer(cx: &mut gpui::VisualTestContext) -> gpui::Entity<ChatReferenceC
 /// park it there.
 fn set_input_value(
     cx: &mut gpui::VisualTestContext,
-    input: &gpui::Entity<InputState>,
+    input: &gpui::Entity<TextareaState>,
     value: &str,
 ) {
     cx.update(|window, cx| {

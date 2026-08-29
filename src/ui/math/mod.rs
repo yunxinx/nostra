@@ -86,6 +86,13 @@ pub(super) fn extend(
         .block_renderer(NODE_NAME, move |node, window, cx| {
             render_display(node, owner_id, window, cx)
         })
+        .block_renderer(LITERAL_NODE_NAME, |node, _, _| {
+            // An unfinished flow-math opener is kept as a literal custom
+            // block until the closing delimiter arrives. This preserves the
+            // streamed source and avoids the native empty Math/CodeBlock
+            // fallback dropping the delimiter from selection and copy.
+            div().child(node.as_text().to_string()).into_any_element()
+        })
 }
 
 fn parse_inline(
@@ -159,11 +166,15 @@ fn parse_display(
         }
         _ => return None,
     };
-    let formula = MathFormula::from_recognized(
-        parse::display_formula_from_ast(original, ast_value)?,
-        cx.node_range(node)?.start,
-        source_offset,
-    );
+    let Some(recognized) = parse::display_formula_from_ast(original, ast_value) else {
+        return Some(
+            MarkdownNode::new(LITERAL_NODE_NAME, ())
+                .text(original.to_string())
+                .markdown(original.to_string()),
+        );
+    };
+    let formula =
+        MathFormula::from_recognized(recognized, cx.node_range(node)?.start, source_offset);
     Some(display_markdown_node(formula))
 }
 

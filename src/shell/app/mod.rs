@@ -24,7 +24,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme, Icon, IconName, InteractiveElementExt as _, Root, Sizable as _, StyledExt as _,
     TITLE_BAR_HEIGHT, WindowExt as _,
-    animation::{Transition, ease_in_out_cubic},
+    animation::{EffectTransition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::DropdownMenu as _,

@@ -483,7 +483,7 @@ pub(super) fn render(
                         .child(
                             Scrollbar::horizontal(&scroll_handle)
                                 .id(scrollbar_id)
-                                .scrollbar_show(ScrollbarShow::Always),
+                                .mode(ScrollbarMode::Always),
                         ),
                 )
             });

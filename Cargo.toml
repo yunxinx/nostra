@@ -44,15 +44,15 @@ unicode-segmentation = "1.12"
 # Zed/GPUI and gpui-component are maintained as one verified fork set. Checked-in
 # dependencies pin exact commits: every GPUI crate shares one Zed revision and
 # both component crates share one gpui-component revision.
-gpui = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30aa889a99d499602bdaad51fb7f2f2ca" }
-gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30aa889a99d499602bdaad51fb7f2f2ca", features = [
+gpui = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
+gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a", features = [
     "font-kit",
     "x11",
     "wayland",
     "runtime_shaders",
 ] }
-http_client = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30aa889a99d499602bdaad51fb7f2f2ca" }
-reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30aa889a99d499602bdaad51fb7f2f2ca" }
+http_client = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
+reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a" }
 
 # Bundled composer fonts remain reliable, cross-platform product defaults.
 # Soft wrapping is now measured through production shaping, so correctness no
@@ -66,10 +66,10 @@ reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30a
 # The pinned gpui-component revision owns Nostra's authoritative streaming
 # TextView state, composable inline Markdown extensions, standard button/menu
 # interaction contract, title-bar geometry, and nested horizontal scrolling.
-gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "f8864b2bfbbe8bb71941bdb864cf6969ae50973e", features = [
+gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "76870af0da1c8d39e9c6693374657b2201c3205f", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "f8864b2bfbbe8bb71941bdb864cf6969ae50973e" }
+gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "76870af0da1c8d39e9c6693374657b2201c3205f" }
 
 # RaTeX publishes versioned crates on crates.io, so use a semver-compatible
 # requirement here; Cargo.lock records the exact verified release. The
@@ -91,7 +91,8 @@ ratex-unicode-font = { path = "vendor/ratex-unicode-font" }
 ratex-svg = { path = "vendor/ratex-svg" }
 
 [dev-dependencies]
-gpui = { git = "https://github.com/yunxinx/zed.git", rev = "4d8e84d30aa889a99d499602bdaad51fb7f2f2ca", features = ["test-support"] }
+gpui = { git = "https://github.com/yunxinx/zed.git", rev = "13e725c42f723f81c87231cb65459eeb561b5f6a", features = ["test-support"] }
+gpui-base = { git = "https://github.com/yunxinx/gpui-component.git", rev = "76870af0da1c8d39e9c6693374657b2201c3205f" }
 
 # Build tweaks copied from the gpui-component workspace to keep dev builds
 # usable; without these the dev binary is very slow.

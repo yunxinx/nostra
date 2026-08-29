@@ -281,8 +281,6 @@ fn currency_closing_context_stays_native_and_selectable(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn inline_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext) {
-    use gpui_component::WindowExt as _;
-
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     let markdown = "before $x^2$ after";
@@ -320,7 +318,7 @@ fn inline_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext)
     redraw(cx);
     cx.simulate_mouse_move(formula_left, Some(MouseButton::Left), Modifiers::default());
     redraw(cx);
-    let selected_inside_formula = cx.update(|window, cx| window.selected_text(cx));
+    let selected_inside_formula = cx.update(gpui_base::TextSelection::selected_text);
     assert!(
         selected_inside_formula.contains("$x^2$"),
         "dragging inside the atomic formula did not select it: {selected_inside_formula:?}"
@@ -331,7 +329,7 @@ fn inline_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext)
     cx.simulate_mouse_up(text_endpoint, MouseButton::Left, Modifiers::default());
     redraw(cx);
 
-    let selected = cx.update(|window, cx| window.selected_text(cx));
+    let selected = cx.update(gpui_base::TextSelection::selected_text);
     assert!(
         selected.contains("$x^2$"),
         "reverse drag dropped the atomic formula fallback: {selected:?}"
@@ -350,8 +348,6 @@ fn inline_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn display_formula_drag_preserves_interleaved_markdown_order(cx: &mut TestAppContext) {
-    use gpui_component::WindowExt as _;
-
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     let markdown = "$$\na\n$$\nmiddle\n$$\nb\n$$";
@@ -394,7 +390,7 @@ fn display_formula_drag_preserves_interleaved_markdown_order(cx: &mut TestAppCon
     redraw(cx);
 
     assert_eq!(
-        cx.update(|window, cx| window.selected_text(cx)).trim(),
+        cx.update(gpui_base::TextSelection::selected_text).trim(),
         markdown
     );
 

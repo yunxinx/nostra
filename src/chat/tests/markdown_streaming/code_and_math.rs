@@ -29,7 +29,7 @@ fn complete_syntax_registry_supports_common_fence_aliases() {
         !highlighter
             .styles(
                 &(0..code.len()),
-                &gpui_component::highlighter::HighlightTheme::default_dark(),
+                gpui_component::highlighter::HighlightTheme::default_dark().as_ref(),
             )
             .is_empty(),
         "a registered grammar must produce token styles, not just monospace text"

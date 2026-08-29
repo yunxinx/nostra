@@ -28,10 +28,12 @@ use gpui::{
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{IndentInline, Input, InputEvent, InputState, MoveLeft, MoveRight, OutdentInline},
+    input::{
+        IndentInline, InputEvent, MoveLeft, MoveRight, OutdentInline, Textarea, TextareaState,
+    },
     spinner::Spinner,
     tag::Tag,
     v_flex,
@@ -434,7 +436,7 @@ struct CompletionState {
 /// token drops (cancels) the previous request, and a query generation guards
 /// late results on top of that.
 pub(crate) struct ChatReferenceComposer {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     references_enabled: bool,
     status: Rc<Cell<ComposerStatus>>,
     completion: CompletionState,
@@ -486,7 +488,7 @@ impl ChatReferenceComposer {
         }
         .into();
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(1, 8)
                 .submit_on_enter(true)
                 .placeholder(placeholder)
@@ -532,7 +534,7 @@ impl ChatReferenceComposer {
         }
     }
 
-    pub(crate) fn input(&self) -> Entity<InputState> {
+    pub(crate) fn input(&self) -> Entity<TextareaState> {
         self.input.clone()
     }
 
@@ -605,7 +607,7 @@ impl ChatReferenceComposer {
 
     fn sync_completion_with_input(
         &mut self,
-        input: &Entity<InputState>,
+        input: &Entity<TextareaState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1364,7 +1366,7 @@ impl Render for ChatReferenceComposer {
                                 this.child(self.render_chips(cx))
                             })
                             .child(
-                                Input::new(&self.input)
+                                Textarea::new(&self.input)
                                     .appearance(false)
                                     .font_family(crate::appearance::fonts::active(cx).family())
                                     .pr(px(8.)),

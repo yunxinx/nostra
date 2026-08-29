@@ -16,7 +16,7 @@ use gpui_component::{
     clipboard::Clipboard,
     h_flex,
     highlighter::{HighlightTheme, SyntaxHighlighter},
-    scroll::{ScrollableMask, Scrollbar, ScrollbarShow},
+    scroll::{ScrollableMask, Scrollbar, ScrollbarMode},
     text::{
         MarkdownExtensions, MarkdownNode, SelectableText, SelectableTextState, TextView,
         TextViewState, TextViewStyle, markdown_ast,

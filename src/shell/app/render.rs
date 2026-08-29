@@ -258,7 +258,7 @@ impl Render for ChatApp {
             .child(sidebar_inner);
 
         let sidebar_column: AnyElement = if self.has_toggled {
-            Transition::new(SIDEBAR_ANIM)
+            EffectTransition::new(SIDEBAR_ANIM)
                 .ease(ease_in_out_cubic)
                 .width(from_w, to_w)
                 .apply(
@@ -393,7 +393,7 @@ impl Render for ChatApp {
             });
 
         let pill_element: AnyElement = if self.has_toggled {
-            Transition::new(SIDEBAR_ANIM)
+            EffectTransition::new(SIDEBAR_ANIM)
                 .ease(ease_in_out_cubic)
                 .slide_x(pill_from, pill_to)
                 .apply(

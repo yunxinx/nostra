@@ -33,7 +33,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, ElementExt as _, StyledExt as _, WindowExt as _, h_flex,
-    input::{InputEvent, InputState, RopeExt as _},
+    input::{InputEvent, RopeExt as _, TextareaState},
     notification::NotificationType,
     scroll::ScrollableElement as _,
     text::{TextView, TextViewStyle},
@@ -108,7 +108,7 @@ pub(crate) enum ChatDeleteRequest {
 pub struct ChatView {
     window_handle: AnyWindowHandle,
     messages: Vec<Message>,
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     composer: Entity<ChatReferenceComposer>,
     composer_status: Rc<Cell<ComposerStatus>>,
     scope: ConversationScope,

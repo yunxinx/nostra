@@ -1,7 +1,8 @@
 use gpui::{
     Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, point,
 };
-use gpui_component::{ActiveTheme as _, Root, WindowExt as _};
+use gpui_base::TextSelection;
+use gpui_component::{ActiveTheme as _, Root};
 
 use super::*;
 
@@ -69,7 +70,7 @@ fn assert_fenced_code_drag_copy(cx: &mut TestAppContext, wrap: bool) {
     });
     cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
 
-    let selected = cx.update(|window, cx| window.selected_text(cx));
+    let selected = cx.update(TextSelection::selected_text);
     assert_eq!(selected.trim_end_matches('\n'), CODE);
 
     cx.dispatch_action(gpui_component::input::Copy);
@@ -161,7 +162,7 @@ fn language_identifiers_are_ascii_case_insensitive() {
     assert!(highlighter.update(None, &rope, None));
     assert!(
         !highlighter
-            .styles(&(0..code.len()), &HighlightTheme::default_dark())
+            .styles(&(0..code.len()), HighlightTheme::default_dark().as_ref())
             .is_empty(),
         "uppercase Python must produce syntax styles rather than plain text"
     );
@@ -316,7 +317,7 @@ fn syntax_highlighter_runs_off_thread_and_returns_send_styles() {
     let styles = std::thread::spawn(move || {
         let mut highlighter = SyntaxHighlighter::new("rust");
         highlighter.update(None, &code, None);
-        highlighter.styles(&(0..code.len()), &HighlightTheme::default_dark())
+        highlighter.styles(&(0..code.len()), HighlightTheme::default_dark().as_ref())
     })
     .join()
     .expect("worker thread");
@@ -530,8 +531,15 @@ fn replacing_a_long_block_restarts_the_background_worker_for_the_new_generation(
     // started for the new generation. Before this fix the stale task was
     // retained, so no new worker was spawned here and the block stayed as
     // a placeholder until a later frame.
-    cx.update(|window, cx| {
+    cx.update(|_, cx| {
         content.update(cx, |root, cx| root.body.set_text(&new_source, cx));
+    });
+    // Large full replacements are parsed off the UI thread. Wait for the
+    // replacement AST before drawing the new code block so this assertion
+    // observes the worker generation transition rather than the old frame
+    // that remains visible while parsing is in flight.
+    cx.run_until_parked();
+    cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
     assert_eq!(

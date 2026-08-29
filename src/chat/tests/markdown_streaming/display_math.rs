@@ -195,8 +195,6 @@ fn list_display_math_uses_container_free_formula_source(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext) {
-    use gpui_component::WindowExt as _;
-
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     let markdown = "$$\nx^2 + y^2\n$$";
@@ -235,7 +233,7 @@ fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext
     cx.simulate_mouse_up(left, MouseButton::Left, Modifiers::default());
     redraw(cx);
 
-    let selected = cx.update(|window, cx| window.selected_text(cx));
+    let selected = cx.update(gpui_base::TextSelection::selected_text);
     assert_eq!(selected.trim(), markdown);
 
     let selected_all = cx.update(|_, cx| {
