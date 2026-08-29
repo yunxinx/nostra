@@ -287,6 +287,14 @@ impl AgentWorkspace {
         self.session_load_state = AgentLoadState::Unloaded;
     }
 
+    /// Invalidate any detail load that belongs to the previously opened
+    /// session before a new project target is selected.  The task may still
+    /// finish, but its generation can no longer publish into this workspace.
+    pub(super) fn invalidate_session_load(&mut self) {
+        self.next_session_generation();
+        self.clear_open_detail();
+    }
+
     /// Expand a project without changing the open conversation.
     pub(super) fn expand_project(&mut self, project_id: String) {
         self.expanded_project_ids.insert(project_id);
@@ -305,20 +313,20 @@ impl AgentWorkspace {
 
     /// Open a session in the main pane without leaving the grouped tree.
     pub(super) fn select_session(&mut self, project_id: String, session_id: SessionId) {
+        self.invalidate_session_load();
         self.open = Some(AgentOpen::Session {
             project_id,
             session_id,
         });
-        self.clear_open_detail();
     }
 
     /// Start a fresh conversation draft under `project_id`, expand that
     /// project, and open the composer. No session id exists until a future
     /// send runtime persists the first turn.
     pub(super) fn new_project_draft(&mut self, project_id: String) {
+        self.invalidate_session_load();
         self.expanded_project_ids.insert(project_id.clone());
         self.open = Some(AgentOpen::Draft { project_id });
-        self.clear_open_detail();
     }
 
     pub(super) fn open_draft(&mut self, project_id: String) {
@@ -326,17 +334,17 @@ impl AgentWorkspace {
     }
 
     pub(super) fn bind_draft_session(&mut self, project_id: String, session_id: SessionId) {
+        self.invalidate_session_load();
         self.open = Some(AgentOpen::Session {
             project_id,
             session_id,
         });
-        self.clear_open_detail();
     }
 
     pub(super) fn discard_draft(&mut self, project_id: &str) {
         if matches!(self.open, Some(AgentOpen::Draft { project_id: ref id }) if id == project_id) {
             self.open = None;
-            self.clear_open_detail();
+            self.invalidate_session_load();
         }
     }
 
@@ -348,7 +356,7 @@ impl AgentWorkspace {
         if matches!(self.open, Some(AgentOpen::Session { project_id: ref pid, session_id: ref sid }) if pid == project_id && sid == session_id)
         {
             self.open = None;
-            self.clear_open_detail();
+            self.invalidate_session_load();
         }
     }
 
@@ -359,7 +367,7 @@ impl AgentWorkspace {
         self.expanded_project_ids.remove(project_id);
         if self.open_project_id() == Some(project_id) {
             self.open = None;
-            self.clear_open_detail();
+            self.invalidate_session_load();
         }
     }
 }

@@ -12,12 +12,47 @@ use std::{
 use gpui::TestAppContext;
 
 use crate::session::{
-    InMemorySessionStore, LocalSessionStore, LocalStoreConfig, ProjectCatalogQuery,
-    ProjectIdentity, ProjectSessionStore, SessionCatalogStore, SessionDomain, SessionHeader,
-    SessionLifecycleStore, SessionReadStore, SessionStores, TurnStatus,
+    ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
+    LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
+    SessionCatalogStore, SessionDomain, SessionHeader, SessionLifecycleStore, SessionReadStore,
+    SessionStores, TurnStatus,
 };
 
 use super::*;
+
+fn seed_persisted_conversation(
+    stores: &SessionStores,
+    project: Option<ProjectIdentity>,
+) -> SessionId {
+    let store = if project.is_some() {
+        stores.agent().expect("Agent lifecycle store")
+    } else {
+        stores.chat().expect("Chat lifecycle store")
+    };
+    let mut controller = match project {
+        Some(project) => ChatSessionController::for_project(store, project),
+        None => ChatSessionController::new(store),
+    };
+    let message = crate::llm::Message {
+        role: crate::llm::Role::User,
+        content: vec![crate::llm::ContentBlock::Text {
+            text: "persisted fixture".into(),
+            provider_metadata: crate::llm::ProviderMetadata::default(),
+        }],
+        provider_metadata: crate::llm::ProviderMetadata::default(),
+    };
+    let selection = crate::llm::ModelSelection {
+        profile_id: "fixture-profile".into(),
+        model_id: "fixture-model".into(),
+    };
+    let start = controller
+        .begin_turn(message, selection, "fixture-turn")
+        .expect("begin persisted fixture");
+    controller
+        .finish_turn("fixture-turn", &ChatTurnTerminal::cancelled())
+        .expect("finish persisted fixture");
+    start.session_id
+}
 
 fn add_app_window(cx: &mut TestAppContext) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
     add_app_window_with_stores(cx, None)
@@ -930,5 +965,62 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
             "reuse without spawning a new view"
         );
         assert_eq!(this.conversations.len(), 2);
+    });
+}
+
+#[gpui::test]
+fn selecting_a_chat_draft_invalidates_an_older_session_restore(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_id = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+
+    let draft_target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id.clone(), window, cx);
+            this.spawn_draft(window, cx);
+            this.active.expect("new draft is active")
+        })
+    });
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.active, Some(draft_target));
+        assert_eq!(this.conversations.len(), 1);
+        assert!(!this.opened_session_index.contains_key(&session_id));
+    });
+}
+
+#[gpui::test]
+fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().expect("project folder");
+    let project = ProjectIdentity::new(folder.path(), "Project fixture");
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_id = seed_persisted_conversation(&stores, Some(project.clone()));
+    let prefs = Preferences {
+        agent_projects: vec![crate::preferences::AgentProjectRecord {
+            project_id: project.project_id.clone(),
+            canonical_path: project.canonical_path.clone(),
+            display_name: project.display_name.clone(),
+        }],
+        ..Preferences::default()
+    };
+    let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
+
+    let draft_target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.open_agent_session(project.project_id.clone(), session_id.clone(), window, cx);
+            this.open_agent_draft(project.project_id.clone(), window, cx);
+            this.agent_active.expect("new project draft is active")
+        })
+    });
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.agent_active, Some(draft_target));
+        assert_eq!(this.agent_conversations.len(), 1);
+        assert!(this.agent_conversations[0].session_id.is_none());
     });
 }

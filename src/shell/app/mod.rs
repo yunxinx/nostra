@@ -77,6 +77,37 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(80.);
 #[cfg(not(target_os = "macos"))]
 const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SelectionRequest(u64);
+
+#[derive(Default)]
+struct SelectionEpoch {
+    current: u64,
+}
+
+impl SelectionEpoch {
+    fn begin(&mut self) -> SelectionRequest {
+        self.current = self.current.wrapping_add(1);
+        SelectionRequest(self.current)
+    }
+
+    fn invalidate(&mut self) {
+        self.current = self.current.wrapping_add(1);
+    }
+
+    fn is_current(&self, request: SelectionRequest) -> bool {
+        request.0 == self.current
+    }
+}
+
+struct AgentSessionRestore {
+    request: SelectionRequest,
+    project_id: String,
+    session_id: SessionId,
+    view: Entity<ChatView>,
+    state: ResolvedSessionState,
+}
+
 pub struct ChatApp {
     focus_handle: FocusHandle,
     conversations: Vec<Conversation>,
@@ -87,10 +118,9 @@ pub struct ChatApp {
     /// Entity id of the currently displayed conversation, or `None` when the
     /// workspace is showing the empty detail state.
     active: Option<gpui::EntityId>,
-    /// Monotonic counter guarding against stale background session selections
-    /// overwriting a newer active target.
-    #[allow(dead_code)]
-    selection_generation: u64,
+    /// Request identity guarding Chat session materialization. Every direct
+    /// target change invalidates the previous request before changing `active`.
+    chat_selection_epoch: SelectionEpoch,
     /// Background task owning an in-flight catalog/select + hydrate cycle.
     /// Dropping it cancels the work.
     _selection_task: Option<Task<()>>,
@@ -145,12 +175,17 @@ pub struct ChatApp {
     agent_conversations: Vec<AgentConversation>,
     /// Entity id of the currently displayed project conversation.
     agent_active: Option<gpui::EntityId>,
+    /// Request identity guarding project-session materialization independently
+    /// from the older read-only Agent snapshot loader.
+    agent_selection_epoch: SelectionEpoch,
     /// Background task owning the Agent project catalog load.
     _agent_projects_task: Option<Task<()>>,
     /// Background tasks owning per-project Agent session-list loads.
     _agent_session_list_tasks: HashMap<String, Task<()>>,
     /// Background task owning the Agent session detail load.
     _agent_session_task: Option<Task<()>>,
+    /// Background task opening a project session into a retained `ChatView`.
+    _agent_open_task: Option<Task<()>>,
     /// Background task owning a direct Agent session or project deletion.
     _agent_delete_task: Option<Task<()>>,
     /// Projects hidden from interaction while their durable deletion runs.
@@ -265,7 +300,7 @@ impl ChatApp {
             conversations: Vec::new(),
             opened_session_index: HashMap::new(),
             active: None,
-            selection_generation: 0,
+            chat_selection_epoch: SelectionEpoch::default(),
             _selection_task: None,
             collapsed: prefs.sidebar_collapsed,
             has_toggled: false,
@@ -287,9 +322,11 @@ impl ChatApp {
             agent: AgentWorkspace::new(),
             agent_conversations: Vec::new(),
             agent_active: None,
+            agent_selection_epoch: SelectionEpoch::default(),
             _agent_projects_task: None,
             _agent_session_list_tasks: HashMap::new(),
             _agent_session_task: None,
+            _agent_open_task: None,
             _agent_delete_task: None,
             agent_deleting_projects: HashSet::new(),
             _folder_task: None,
@@ -431,10 +468,44 @@ impl ChatApp {
         }));
     }
 
+    fn begin_chat_selection_request(&mut self) -> SelectionRequest {
+        self._selection_task = None;
+        self.chat_selection_epoch.begin()
+    }
+
+    fn invalidate_chat_selection_request(&mut self) {
+        self._selection_task = None;
+        self.chat_selection_epoch.invalidate();
+    }
+
+    fn begin_agent_selection_request(&mut self) -> SelectionRequest {
+        self._agent_open_task = None;
+        self.agent_selection_epoch.begin()
+    }
+
+    fn invalidate_agent_selection_request(&mut self) {
+        self._agent_open_task = None;
+        self._agent_session_task = None;
+        self.agent.invalidate_session_load();
+        self.agent_selection_epoch.invalidate();
+    }
+
+    fn agent_selection_request_is_current(
+        &self,
+        request: SelectionRequest,
+        project_id: &str,
+        session_id: &SessionId,
+    ) -> bool {
+        self.agent_selection_epoch.is_current(request)
+            && self.agent.open_project_id() == Some(project_id)
+            && self.agent.selected_session_id() == Some(session_id)
+    }
+
     /// Create a fresh draft conversation with no persisted session id.  The
     /// session id is bound only after the first durable turn begin succeeds
     /// (see [`Self::handle_session_bound`]).
     fn spawn_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_chat_selection_request();
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
@@ -539,16 +610,16 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(existing) = self
+        if let Some(existing_view) = self
             .agent_conversations
             .iter()
             .find(|c| c.project_id == project_id && c.session_id.is_none())
+            .map(|conversation| conversation.view.clone())
         {
+            self.invalidate_agent_selection_request();
             self.agent.open_draft(project_id);
-            existing
-                .view
-                .update(cx, |view, cx| view.focus_composer(window, cx));
-            self.agent_active = Some(existing.view.entity_id());
+            existing_view.update(cx, |view, cx| view.focus_composer(window, cx));
+            self.agent_active = Some(existing_view.entity_id());
             self.sync_model_picker_to_active(window, cx);
             cx.notify();
             return;
@@ -556,6 +627,7 @@ impl ChatApp {
         let Some(identity) = self.project_identity(&project_id, cx) else {
             return;
         };
+        self.invalidate_agent_selection_request();
         let view = ChatView::project_view(identity, window, cx);
         let selection = view.read(cx).selection();
         let subscription = self.subscribe_agent_conversation(&view, window, cx);
@@ -583,13 +655,15 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(existing) = self
+        if let Some(existing_target) = self
             .agent_conversations
             .iter()
             .find(|c| c.session_id.as_ref() == Some(&session_id))
+            .map(|conversation| conversation.view.entity_id())
         {
+            self.invalidate_agent_selection_request();
             self.agent.select_session(project_id, session_id);
-            self.agent_active = Some(existing.view.entity_id());
+            self.agent_active = Some(existing_target);
             self.sync_model_picker_to_active(window, cx);
             cx.notify();
             return;
@@ -604,8 +678,8 @@ impl ChatApp {
             Ok(store) => store,
             Err(_) => return,
         };
+        let request = self.begin_agent_selection_request();
         let view = ChatView::project_view(identity, window, cx);
-        let target = view.entity_id();
         let app = cx.entity();
         let window_handle = window.window_handle();
         self.agent
@@ -624,49 +698,88 @@ impl ChatApp {
                     let Ok(state) = loaded else {
                         return;
                     };
-                    let title = state
-                        .messages
-                        .iter()
-                        .find(|message| message.message.role == crate::llm::Role::User)
-                        .and_then(|message| {
-                            message
-                                .message
-                                .content
-                                .iter()
-                                .find_map(|block| match block {
-                                    crate::llm::ContentBlock::Text { text, .. }
-                                        if !text.trim().is_empty() =>
-                                    {
-                                        Some(derive_chat_title(text))
-                                    }
-                                    _ => None,
-                                })
-                        })
-                        .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
-                    if view
-                        .update(cx, |chat, cx| {
-                            chat.restore_from_session(&session_id, &state, cx)
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let subscription = this.subscribe_agent_conversation(&view, window, cx);
-                    this.agent_conversations.push(AgentConversation {
-                        view: view.clone(),
-                        project_id: project_id.clone(),
-                        title,
-                        selection: view.read(cx).selection(),
-                        session_id: Some(session_id.clone()),
-                        _subscription: subscription,
-                    });
-                    this.agent_active = Some(target);
-                    this.sync_model_picker_to_active(window, cx);
-                    cx.notify();
+                    this.apply_agent_session_restore(
+                        AgentSessionRestore {
+                            request,
+                            project_id,
+                            session_id,
+                            view,
+                            state,
+                        },
+                        window,
+                        cx,
+                    );
                 });
             });
         });
-        self._agent_session_task = Some(task);
+        self._agent_open_task = Some(task);
+        cx.notify();
+    }
+
+    fn apply_agent_session_restore(
+        &mut self,
+        restore: AgentSessionRestore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.agent_selection_request_is_current(
+            restore.request,
+            &restore.project_id,
+            &restore.session_id,
+        ) {
+            return;
+        }
+        if let Some(existing_target) = self
+            .agent_conversations
+            .iter()
+            .find(|conversation| conversation.session_id.as_ref() == Some(&restore.session_id))
+            .map(|conversation| conversation.view.entity_id())
+        {
+            self.agent_active = Some(existing_target);
+            self.sync_model_picker_to_active(window, cx);
+            cx.notify();
+            return;
+        }
+
+        let title = restore
+            .state
+            .messages
+            .iter()
+            .find(|message| message.message.role == crate::llm::Role::User)
+            .and_then(|message| {
+                message
+                    .message
+                    .content
+                    .iter()
+                    .find_map(|block| match block {
+                        crate::llm::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
+                            Some(derive_chat_title(text))
+                        }
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
+        if restore
+            .view
+            .update(cx, |chat, cx| {
+                chat.restore_from_session(&restore.session_id, &restore.state, cx)
+            })
+            .is_err()
+        {
+            return;
+        }
+        let subscription = self.subscribe_agent_conversation(&restore.view, window, cx);
+        let target = restore.view.entity_id();
+        self.agent_conversations.push(AgentConversation {
+            view: restore.view.clone(),
+            project_id: restore.project_id,
+            title,
+            selection: restore.view.read(cx).selection(),
+            session_id: Some(restore.session_id),
+            _subscription: subscription,
+        });
+        self.agent_active = Some(target);
+        self.sync_model_picker_to_active(window, cx);
         cx.notify();
     }
 
@@ -803,6 +916,9 @@ impl ChatApp {
                     match result {
                         Ok(()) => {
                             preferences::remove_agent_project(&apply_project_id, cx);
+                            if this.agent.open_project_id() == Some(apply_project_id.as_str()) {
+                                this.invalidate_agent_selection_request();
+                            }
                             let removed_targets = this
                                 .agent_conversations
                                 .iter()
@@ -920,6 +1036,7 @@ impl ChatApp {
     /// never drops or cancels another conversation's streaming task.
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         if ix < self.conversations.len() {
+            self.invalidate_chat_selection_request();
             let target = self.conversations[ix].view.entity_id();
             if self.active != Some(target) {
                 self.model_picker
@@ -940,14 +1057,15 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active == Some(target) {
-            return;
-        }
         if !self
             .conversations
             .iter()
             .any(|c| c.view.entity_id() == target)
         {
+            return;
+        }
+        self.invalidate_chat_selection_request();
+        if self.active == Some(target) {
             return;
         }
         self.model_picker
@@ -986,8 +1104,7 @@ impl ChatApp {
             }
         };
 
-        self.selection_generation = self.selection_generation.wrapping_add(1);
-        let generation = self.selection_generation;
+        let request = self.begin_chat_selection_request();
         let app = cx.entity();
         let window_handle = window.window_handle();
         let task = cx.spawn(async move |_this, cx| {
@@ -1015,7 +1132,7 @@ impl ChatApp {
             };
             let _ = window_handle.update(cx, |_, window, cx| {
                 app.update(cx, |this, cx| {
-                    this.apply_session_restore(generation, session_id, state, window, cx);
+                    this.apply_session_restore(request, session_id, state, window, cx);
                 });
             });
         });
@@ -1028,17 +1145,20 @@ impl ChatApp {
     /// target the user has since chosen.
     fn apply_session_restore(
         &mut self,
-        generation: u64,
+        request: SelectionRequest,
         session_id: SessionId,
         state: ResolvedSessionState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if generation != self.selection_generation {
+        if !self.chat_selection_epoch.is_current(request) {
             return;
         }
         if let Some(&target) = self.opened_session_index.get(&session_id) {
-            self.select_target(target, window, cx);
+            self.active = Some(target);
+            self.sync_model_picker_to_active(window, cx);
+            self.record_active_session(&session_id, cx);
+            cx.notify();
             return;
         }
 
@@ -1400,6 +1520,13 @@ impl ChatApp {
         let Some(index) = self.conversation_index(target) else {
             return;
         };
+
+        // Removing the visible target is another selection change. Invalidate
+        // a pending restore before choosing the replacement slot below; an old
+        // completion must not resurrect the deleted target as active.
+        if self.active == Some(target) {
+            self.invalidate_chat_selection_request();
+        }
 
         let removed = self.conversations.remove(index);
         if let Some(session_id) = &removed.session_id {
