@@ -77,7 +77,10 @@ pub fn sync_system_appearance(window: &mut Window, cx: &mut App) {
 /// is the active one.  The choice is persisted.
 pub fn select_theme(name: &str, cx: &mut App) {
     let Some(config) = ThemeRegistry::global(cx).themes().get(name).cloned() else {
-        eprintln!("ignoring unknown theme: {name}");
+        crate::logging::warn(
+            "appearance.theme",
+            format_args!("ignoring unknown registered-theme name: {name}"),
+        );
         return;
     };
 
@@ -167,16 +170,25 @@ fn register_embedded_themes(cx: &mut App) {
     let registry = ThemeRegistry::global_mut(cx);
     for path in THEME_FILES {
         let Some(bytes) = assets::embedded(path) else {
-            eprintln!("missing embedded theme file: {path}");
+            crate::logging::error(
+                "appearance.theme",
+                format_args!("missing embedded theme file: {path}"),
+            );
             continue;
         };
         match std::str::from_utf8(&bytes) {
             Ok(content) => {
                 if let Err(e) = registry.load_themes_from_str(content) {
-                    eprintln!("failed to load themes from {path}: {e:?}");
+                    crate::logging::error(
+                        "appearance.theme",
+                        format_args!("failed to load themes from {path}: {e:?}"),
+                    );
                 }
             }
-            Err(e) => eprintln!("embedded theme {path} is not valid UTF-8: {e:?}"),
+            Err(e) => crate::logging::error(
+                "appearance.theme",
+                format_args!("embedded theme {path} is not valid UTF-8: {e:?}"),
+            ),
         }
     }
 }

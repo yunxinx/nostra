@@ -34,7 +34,10 @@ pub fn init(saved: ComposerFont, cx: &mut App) {
     debug_assert_eq!(fonts.len(), FONT_FILES.len(), "bundled font missing");
 
     if let Err(e) = cx.text_system().add_fonts(fonts) {
-        eprintln!("failed to register bundled fonts: {e:?}");
+        crate::logging::error(
+            "appearance.fonts",
+            format_args!("failed to register bundled fonts: {e:?}"),
+        );
     }
 
     cx.set_global(ActiveComposerFont(saved));

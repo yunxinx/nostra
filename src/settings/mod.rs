@@ -127,7 +127,10 @@ pub fn open(cx: &mut App) {
                 .ok();
             cx.set_global(SettingsWindowHandle(Some(handle)));
         }
-        Err(e) => eprintln!("failed to open settings window: {e:?}"),
+        Err(e) => crate::logging::error(
+            "settings.window",
+            format_args!("failed to open settings window: {e:?}"),
+        ),
     }
 }
 

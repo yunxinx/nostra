@@ -2,13 +2,16 @@
 //!
 //! [`markdown`] renders assistant prose and fenced code blocks; it is used both
 //! by the transcript and by any card that shows model output. [`model_select`]
-//! is the title-bar model picker. Interaction helpers small enough not to need a
-//! module of their own live directly here.
+//! is the title-bar model picker; [`reference_picker`] is the reusable `$`
+//! Chat-reference composer used by the Agent workspace. Interaction helpers
+//! small enough not to need a module of their own live directly here.
 
 pub(crate) mod inline_delete_confirmation;
 pub(crate) mod markdown;
 pub(crate) mod math;
 pub(crate) mod model_select;
+pub(crate) mod popover;
+pub(crate) mod reference_picker;
 
 use gpui::{App, KeyDownEvent, Window};
 

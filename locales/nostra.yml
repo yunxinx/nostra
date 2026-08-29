@@ -27,10 +27,34 @@ sidebar:
   more_actions:
     en: More actions
     zh-CN: 更多操作
+  load_more:
+    en: Load more
+    zh-CN: 加载更多
+  loading_chats:
+    en: Loading…
+    zh-CN: 加载中…
+  empty:
+    en: No conversations yet
+    zh-CN: 还没有会话
+  empty_hint:
+    en: Click "New chat" to start one.
+    zh-CN: 点击“新建聊天”开始一个会话。
+  load_failed:
+    en: Failed to load conversations
+    zh-CN: 加载会话失败
+  retry:
+    en: Retry
+    zh-CN: 重试
+  generating:
+    en: Generating…
+    zh-CN: 生成中…
 account:
   settings:
     en: Settings…
     zh-CN: 设置…
+  work_mode:
+    en: Work mode
+    zh-CN: 工作模式
   switch_to_light:
     en: Switch to light mode
     zh-CN: 切换到浅色模式
@@ -107,6 +131,18 @@ chat:
       en: Copy reasoning
       zh-CN: 复制思考过程
   error:
+    persistence_start_failed:
+      en: The message could not be saved. Check local storage and try again.
+      zh-CN: 消息无法保存，请检查本地存储后重试。
+    persistence_finish_failed:
+      en: The reply is visible but not saved yet. Sending again will retry it first.
+      zh-CN: 回复目前可见但尚未保存；下次发送时会先重试保存。
+    persistence_retry_failed:
+      en: The previous reply is still not saved. Check local storage and try again.
+      zh-CN: 上一条回复仍未保存，请检查本地存储后重试。
+    persistence_delete_failed:
+      en: The chat could not be permanently deleted. Check local storage and try again.
+      zh-CN: 聊天无法永久删除，请检查本地存储后重试。
     markdown:
       en: Nostra could not safely render this Markdown content.
       zh-CN: Nostra 无法安全渲染这段 Markdown 内容。
@@ -146,6 +182,12 @@ chat:
   empty_hint:
     en: "Ask me anything.  Enter to send, Shift+Enter for newline."
     zh-CN: "随便问点什么。Enter 发送，Shift+Enter 换行。"
+  workspace_empty_title:
+    en: No conversation open
+    zh-CN: 没有打开的会话
+  workspace_empty_hint:
+    en: Click "New chat" to start a conversation.
+    zh-CN: 点击“新建聊天”开始对话。
 menu:
   file:
     en: File
@@ -197,6 +239,24 @@ settings:
   language_desc:
     en: Language used across the app UI.
     zh-CN: 应用界面所使用的语言。
+  detailed_logging:
+    en: Detailed diagnostic logs
+    zh-CN: 详细诊断日志
+  detailed_logging_desc:
+    en: By default Nostra records warnings and errors only. Enable this to also record sparse lifecycle information; prompts, API keys, and provider response bodies are never logged.
+    zh-CN: Nostra 默认只记录警告和错误。开启后会额外记录少量生命周期信息；提示词、API 密钥和供应商响应正文永远不会写入日志。
+  restore_last_chat:
+    en: Restore last chat on start
+    zh-CN: 启动时恢复上次聊天
+  restore_last_chat_desc:
+    en: Reopen the most recently active conversation when Nostra launches. The first catalog frame is never blocked; a missing or invalid session falls back to the empty workspace.
+    zh-CN: 启动 Nostra 时重新打开最近活动的会话。首帧目录不会被阻塞；会话缺失或无效时回退到空工作区。
+  restore_last_workspace:
+    en: Restore last workspace on start
+    zh-CN: 启动时恢复上次工作区
+  restore_last_workspace_desc:
+    en: Reopen the last selected Chat or Project workspace when Nostra launches. When disabled, Nostra always starts in Chat.
+    zh-CN: 启动 Nostra 时重新打开上次选择的聊天或项目工作区。关闭后将始终从聊天工作区启动。
   theme_mode:
     en: Theme mode
     zh-CN: 主题模式
@@ -426,3 +486,191 @@ settings:
     license:
       en: Released under the Apache License 2.0.
       zh-CN: 基于 Apache License 2.0 许可发布。
+agent:
+  mode:
+    en: Project
+    zh-CN: 项目
+  new_draft:
+    en: New conversation
+    zh-CN: 新对话
+  open_folder:
+    en: Open Folder…
+    zh-CN: 打开文件夹…
+  open_folder_prompt:
+    en: Choose a folder for the project
+    zh-CN: 选择项目工作文件夹
+  guide_title:
+    en: Open a folder to get started
+    zh-CN: 打开一个文件夹开始
+  guide_hint:
+    en: The folder becomes the work project that your sessions belong to.
+    zh-CN: 该文件夹将作为工作项目，会话归属于它。
+  idle_title:
+    en: Select a conversation
+    zh-CN: 选择一个对话
+  idle_hint:
+    en: Open a session, or create one with + on a project row.
+    zh-CN: 打开一个会话，或通过项目行上的 + 新建对话。
+  show_more:
+    en: Show more
+    zh-CN: 显示更多
+  time_just_now:
+    en: Just now
+    zh-CN: 刚刚
+  time_hours_ago:
+    en: "%{n}h ago"
+    zh-CN: "%{n} 小时前"
+  time_days_ago:
+    en: "%{n}d ago"
+    zh-CN: "%{n} 天前"
+  new_in_project:
+    en: New conversation in this project
+    zh-CN: 在此项目下新建对话
+  delete_session:
+    en: Delete conversation
+    zh-CN: 删除对话
+  delete_session_title:
+    en: Delete this conversation?
+    zh-CN: 删除这个对话？
+  delete_session_description:
+    en: '"%{title}" and its messages will be permanently removed.'
+    zh-CN: '“%{title}”及其中的消息将被永久删除。'
+  delete_project:
+    en: Delete project
+    zh-CN: 删除项目
+  delete_project_title:
+    en: Delete this project from Nostra?
+    zh-CN: 从 Nostra 中删除这个项目？
+  delete_project_description:
+    en: 'All conversations in "%{name}" will be permanently removed. The local folder and its files will not be deleted.'
+    zh-CN: '“%{name}”中的全部对话将被永久删除。本地文件夹及其中的文件不会被删除。'
+  delete_failed:
+    en: The project data could not be deleted. Nothing was removed from the workspace.
+    zh-CN: 项目数据删除失败，工作区中的内容未被移除。
+  delete_busy:
+    en: Stop the active response before deleting this project.
+    zh-CN: 请先停止当前响应，再删除这个项目。
+  deleting_project:
+    en: Deleting project conversations…
+    zh-CN: 正在删除项目对话…
+  welcome_title:
+    en: What are we working on?
+    zh-CN: 这个项目要做什么？
+  welcome_hint:
+    en: "Type below to draft the conversation.  Enter $ to reference a chat message."
+    zh-CN: "在下方输入内容草拟对话。输入 $ 可引用聊天消息。"
+  send_disabled_tooltip:
+    en: The project runtime is not connected yet
+    zh-CN: 项目运行时尚未接入
+  projects:
+    en: Projects
+    zh-CN: 项目
+  loading:
+    en: Loading…
+    zh-CN: 加载中…
+  loading_session:
+    en: Loading session…
+    zh-CN: 正在加载会话…
+  load_more:
+    en: Load more
+    zh-CN: 加载更多
+  load_failed:
+    en: Failed to load
+    zh-CN: 加载失败
+  retry:
+    en: Retry
+    zh-CN: 重试
+  no_projects:
+    en: No projects yet
+    zh-CN: 还没有项目
+  no_projects_hint:
+    en: Project sessions will appear here.
+    zh-CN: 项目会话将显示在这里。
+  no_sessions:
+    en: No sessions in this project
+    zh-CN: 此项目中没有会话
+  untitled_session:
+    en: Untitled session
+    zh-CN: 未命名会话
+  compacted:
+    en: This session has been compacted.
+    zh-CN: 此会话已被压缩。
+  empty_session:
+    en: This session has no messages.
+    zh-CN: 此会话没有消息。
+  role_user:
+    en: User
+    zh-CN: 用户
+  role_assistant:
+    en: Assistant
+    zh-CN: 助手
+  role_system:
+    en: System
+    zh-CN: 系统
+  role_developer:
+    en: Developer
+    zh-CN: 开发者
+  role_tool:
+    en: Tool
+    zh-CN: 工具
+  reasoning_block:
+    en: "[Reasoning]"
+    zh-CN: "[推理]"
+  tool_call:
+    en: Tool call
+    zh-CN: 工具调用
+  tool_result:
+    en: "[Tool result]"
+    zh-CN: "[工具结果]"
+reference_picker:
+  composer_placeholder:
+    en: "Ask about the project…  Type $ to reference a chat."
+    zh-CN: "向项目提问…输入 $ 引用聊天。"
+  hint:
+    en: Type to search your chats
+    zh-CN: 输入关键词搜索聊天
+  empty:
+    en: No matching chats
+    zh-CN: 没有匹配的会话
+  empty_turns:
+    en: No matching turns in this chat
+    zh-CN: 此会话中没有匹配的轮次
+  error_search:
+    en: Failed to search chat history
+    zh-CN: 搜索聊天记录失败
+  error_read:
+    en: Failed to read the selected message
+    zh-CN: 读取所选消息失败
+  error_too_large:
+    en: "This message is too large to reference (limit %{limit} bytes)"
+    zh-CN: "这条消息过大，无法引用（上限 %{limit} 字节）"
+  error_unavailable_session:
+    en: The source chat was deleted
+    zh-CN: 原聊天已被删除
+  error_unavailable_message:
+    en: The source message is no longer available
+    zh-CN: 原消息已不可用
+  error_unavailable_corrupt:
+    en: The source chat transcript is unavailable
+    zh-CN: 原聊天记录无法读取
+  remove:
+    en: Remove reference
+    zh-CN: 移除引用
+  untitled_chat:
+    en: Untitled chat
+    zh-CN: 未命名聊天
+  role_user:
+    en: User
+    zh-CN: 用户
+  role_assistant:
+    en: Assistant
+    zh-CN: 助手
+  role_system:
+    en: System
+    zh-CN: 系统
+  role_developer:
+    en: Developer
+    zh-CN: 开发者
+  role_tool:
+    en: Tool
+    zh-CN: 工具

@@ -22,8 +22,11 @@ mod assets;
 mod chat;
 mod i18n;
 pub mod llm;
+mod logging;
+mod paths;
 pub mod preferences;
 mod providers;
+pub mod session;
 mod settings;
 mod shell;
 mod ui;
@@ -45,14 +48,21 @@ use crate::shell::window;
 
 /// Entry point used by `main.rs`.
 pub fn run() {
+    // Diagnostics are independent from session facts and are best-effort. We
+    // start them before loading preferences so startup failures are captured.
+    logging::init();
     let app = gpui_platform::application()
         .with_assets(NostraAssets)
         .with_http_client(std::sync::Arc::new(ReqwestClient::new()));
     app.run(|cx| {
         let prefs = preferences::load();
+        logging::set_detailed(prefs.detailed_logging);
+        logging::info("app.lifecycle", "application started");
         init(prefs.clone(), cx);
         window::open_main_window(prefs, cx);
     });
+    logging::info("app.lifecycle", "application stopped");
+    logging::shutdown();
 }
 
 /// One-time application setup: initialise components, prefs, locale, theme,
@@ -78,7 +88,7 @@ fn init(prefs: preferences::Preferences, cx: &mut App) {
 
 /// Application-scoped action handlers (per-view actions live in `shell::app`).
 fn install_action_handlers(cx: &mut App) {
-    cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+    cx.on_action(|_: &Quit, cx: &mut App| window::request_quit(cx));
 
     cx.on_action(|_: &ToggleTheme, cx: &mut App| {
         let next = if cx.theme().mode.is_dark() {
