@@ -30,6 +30,7 @@ pub(super) fn render(cx: &App) -> AnyElement {
             ),
             detailed_logging_row(cx),
             restore_last_chat_row(cx),
+            restore_last_workspace_row(cx),
         ],
         cx,
     )
@@ -70,6 +71,25 @@ fn restore_last_chat_row(cx: &App) -> AnyElement {
     )
 }
 
+fn restore_last_workspace_row(cx: &App) -> AnyElement {
+    ui::row(
+        "restore-last-workspace",
+        t!("settings.restore_last_workspace").to_string(),
+        Some(t!("settings.restore_last_workspace_desc").to_string()),
+        Switch::new("restore-last-workspace-switch")
+            .small()
+            .checked(preferences::get(cx).restore_last_workspace_on_start)
+            .on_click(|enabled, _, cx| {
+                preferences::update(cx, |prefs| {
+                    prefs.restore_last_workspace_on_start = *enabled;
+                });
+                cx.refresh_windows();
+            })
+            .into_any_element(),
+        cx,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +102,8 @@ mod tests {
                 "settings.detailed_logging_desc",
                 "settings.restore_last_chat",
                 "settings.restore_last_chat_desc",
+                "settings.restore_last_workspace",
+                "settings.restore_last_workspace_desc",
             ] {
                 let resolved = t!(key, locale = locale).to_string();
                 assert!(!resolved.contains(key), "{key} unresolved for {locale}");

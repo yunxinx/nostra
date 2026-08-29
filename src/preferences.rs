@@ -42,6 +42,16 @@ pub struct Preferences {
     /// Most recent explicitly active Chat session, retained even while
     /// automatic restoration is disabled.
     pub last_active_chat_session: Option<SessionId>,
+    /// Whether startup restores [`last_workspace_mode`](Self::last_workspace_mode).
+    /// Missing values from preferences written before workspace modes existed
+    /// migrate to the enabled default instead of invalidating the whole file.
+    #[serde(default = "default_restore_last_workspace_on_start")]
+    pub restore_last_workspace_on_start: bool,
+    /// Most recently selected top-level workspace. This is retained even while
+    /// automatic restoration is disabled so re-enabling the preference resumes
+    /// the user's last explicit choice.
+    #[serde(default)]
+    pub last_workspace_mode: WorkspaceMode,
     /// Explicit theme mode override.  `None` means "follow system".
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.
@@ -118,6 +128,8 @@ impl Default for Preferences {
             sidebar_collapsed: false,
             restore_last_chat_on_start: false,
             last_active_chat_session: None,
+            restore_last_workspace_on_start: default_restore_last_workspace_on_start(),
+            last_workspace_mode: WorkspaceMode::default(),
             theme_mode: None,
             composer_font: ComposerFont::default(),
             user_message_markdown: false,
@@ -139,6 +151,19 @@ impl Default for Preferences {
             agent_projects: Vec::new(),
         }
     }
+}
+
+fn default_restore_last_workspace_on_start() -> bool {
+    true
+}
+
+/// Top-level workspace selected in the main window.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+    #[default]
+    Chat,
+    Project,
 }
 
 /// UI languages the app can render in.  The serialized form doubles as the
@@ -328,6 +353,31 @@ pub fn update(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
     }
 }
 
+/// Record the user's explicit workspace selection. Entity tests keep this
+/// mutation in memory so exercising the account menu never writes to the real
+/// user configuration directory.
+pub fn set_last_workspace_mode(mode: WorkspaceMode, cx: &mut App) {
+    #[cfg(not(test))]
+    update(cx, |prefs| prefs.last_workspace_mode = mode);
+    #[cfg(test)]
+    update_in_memory(cx, |prefs| prefs.last_workspace_mode = mode);
+}
+
+pub fn remove_agent_project(project_id: &str, cx: &mut App) {
+    #[cfg(not(test))]
+    update(cx, |prefs| {
+        prefs
+            .agent_projects
+            .retain(|record| record.project_id != project_id);
+    });
+    #[cfg(test)]
+    update_in_memory(cx, |prefs| {
+        prefs
+            .agent_projects
+            .retain(|record| record.project_id != project_id);
+    });
+}
+
 /// Mutate live preferences without persistence so entity tests can exercise
 /// global observation without writing to the user's configuration directory.
 #[cfg(test)]
@@ -502,6 +552,33 @@ mod tests {
         assert!(!prefs.code_block_line_numbers);
         assert!(!prefs.restore_last_chat_on_start);
         assert!(prefs.last_active_chat_session.is_none());
+        assert!(prefs.restore_last_workspace_on_start);
+        assert_eq!(prefs.last_workspace_mode, WorkspaceMode::Chat);
+    }
+
+    #[test]
+    fn workspace_preferences_migrate_old_documents_and_round_trip() {
+        let mut old_document =
+            serde_json::to_value(Preferences::default()).expect("serialize preferences");
+        let object = old_document.as_object_mut().expect("preferences object");
+        object.remove("restore_last_workspace_on_start");
+        object.remove("last_workspace_mode");
+
+        let migrated: Preferences =
+            serde_json::from_value(old_document).expect("migrate workspace preferences");
+        assert!(migrated.restore_last_workspace_on_start);
+        assert_eq!(migrated.last_workspace_mode, WorkspaceMode::Chat);
+
+        let prefs = Preferences {
+            restore_last_workspace_on_start: false,
+            last_workspace_mode: WorkspaceMode::Project,
+            ..Preferences::default()
+        };
+        let json = serde_json::to_string(&prefs).expect("serialize workspace preferences");
+        let restored: Preferences =
+            serde_json::from_str(&json).expect("deserialize workspace preferences");
+        assert!(!restored.restore_last_workspace_on_start);
+        assert_eq!(restored.last_workspace_mode, WorkspaceMode::Project);
     }
 
     #[test]

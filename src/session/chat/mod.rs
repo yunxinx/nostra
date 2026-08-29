@@ -6,8 +6,9 @@ use crate::llm::{
 };
 
 use super::{
-    ConfigChange, EntryId, MessageEntry, ResolvedSessionState, SafeError, SessionDomain,
-    SessionEntryKind, SessionError, SessionHeader, SessionId, SessionStore, TurnResult, TurnStatus,
+    ConfigChange, EntryId, MessageEntry, ProjectIdentity, ResolvedSessionState, SafeError,
+    SessionDomain, SessionEntryKind, SessionError, SessionHeader, SessionId, SessionStore,
+    TurnResult, TurnStatus,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +133,29 @@ struct PendingTurn {
     terminal: Option<ChatTurnTerminal>,
 }
 
+/// Durable conversation scope owned by one controller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConversationScope {
+    Chat,
+    Project(ProjectIdentity),
+}
+
+impl ConversationScope {
+    fn domain(&self) -> SessionDomain {
+        match self {
+            Self::Chat => SessionDomain::Chat,
+            Self::Project(_) => SessionDomain::Agent,
+        }
+    }
+
+    fn project(&self) -> Option<ProjectIdentity> {
+        match self {
+            Self::Chat => None,
+            Self::Project(project) => Some(project.clone()),
+        }
+    }
+}
+
 /// UI-independent owner of one Chat session's durable lifecycle.
 ///
 /// The synchronous capability is intentional. GPUI integration schedules the
@@ -139,6 +163,7 @@ struct PendingTurn {
 /// an entity update or render pass.
 pub struct ChatSessionController<S> {
     store: S,
+    scope: ConversationScope,
     session_id: Option<SessionId>,
     current_model: Option<ModelSelection>,
     pending_turn: Option<PendingTurn>,
@@ -173,8 +198,18 @@ where
 {
     #[must_use]
     pub fn new(store: S) -> Self {
+        Self::with_scope(store, ConversationScope::Chat)
+    }
+
+    #[must_use]
+    pub fn for_project(store: S, project: ProjectIdentity) -> Self {
+        Self::with_scope(store, ConversationScope::Project(project))
+    }
+
+    fn with_scope(store: S, scope: ConversationScope) -> Self {
         Self {
             store,
+            scope,
             session_id: None,
             current_model: None,
             pending_turn: None,
@@ -253,7 +288,7 @@ where
 
         let created = self.session_id.is_none();
         let (session_id, session_header, session_created) = if created {
-            let mut header = SessionHeader::new(SessionDomain::Chat, None);
+            let mut header = SessionHeader::new(self.scope.domain(), self.scope.project());
             header.initial_model = Some(model.clone());
             (header.session_id.clone(), Some(header), false)
         } else {
@@ -500,7 +535,7 @@ where
                 turn_id: pending.turn_id.clone(),
             });
         }
-        if session_id.domain() != SessionDomain::Chat {
+        if session_id.domain() != self.scope.domain() {
             return Err(ChatSessionControllerError::NotChatSession {
                 session_id: session_id.clone(),
             });

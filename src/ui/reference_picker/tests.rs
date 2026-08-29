@@ -2,7 +2,7 @@ use super::*;
 
 use crate::llm::{ContentBlock, Message, ProviderMetadata, Role};
 use crate::session::{
-    ChatMessageUnavailable, EntryId, ReferencedMessage, SessionDomain, SessionId,
+    ChatMessageUnavailable, ChatSessionRef, EntryId, ReferencedMessage, SessionDomain, SessionId,
 };
 
 fn chat_reference() -> ChatMessageRef {
@@ -181,7 +181,7 @@ fn draft_keeps_reference_and_bounded_label_only() {
     let reference = chat_reference();
     let draft = ChatReferenceDraft::from_read(sample_read(reference.clone(), Some("Session")));
 
-    assert_eq!(draft.reference, reference);
+    assert_eq!(draft.kind, ChatReferenceKind::Message(reference));
     assert_eq!(draft.session_title.as_deref(), Some("Session"));
     assert_eq!(draft.snippet.as_deref(), Some("first line\nsecond line"));
     assert_eq!(draft.timestamp, 42);
@@ -208,7 +208,7 @@ fn draft_keeps_reference_and_bounded_label_only() {
 #[test]
 fn chip_label_bounds_long_first_lines() {
     let draft = ChatReferenceDraft {
-        reference: chat_reference(),
+        kind: ChatReferenceKind::Message(chat_reference()),
         session_title: Some("Session".to_string()),
         snippet: Some("x".repeat(200)),
         timestamp: 1,
@@ -226,20 +226,57 @@ fn draft_dedup_uses_reference_identity() {
 
     let mut selected = HashSet::new();
     let mut drafts = vec![first.clone()];
-    selected.insert(first.reference.clone());
-    if selected.insert(second.reference.clone()) {
+    selected.insert(first.kind.clone());
+    if selected.insert(second.kind.clone()) {
         drafts.push(second);
     }
     assert_eq!(drafts.len(), 1, "same reference cannot join twice");
 
     // A different reference is independent.
     let other = ChatReferenceDraft::from_read(sample_read(chat_reference(), None));
-    assert!(selected.insert(other.reference.clone()));
+    assert!(selected.insert(other.kind.clone()));
+
+    // A session-level chip in the same chat is not a duplicate of a message chip.
+    let session = ChatSessionRef::new(reference.session_id.clone()).expect("session ref");
+    let session_kind = ChatReferenceKind::Session(session);
+    assert!(selected.insert(session_kind));
 }
 
-// ---------------------------------------------------------------------------
-// Confirm error mapping
-// ---------------------------------------------------------------------------
+#[test]
+fn search_results_group_by_session() {
+    let session_a = SessionId::new(SessionDomain::Chat);
+    let session_b = SessionId::new(SessionDomain::Chat);
+    let a1 = preview(
+        ChatMessageRef {
+            session_id: session_a.clone(),
+            entry_id: EntryId::new(),
+        },
+        Some("Alpha"),
+        10,
+    );
+    let a2 = preview(
+        ChatMessageRef {
+            session_id: session_a.clone(),
+            entry_id: EntryId::new(),
+        },
+        Some("Alpha"),
+        11,
+    );
+    let b1 = preview(
+        ChatMessageRef {
+            session_id: session_b,
+            entry_id: EntryId::new(),
+        },
+        Some("Beta"),
+        12,
+    );
+    let groups = group_search_results(&[a1, b1, a2]);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].session_title.as_deref(), Some("Alpha"));
+    assert_eq!(groups[0].messages.len(), 2);
+    assert_eq!(groups[1].session_title.as_deref(), Some("Beta"));
+    assert_eq!(groups[1].messages.len(), 1);
+}
 
 #[test]
 fn confirm_error_maps_typed_store_errors() {
@@ -434,13 +471,11 @@ fn confirming_completion_removes_token_and_adds_chip(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let composer = composer.read(cx);
         assert_eq!(composer.drafts.len(), 1);
-        assert!(
-            composer.drafts[0]
-                .chip_label()
-                .as_ref()
-                .contains("the unique needle message")
-        );
-        assert!(composer.selected.contains(&composer.drafts[0].reference));
+        assert!(matches!(
+            composer.drafts[0].kind,
+            ChatReferenceKind::Session(_)
+        ));
+        assert!(composer.selected.contains(&composer.drafts[0].kind));
         // The `$needle` token was removed from the draft text.
         assert_eq!(input.read(cx).value().as_ref(), "note the ");
         // Completion closed with the token gone.
@@ -448,16 +483,12 @@ fn confirming_completion_removes_token_and_adds_chip(cx: &mut TestAppContext) {
     });
 
     // Removing the chip only touches draft state.
-    let reference = cx.update(|_, cx| composer.read(cx).drafts[0].reference.clone());
-    cx.update(|_, cx| {
-        composer.update(cx, |composer, cx| {
-            composer.remove_draft(reference.clone(), cx)
-        });
-    });
+    let kind = cx.update(|_, cx| composer.read(cx).drafts[0].kind.clone());
+    cx.update(|_, cx| composer.update(cx, |composer, cx| composer.remove_draft(kind.clone(), cx)));
     cx.update(|_, cx| {
         let composer = composer.read(cx);
         assert!(composer.drafts.is_empty());
-        assert!(!composer.selected.contains(&reference));
+        assert!(!composer.selected.contains(&kind));
     });
 }
 
@@ -473,7 +504,7 @@ fn popup_cursor_moves_within_results(cx: &mut TestAppContext) {
     set_input_value(cx, &input, "$needle");
 
     cx.update(|_, cx| {
-        assert_eq!(composer.read(cx).completion.search.results.len(), 2);
+        assert_eq!(composer.read(cx).visible_completion_rows().len(), 2);
     });
     cx.update(|_, cx| {
         composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
@@ -506,6 +537,11 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
     let composer = new_composer(cx);
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
     set_input_value(cx, &input, "$soon");
+
+    cx.update(|_, cx| {
+        composer.update(cx, |composer, cx| composer.expand_highlighted_session(cx));
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
+    });
 
     // Delete the source session between search and confirm.
     cx.update(|_, cx| {
@@ -550,6 +586,11 @@ fn confirm_reports_oversized_messages(cx: &mut TestAppContext) {
     let composer = new_composer(cx);
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
     set_input_value(cx, &input, "$giant");
+
+    cx.update(|_, cx| {
+        composer.update(cx, |composer, cx| composer.expand_highlighted_session(cx));
+        composer.update(cx, |composer, cx| composer.move_completion_cursor(1, cx));
+    });
 
     cx.update(|window, cx| {
         composer.update(cx, |composer, cx| composer.confirm_completion(window, cx));
@@ -639,6 +680,10 @@ fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let state = composer.read(cx);
         assert_eq!(state.drafts.len(), 1);
+        assert!(matches!(
+            state.drafts[0].kind,
+            ChatReferenceKind::Session(_)
+        ));
         assert!(!state.is_completion_open());
         assert_eq!(input.read(cx).value().as_ref(), "");
     });
@@ -651,4 +696,75 @@ fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
         assert!(!composer.read(cx).is_completion_open());
     });
 }
-// temporary probe appended into picker tests
+
+#[gpui::test]
+fn tab_expands_session_and_enter_confirms_message(cx: &mut TestAppContext) {
+    seed_global_stores(cx, |memory| {
+        seed_chat_message(memory, "the unique needle message");
+    });
+    let composer_cell: std::rc::Rc<
+        std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let cell = composer_cell.clone();
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        composer.update(cx, |composer, cx| composer.focus_input(window, cx));
+        *cell.borrow_mut() = Some(composer.clone());
+        let host = cx.new(|_| ComposerHost(composer));
+        gpui_component::Root::new(host, window, cx)
+    });
+    let composer = composer_cell
+        .borrow()
+        .clone()
+        .expect("composer built with the window root");
+
+    let input = cx.update(|_, cx| composer.read(cx).input.clone());
+    set_input_value(cx, &input, "$needle");
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+
+    press_key(cx, "tab", false);
+    cx.update(|_, cx| {
+        let state = composer.read(cx);
+        assert!(state.completion.expanded_session.is_some());
+        assert_eq!(state.visible_completion_rows().len(), 2);
+    });
+
+    press_key(cx, "n", true);
+    press_key(cx, "enter", false);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let state = composer.read(cx);
+        assert_eq!(state.drafts.len(), 1);
+        assert!(matches!(
+            state.drafts[0].kind,
+            ChatReferenceKind::Message(_)
+        ));
+        assert!(
+            state.drafts[0]
+                .chip_label()
+                .as_ref()
+                .contains("the unique needle message")
+        );
+        assert!(!state.is_completion_open());
+        assert_eq!(input.read(cx).value().as_ref(), "");
+    });
+}
+
+#[test]
+fn reference_picker_labels_resolve_in_every_locale() {
+    for locale in ["en", "zh-CN"] {
+        for key in [
+            "reference_picker.composer_placeholder",
+            "reference_picker.hint",
+            "reference_picker.empty",
+            "reference_picker.empty_turns",
+            "reference_picker.untitled_chat",
+        ] {
+            let resolved = t!(key, locale = locale).to_string();
+            assert_ne!(resolved, key, "{key} unresolved for {locale}");
+            assert!(!resolved.is_empty(), "{key} empty for {locale}");
+        }
+    }
+}

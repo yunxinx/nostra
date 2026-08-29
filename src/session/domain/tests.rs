@@ -156,6 +156,35 @@ fn transcript_replay_rejects_missing_runtime_identifiers() {
 }
 
 #[test]
+fn chat_session_ref_requires_chat_domain() {
+    let chat = ChatSessionRef::new(SessionId::new(SessionDomain::Chat)).expect("chat session");
+    assert_eq!(chat.session_id.domain(), SessionDomain::Chat);
+    assert!(chat.validate().is_ok());
+
+    let agent = SessionId::new(SessionDomain::Agent);
+    assert!(matches!(
+        ChatSessionRef::new(agent.clone()),
+        Err(SessionError::ReferenceSourceNotChat)
+    ));
+    let invalid = ChatSessionRef { session_id: agent };
+    assert!(matches!(
+        invalid.validate(),
+        Err(SessionError::ReferenceSourceNotChat)
+    ));
+}
+
+#[test]
+fn chat_message_ref_requires_chat_domain() {
+    let chat_id = SessionId::new(SessionDomain::Chat);
+    let reference = ChatMessageRef::new(chat_id, EntryId::new()).expect("chat reference");
+    assert!(reference.validate().is_ok());
+    assert!(matches!(
+        ChatMessageRef::new(SessionId::new(SessionDomain::Agent), EntryId::new()),
+        Err(SessionError::ReferenceSourceNotChat)
+    ));
+}
+
+#[test]
 fn unsafe_gateway_body_is_not_part_of_the_safe_error_projection() {
     let raw_body = r#"{"error":"sk-sensitive-value"}"#;
     let error = crate::llm::GatewayError::provider("Provider failed.", Some("safe-code".into()))

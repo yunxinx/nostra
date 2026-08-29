@@ -25,15 +25,16 @@ pub use catalog::{
 };
 pub use chat::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
+    ConversationScope,
 };
 pub use chat_catalog::{
     ChatSessionCatalogController, ChatSessionCatalogError, SelectedChatSession,
 };
 pub use domain::{
-    BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, Compaction, ConfigChange, EntryId, Leaf,
-    MessageEntry, ProjectIdentity, Reference, SafeError, SafeErrorCategory, SessionDomain,
-    SessionEntry, SessionEntryKind, SessionHeader, SessionId, TranscriptReplay, TurnResult,
-    TurnStatus,
+    BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, ChatSessionRef, Compaction,
+    ConfigChange, EntryId, Leaf, MessageEntry, ProjectIdentity, Reference, SafeError,
+    SafeErrorCategory, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader, SessionId,
+    TranscriptReplay, TurnResult, TurnStatus,
 };
 pub use error::{DiagnosticKind, JsonlDiagnostic, SessionError};
 pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};

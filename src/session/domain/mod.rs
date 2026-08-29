@@ -637,6 +637,31 @@ impl ChatMessageRef {
     }
 }
 
+/// A Chat-session reference held by an Agent draft. Unlike [`ChatMessageRef`],
+/// this names the whole conversation (session id only) so a later tool can
+/// search that chat. It is not a JSONL `Reference` fact and is not serialized
+/// into session entries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ChatSessionRef {
+    pub session_id: SessionId,
+}
+
+impl ChatSessionRef {
+    pub fn new(session_id: SessionId) -> Result<Self, SessionError> {
+        if session_id.domain() != SessionDomain::Chat {
+            return Err(SessionError::ReferenceSourceNotChat);
+        }
+        Ok(Self { session_id })
+    }
+
+    pub fn validate(&self) -> Result<(), SessionError> {
+        if self.session_id.domain() != SessionDomain::Chat {
+            return Err(SessionError::ReferenceSourceNotChat);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reference {
     pub source: ChatMessageRef,

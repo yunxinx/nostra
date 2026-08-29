@@ -59,7 +59,10 @@ impl ChatApp {
     /// The interactive buttons themselves live in the app-level overlay so
     /// they don't move when the sidebar collapses.
     fn render_sidebar_top_row(&self, _: &mut Context<Self>) -> impl IntoElement {
-        div().h(TITLE_BAR_HEIGHT).flex_shrink_0()
+        div()
+            .debug_selector(|| "sidebar-top-reserved".to_string())
+            .h(TITLE_BAR_HEIGHT)
+            .flex_shrink_0()
     }
 
     fn render_sidebar_content(
@@ -70,18 +73,18 @@ impl ChatApp {
         v_flex()
             .flex_1()
             .min_h_0()
-            .px_2()
-            .pt_1()
-            .gap_1()
-            .child(self.render_workspace_mode_tabs(cx))
+            .px(SIDEBAR_CONTENT_INSET)
+            .pt(SIDEBAR_CONTENT_INSET)
             .child(match self.workspace_mode {
                 WorkspaceMode::Chat => self.render_history_content(window, cx),
-                WorkspaceMode::Agent => self.render_agent_content(window, cx),
+                WorkspaceMode::Project => self.render_agent_content(window, cx),
             })
     }
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dark = cx.theme().mode.is_dark();
+        let workspace_mode = self.workspace_mode;
+        let app = cx.weak_entity();
 
         let account = Button::new("account")
             .ghost()
@@ -112,7 +115,7 @@ impl ChatApp {
                             .child("yuewei"),
                     ),
             )
-            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, _, _| {
+            .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, cx| {
                 let (theme_label, theme_icon) = if is_dark {
                     (t!("account.switch_to_light"), IconName::Sun)
                 } else {
@@ -122,6 +125,58 @@ impl ChatApp {
                     t!("account.settings").to_string(),
                     IconName::Settings,
                     Box::new(OpenSettings),
+                )
+                .submenu_with_icon(
+                    Some(Icon::new(IconName::ChevronsUpDown)),
+                    t!("account.work_mode").to_string(),
+                    window,
+                    cx,
+                    {
+                        let app = app.clone();
+                        move |submenu, _, _| {
+                            let chat_app = app.clone();
+                            let project_app = app.clone();
+                            submenu
+                                .item(
+                                    gpui_component::menu::PopupMenuItem::new(
+                                        t!("sidebar.chats").to_string(),
+                                    )
+                                    .checked(matches!(workspace_mode, WorkspaceMode::Chat))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            chat_app
+                                                .update(cx, |this, cx| {
+                                                    this.switch_workspace_mode(
+                                                        WorkspaceMode::Chat,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                        },
+                                    ),
+                                )
+                                .item(
+                                    gpui_component::menu::PopupMenuItem::new(
+                                        t!("agent.mode").to_string(),
+                                    )
+                                    .checked(matches!(workspace_mode, WorkspaceMode::Project))
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            project_app
+                                                .update(cx, |this, cx| {
+                                                    this.switch_workspace_mode(
+                                                        WorkspaceMode::Project,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .ok();
+                                        },
+                                    ),
+                                )
+                        }
+                    },
                 )
                 .menu_with_icon(
                     theme_label.to_string(),
@@ -135,15 +190,23 @@ impl ChatApp {
             .gap_2()
             .h(px(52.))
             .flex_shrink_0()
-            .px_2()
-            .child(account)
+            .px(SIDEBAR_CONTENT_INSET)
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-account-boundary".to_string())
+                    .child(account),
+            )
             .child(div().flex_1())
             .child(
-                Button::new("search")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Search)
-                    .tooltip(t!("sidebar.search").to_string()),
+                div()
+                    .debug_selector(|| "sidebar-search-boundary".to_string())
+                    .child(
+                        Button::new("search")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Search)
+                            .tooltip(t!("sidebar.search").to_string()),
+                    ),
             )
     }
 }
@@ -157,7 +220,10 @@ impl Focusable for ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_view = self.active_view();
-        let has_active = active_view.is_some();
+        let has_active = match self.workspace_mode {
+            WorkspaceMode::Chat => active_view.is_some(),
+            WorkspaceMode::Project => self.active_agent_view().is_some(),
+        };
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
         // inside the top-level view of the window.
@@ -216,7 +282,7 @@ impl Render for ChatApp {
                 .when_some(active_view, |this, view| this.child(view))
                 .when(!has_active, |this| this.child(render_empty_workspace(cx)))
                 .into_any_element(),
-            WorkspaceMode::Agent => self.render_agent_main(window, cx),
+            WorkspaceMode::Project => self.render_agent_main(window, cx),
         };
 
         let main_column = v_flex()
@@ -259,7 +325,7 @@ impl Render for ChatApp {
                     .tooltip(if matches!(self.workspace_mode, WorkspaceMode::Chat) {
                         t!("sidebar.new_chat").to_string()
                     } else {
-                        t!("agent.new_session").to_string()
+                        t!("agent.open_folder").to_string()
                     })
                     .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
             );
@@ -289,10 +355,7 @@ impl Render for ChatApp {
             .flex()
             .items_center()
             .occlude()
-            .when(
-                has_active && matches!(self.workspace_mode, WorkspaceMode::Chat),
-                |this| this.child(self.model_picker.clone()),
-            );
+            .when(has_active, |this| this.child(self.model_picker.clone()));
 
         // AppKit otherwise treats every point in a transparent native
         // titlebar as draggable, including controls. This layer sits behind

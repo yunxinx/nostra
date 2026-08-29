@@ -5,7 +5,7 @@ mod history_sidebar;
 mod render;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -26,9 +26,9 @@ use gpui_component::{
     TITLE_BAR_HEIGHT, WindowExt as _,
     animation::{Transition, ease_in_out_cubic},
     button::{Button, ButtonVariants as _},
-    dialog::DialogButtonProps,
     h_flex,
     menu::DropdownMenu as _,
+    notification::NotificationType,
     sidebar::SidebarToggleButton,
     v_flex,
 };
@@ -37,12 +37,12 @@ use rust_i18n::t;
 use crate::appearance::{glass, theme};
 use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
 use crate::llm::ModelSelection;
-use crate::preferences::{self, Preferences, WindowGeometry};
+use crate::preferences::{self, Preferences, WindowGeometry, WorkspaceMode};
 use crate::session::{
-    ChatSessionCatalogController, ResolvedSessionState, SessionId, SessionStores,
+    ChatSessionCatalogController, ProjectSessionStore as _, ResolvedSessionState, SessionId,
+    SessionLifecycleStore as _, SessionStores,
 };
 use crate::shell::actions::{OpenSettings, ToggleTheme};
-use crate::ui::reference_picker::ChatReferenceComposer;
 use crate::ui::{
     inline_delete_confirmation::InlineDeleteConfirmationHandle, model_select::ModelPicker,
 };
@@ -64,9 +64,12 @@ const SIDEBAR_ANIM: Duration = Duration::from_millis(220);
 const APP_QUIT_STORAGE_BUDGET: Duration = Duration::from_millis(150);
 
 /// x-coordinate where the main column's floating content (model pill) should
-/// start when the sidebar is fully collapsed.  Equals the width of the fixed
-/// top-left overlay (traffic-light padding + toggle + new-chat button + gap).
+/// start when the sidebar is fully collapsed. Equals the width of the fixed
+/// top-left overlay (traffic-light padding + toggle + new-chat).
 const OVERLAY_INSET: Pixels = px(148.);
+
+/// Shared outer inset for scrollable sidebar content and its fixed footer.
+const SIDEBAR_CONTENT_INSET: Pixels = px(8.);
 
 /// Left-pad so content sits to the right of the macOS traffic lights (x=9..77).
 #[cfg(target_os = "macos")]
@@ -138,15 +141,20 @@ pub struct ChatApp {
     /// Agent project workspace snapshot.  Render only reads this; every
     /// mutation comes from a background load completion.
     agent: AgentWorkspace,
-    /// Agent draft composer hosting the `$` Chat reference picker.  Created
-    /// once here so render never builds entities.
-    agent_composer: Entity<ChatReferenceComposer>,
+    /// Project conversations use the same ChatView/composer as Chat mode.
+    agent_conversations: Vec<AgentConversation>,
+    /// Entity id of the currently displayed project conversation.
+    agent_active: Option<gpui::EntityId>,
     /// Background task owning the Agent project catalog load.
     _agent_projects_task: Option<Task<()>>,
-    /// Background task owning the Agent session list load.
-    _agent_sessions_task: Option<Task<()>>,
+    /// Background tasks owning per-project Agent session-list loads.
+    _agent_session_list_tasks: HashMap<String, Task<()>>,
     /// Background task owning the Agent session detail load.
     _agent_session_task: Option<Task<()>>,
+    /// Background task owning a direct Agent session or project deletion.
+    _agent_delete_task: Option<Task<()>>,
+    /// Projects hidden from interaction while their durable deletion runs.
+    agent_deleting_projects: HashSet<String>,
     /// Background task resolving the native folder picker for a new Agent
     /// work project.
     _folder_task: Option<Task<()>>,
@@ -165,14 +173,12 @@ type PreferenceSaver = Arc<dyn Fn(Preferences) -> anyhow::Result<()> + Send + Sy
 pub(super) enum SidebarTarget {
     View(gpui::EntityId),
     Session(SessionId),
-}
-
-/// Top-level workspace mode: Chat (interactive conversations) or Agent
-/// (read-only browsing of persisted agent projects and sessions).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum WorkspaceMode {
-    Chat,
-    Agent,
+    AgentView(gpui::EntityId),
+    AgentSession {
+        project_id: String,
+        session_id: SessionId,
+    },
+    AgentProject(String),
 }
 
 use agent_workspace::AgentWorkspace;
@@ -190,6 +196,15 @@ struct Conversation {
     selection: Option<ModelSelection>,
     /// `None` while this view is an unbound draft; `Some` once a durable turn
     /// begin or a successful restore has bound it to a persisted session.
+    session_id: Option<SessionId>,
+    _subscription: Subscription,
+}
+
+struct AgentConversation {
+    view: Entity<ChatView>,
+    project_id: String,
+    title: SharedString,
+    selection: Option<ModelSelection>,
     session_id: Option<SessionId>,
     _subscription: Subscription,
 }
@@ -225,6 +240,11 @@ impl ChatApp {
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
+        let workspace_mode = if prefs.restore_last_workspace_on_start {
+            prefs.last_workspace_mode
+        } else {
+            WorkspaceMode::Chat
+        };
 
         let parent = cx.weak_entity();
         let model_picker = cx.new(|cx| {
@@ -263,12 +283,15 @@ impl ChatApp {
             _summary_refresh_task: None,
             _history_delete_task: None,
             startup_restore_attempted: false,
-            workspace_mode: WorkspaceMode::Chat,
+            workspace_mode,
             agent: AgentWorkspace::new(),
-            agent_composer: cx.new(|cx| ChatReferenceComposer::new(window, cx)),
+            agent_conversations: Vec::new(),
+            agent_active: None,
             _agent_projects_task: None,
-            _agent_sessions_task: None,
+            _agent_session_list_tasks: HashMap::new(),
             _agent_session_task: None,
+            _agent_delete_task: None,
+            agent_deleting_projects: HashSet::new(),
             _folder_task: None,
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
@@ -280,6 +303,9 @@ impl ChatApp {
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
         this.start_catalog_initial_load(window, cx);
+        if matches!(this.workspace_mode, WorkspaceMode::Project) {
+            this.start_agent_projects_load(cx);
+        }
         this
     }
 
@@ -425,6 +451,395 @@ impl ChatApp {
         self.active = self.conversations.last().map(|c| c.view.entity_id());
         self.sync_model_picker_to_active(window, cx);
         cx.notify();
+    }
+
+    fn agent_conversation_index(&self, target: gpui::EntityId) -> Option<usize> {
+        self.agent_conversations
+            .iter()
+            .position(|conversation| conversation.view.entity_id() == target)
+    }
+
+    fn project_identity(
+        &self,
+        project_id: &str,
+        cx: &App,
+    ) -> Option<crate::session::ProjectIdentity> {
+        self.agent
+            .projects()
+            .iter()
+            .find(|project| project.project_id == project_id)
+            .and_then(|project| {
+                crate::session::ProjectIdentity::from_parts(
+                    project.project_id.clone(),
+                    project.canonical_path.clone(),
+                    project.display_name.clone(),
+                )
+                .ok()
+            })
+            .or_else(|| {
+                crate::preferences::get(cx)
+                    .agent_projects
+                    .iter()
+                    .find(|project| project.project_id == project_id)
+                    .and_then(|project| {
+                        crate::session::ProjectIdentity::from_parts(
+                            project.project_id.clone(),
+                            project.canonical_path.clone(),
+                            project.display_name.clone(),
+                        )
+                        .ok()
+                    })
+            })
+    }
+
+    fn subscribe_agent_conversation(
+        &mut self,
+        view: &Entity<ChatView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(view, window, |this, view, event, window, cx| {
+            let target = view.entity_id();
+            let Some(index) = this.agent_conversation_index(target) else {
+                return;
+            };
+            match event {
+                ChatEvent::TitleChanged(title) => {
+                    this.agent_conversations[index].title = title.clone();
+                }
+                ChatEvent::SelectionChanged(selection) => {
+                    this.agent_conversations[index].selection = Some(selection.clone());
+                    if this.agent_active == Some(target) {
+                        this.sync_model_picker_to_active(window, cx);
+                    }
+                }
+                ChatEvent::SessionBound(session_id) => {
+                    let project_id = this.agent_conversations[index].project_id.clone();
+                    this.agent_conversations[index].session_id = Some(session_id.clone());
+                    this.agent
+                        .bind_draft_session(project_id.clone(), session_id.clone());
+                    this.refresh_agent_sessions(project_id, cx);
+                }
+                ChatEvent::DeleteCompleted => {
+                    let conversation = &this.agent_conversations[index];
+                    let project_id = conversation.project_id.clone();
+                    let session_id = conversation.session_id.clone();
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.remove_agent_conversation(target, project_id, session_id, window, cx);
+                    });
+                }
+            }
+            cx.notify();
+        })
+    }
+
+    fn open_agent_draft(
+        &mut self,
+        project_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self
+            .agent_conversations
+            .iter()
+            .find(|c| c.project_id == project_id && c.session_id.is_none())
+        {
+            self.agent.open_draft(project_id);
+            existing
+                .view
+                .update(cx, |view, cx| view.focus_composer(window, cx));
+            self.agent_active = Some(existing.view.entity_id());
+            self.sync_model_picker_to_active(window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(identity) = self.project_identity(&project_id, cx) else {
+            return;
+        };
+        let view = ChatView::project_view(identity, window, cx);
+        let selection = view.read(cx).selection();
+        let subscription = self.subscribe_agent_conversation(&view, window, cx);
+        let target = view.entity_id();
+        self.agent_conversations.push(AgentConversation {
+            view: view.clone(),
+            project_id: project_id.clone(),
+            title: t!("agent.new_draft").to_string().into(),
+            selection,
+            session_id: None,
+            _subscription: subscription,
+        });
+        self.agent.new_project_draft(project_id.clone());
+        self.start_agent_sessions_load(project_id, cx);
+        self.agent_active = Some(target);
+        view.update(cx, |view, cx| view.focus_composer(window, cx));
+        self.sync_model_picker_to_active(window, cx);
+        cx.notify();
+    }
+
+    fn open_agent_session(
+        &mut self,
+        project_id: String,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing) = self
+            .agent_conversations
+            .iter()
+            .find(|c| c.session_id.as_ref() == Some(&session_id))
+        {
+            self.agent.select_session(project_id, session_id);
+            self.agent_active = Some(existing.view.entity_id());
+            self.sync_model_picker_to_active(window, cx);
+            cx.notify();
+            return;
+        }
+        let Some(identity) = self.project_identity(&project_id, cx) else {
+            return;
+        };
+        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
+            return;
+        };
+        let project_store = match stores.agent_projects() {
+            Ok(store) => store,
+            Err(_) => return,
+        };
+        let view = ChatView::project_view(identity, window, cx);
+        let target = view.entity_id();
+        let app = cx.entity();
+        let window_handle = window.window_handle();
+        self.agent
+            .select_session(project_id.clone(), session_id.clone());
+        let load_project_id = project_id.clone();
+        let load_session_id = session_id.clone();
+        let task = cx.spawn(async move |_, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    project_store.load_project_session(&load_project_id, &load_session_id, None)
+                })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                app.update(cx, |this, cx| {
+                    let Ok(state) = loaded else {
+                        return;
+                    };
+                    let title = state
+                        .messages
+                        .iter()
+                        .find(|message| message.message.role == crate::llm::Role::User)
+                        .and_then(|message| {
+                            message
+                                .message
+                                .content
+                                .iter()
+                                .find_map(|block| match block {
+                                    crate::llm::ContentBlock::Text { text, .. }
+                                        if !text.trim().is_empty() =>
+                                    {
+                                        Some(derive_chat_title(text))
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
+                    if view
+                        .update(cx, |chat, cx| {
+                            chat.restore_from_session(&session_id, &state, cx)
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let subscription = this.subscribe_agent_conversation(&view, window, cx);
+                    this.agent_conversations.push(AgentConversation {
+                        view: view.clone(),
+                        project_id: project_id.clone(),
+                        title,
+                        selection: view.read(cx).selection(),
+                        session_id: Some(session_id.clone()),
+                        _subscription: subscription,
+                    });
+                    this.agent_active = Some(target);
+                    this.sync_model_picker_to_active(window, cx);
+                    cx.notify();
+                });
+            });
+        });
+        self._agent_session_task = Some(task);
+        cx.notify();
+    }
+
+    fn remove_agent_conversation(
+        &mut self,
+        target: gpui::EntityId,
+        project_id: String,
+        session_id: Option<SessionId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.agent_conversation_index(target) else {
+            return;
+        };
+        self.agent_conversations.remove(index);
+        if let Some(session_id) = session_id {
+            self.agent.remove_session(&project_id, &session_id);
+        }
+        self.agent.discard_draft(&project_id);
+        if self.agent_active == Some(target) {
+            self.agent_active = None;
+        }
+        self.sync_model_picker_to_active(window, cx);
+        cx.notify();
+    }
+
+    fn delete_unopened_agent_session(
+        &mut self,
+        project_id: String,
+        session_id: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
+            return;
+        };
+        let Ok(mut store) = stores.agent() else {
+            return;
+        };
+        let app = cx.weak_entity();
+        let window_handle = window.window_handle();
+        self._agent_delete_task = Some(cx.spawn(async move |_, cx| {
+            let delete_id = session_id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { store.delete_session(&delete_id) })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                app.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => this.agent.remove_session(&project_id, &session_id),
+                        Err(error) => {
+                            crate::logging::error(
+                                "agent.delete",
+                                format_args!("failed to delete Agent session: {error}"),
+                            );
+                            window.push_notification(
+                                (
+                                    NotificationType::Error,
+                                    t!("agent.delete_failed").to_string(),
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    this._agent_delete_task = None;
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
+    }
+
+    fn delete_agent_project(
+        &mut self,
+        project: crate::session::ProjectSummary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let has_in_flight_work = self
+            .agent_conversations
+            .iter()
+            .filter(|conversation| conversation.project_id == project.project_id)
+            .any(|conversation| conversation.view.read(cx).has_in_flight_work());
+        if has_in_flight_work {
+            window.push_notification(
+                (NotificationType::Error, t!("agent.delete_busy").to_string()),
+                cx,
+            );
+            return;
+        }
+        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
+            return;
+        };
+        let Ok(project_store) = stores.agent_projects() else {
+            return;
+        };
+        let Ok(mut lifecycle) = stores.agent() else {
+            return;
+        };
+        let project_id = project.project_id.clone();
+        let apply_project_id = project_id.clone();
+        let app = cx.weak_entity();
+        let window_handle = window.window_handle();
+        self.agent_deleting_projects
+            .insert(apply_project_id.clone());
+        cx.notify();
+        self._agent_delete_task = Some(cx.spawn(async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut cursor = None;
+                    loop {
+                        let page = project_store.list_project_sessions(
+                            &project_id,
+                            crate::session::CatalogQuery {
+                                cursor,
+                                ..crate::session::CatalogQuery::first_page()
+                            },
+                        )?;
+                        for summary in page.sessions {
+                            lifecycle.delete_session(&summary.session_id)?;
+                        }
+                        let Some(next) = page.next_cursor else {
+                            break;
+                        };
+                        cursor = Some(next);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                app.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            preferences::remove_agent_project(&apply_project_id, cx);
+                            let removed_targets = this
+                                .agent_conversations
+                                .iter()
+                                .filter(|conversation| conversation.project_id == apply_project_id)
+                                .map(|conversation| conversation.view.entity_id())
+                                .collect::<Vec<_>>();
+                            this.agent_conversations
+                                .retain(|conversation| conversation.project_id != apply_project_id);
+                            if this
+                                .agent_active
+                                .is_some_and(|target| removed_targets.contains(&target))
+                            {
+                                this.agent_active = None;
+                            }
+                            this.agent.remove_project(&apply_project_id);
+                        }
+                        Err(error) => {
+                            crate::logging::error(
+                                "agent.delete",
+                                format_args!("failed to delete Agent project: {error}"),
+                            );
+                            window.push_notification(
+                                (
+                                    NotificationType::Error,
+                                    t!("agent.delete_failed").to_string(),
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    this.agent_deleting_projects.remove(&apply_project_id);
+                    this._agent_delete_task = None;
+                    cx.notify();
+                })
+                .ok();
+            });
+        }));
     }
 
     /// Wire up the [`ChatEvent`] subscription for a conversation view.  Kept as
@@ -673,17 +1088,25 @@ impl ChatApp {
     }
 
     fn sync_model_picker_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.active else {
+        let target = match self.workspace_mode {
+            WorkspaceMode::Chat => self.active,
+            WorkspaceMode::Project => self.agent_active,
+        };
+        let Some(target) = target else {
             return;
         };
-        let Some(conversation) = self
-            .conversations
-            .iter()
-            .find(|c| c.view.entity_id() == target)
-        else {
-            return;
+        let selection = match self.workspace_mode {
+            WorkspaceMode::Chat => self
+                .conversations
+                .iter()
+                .find(|c| c.view.entity_id() == target)
+                .and_then(|conversation| conversation.selection.clone()),
+            WorkspaceMode::Project => self
+                .agent_conversations
+                .iter()
+                .find(|c| c.view.entity_id() == target)
+                .and_then(|conversation| conversation.selection.clone()),
         };
-        let selection = conversation.selection.clone();
         self.model_picker.update(cx, |picker, cx| {
             picker.set_conversation(selection, window, cx)
         });
@@ -694,17 +1117,28 @@ impl ChatApp {
         selection: ModelSelection,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(target) = self.active else {
+        let target = match self.workspace_mode {
+            WorkspaceMode::Chat => self.active,
+            WorkspaceMode::Project => self.agent_active,
+        };
+        let Some(target) = target else {
             return false;
         };
-        let Some(conversation) = self
-            .conversations
-            .iter()
-            .find(|c| c.view.entity_id() == target)
-        else {
+        let view = match self.workspace_mode {
+            WorkspaceMode::Chat => self
+                .conversations
+                .iter()
+                .find(|c| c.view.entity_id() == target)
+                .map(|conversation| conversation.view.clone()),
+            WorkspaceMode::Project => self
+                .agent_conversations
+                .iter()
+                .find(|c| c.view.entity_id() == target)
+                .map(|conversation| conversation.view.clone()),
+        };
+        let Some(view) = view else {
             return false;
         };
-        let view = conversation.view.clone();
         view.update(cx, |chat, cx| chat.select_model(selection, cx));
         true
     }
@@ -718,21 +1152,7 @@ impl ChatApp {
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.workspace_mode {
             WorkspaceMode::Chat => self.spawn_draft(window, cx),
-            WorkspaceMode::Agent => self.agent_new_conversation(window, cx),
-        }
-    }
-
-    /// Agent-mode counterpart of the new-chat button: with a selected
-    /// project, start a fresh conversation draft; without one, guide the
-    /// user through opening a folder first.
-    fn agent_new_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.selected_project_id().is_some() {
-            self.agent.new_agent_draft();
-            self.agent_composer
-                .update(cx, |composer, cx| composer.focus_input(window, cx));
-            cx.notify();
-        } else {
-            self.open_project_folder(cx);
+            WorkspaceMode::Project => self.open_project_folder(cx),
         }
     }
 
@@ -745,8 +1165,7 @@ impl ChatApp {
             multiple: false,
             prompt: Some(t!("agent.open_folder_prompt").to_string().into()),
         });
-        let app = cx.entity();
-        let task = cx.spawn(async move |_this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             let picked = match prompt.await {
                 Ok(Ok(Some(paths))) => paths.into_iter().next(),
                 _ => None,
@@ -757,7 +1176,10 @@ impl ChatApp {
             // The dialog returns the displayed path; canonicalize when the
             // entry still resolves so identity survives symlinked mounts.
             let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-            app.update(cx, |this, cx| this.register_agent_project(canonical, cx));
+            this.update(cx, |state, cx| {
+                state.register_agent_project(canonical, cx);
+            })
+            .ok();
         });
         self._folder_task = Some(task);
     }
@@ -800,57 +1222,82 @@ impl ChatApp {
             identity.project_id
         });
 
-        self.agent.select_project(project_id);
-        self.agent.new_agent_draft();
-        self.start_agent_sessions_load(cx);
+        self.agent.expand_project(project_id.clone());
+        self.start_agent_sessions_load(project_id, cx);
         cx.notify();
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.workspace_mode, WorkspaceMode::Project) {
+            let Some(entity) = self.agent_active else {
+                return;
+            };
+            let Some((project_id, session_id)) = self
+                .agent_conversations
+                .iter()
+                .find(|conversation| conversation.view.entity_id() == entity)
+                .map(|conversation| {
+                    (
+                        conversation.project_id.clone(),
+                        conversation.session_id.clone(),
+                    )
+                })
+            else {
+                return;
+            };
+            let target = session_id.map_or_else(
+                || SidebarTarget::AgentView(entity),
+                |session_id| SidebarTarget::AgentSession {
+                    project_id: project_id.clone(),
+                    session_id,
+                },
+            );
+            if self.collapsed {
+                self.collapsed = false;
+                self.has_toggled = true;
+            }
+            self.agent.expand_project(project_id);
+            self.begin_delete_confirmation(target, window, cx);
+            return;
+        }
         let Some(target) = self.active else {
             return;
         };
-        let Some(conversation) = self
+        if !self
             .conversations
             .iter()
-            .find(|c| c.view.entity_id() == target)
-        else {
+            .any(|conversation| conversation.view.entity_id() == target)
+        {
             return;
-        };
-        let title = conversation.title.clone();
-        self.request_delete_conversation(target, title, window, cx);
+        }
+        if self.collapsed {
+            self.collapsed = false;
+            self.has_toggled = true;
+        }
+        self.begin_delete_confirmation(SidebarTarget::View(target), window, cx);
     }
 
-    fn request_delete_conversation(
-        &self,
+    fn delete_agent_conversation(
+        &mut self,
         target: gpui::EntityId,
-        title: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let app = cx.weak_entity();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let app = app.clone();
-            alert
-                .confirm()
-                .title(t!("sidebar.delete_chat_title").to_string())
-                .description(
-                    t!("sidebar.delete_chat_description", title = title.as_ref()).to_string(),
-                )
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(t!("sidebar.delete_chat_confirm").to_string())
-                        .ok_variant(gpui_component::button::ButtonVariant::Danger)
-                        .cancel_text(t!("sidebar.delete_chat_cancel").to_string())
-                        .show_cancel(true),
-                )
-                .on_ok(move |_, window, cx| {
-                    app.update(cx, |this, cx| {
-                        this.delete_conversation(target, window, cx);
-                    })
-                    .is_ok()
-                })
-        });
+        let Some(index) = self.agent_conversation_index(target) else {
+            return;
+        };
+        let project_id = self.agent_conversations[index].project_id.clone();
+        let session_id = self.agent_conversations[index].session_id.clone();
+        if session_id.is_none() {
+            self.remove_agent_conversation(target, project_id, None, window, cx);
+            return;
+        }
+        let request = self.agent_conversations[index]
+            .view
+            .update(cx, |chat, cx| chat.request_delete(cx));
+        if request == ChatDeleteRequest::RemoveNow {
+            self.remove_agent_conversation(target, project_id, session_id, window, cx);
+        }
     }
 
     /// Arm inline delete confirmation for a sidebar row.  The row's actions
@@ -882,6 +1329,31 @@ impl ChatApp {
                     self.delete_conversation(entity, window, cx);
                 } else {
                     self.delete_unopened_session(session_id, window, cx);
+                }
+            }
+            SidebarTarget::AgentView(entity) => self.delete_agent_conversation(entity, window, cx),
+            SidebarTarget::AgentSession {
+                project_id,
+                session_id,
+            } => {
+                if let Some(entity) = self
+                    .agent_conversations
+                    .iter()
+                    .find(|conversation| conversation.session_id.as_ref() == Some(&session_id))
+                    .map(|conversation| conversation.view.entity_id())
+                {
+                    self.delete_agent_conversation(entity, window, cx);
+                } else {
+                    self.delete_unopened_agent_session(project_id, session_id, window, cx);
+                }
+            }
+            SidebarTarget::AgentProject(project_id) => {
+                if let Some(project) = self
+                    .merged_agent_projects(cx)
+                    .into_iter()
+                    .find(|project| project.project_id == project_id)
+                {
+                    self.delete_agent_project(project, window, cx);
                 }
             }
         }
@@ -979,6 +1451,15 @@ impl ChatApp {
                 .iter()
                 .find(|c| c.view.entity_id() == target)
                 .map(|c| c.view.clone())
+        })
+    }
+
+    fn active_agent_view(&self) -> Option<Entity<ChatView>> {
+        self.agent_active.and_then(|target| {
+            self.agent_conversations
+                .iter()
+                .find(|conversation| conversation.view.entity_id() == target)
+                .map(|conversation| conversation.view.clone())
         })
     }
 }

@@ -7,8 +7,8 @@ use std::{
 };
 
 use gpui::{
-    IntoElement as _, ListOffset, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
-    TestAppContext, point, px,
+    AppContext as _, IntoElement as _, ListOffset, Modifiers, MouseButton, ParentElement as _,
+    ScrollDelta, ScrollWheelEvent, TestAppContext, point, px,
 };
 use gpui_component::input::InputEvent;
 
@@ -19,8 +19,8 @@ use crate::llm::{
 use crate::preferences;
 use crate::session::{
     CatalogQuery, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore, LocalStoreConfig,
-    ResolvedSessionState, SessionCatalogStore, SessionDomain, SessionId, SessionReadStore,
-    SessionStores, TurnStatus,
+    ProjectIdentity, ResolvedSessionState, SessionCatalogStore, SessionDomain, SessionId,
+    SessionReadStore, SessionStores, TurnStatus,
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
@@ -146,6 +146,53 @@ fn add_chat_window(
             .expect("Root must contain the ChatView")
     });
     (chat, cx)
+}
+
+#[gpui::test]
+fn chat_and_project_modes_share_the_composer_entity_with_project_references_enabled(
+    cx: &mut TestAppContext,
+) {
+    init_app(cx);
+    cx.update(|cx| {
+        cx.set_global(SessionStores::with_stores(
+            InMemorySessionStore::new(),
+            InMemorySessionStore::new(),
+        ));
+    });
+    let project = ProjectIdentity::new("/tmp/nostra-shared-composer", "Shared composer");
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let chat = ChatView::view(window, cx);
+        let project = ChatView::project_view(project.clone(), window, cx);
+        let pair = cx.new(|_| ComposerPair { chat, project });
+        gpui_component::Root::new(pair, window, cx)
+    });
+    let pair = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ComposerPair>()
+            .expect("Root must contain the composer pair")
+    });
+    pair.read_with(cx, |pair, cx| {
+        assert!(!pair.chat.read(cx).composer.read(cx).references_enabled());
+        assert!(pair.project.read(cx).composer.read(cx).references_enabled());
+    });
+}
+
+struct ComposerPair {
+    chat: gpui::Entity<ChatView>,
+    project: gpui::Entity<ChatView>,
+}
+
+impl gpui::Render for ComposerPair {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+            .child(self.chat.clone())
+            .child(self.project.clone())
+    }
 }
 
 fn redraw(cx: &mut gpui::VisualTestContext) {

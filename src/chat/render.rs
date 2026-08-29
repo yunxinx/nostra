@@ -7,11 +7,17 @@ impl Render for ChatView {
         self.sync_selection_availability(cx);
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
-        let placeholder: SharedString = t!("chat.placeholder").to_string().into();
+        let placeholder: SharedString = match &self.scope {
+            crate::session::ConversationScope::Chat => t!("chat.placeholder").to_string(),
+            crate::session::ConversationScope::Project(_) => {
+                t!("reference_picker.composer_placeholder").to_string()
+            }
+        }
+        .into();
         if self.placeholder != placeholder {
             self.placeholder = placeholder.clone();
-            self.input.update(cx, |state, cx| {
-                state.set_placeholder(placeholder, window, cx);
+            self.composer.update(cx, |composer, cx| {
+                composer.set_placeholder(placeholder, window, cx)
             });
         }
 
@@ -23,6 +29,11 @@ impl Render for ChatView {
             || !self.selection_available;
         let composer_height = self.composer_height;
         let base_composer_height = self.base_composer_height;
+        self.composer_status
+            .set(crate::ui::reference_picker::ComposerStatus {
+                pending: self.pending,
+                send_disabled,
+            });
         let view = cx.weak_entity();
 
         // Full-height message viewport with a floating composer stacked on top
@@ -44,7 +55,7 @@ impl Render for ChatView {
                     .bottom_0()
                     .left_0()
                     .right_0()
-                    .child(self.render_input_area(send_disabled, cx))
+                    .child(self.composer.clone())
                     .on_prepaint(move |bounds, _, cx| {
                         view.update(cx, |this, cx| {
                             if this.record_composer_height(bounds.size.height) {
@@ -279,97 +290,6 @@ impl ChatView {
         if let Some(index) = self.messages.len().checked_sub(1) {
             self.list_state.remeasure_items(index..index + 1);
         }
-    }
-
-    fn render_input_area(&self, send_disabled: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-
-        h_flex()
-            .w_full()
-            .justify_center()
-            .px_6()
-            .pt_2()
-            .pb_3()
-            .child(
-                v_flex()
-                    .w_full()
-                    .max_w(CONTENT_MAX_WIDTH)
-                    .gap_0p5()
-                    .bg(theme.background)
-                    .border_1()
-                    .border_color(theme.border)
-                    .rounded(theme.radius_lg)
-                    .shadow_md()
-                    .py_1()
-                    // Input consumes wheel events while its viewport moves, but
-                    // deliberately propagates them at the top/bottom boundary.
-                    // Contain that remainder inside the floating composer so it
-                    // cannot scroll the transcript underneath.
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    // The multi-line Input places its overlay scrollbar inside its
-                    // own horizontal padding and soft-wraps text 10px short of the
-                    // text area (RIGHT_MARGIN, fixed upstream).  The thumb's left
-                    // edge sits at `text_right + padding.right − 12px`, so the
-                    // glyph→thumb gap works out to `padding.right − 2px`: the
-                    // default 12px padding reads as a too-wide 10px gap, 8px
-                    // brings it to 6px. Don't go much lower: this is the final
-                    // visual separation between the production-shaped line and
-                    // the thumb. The card adds no horizontal padding of its own
-                    // around the input; the toolbar row below carries its own
-                    // inset.
-                    //
-                    // Bundled fonts remain the product defaults for consistent
-                    // cross-platform appearance, but are no longer a wrapping
-                    // workaround. gpui-component derives soft-wrap points from
-                    // production-shaped widths, including system fallback and
-                    // fullwidth punctuation. `cargo run --example wrap_probe`
-                    // compares the legacy estimator with production shaping on
-                    // real fonts; production lines must remain overflow-free.
-                    .child(
-                        Input::new(&self.input)
-                            .appearance(false)
-                            .font_family(fonts::active(cx).family())
-                            .pr(px(8.)),
-                    )
-                    .child(
-                        h_flex()
-                            .px_1p5()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                Button::new("attach")
-                                    .ghost()
-                                    .small()
-                                    .icon(IconName::Plus)
-                                    .tooltip(t!("chat.attach").to_string()),
-                            )
-                            .child(div().flex_1())
-                            .when(self.pending, |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(t!("chat.generating").to_string()),
-                                )
-                            })
-                            .child(if self.pending {
-                                Button::new("stop")
-                                    .primary()
-                                    .icon(IconName::Close)
-                                    .small()
-                                    .tooltip(t!("chat.stop_tooltip").to_string())
-                                    .on_click(cx.listener(Self::on_stop_click))
-                            } else {
-                                Button::new("send")
-                                    .primary()
-                                    .icon(IconName::ArrowUp)
-                                    .small()
-                                    .disabled(send_disabled)
-                                    .tooltip(t!("chat.send_tooltip").to_string())
-                                    .on_click(cx.listener(Self::on_send_click))
-                            }),
-                    ),
-            )
     }
 }
 

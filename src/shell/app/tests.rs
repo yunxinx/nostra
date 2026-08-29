@@ -12,8 +12,9 @@ use std::{
 use gpui::TestAppContext;
 
 use crate::session::{
-    InMemorySessionStore, LocalSessionStore, LocalStoreConfig, SessionCatalogStore, SessionDomain,
-    SessionReadStore, SessionStores, TurnStatus,
+    InMemorySessionStore, LocalSessionStore, LocalStoreConfig, ProjectCatalogQuery,
+    ProjectIdentity, ProjectSessionStore, SessionCatalogStore, SessionDomain, SessionHeader,
+    SessionLifecycleStore, SessionReadStore, SessionStores, TurnStatus,
 };
 
 use super::*;
@@ -26,7 +27,21 @@ fn add_app_window_with_stores(
     cx: &mut TestAppContext,
     stores: Option<SessionStores>,
 ) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
-    let prefs = Preferences::default();
+    add_app_window_with_preferences_and_stores(cx, Preferences::default(), stores)
+}
+
+fn add_app_window_with_preferences(
+    cx: &mut TestAppContext,
+    prefs: Preferences,
+) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
+    add_app_window_with_preferences_and_stores(cx, prefs, None)
+}
+
+fn add_app_window_with_preferences_and_stores(
+    cx: &mut TestAppContext,
+    prefs: Preferences,
+    stores: Option<SessionStores>,
+) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
         crate::appearance::fonts::init(prefs.composer_font, cx);
@@ -390,18 +405,19 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             this.spawn_draft(window, cx);
             this.active = Some(this.conversations[0].view.entity_id());
             let target = this.conversations[0].view.entity_id();
-            let title = this.conversations[0].title.clone();
             let selected = this.conversations[2].view.entity_id();
-            this.request_delete_conversation(target, title, window, cx);
+            this.begin_delete_confirmation(SidebarTarget::View(target), window, cx);
             this.select(2, window, cx);
             (target, selected)
         })
     });
 
     cx.update(|window, cx| {
-        let _ = window.draw(cx);
+        app.update(cx, |this, cx| {
+            let target = this.confirming.clone().expect("delete target");
+            this.confirm_delete_target(target, window, cx);
+        });
     });
-    cx.dispatch_action(gpui_component::dialog::ConfirmDialog);
     cx.run_until_parked();
 
     app.read_with(cx, |this, _| {
@@ -464,6 +480,102 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().expect("project folder");
+    let project = ProjectIdentity::new(folder.path(), "Draft project");
+    let prefs = Preferences {
+        agent_projects: vec![crate::preferences::AgentProjectRecord {
+            project_id: project.project_id.clone(),
+            canonical_path: project.canonical_path.clone(),
+            display_name: project.display_name.clone(),
+        }],
+        ..Preferences::default()
+    };
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.open_agent_draft(project.project_id.clone(), window, cx);
+            this.agent_active.expect("active Agent draft")
+        })
+    });
+    redraw(cx);
+
+    let actions =
+        Box::leak(format!("agent-conversation-actions-{}", target.as_u64()).into_boxed_str());
+    click(cx, actions);
+    cx.simulate_keystrokes("down enter");
+    redraw(cx);
+    assert_eq!(
+        app.read_with(cx, |this, _| this.confirming.clone()),
+        Some(SidebarTarget::AgentView(target))
+    );
+
+    let confirm = Box::leak(
+        format!(
+            "agent-conversation-delete-confirm-{}-confirm",
+            target.as_u64()
+        )
+        .into_boxed_str(),
+    );
+    click(cx, confirm);
+
+    app.read_with(cx, |this, _| {
+        assert!(this.agent_conversations.is_empty());
+        assert!(this.agent_active.is_none());
+        assert_eq!(this.confirming, None);
+    });
+}
+
+#[gpui::test]
+fn deleting_the_active_agent_reveals_its_inline_confirmation_anchor(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().expect("project folder");
+    let project = ProjectIdentity::new(folder.path(), "Draft project");
+    let prefs = Preferences {
+        agent_projects: vec![crate::preferences::AgentProjectRecord {
+            project_id: project.project_id.clone(),
+            canonical_path: project.canonical_path.clone(),
+            display_name: project.display_name.clone(),
+        }],
+        ..Preferences::default()
+    };
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.open_agent_draft(project.project_id.clone(), window, cx);
+            this.collapsed = true;
+            assert!(
+                !this
+                    .agent
+                    .toggle_project_expanded(project.project_id.clone())
+            );
+            this.request_delete_active(window, cx);
+            this.agent_active.expect("active Agent draft")
+        })
+    });
+    redraw(cx);
+
+    app.read_with(cx, |this, _| {
+        assert!(!this.collapsed);
+        assert!(this.agent.is_project_expanded(&project.project_id));
+        assert_eq!(this.confirming, Some(SidebarTarget::AgentView(target)));
+    });
+    let confirm = Box::leak(
+        format!(
+            "agent-conversation-delete-confirm-{}-confirm",
+            target.as_u64()
+        )
+        .into_boxed_str(),
+    );
+    assert!(cx.debug_bounds(confirm).is_some());
+}
+
 #[test]
 fn delete_chat_labels_resolve_in_every_locale() {
     for locale in ["en", "zh-CN"] {
@@ -496,6 +608,217 @@ fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContex
         assert!(this.conversations.is_empty(), "no draft on startup");
         assert!(this.active.is_none(), "no active target on startup");
         assert!(this.opened_session_index.is_empty());
+    });
+}
+
+#[gpui::test]
+fn startup_restores_the_last_workspace_when_enabled(cx: &mut TestAppContext) {
+    let prefs = Preferences {
+        restore_last_workspace_on_start: true,
+        last_workspace_mode: WorkspaceMode::Project,
+        ..Preferences::default()
+    };
+    let (app, _) = add_app_window_with_preferences(cx, prefs);
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+    });
+}
+
+#[gpui::test]
+fn startup_uses_chat_when_workspace_restore_is_disabled(cx: &mut TestAppContext) {
+    let prefs = Preferences {
+        restore_last_workspace_on_start: false,
+        last_workspace_mode: WorkspaceMode::Project,
+        ..Preferences::default()
+    };
+    let (app, _) = add_app_window_with_preferences(cx, prefs);
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.workspace_mode, WorkspaceMode::Chat);
+    });
+}
+
+#[gpui::test]
+fn disabled_workspace_restore_still_records_an_explicit_mode(cx: &mut TestAppContext) {
+    let prefs = Preferences {
+        restore_last_workspace_on_start: false,
+        ..Preferences::default()
+    };
+    let (app, cx) = add_app_window_with_preferences(cx, prefs);
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+        });
+    });
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+    });
+    cx.update(|_, cx| {
+        let prefs = crate::preferences::get(cx);
+        assert!(!prefs.restore_last_workspace_on_start);
+        assert_eq!(prefs.last_workspace_mode, WorkspaceMode::Project);
+    });
+}
+
+#[gpui::test]
+fn deleting_an_agent_draft_discards_only_the_unpersisted_view(cx: &mut TestAppContext) {
+    let folder = tempfile::tempdir().expect("project folder");
+    let project = ProjectIdentity::new(folder.path(), "Draft project");
+    let prefs = Preferences {
+        agent_projects: vec![crate::preferences::AgentProjectRecord {
+            project_id: project.project_id.clone(),
+            canonical_path: project.canonical_path.clone(),
+            display_name: project.display_name.clone(),
+        }],
+        ..Preferences::default()
+    };
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let project_store = stores.agent_projects().expect("Agent project store");
+    let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.open_agent_draft(project.project_id.clone(), window, cx);
+            let target = this.agent_active.expect("active Agent draft");
+            this.delete_agent_conversation(target, window, cx);
+        });
+    });
+
+    app.read_with(cx, |this, _| {
+        assert!(this.agent_conversations.is_empty());
+        assert!(this.agent_active.is_none());
+        assert!(this.agent.open().is_none());
+    });
+    let page = project_store
+        .list_project_sessions(
+            &project.project_id,
+            crate::session::CatalogQuery::first_page(),
+        )
+        .expect("list project sessions");
+    assert!(page.sessions.is_empty());
+    assert!(folder.path().exists());
+}
+
+#[gpui::test]
+fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_folder(
+    cx: &mut TestAppContext,
+) {
+    let folder = tempfile::tempdir().expect("project folder");
+    let project = ProjectIdentity::new(folder.path(), "Persistent project");
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let mut lifecycle = stores.agent().expect("Agent lifecycle store");
+    lifecycle
+        .create_session(SessionHeader::new(
+            SessionDomain::Agent,
+            Some(project.clone()),
+        ))
+        .expect("create Agent session");
+    let project_store = stores.agent_projects().expect("Agent project store");
+    let summary = project_store
+        .list_projects(ProjectCatalogQuery::first_page())
+        .expect("list projects")
+        .projects
+        .into_iter()
+        .next()
+        .expect("project summary");
+    let prefs = Preferences {
+        agent_projects: vec![crate::preferences::AgentProjectRecord {
+            project_id: project.project_id.clone(),
+            canonical_path: project.canonical_path.clone(),
+            display_name: project.display_name.clone(),
+        }],
+        ..Preferences::default()
+    };
+    let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.delete_agent_project(summary, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let page = project_store
+        .list_project_sessions(
+            &project.project_id,
+            crate::session::CatalogQuery::first_page(),
+        )
+        .expect("list sessions after delete");
+    assert!(page.sessions.is_empty());
+    cx.update(|_, cx| {
+        assert!(crate::preferences::get(cx).agent_projects.is_empty());
+    });
+    assert!(folder.path().exists());
+    app.read_with(cx, |this, _| {
+        assert!(!this.agent_deleting_projects.contains(&project.project_id));
+    });
+}
+
+fn assert_sidebar_content_alignment(cx: &mut gpui::VisualTestContext) {
+    redraw(cx);
+    let top = cx
+        .debug_bounds("sidebar-top-reserved")
+        .expect("sidebar top reservation");
+    let list = cx
+        .debug_bounds("sidebar-list-surface")
+        .expect("sidebar list surface");
+    let account = cx
+        .debug_bounds("sidebar-account-boundary")
+        .expect("sidebar account boundary");
+    let search = cx
+        .debug_bounds("sidebar-search-boundary")
+        .expect("sidebar search boundary");
+
+    assert_eq!(list.left(), account.left());
+    assert_eq!(list.right(), search.right());
+    assert_eq!(list.top() - top.bottom(), SIDEBAR_CONTENT_INSET);
+}
+
+#[gpui::test]
+fn chat_sidebar_uses_the_shared_content_inset(cx: &mut TestAppContext) {
+    let (_, cx) = add_app_window(cx);
+    assert_sidebar_content_alignment(cx);
+}
+
+#[gpui::test]
+fn project_sidebar_uses_the_shared_content_inset(cx: &mut TestAppContext) {
+    let prefs = Preferences {
+        last_workspace_mode: WorkspaceMode::Project,
+        ..Preferences::default()
+    };
+    let (_, cx) = add_app_window_with_preferences(cx, prefs);
+    assert_sidebar_content_alignment(cx);
+}
+
+#[gpui::test]
+fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    redraw(cx);
+    let account = cx
+        .debug_bounds("sidebar-account-boundary")
+        .expect("account menu trigger");
+    cx.simulate_click(account.center(), Default::default());
+    redraw(cx);
+
+    // Settings is initially selected; move to Work mode, enter its submenu,
+    // then select Project.
+    cx.simulate_keystrokes("down down right down enter");
+    redraw(cx);
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+    });
+    cx.update(|_, cx| {
+        assert_eq!(
+            crate::preferences::get(cx).last_workspace_mode,
+            WorkspaceMode::Project
+        );
     });
 }
 

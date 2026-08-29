@@ -534,11 +534,10 @@ impl ChatApp {
 
         v_flex()
             .id("chats")
+            .debug_selector(|| "sidebar-list-surface".to_string())
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
-            .px_2()
-            .pt_2()
             .gap_1()
             .children(children)
             .into_any_element()
@@ -843,7 +842,7 @@ impl ChatApp {
                     .top(px(6.))
                     .size_5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_history_actions(
+                    .child(self.render_sidebar_actions(
                         target_for_actions,
                         actions_visible,
                         is_confirming,
@@ -856,7 +855,7 @@ impl ChatApp {
     /// Render the trailing actions button for any sidebar row.  When
     /// confirming, the button becomes a Popover trigger with an inline delete
     /// card; otherwise it opens a dropdown menu with a delete entry.
-    fn render_history_actions(
+    pub(super) fn render_sidebar_actions(
         &self,
         target: SidebarTarget,
         visible: bool,
@@ -864,30 +863,58 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.weak_entity();
-        let trigger_id: ElementId = match target {
-            SidebarTarget::View(entity) => ("conversation-actions", entity).into(),
-            SidebarTarget::Session(ref session) => format!("history-actions-{session}").into(),
-        };
-        let confirm_id: ElementId = match target {
-            SidebarTarget::View(entity) => ("conversation-delete-confirm", entity).into(),
-            SidebarTarget::Session(ref session) => {
-                format!("history-delete-confirm-{session}").into()
-            }
-        };
-        let trigger_debug_selector = match target {
-            SidebarTarget::View(entity) => {
-                Some(format!("conversation-actions-{}", entity.as_u64()))
-            }
-            SidebarTarget::Session(ref session) => Some(format!("history-actions-{session}")),
+        let (trigger_id, confirm_id, trigger_debug_selector, delete_label, confirm_title): (
+            ElementId,
+            ElementId,
+            String,
+            String,
+            String,
+        ) = match &target {
+            SidebarTarget::View(entity) => (
+                ("conversation-actions", *entity).into(),
+                ("conversation-delete-confirm", *entity).into(),
+                format!("conversation-actions-{}", entity.as_u64()),
+                t!("sidebar.delete_chat").to_string(),
+                t!("sidebar.delete_chat_title").to_string(),
+            ),
+            SidebarTarget::Session(session) => (
+                format!("history-actions-{session}").into(),
+                format!("history-delete-confirm-{session}").into(),
+                format!("history-actions-{session}"),
+                t!("sidebar.delete_chat").to_string(),
+                t!("sidebar.delete_chat_title").to_string(),
+            ),
+            SidebarTarget::AgentView(entity) => (
+                ("agent-conversation-actions", *entity).into(),
+                ("agent-conversation-delete-confirm", *entity).into(),
+                format!("agent-conversation-actions-{}", entity.as_u64()),
+                t!("agent.delete_session").to_string(),
+                t!("agent.delete_session_title").to_string(),
+            ),
+            SidebarTarget::AgentSession {
+                project_id,
+                session_id,
+            } => (
+                format!("agent-session-actions-{project_id}-{session_id}").into(),
+                format!("agent-session-delete-confirm-{project_id}-{session_id}").into(),
+                format!("agent-session-actions-{project_id}-{session_id}"),
+                t!("agent.delete_session").to_string(),
+                t!("agent.delete_session_title").to_string(),
+            ),
+            SidebarTarget::AgentProject(project_id) => (
+                format!("agent-project-actions-{project_id}").into(),
+                format!("agent-project-delete-confirm-{project_id}").into(),
+                format!("agent-project-actions-{project_id}"),
+                t!("agent.delete_project").to_string(),
+                t!("agent.delete_project_title").to_string(),
+            ),
         };
         let trigger = Button::new(trigger_id)
             .ghost()
             .xsmall()
             .icon(IconName::Ellipsis)
             .tooltip(t!("sidebar.more_actions").to_string())
-            .when_some(trigger_debug_selector, |this, selector| {
-                this.debug_selector(move || selector.clone())
-            });
+            .debug_selector(move || trigger_debug_selector.clone());
 
         if confirming {
             let target_for_open = target.clone();
@@ -895,7 +922,7 @@ impl ChatApp {
             InlineDeleteConfirmation::new(
                 confirm_id,
                 trigger,
-                t!("sidebar.delete_chat_title").to_string(),
+                confirm_title,
                 t!("sidebar.delete_chat_cancel").to_string(),
                 t!("sidebar.delete_chat_confirm").to_string(),
                 self.delete_confirmation.clone(),
@@ -922,16 +949,16 @@ impl ChatApp {
                 .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
                     let weak = weak.clone();
                     let target = target.clone();
+                    let delete_label = delete_label.clone();
                     menu.item(
-                        gpui_component::menu::PopupMenuItem::new(
-                            t!("sidebar.delete_chat").to_string(),
-                        )
-                        .on_click(move |_, window, cx| {
-                            weak.update(cx, |this, cx| {
-                                this.begin_delete_confirmation(target.clone(), window, cx)
-                            })
-                            .ok();
-                        }),
+                        gpui_component::menu::PopupMenuItem::new(delete_label).on_click(
+                            move |_, window, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.begin_delete_confirmation(target.clone(), window, cx)
+                                })
+                                .ok();
+                            },
+                        ),
                     )
                 })
                 .into_any_element()

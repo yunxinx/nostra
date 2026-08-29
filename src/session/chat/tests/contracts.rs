@@ -1,5 +1,7 @@
 use super::*;
-use crate::session::{SessionCatalogStore, SessionStores};
+use crate::session::{
+    CatalogQuery, ProjectIdentity, ProjectSessionStore, SessionCatalogStore, SessionStores,
+};
 
 #[test]
 fn completed_contract_works_with_memory_store() {
@@ -43,6 +45,41 @@ fn deleting_a_shared_chat_controller_removes_the_durable_session() {
             .expect("read catalog")
             .is_none()
     );
+}
+
+#[test]
+fn project_controller_creates_and_restores_a_project_scoped_session() {
+    let project = ProjectIdentity::new("/tmp/project-controller", "Project Controller");
+    let stores = SessionStores::with_agent_store(InMemorySessionStore::new());
+    let lifecycle = stores.agent().expect("Agent lifecycle capability");
+    let catalog = stores
+        .agent_projects()
+        .expect("Agent project catalog capability");
+    let mut controller = ChatSessionController::for_project(lifecycle, project.clone());
+
+    let start = controller
+        .begin_turn(
+            text_message(Role::User, "project turn"),
+            model("model-a"),
+            "turn-1",
+        )
+        .expect("create project-scoped session");
+    controller
+        .finish_turn("turn-1", &ChatTurnTerminal::cancelled())
+        .expect("persist project terminal");
+
+    assert_eq!(start.session_id.domain(), SessionDomain::Agent);
+    let page = catalog
+        .list_project_sessions(&project.project_id, CatalogQuery::first_page())
+        .expect("list project sessions");
+    assert_eq!(page.sessions.len(), 1);
+    assert_eq!(page.sessions[0].session_id, start.session_id);
+    assert_eq!(page.sessions[0].project.as_ref(), Some(&project));
+
+    let restored = controller
+        .restore(&start.session_id)
+        .expect("restore project session");
+    assert_eq!(restored.messages.len(), 1);
 }
 
 #[test]

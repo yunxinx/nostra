@@ -373,11 +373,11 @@ impl ChatView {
         self.reply_task = Some(reply_task);
         if self.composer_revision == request.composer_revision {
             self.input_empty = true;
-            let input = self.input.clone();
+            let composer = self.composer.clone();
             let window_handle = self.window_handle;
             cx.defer(move |cx| {
                 let _ = window_handle.update(cx, |_, window, cx| {
-                    input.update(cx, |state, cx| state.set_value("", window, cx));
+                    composer.update(cx, |composer, cx| composer.clear_after_submit(window, cx));
                 });
             });
         }

@@ -3,31 +3,35 @@
 //! The composer mirrors the chat input card: a floating card holding the
 //! reference chips, a multi-line input, and a toolbar row. Typing a `$` token
 //! (`$` at a word boundary followed by non-whitespace query characters) opens
-//! a completion popup directly above the card; results come from the
-//! read-only Chat reference capability on the background executor, guarded by
-//! a query generation so stale pages cannot land. Confirming a row removes the
-//! `$token` text, validates the reference with a background exact read, and
-//! adds a removable chip — the draft never copies message bodies.
+//! a completion popup the width of the card; results come from the read-only
+//! Chat reference capability on the background executor, guarded by a query
+//! generation so stale pages cannot land. Hits are grouped by Chat session.
+//! Confirming a session row inserts a session-level chip (no exact read);
+//! Tab/Right expands matching turns, and confirming a turn validates with a
+//! background exact read. The draft never copies message bodies.
 //!
-//! Key routing follows gpui's dispatch order: the input's bound `up`/`down`
-//! actions consume those keystrokes, so popup navigation uses `ctrl-n`/`ctrl-p`
-//! (unbound, reaching this view's `on_key_down`). Enter arrives as
-//! `InputEvent::PressEnter`, Escape propagates from the input's handler.
+//! The input binds Tab, arrows, and indent, so an open popup captures those
+//! actions on this wrapper before Input handles them. Popup navigation also
+//! uses `ctrl-n`/`ctrl-p`. Enter arrives as `InputEvent::PressEnter`.
 
-use std::collections::HashSet;
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 use chrono::{Datelike as _, TimeZone as _};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Pixels, Render, SharedString,
+    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{IndentInline, Input, InputEvent, InputState, MoveLeft, MoveRight, OutdentInline},
     spinner::Spinner,
     tag::Tag,
     v_flex,
@@ -38,44 +42,73 @@ use crate::llm::Role;
 use crate::session::{
     ChatMessagePreview, ChatMessageRead, ChatMessageRef, ChatMessageReferenceStore,
     ChatMessageSearchCursor, ChatMessageSearchPage, ChatMessageSearchQuery,
-    ChatMessageUnavailableReason, ChatReferenceError, SharedChatReferenceStore,
+    ChatMessageUnavailableReason, ChatReferenceError, ChatSessionRef, SessionId,
+    SharedChatReferenceStore,
 };
 
-/// Width of the completion popup above the input card.
-const POPUP_WIDTH: Pixels = px(440.);
 /// Max height of the popup result list; rows scroll inside it.
 const POPUP_MAX_HEIGHT: Pixels = px(288.);
-/// Trigger character and toolbar affordance.
+/// Trigger character typed in the input to open completion.
 const TRIGGER_CHARACTER: char = '$';
 /// A query longer than this is treated as ordinary text (no completion).
 const MAX_QUERY_CHARS: usize = 64;
+const COMPOSER_MAX_WIDTH: Pixels = px(760.);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ComposerStatus {
+    pub pending: bool,
+    pub send_disabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComposerEvent {
+    Submit(String),
+    Stop,
+}
 
 // ---------------------------------------------------------------------------
 // Draft state
 // ---------------------------------------------------------------------------
 
+/// Identity of a Chat reference held by an Agent draft. A session-level
+/// chip and a message-level chip in the same chat are distinct.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ChatReferenceKind {
+    Session(ChatSessionRef),
+    Message(ChatMessageRef),
+}
+
 /// A Chat reference held by an Agent draft.
 ///
-/// Presentation metadata only: the durable part is the typed
-/// [`ChatMessageRef`]; the label fields are disposable display copies bounded
-/// by the catalog projection. The canonical message body is never retained.
+/// Presentation metadata only: the durable part is [`ChatReferenceKind`];
+/// the label fields are disposable display copies. The canonical message
+/// body is never retained.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChatReferenceDraft {
-    pub reference: ChatMessageRef,
+    pub kind: ChatReferenceKind,
     pub session_title: Option<String>,
     pub snippet: Option<String>,
     pub timestamp: i64,
 }
 
 impl ChatReferenceDraft {
-    /// Project a bounded exact read into a draft label. The read itself is
-    /// dropped; only the reference and short display text survive.
+    /// Project a bounded exact read into a message-level draft label.
     fn from_read(read: ChatMessageRead) -> Self {
         Self {
-            reference: read.reference,
+            kind: ChatReferenceKind::Message(read.reference),
             session_title: read.session_title,
             snippet: read.message.preview(),
             timestamp: read.timestamp,
+        }
+    }
+
+    /// Session-level chip: title only, no exact message read.
+    fn from_session(reference: ChatSessionRef, title: Option<String>, timestamp: i64) -> Self {
+        Self {
+            kind: ChatReferenceKind::Session(reference),
+            session_title: title,
+            snippet: None,
+            timestamp,
         }
     }
 
@@ -245,6 +278,47 @@ fn dedup_previews(previews: Vec<ChatMessagePreview>) -> Vec<ChatMessagePreview> 
         .collect()
 }
 
+/// Search hits grouped by Chat session, preserving first-seen order.
+#[derive(Clone, Debug)]
+struct SessionGroup {
+    session_id: SessionId,
+    session_title: Option<String>,
+    timestamp: i64,
+    messages: Vec<usize>,
+}
+
+fn group_search_results(results: &[ChatMessagePreview]) -> Vec<SessionGroup> {
+    let mut groups: Vec<SessionGroup> = Vec::new();
+    let mut index_by_session: HashMap<SessionId, usize> = HashMap::new();
+    for (index, row) in results.iter().enumerate() {
+        let session_id = row.reference.session_id.clone();
+        if let Some(&group_index) = index_by_session.get(&session_id) {
+            groups[group_index].messages.push(index);
+            if row.timestamp > groups[group_index].timestamp {
+                groups[group_index].timestamp = row.timestamp;
+            }
+            if groups[group_index].session_title.is_none() {
+                groups[group_index].session_title = row.session_title.clone();
+            }
+        } else {
+            index_by_session.insert(session_id.clone(), groups.len());
+            groups.push(SessionGroup {
+                session_id,
+                session_title: row.session_title.clone(),
+                timestamp: row.timestamp,
+                messages: vec![index],
+            });
+        }
+    }
+    groups
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisibleCompletionRow {
+    Session { group_index: usize },
+    Message { result_index: usize },
+}
+
 // ---------------------------------------------------------------------------
 // $ token parsing
 // ---------------------------------------------------------------------------
@@ -348,6 +422,7 @@ struct CompletionState {
     token: Option<ActiveToken>,
     search: ReferenceSearch,
     cursor: usize,
+    expanded_session: Option<SessionId>,
 }
 
 /// Chat-style draft composer for the Agent workspace: reference chips, a
@@ -360,11 +435,13 @@ struct CompletionState {
 /// late results on top of that.
 pub(crate) struct ChatReferenceComposer {
     input: Entity<InputState>,
+    references_enabled: bool,
+    status: Rc<Cell<ComposerStatus>>,
     completion: CompletionState,
     drafts: Vec<ChatReferenceDraft>,
-    selected: HashSet<ChatMessageRef>,
-    /// References with an in-flight exact read, so quick re-confirms cannot
-    /// enqueue duplicate work.
+    selected: HashSet<ChatReferenceKind>,
+    /// Message references with an in-flight exact read, so quick re-confirms
+    /// cannot enqueue duplicate work.
     pending: HashSet<ChatMessageRef>,
     confirm_error: Option<ReferenceConfirmError>,
     _search_task: Option<Task<()>>,
@@ -375,10 +452,39 @@ pub(crate) struct ChatReferenceComposer {
 }
 
 impl ChatReferenceComposer {
+    #[allow(dead_code)]
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let placeholder: SharedString = t!("reference_picker.composer_placeholder")
-            .to_string()
-            .into();
+        Self::with_references(Rc::new(Cell::new(ComposerStatus::default())), window, cx)
+    }
+
+    pub(crate) fn chat(
+        status: Rc<Cell<ComposerStatus>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(false, status, window, cx)
+    }
+
+    pub(crate) fn with_references(
+        status: Rc<Cell<ComposerStatus>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(true, status, window, cx)
+    }
+
+    fn build(
+        references_enabled: bool,
+        status: Rc<Cell<ComposerStatus>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let placeholder: SharedString = if references_enabled {
+            t!("reference_picker.composer_placeholder").to_string()
+        } else {
+            t!("chat.placeholder").to_string()
+        }
+        .into();
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .auto_grow(1, 8)
@@ -390,9 +496,17 @@ impl ChatReferenceComposer {
                 &input,
                 window,
                 |this, input, event, window, cx| match event {
-                    InputEvent::Change => this.sync_completion_with_input(input, window, cx),
+                    InputEvent::Change if this.references_enabled => {
+                        this.sync_completion_with_input(input, window, cx)
+                    }
                     InputEvent::PressEnter { shift: false, .. } if this.completion.is_open() => {
                         this.confirm_completion(window, cx);
+                    }
+                    InputEvent::PressEnter { shift: false, .. } => {
+                        let text = input.read(cx).value().trim().to_string();
+                        if !text.is_empty() && !this.status.get().send_disabled {
+                            cx.emit(ComposerEvent::Submit(text));
+                        }
                     }
                     _ => {}
                 },
@@ -400,10 +514,13 @@ impl ChatReferenceComposer {
 
         Self {
             input,
+            references_enabled,
+            status,
             completion: CompletionState {
                 token: None,
                 search: ReferenceSearch::new(),
                 cursor: 0,
+                expanded_session: None,
             },
             drafts: Vec::new(),
             selected: HashSet::new(),
@@ -413,6 +530,37 @@ impl ChatReferenceComposer {
             _read_tasks: Vec::new(),
             _input_subscription: subscription,
         }
+    }
+
+    pub(crate) fn input(&self) -> Entity<InputState> {
+        self.input.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn references_enabled(&self) -> bool {
+        self.references_enabled
+    }
+
+    pub(crate) fn set_placeholder(
+        &self,
+        placeholder: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input.update(cx, |state, cx| {
+            state.set_placeholder(placeholder, window, cx)
+        });
+    }
+
+    pub(crate) fn clear_after_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.drafts.clear();
+        self.selected.clear();
+        self.pending.clear();
+        self.confirm_error = None;
+        self.close_completion_popup();
+        cx.notify();
     }
 
     /// True while the completion popup should render.
@@ -427,18 +575,30 @@ impl ChatReferenceComposer {
 
     /// Programmatically close the popup (e.g. when leaving the workspace).
     pub(crate) fn dismiss_completion(&mut self, cx: &mut Context<Self>) {
-        if self.completion.token.take().is_some() {
+        if self.completion.is_open() {
+            self.close_completion_popup();
             cx.notify();
         }
     }
 
-    /// Insert the `$` trigger at the caret so the toolbar button opens the
-    /// same completion flow as typing the character.
-    pub(crate) fn insert_trigger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.input.update(cx, |state, cx| {
-            state.insert(TRIGGER_CHARACTER.to_string(), window, cx);
-            state.focus(window, cx);
-        });
+    fn close_completion_popup(&mut self) {
+        self.completion.token = None;
+        self.completion.expanded_session = None;
+        self._search_task = None;
+    }
+
+    fn visible_completion_rows(&self) -> Vec<VisibleCompletionRow> {
+        let groups = group_search_results(&self.completion.search.results);
+        let mut rows = Vec::new();
+        for (group_index, group) in groups.iter().enumerate() {
+            rows.push(VisibleCompletionRow::Session { group_index });
+            if self.completion.expanded_session.as_ref() == Some(&group.session_id) {
+                for &result_index in &group.messages {
+                    rows.push(VisibleCompletionRow::Message { result_index });
+                }
+            }
+        }
+        rows
     }
 
     // ----- completion flow -----
@@ -460,6 +620,7 @@ impl ChatReferenceComposer {
             return;
         }
         self.completion.cursor = 0;
+        self.completion.expanded_session = None;
         match token {
             None => {
                 self._search_task = None;
@@ -512,12 +673,12 @@ impl ChatReferenceComposer {
         }));
     }
 
-    /// Move the popup cursor by `delta`, clamped to the current result rows.
+    /// Move the popup cursor by `delta`, clamped to visible session/turn rows.
     fn move_completion_cursor(&mut self, delta: isize, cx: &mut Context<Self>) {
         if !self.completion.is_open() {
             return;
         }
-        let len = self.completion.search.results.len();
+        let len = self.visible_completion_rows().len();
         if len == 0 {
             return;
         }
@@ -529,33 +690,96 @@ impl ChatReferenceComposer {
         }
     }
 
-    /// Confirm the row under the popup cursor (Enter). Removes the `$token`
-    /// text and routes the typed reference through the background read.
-    fn confirm_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let row = self
-            .completion
-            .search
-            .results
-            .get(self.completion.cursor)
-            .cloned();
-        let Some(row) = row else {
+    fn expand_highlighted_session(&mut self, cx: &mut Context<Self>) {
+        let rows = self.visible_completion_rows();
+        let Some(row) = rows.get(self.completion.cursor).copied() else {
             return;
         };
-        self.complete_row(&row, window, cx);
+        match row {
+            VisibleCompletionRow::Session { group_index } => {
+                let groups = group_search_results(&self.completion.search.results);
+                let Some(group) = groups.get(group_index) else {
+                    return;
+                };
+                if self.completion.expanded_session.as_ref() == Some(&group.session_id) {
+                    if !group.messages.is_empty() {
+                        self.completion.cursor += 1;
+                        cx.notify();
+                    }
+                    return;
+                }
+                self.completion.expanded_session = Some(group.session_id.clone());
+                cx.notify();
+            }
+            VisibleCompletionRow::Message { .. } => {}
+        }
     }
 
-    fn complete_row(
-        &mut self,
-        row: &ChatMessagePreview,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn collapse_highlighted_session(&mut self, cx: &mut Context<Self>) {
+        let rows = self.visible_completion_rows();
+        let Some(row) = rows.get(self.completion.cursor).copied() else {
+            return;
+        };
+        match row {
+            VisibleCompletionRow::Message { .. } => {
+                let Some(session_id) = self.completion.expanded_session.clone() else {
+                    return;
+                };
+                self.completion.expanded_session = None;
+                let groups = group_search_results(&self.completion.search.results);
+                let rows = self.visible_completion_rows();
+                if let Some(index) = rows.iter().position(|row| match row {
+                    VisibleCompletionRow::Session { group_index } => groups
+                        .get(*group_index)
+                        .is_some_and(|group| group.session_id == session_id),
+                    VisibleCompletionRow::Message { .. } => false,
+                }) {
+                    self.completion.cursor = index;
+                }
+                cx.notify();
+            }
+            VisibleCompletionRow::Session { group_index } => {
+                let groups = group_search_results(&self.completion.search.results);
+                let Some(group) = groups.get(group_index) else {
+                    return;
+                };
+                if self.completion.expanded_session.as_ref() == Some(&group.session_id) {
+                    self.completion.expanded_session = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Confirm the row under the popup cursor (Enter).
+    fn confirm_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.visible_completion_rows();
+        let Some(row) = rows.get(self.completion.cursor).copied() else {
+            return;
+        };
+        match row {
+            VisibleCompletionRow::Session { group_index } => {
+                let groups = group_search_results(&self.completion.search.results);
+                let Some(group) = groups.get(group_index).cloned() else {
+                    return;
+                };
+                self.complete_session(&group, window, cx);
+            }
+            VisibleCompletionRow::Message { result_index } => {
+                let Some(preview) = self.completion.search.results.get(result_index).cloned()
+                else {
+                    return;
+                };
+                self.complete_message(&preview, window, cx);
+            }
+        }
+    }
+
+    fn remove_active_token(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (value, cursor) = {
             let state = self.input.read(cx);
             (state.value(), state.cursor())
         };
-        // Re-parse at confirm time: the stored token may predate the last
-        // edit if a click raced a keystroke.
         if let Some(token) = active_dollar_token(&value, cursor) {
             let cursor_after_removal = token.start;
             let mut new_value = String::with_capacity(value.len());
@@ -563,11 +787,44 @@ impl ChatReferenceComposer {
             new_value.push_str(&value[token.end..]);
             self.input.update(cx, |state, cx| {
                 state.replace_all(new_value, window, cx);
-                // Multi-line `replace_all` rewinds the caret to the start;
-                // park it where the token used to begin instead.
                 state.set_selected_range(cursor_after_removal..cursor_after_removal, cx);
             });
         }
+    }
+
+    fn complete_session(
+        &mut self,
+        group: &SessionGroup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(reference) = ChatSessionRef::new(group.session_id.clone()) else {
+            return;
+        };
+        self.remove_active_token(window, cx);
+        self.close_completion_popup();
+        self.confirm_error = None;
+        let kind = ChatReferenceKind::Session(reference.clone());
+        if self.selected.insert(kind.clone()) {
+            self.drafts.push(ChatReferenceDraft::from_session(
+                reference,
+                group.session_title.clone(),
+                group.timestamp,
+            ));
+        }
+        cx.notify();
+    }
+
+    fn complete_message(
+        &mut self,
+        row: &ChatMessagePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remove_active_token(window, cx);
+        // `replace_all` does not emit InputEvent::Change, so close the popup
+        // explicitly. Leaving `token` set would keep a stale overlay open.
+        self.close_completion_popup();
         self.handle_select(row, cx);
     }
 
@@ -578,7 +835,8 @@ impl ChatReferenceComposer {
     /// sources surface as typed errors instead of ghost chips.
     fn handle_select(&mut self, row: &ChatMessagePreview, cx: &mut Context<Self>) {
         self.confirm_error = None;
-        if self.selected.contains(&row.reference) || self.pending.contains(&row.reference) {
+        let kind = ChatReferenceKind::Message(row.reference.clone());
+        if self.selected.contains(&kind) || self.pending.contains(&row.reference) {
             return;
         }
         let Some(store) = chat_reference_store(cx) else {
@@ -612,7 +870,7 @@ impl ChatReferenceComposer {
         match result {
             Ok(read) => {
                 let draft = ChatReferenceDraft::from_read(read);
-                if self.selected.insert(draft.reference.clone()) {
+                if self.selected.insert(draft.kind.clone()) {
                     self.drafts.push(draft);
                 }
             }
@@ -629,10 +887,12 @@ impl ChatReferenceComposer {
 
     /// Remove a reference from the draft. This only touches local draft
     /// state; the Chat source is untouched.
-    fn remove_draft(&mut self, reference: ChatMessageRef, cx: &mut Context<Self>) {
-        self.pending.remove(&reference);
-        self.drafts.retain(|draft| draft.reference != reference);
-        self.selected.remove(&reference);
+    fn remove_draft(&mut self, kind: ChatReferenceKind, cx: &mut Context<Self>) {
+        if let ChatReferenceKind::Message(reference) = &kind {
+            self.pending.remove(reference);
+        }
+        self.drafts.retain(|draft| draft.kind != kind);
+        self.selected.remove(&kind);
         cx.notify();
     }
 
@@ -645,7 +905,7 @@ impl ChatReferenceComposer {
             .px_1p5()
             .pt_1()
             .children(self.drafts.iter().enumerate().map(|(index, draft)| {
-                let reference = draft.reference.clone();
+                let kind = draft.kind.clone();
                 Tag::secondary()
                     .small()
                     .rounded_full()
@@ -666,7 +926,7 @@ impl ChatReferenceComposer {
                                 .tooltip(t!("reference_picker.remove").to_string())
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
-                                        this.remove_draft(reference.clone(), cx);
+                                        this.remove_draft(kind.clone(), cx);
                                     },
                                 )),
                             ),
@@ -674,14 +934,14 @@ impl ChatReferenceComposer {
             }))
     }
 
-    fn render_completion_row(
+    fn render_session_completion_row(
         &self,
-        index: usize,
-        row: &ChatMessagePreview,
+        visible_index: usize,
+        group: &SessionGroup,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let title: SharedString = row
+        let title: SharedString = group
             .session_title
             .as_deref()
             .map(str::trim)
@@ -691,6 +951,110 @@ impl ChatReferenceComposer {
                 ToOwned::to_owned,
             )
             .into();
+        let kind = ChatSessionRef::new(group.session_id.clone())
+            .ok()
+            .map(ChatReferenceKind::Session);
+        let checked = kind
+            .as_ref()
+            .is_some_and(|kind| self.selected.contains(kind));
+        let selected = visible_index == self.completion.cursor;
+        let expanded = self.completion.expanded_session.as_ref() == Some(&group.session_id);
+        let chevron = if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let session_id = group.session_id.clone();
+        let confirm_group = group.clone();
+        let time = format_reference_time(chrono::Local::now().timestamp_millis(), group.timestamp);
+
+        div()
+            .id(SharedString::from(format!(
+                "reference-session-{}",
+                group.session_id
+            )))
+            .px_2()
+            .py_1p5()
+            .rounded(theme.radius)
+            .cursor_default()
+            .when(!selected, |this| {
+                this.hover(|this| this.bg(theme.accent.opacity(0.7)))
+            })
+            .when(selected, |this| this.bg(theme.accent))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.complete_session(&confirm_group, window, cx);
+            }))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "reference-session-expand-{}",
+                                group.session_id
+                            )))
+                            .cursor_default()
+                            .p_0p5()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                cx.stop_propagation();
+                                if this.completion.expanded_session.as_ref() == Some(&session_id) {
+                                    this.completion.expanded_session = None;
+                                } else {
+                                    this.completion.expanded_session = Some(session_id.clone());
+                                }
+                                let groups = group_search_results(&this.completion.search.results);
+                                let rows = this.visible_completion_rows();
+                                if let Some(index) = rows.iter().position(|row| match row {
+                                    VisibleCompletionRow::Session { group_index } => groups
+                                        .get(*group_index)
+                                        .is_some_and(|group| group.session_id == session_id),
+                                    VisibleCompletionRow::Message { .. } => false,
+                                }) {
+                                    this.completion.cursor = index;
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                Icon::new(chevron)
+                                    .size_3p5()
+                                    .text_color(theme.muted_foreground),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.foreground)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(time),
+                    )
+                    .when(checked, |this| {
+                        this.child(
+                            Icon::new(IconName::Check)
+                                .size_4()
+                                .text_color(theme.primary),
+                        )
+                    }),
+            )
+    }
+
+    fn render_message_completion_row(
+        &self,
+        visible_index: usize,
+        result_index: usize,
+        row: &ChatMessagePreview,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
         let role_tag = match row.role {
             Role::User => Tag::primary(),
             _ => Tag::secondary(),
@@ -698,12 +1062,18 @@ impl ChatReferenceComposer {
         .small()
         .rounded_full()
         .child(role_label(row.role));
-        let checked = self.selected.contains(&row.reference);
-        let selected = index == self.completion.cursor;
+        let checked = self
+            .selected
+            .contains(&ChatReferenceKind::Message(row.reference.clone()));
+        let selected = visible_index == self.completion.cursor;
         let time = format_reference_time(chrono::Local::now().timestamp_millis(), row.timestamp);
 
         div()
-            .id(SharedString::from(format!("reference-row-{index}")))
+            .id(SharedString::from(format!(
+                "reference-message-{}",
+                row.reference.entry_id
+            )))
+            .ml_4()
             .px_2()
             .py_1p5()
             .rounded(theme.radius)
@@ -712,47 +1082,19 @@ impl ChatReferenceComposer {
             })
             .when(selected, |this| this.bg(theme.accent))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                let row = this.completion.search.results.get(index).cloned();
-                if let Some(row) = row {
-                    this.completion.cursor = index;
-                    this.complete_row(&row, window, cx);
+                this.completion.cursor = visible_index;
+                if let Some(row) = this.completion.search.results.get(result_index).cloned() {
+                    this.complete_message(&row, window, cx);
                 }
             }))
             .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .items_center()
-                            .gap_1p5()
-                            .child(role_tag)
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .text_color(theme.foreground)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(time),
-                            )
-                            .when(checked, |this| {
-                                this.child(
-                                    Icon::new(IconName::Check)
-                                        .size_4()
-                                        .text_color(theme.primary),
-                                )
-                            }),
-                    )
-                    .child(
-                        h_flex().min_w_0().items_center().child(
+                v_flex().min_w_0().gap_0p5().child(
+                    h_flex()
+                        .min_w_0()
+                        .items_center()
+                        .gap_1p5()
+                        .child(role_tag)
+                        .child(
                             div()
                                 .min_w_0()
                                 .flex_1()
@@ -760,8 +1102,22 @@ impl ChatReferenceComposer {
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
                                 .child(row.preview.clone().unwrap_or_default()),
-                        ),
-                    ),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(time),
+                        )
+                        .when(checked, |this| {
+                            this.child(
+                                Icon::new(IconName::Check)
+                                    .size_4()
+                                    .text_color(theme.primary),
+                            )
+                        }),
+                ),
             )
     }
 
@@ -803,52 +1159,48 @@ impl ChatReferenceComposer {
                     .into_any_element(),
             ]
         } else {
-            search
-                .results
-                .iter()
+            let groups = group_search_results(&search.results);
+            let rows = self.visible_completion_rows();
+            rows.iter()
                 .enumerate()
-                .map(|(index, row)| {
-                    self.render_completion_row(index, row, cx)
-                        .into_any_element()
+                .filter_map(|(visible_index, row)| match *row {
+                    VisibleCompletionRow::Session { group_index } => {
+                        groups.get(group_index).map(|group| {
+                            self.render_session_completion_row(visible_index, group, cx)
+                                .into_any_element()
+                        })
+                    }
+                    VisibleCompletionRow::Message { result_index } => {
+                        search.results.get(result_index).map(|preview| {
+                            self.render_message_completion_row(
+                                visible_index,
+                                result_index,
+                                preview,
+                                cx,
+                            )
+                            .into_any_element()
+                        })
+                    }
                 })
                 .collect()
         };
 
         v_flex()
             .id("reference-completion")
-            .min_w(POPUP_WIDTH)
+            .w_full()
             .max_h(POPUP_MAX_HEIGHT)
             .overflow_y_scroll()
             .p_1()
             .child(v_flex().children(body))
-            .child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(t!("reference_picker.popup_hint").to_string()),
-            )
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let status = self.status.get();
         h_flex()
             .px_1p5()
             .items_center()
             .gap_1()
-            .child(
-                Button::new("reference-trigger")
-                    .ghost()
-                    .small()
-                    .label(TRIGGER_CHARACTER.to_string())
-                    .tooltip(t!("reference_picker.trigger_tooltip").to_string())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.insert_trigger(window, cx);
-                    })),
-            )
             .when_some(self.confirm_error.as_ref(), |this, error| {
                 this.child(
                     h_flex()
@@ -871,15 +1223,43 @@ impl ChatReferenceComposer {
                         ),
                 )
             })
-            .child(div().flex_1())
             .child(
-                Button::new("agent-send")
+                Button::new("attach")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Plus)
+                    .tooltip(t!("chat.attach").to_string()),
+            )
+            .child(div().flex_1())
+            .when(status.pending, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(t!("chat.generating").to_string()),
+                )
+            })
+            .child(if status.pending {
+                Button::new("stop")
+                    .primary()
+                    .icon(IconName::Close)
+                    .small()
+                    .tooltip(t!("chat.stop_tooltip").to_string())
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ComposerEvent::Stop)))
+            } else {
+                Button::new("send")
                     .primary()
                     .small()
                     .icon(IconName::ArrowUp)
-                    .disabled(true)
-                    .tooltip(t!("agent.send_disabled_tooltip").to_string()),
-            )
+                    .disabled(status.send_disabled)
+                    .tooltip(t!("chat.send_tooltip").to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let text = this.input.read(cx).value().trim().to_string();
+                        if !text.is_empty() && !this.status.get().send_disabled {
+                            cx.emit(ComposerEvent::Submit(text));
+                        }
+                    }))
+            })
     }
 }
 
@@ -891,71 +1271,111 @@ impl CompletionState {
 
 impl Render for ChatReferenceComposer {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let completion_open = self.is_completion_open();
+        let completion_open = self.references_enabled && self.is_completion_open();
         let (background, border, radius_lg) = {
             let theme = cx.theme();
             (theme.background, theme.border, theme.radius_lg)
         };
 
-        div()
-            .id("agent-composer")
-            .relative()
+        h_flex()
             .w_full()
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if !this.is_completion_open() {
-                    return;
-                }
-                let key = event.keystroke.key.as_str();
-                let control = event.keystroke.modifiers.control;
-                if key == "escape" {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    this.dismiss_completion(cx);
-                } else if control && key == "n" {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    this.move_completion_cursor(1, cx);
-                } else if control && key == "p" {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    this.move_completion_cursor(-1, cx);
-                }
-            }))
-            .when(completion_open, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .bottom_full()
-                        .left_0()
-                        .mb_2()
-                        .popover_style(cx)
-                        .shadow_md()
-                        .child(self.render_completion_popup(cx)),
-                )
-            })
+            .justify_center()
+            .px_6()
+            .pt_2()
+            .pb_3()
             .child(
-                v_flex()
+                div()
+                    .id("conversation-composer")
+                    .relative()
                     .w_full()
-                    .gap_0p5()
-                    .bg(background)
-                    .border_1()
-                    .border_color(border)
-                    .rounded(radius_lg)
-                    .shadow_md()
-                    .py_1()
-                    .when(!self.drafts.is_empty(), |this| {
-                        this.child(self.render_chips(cx))
+                    .max_w(COMPOSER_MAX_WIDTH)
+                    .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                        if this.is_completion_open() {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.expand_highlighted_session(cx);
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+                        if this.is_completion_open() {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.collapse_highlighted_session(cx);
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &MoveRight, window, cx| {
+                        if this.is_completion_open() {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.expand_highlighted_session(cx);
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &MoveLeft, window, cx| {
+                        if this.is_completion_open() {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.collapse_highlighted_session(cx);
+                        }
+                    }))
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if !this.is_completion_open() {
+                            return;
+                        }
+                        let key = event.keystroke.key.as_str();
+                        let control = event.keystroke.modifiers.control;
+                        if key == "escape" {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.dismiss_completion(cx);
+                        } else if control && key == "n" {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.move_completion_cursor(1, cx);
+                        } else if control && key == "p" {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            this.move_completion_cursor(-1, cx);
+                        }
+                    }))
+                    .when(completion_open, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .bottom_full()
+                                .left_0()
+                                .w_full()
+                                .mb_2()
+                                .popover_style(cx)
+                                .shadow_md()
+                                .child(self.render_completion_popup(cx)),
+                        )
                     })
                     .child(
-                        Input::new(&self.input)
-                            .appearance(false)
-                            .font_family(crate::appearance::fonts::active(cx).family())
-                            .pr(px(8.)),
-                    )
-                    .child(self.render_toolbar(cx)),
+                        v_flex()
+                            .w_full()
+                            .gap_0p5()
+                            .bg(background)
+                            .border_1()
+                            .border_color(border)
+                            .rounded(radius_lg)
+                            .shadow_md()
+                            .py_1()
+                            .when(self.references_enabled && !self.drafts.is_empty(), |this| {
+                                this.child(self.render_chips(cx))
+                            })
+                            .child(
+                                Input::new(&self.input)
+                                    .appearance(false)
+                                    .font_family(crate::appearance::fonts::active(cx).family())
+                                    .pr(px(8.)),
+                            )
+                            .child(self.render_toolbar(cx)),
+                    ),
             )
     }
 }
+
+impl EventEmitter<ComposerEvent> for ChatReferenceComposer {}
 
 #[cfg(test)]
 mod tests;

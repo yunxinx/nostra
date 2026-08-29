@@ -15,24 +15,25 @@ mod reasoning_card;
 mod render;
 mod scrolling;
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, ClickEvent, Context, ElementId, Entity,
-    EventEmitter, FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset,
-    ListState, ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _,
-    Subscription, Task, Window, div, list, point, px,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
+    FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
+    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
+    Task, Window, div, list, point, px,
 };
 use gpui_component::{
-    ActiveTheme, Disableable as _, ElementExt as _, IconName, Sizable as _, StyledExt as _,
-    WindowExt as _,
-    button::{Button, ButtonVariants as _},
-    h_flex,
-    input::{Input, InputEvent, InputState, RopeExt as _},
+    ActiveTheme, ElementExt as _, StyledExt as _, WindowExt as _, h_flex,
+    input::{InputEvent, InputState, RopeExt as _},
     notification::NotificationType,
     scroll::ScrollableElement as _,
     text::{TextView, TextViewStyle},
@@ -40,17 +41,20 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::appearance::fonts;
 use crate::llm::{
     ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
     ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
 use crate::session::{
-    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal, SessionId,
-    SessionOperationGuard, SessionStores, SharedSessionStore,
+    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
+    ConversationScope, ProjectIdentity, SessionId, SessionOperationGuard, SessionStores,
+    SharedSessionStore,
 };
-use crate::ui::markdown::MarkdownBody;
+use crate::ui::{
+    markdown::MarkdownBody,
+    reference_picker::{ChatReferenceComposer, ComposerEvent, ComposerStatus},
+};
 
 use self::error_card::TurnError;
 use self::hover_reveal::hover_reveal_copy;
@@ -105,6 +109,9 @@ pub struct ChatView {
     window_handle: AnyWindowHandle,
     messages: Vec<Message>,
     input: Entity<InputState>,
+    composer: Entity<ChatReferenceComposer>,
+    composer_status: Rc<Cell<ComposerStatus>>,
+    scope: ConversationScope,
     /// Placeholder text currently installed in the input state.  Compared
     /// against the live translation each frame so a language switch updates
     /// the composer without rebuilding it (and without notify loops).
@@ -167,86 +174,114 @@ pub struct ChatView {
 
 impl ChatView {
     pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| Self::new(window, cx))
+        cx.new(|cx| Self::new(ConversationScope::Chat, window, cx))
     }
 
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let placeholder: SharedString = t!("chat.placeholder").to_string().into();
-        let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .auto_grow(1, 8)
-                .submit_on_enter(true)
-                .placeholder(placeholder.clone())
-        });
+    pub(crate) fn project_view(
+        project: ProjectIdentity,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| Self::new(ConversationScope::Project(project), window, cx))
+    }
 
-        let subscription =
-            cx.subscribe_in(
-                &input,
-                window,
-                |this, input, event, window, cx| match event {
-                    InputEvent::PressEnter { shift, .. } if !shift => {
-                        let text = input.read(cx).value().trim().to_string();
-                        this.submit(text, window, cx);
-                    }
-                    InputEvent::Change => {
-                        this.composer_revision = this.composer_revision.saturating_add(1);
-                        // After an edit that lands the caret on the last line
-                        // (typing at the end, or pasting a block of text), snap
-                        // the composer viewport to the bottom.  The component's
-                        // own paste follow-scroll computes against the previous
-                        // frame's layout, so pasting many lines into a shorter
-                        // document clamps its scroll target to zero and the view
-                        // stays stuck at the top.
-                        let (input_empty, cursor_line, lines_len, x) = {
-                            let state = input.read(cx);
-                            (
-                                state.value().is_empty(),
-                                state.cursor_position().line as usize,
-                                state.text().lines_len(),
-                                state.scroll_offset().x,
-                            )
-                        };
-                        this.input_empty = input_empty;
-                        if lines_len > 1 && cursor_line + 1 == lines_len {
-                            input.update(cx, |state, cx| {
-                                state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
-                            });
-                        }
-                    }
-                    _ => {}
-                },
-            );
+    fn new(scope: ConversationScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let placeholder: SharedString = match &scope {
+            ConversationScope::Chat => t!("chat.placeholder").to_string(),
+            ConversationScope::Project(_) => {
+                t!("reference_picker.composer_placeholder").to_string()
+            }
+        }
+        .into();
+        let composer_status = Rc::new(Cell::new(ComposerStatus::default()));
+        let composer = cx.new(|cx| match &scope {
+            ConversationScope::Chat => {
+                ChatReferenceComposer::chat(composer_status.clone(), window, cx)
+            }
+            ConversationScope::Project(_) => {
+                ChatReferenceComposer::with_references(composer_status.clone(), window, cx)
+            }
+        });
+        let input = composer.read(cx).input();
+
+        let composer_subscription = cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, event, window, cx| match event {
+                ComposerEvent::Submit(text) => {
+                    this.submit(text.clone(), window, cx);
+                }
+                ComposerEvent::Stop => this.cancel_reply(),
+            },
+        );
+
+        let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
+            if let InputEvent::Change = event {
+                this.composer_revision = this.composer_revision.saturating_add(1);
+                // After an edit that lands the caret on the last line
+                // (typing at the end, or pasting a block of text), snap
+                // the composer viewport to the bottom.  The component's
+                // own paste follow-scroll computes against the previous
+                // frame's layout, so pasting many lines into a shorter
+                // document clamps its scroll target to zero and the view
+                // stays stuck at the top.
+                let (input_empty, cursor_line, lines_len, x) = {
+                    let state = input.read(cx);
+                    (
+                        state.value().is_empty(),
+                        state.cursor_position().line as usize,
+                        state.text().lines_len(),
+                        state.scroll_offset().x,
+                    )
+                };
+                this.input_empty = input_empty;
+                if lines_len > 1 && cursor_line + 1 == lines_len {
+                    input.update(cx, |state, cx| {
+                        state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
+                    });
+                }
+            }
+        });
 
         let selection = providers::last_selection(cx);
         let selection_available = providers::selection_is_available(selection.as_ref(), cx);
         let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
-        let (session_controller, session_store, session_unavailable) =
-            match cx.try_global::<SessionStores>() {
-                Some(stores) => match stores.chat() {
+        let (session_controller, session_store, session_unavailable) = match cx
+            .try_global::<SessionStores>()
+        {
+            Some(stores) => {
+                let lifecycle = match &scope {
+                    ConversationScope::Chat => stores.chat(),
+                    ConversationScope::Project(_) => stores.agent(),
+                };
+                match lifecycle {
                     Ok(store) => {
-                        let controller_store = store.clone();
-                        (
-                            Some(Arc::new(Mutex::new(ChatSessionController::new(
-                                controller_store,
-                            )))),
-                            Some(store),
-                            None,
-                        )
+                        let controller = match &scope {
+                            ConversationScope::Chat => ChatSessionController::new(store.clone()),
+                            ConversationScope::Project(project) => {
+                                ChatSessionController::for_project(store.clone(), project.clone())
+                            }
+                        };
+                        (Some(Arc::new(Mutex::new(controller))), Some(store), None)
                     }
                     Err(error) => (None, None, Some(error.to_string())),
-                },
-                None => (
-                    None,
-                    None,
-                    Some("Chat session storage has not been initialized".to_string()),
-                ),
-            };
+                }
+            }
+            None => (
+                None,
+                None,
+                Some("Chat session storage has not been initialized".to_string()),
+            ),
+        };
         Self {
             window_handle: window.window_handle(),
             messages: Vec::new(),
             input,
+            composer,
+            composer_status,
+            scope,
             placeholder,
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
@@ -278,10 +313,30 @@ impl ChatView {
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             next_turn_id: 1,
-            _subscriptions: vec![subscription],
+            _subscriptions: vec![composer_subscription, subscription],
             #[cfg(test)]
             materialized_message_indices: std::collections::BTreeSet::new(),
         }
+    }
+
+    pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.focus_input(window, cx));
+    }
+
+    pub(crate) fn dismiss_composer_completion(&self, cx: &mut Context<Self>) {
+        self.composer
+            .update(cx, |composer, cx| composer.dismiss_completion(cx));
+    }
+
+    pub(crate) fn has_in_flight_work(&self) -> bool {
+        self.pending
+            || self.persistence_pending
+            || self.deletion_requested
+            || self.deletion_pending
+            || self.pending_turn_id.is_some()
+            || self.terminal_persistence.is_some()
+            || self.pending_terminal.is_some()
     }
 
     /// Force the newest message into view.  Used right after the user sends a
@@ -737,15 +792,6 @@ impl ChatView {
         }
         self.selection_available = providers::selection_is_available(self.selection.as_ref(), cx);
         self.provider_catalog_revision = revision;
-    }
-
-    fn on_send_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.input.read(cx).value().trim().to_string();
-        self.submit(text, window, cx);
-    }
-
-    fn on_stop_click(&mut self, _: &ClickEvent, _: &mut Window, _: &mut Context<Self>) {
-        self.cancel_reply();
     }
 }
 

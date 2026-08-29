@@ -52,6 +52,9 @@ account:
   settings:
     en: Settings…
     zh-CN: 设置…
+  work_mode:
+    en: Work mode
+    zh-CN: 工作模式
   switch_to_light:
     en: Switch to light mode
     zh-CN: 切换到浅色模式
@@ -248,6 +251,12 @@ settings:
   restore_last_chat_desc:
     en: Reopen the most recently active conversation when Nostra launches. The first catalog frame is never blocked; a missing or invalid session falls back to the empty workspace.
     zh-CN: 启动 Nostra 时重新打开最近活动的会话。首帧目录不会被阻塞；会话缺失或无效时回退到空工作区。
+  restore_last_workspace:
+    en: Restore last workspace on start
+    zh-CN: 启动时恢复上次工作区
+  restore_last_workspace_desc:
+    en: Reopen the last selected Chat or Project workspace when Nostra launches. When disabled, Nostra always starts in Chat.
+    zh-CN: 启动 Nostra 时重新打开上次选择的聊天或项目工作区。关闭后将始终从聊天工作区启动。
   theme_mode:
     en: Theme mode
     zh-CN: 主题模式
@@ -479,23 +488,71 @@ settings:
       zh-CN: 基于 Apache License 2.0 许可发布。
 agent:
   mode:
-    en: Agent
-    zh-CN: 智能体
-  new_session:
-    en: New session
-    zh-CN: 新建会话
+    en: Project
+    zh-CN: 项目
+  new_draft:
+    en: New conversation
+    zh-CN: 新对话
   open_folder:
     en: Open Folder…
     zh-CN: 打开文件夹…
   open_folder_prompt:
-    en: Choose a folder for the Agent project
-    zh-CN: 选择智能体工作项目文件夹
+    en: Choose a folder for the project
+    zh-CN: 选择项目工作文件夹
   guide_title:
     en: Open a folder to get started
     zh-CN: 打开一个文件夹开始
   guide_hint:
-    en: The folder becomes the Agent work project that your sessions belong to.
-    zh-CN: 该文件夹将作为智能体的工作项目，会话归属于它。
+    en: The folder becomes the work project that your sessions belong to.
+    zh-CN: 该文件夹将作为工作项目，会话归属于它。
+  idle_title:
+    en: Select a conversation
+    zh-CN: 选择一个对话
+  idle_hint:
+    en: Open a session, or create one with + on a project row.
+    zh-CN: 打开一个会话，或通过项目行上的 + 新建对话。
+  show_more:
+    en: Show more
+    zh-CN: 显示更多
+  time_just_now:
+    en: Just now
+    zh-CN: 刚刚
+  time_hours_ago:
+    en: "%{n}h ago"
+    zh-CN: "%{n} 小时前"
+  time_days_ago:
+    en: "%{n}d ago"
+    zh-CN: "%{n} 天前"
+  new_in_project:
+    en: New conversation in this project
+    zh-CN: 在此项目下新建对话
+  delete_session:
+    en: Delete conversation
+    zh-CN: 删除对话
+  delete_session_title:
+    en: Delete this conversation?
+    zh-CN: 删除这个对话？
+  delete_session_description:
+    en: '"%{title}" and its messages will be permanently removed.'
+    zh-CN: '“%{title}”及其中的消息将被永久删除。'
+  delete_project:
+    en: Delete project
+    zh-CN: 删除项目
+  delete_project_title:
+    en: Delete this project from Nostra?
+    zh-CN: 从 Nostra 中删除这个项目？
+  delete_project_description:
+    en: 'All conversations in "%{name}" will be permanently removed. The local folder and its files will not be deleted.'
+    zh-CN: '“%{name}”中的全部对话将被永久删除。本地文件夹及其中的文件不会被删除。'
+  delete_failed:
+    en: The project data could not be deleted. Nothing was removed from the workspace.
+    zh-CN: 项目数据删除失败，工作区中的内容未被移除。
+  delete_busy:
+    en: Stop the active response before deleting this project.
+    zh-CN: 请先停止当前响应，再删除这个项目。
+  deleting_project:
+    en: Deleting project conversations…
+    zh-CN: 正在删除项目对话…
   welcome_title:
     en: What are we working on?
     zh-CN: 这个项目要做什么？
@@ -503,14 +560,11 @@ agent:
     en: "Type below to draft the conversation.  Enter $ to reference a chat message."
     zh-CN: "在下方输入内容草拟对话。输入 $ 可引用聊天消息。"
   send_disabled_tooltip:
-    en: The agent runtime is not connected yet
-    zh-CN: 智能体运行时尚未接入
+    en: The project runtime is not connected yet
+    zh-CN: 项目运行时尚未接入
   projects:
     en: Projects
     zh-CN: 项目
-  sessions:
-    en: Sessions
-    zh-CN: 会话
   loading:
     en: Loading…
     zh-CN: 加载中…
@@ -530,8 +584,8 @@ agent:
     en: No projects yet
     zh-CN: 还没有项目
   no_projects_hint:
-    en: Agent sessions will appear here.
-    zh-CN: 智能体会话将显示在这里。
+    en: Project sessions will appear here.
+    zh-CN: 项目会话将显示在这里。
   no_sessions:
     en: No sessions in this project
     zh-CN: 此项目中没有会话
@@ -570,20 +624,17 @@ agent:
     zh-CN: "[工具结果]"
 reference_picker:
   composer_placeholder:
-    en: "Ask the agent…  Type $ to reference a chat message."
-    zh-CN: "向智能体提问…输入 $ 引用聊天消息。"
-  trigger_tooltip:
-    en: "Reference a chat message ($)"
-    zh-CN: "引用聊天消息（$）"
+    en: "Ask about the project…  Type $ to reference a chat."
+    zh-CN: "向项目提问…输入 $ 引用聊天。"
   hint:
-    en: Type to search your chat history
-    zh-CN: 输入关键词搜索聊天记录
-  popup_hint:
-    en: "Enter to confirm · Ctrl-N/P to select · Esc to dismiss"
-    zh-CN: "Enter 确认 · Ctrl-N/P 选择 · Esc 关闭"
+    en: Type to search your chats
+    zh-CN: 输入关键词搜索聊天
   empty:
-    en: No matching messages
-    zh-CN: 没有匹配的消息
+    en: No matching chats
+    zh-CN: 没有匹配的会话
+  empty_turns:
+    en: No matching turns in this chat
+    zh-CN: 此会话中没有匹配的轮次
   error_search:
     en: Failed to search chat history
     zh-CN: 搜索聊天记录失败
