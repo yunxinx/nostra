@@ -3,7 +3,10 @@
 mod capability;
 mod component;
 
-pub use capability::{CapabilityId, CapabilityKey};
+pub use capability::{
+    CapabilityId, CapabilityKey, CapabilityLease, ExclusiveCapabilitySlot, ExclusiveSlotError,
+    PreparedCapability, ProviderRegistration,
+};
 pub use component::{ComponentGeneration, ComponentId, ScopeId};
 
 #[cfg(test)]
