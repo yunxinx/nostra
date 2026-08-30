@@ -4,7 +4,7 @@ use super::*;
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_selection_availability(cx);
+        self.sync_selection_availability();
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
         let placeholder: SharedString = match &self.scope {
@@ -106,7 +106,13 @@ impl ChatView {
             let Some(message) = this.messages.get(index) else {
                 return div().into_any_element();
             };
-            let row = render_message(message, index, window, cx);
+            let row = render_message(
+                message,
+                index,
+                this.preference_snapshot.user_message_markdown,
+                window,
+                cx,
+            );
             div()
                 .w_full()
                 .when(index + 1 < message_count, |this| this.pb_5())
@@ -150,7 +156,9 @@ impl ChatView {
         // Inactive macOS windows may still receive wheel hit-tests, but their
         // frame delivery is throttled. Keep those events on GPUI's native
         // path instead of queueing an animation that cannot advance smoothly.
-        if !smooth_scroll_animation_enabled(window, cx) || event.delta.precise() {
+        if !smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
+            || event.delta.precise()
+        {
             self.smooth_scroll.cancel_motion();
             return;
         }
@@ -184,7 +192,8 @@ impl ChatView {
         // A window can lose activation after the wheel event but before its
         // scheduled frame. Drop the queued motion rather than invalidating a
         // throttled, inactive window on every frame.
-        if !smooth_scroll_animation_enabled(window, cx) {
+        if !smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
+        {
             self.smooth_scroll.cancel_motion();
             return;
         }
@@ -233,7 +242,8 @@ impl ChatView {
         // Reasoning cards share the same inactive-window frame throttling as
         // the transcript, so cancel pending card easing when focus moves to a
         // different window.
-        if !smooth_scroll_animation_enabled(window, cx) {
+        if !smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
+        {
             if let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) {
                 trace.cancel_smooth_scroll_frame();
             }
@@ -296,6 +306,7 @@ impl ChatView {
 fn render_message(
     msg: &Message,
     message_index: usize,
+    render_user_markdown: bool,
     window: &mut Window,
     cx: &mut Context<ChatView>,
 ) -> impl IntoElement {
@@ -311,7 +322,6 @@ fn render_message(
         )
     };
     let is_user = msg.role == Role::User;
-    let render_user_markdown = crate::ui::markdown::user_message_markdown_enabled(cx);
     let parts = msg.parts.iter().filter_map(|part| {
             match part {
                 MessagePart::Text {
@@ -383,7 +393,10 @@ fn render_message(
                             this.smooth_scroll.cancel_motion();
                             // Do not start card easing from an inactive window:
                             // AppKit throttles its animation frames.
-                            let smooth = smooth_scroll_animation_enabled(window, cx)
+                            let smooth = smooth_scroll_animation_enabled(
+                                window,
+                                this.preference_snapshot.smooth_chat_scrolling,
+                            )
                                 && !event.delta.precise();
                             let Some(trace) = this.reasoning_trace_mut(message_ui_id, ui_id) else {
                                 return;

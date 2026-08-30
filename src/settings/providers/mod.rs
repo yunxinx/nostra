@@ -113,6 +113,7 @@ pub(super) struct ProvidersPage {
     /// Restored list width, used as the split's initial size on first render.
     list_width: Pixels,
     preference_handle: preferences::PreferenceHandle,
+    preference_snapshot: preferences::Preferences,
     /// Wire-format switches stay folded away until asked for.
     compatibility_open: bool,
     /// Row the pointer is over, so its remove button can appear.
@@ -129,13 +130,18 @@ pub(super) struct ProvidersPage {
 }
 
 impl ProvidersPage {
-    pub(super) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let selected = providers::profiles(cx)
+    pub(super) fn new(
+        preference_handle: preferences::PreferenceHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let preference_snapshot = preference_handle.snapshot();
+        let selected = providers::profiles_from(&preference_snapshot)
             .first()
             .map(|profile| profile.id.clone());
         let profile = selected
             .as_deref()
-            .and_then(|id| providers::find(id, cx))
+            .and_then(|id| providers::find_in(id, &preference_snapshot))
             .cloned();
         let placeholders = ProviderPlaceholders::resolve();
         let name = input_with_placeholder(
@@ -164,10 +170,9 @@ impl ProvidersPage {
             models: Vec::new(),
             placeholders,
             layout: cx.new(|_| ResizableState::default()),
-            preference_handle: preferences::handle(cx),
-            list_width: clamp_list_width(px(preferences::handle(cx)
-                .snapshot()
-                .provider_list_width)),
+            preference_handle: preference_handle.clone(),
+            preference_snapshot,
+            list_width: clamp_list_width(px(preference_handle.snapshot().provider_list_width)),
             compatibility_open: false,
             hovered: None,
             confirming: None,
@@ -176,6 +181,17 @@ impl ProvidersPage {
             _subscriptions: Vec::new(),
         };
         this.subscribe_profile_fields(window, cx);
+        this._subscriptions
+            .push(
+                cx.observe_global_in::<preferences::Prefs>(window, move |this, _, cx| {
+                    let snapshot = preference_handle.snapshot();
+                    if this.preference_snapshot == snapshot {
+                        return;
+                    }
+                    this.preference_snapshot = snapshot;
+                    cx.notify();
+                }),
+            );
         this.rebuild_models(profile.as_ref(), window, cx);
         this
     }
@@ -198,11 +214,16 @@ impl ProvidersPage {
                         return;
                     };
                     let value = input.read(cx).value().to_string();
-                    providers::update(&selected, cx, |profile| match field {
-                        ProfileField::Name => profile.name = value,
-                        ProfileField::BaseUrl => profile.base_url = value,
-                        ProfileField::ApiKey => profile.api_key = SecretString::new(value),
-                    });
+                    providers::update(
+                        &selected,
+                        &this.preference_handle,
+                        cx,
+                        |profile| match field {
+                            ProfileField::Name => profile.name = value,
+                            ProfileField::BaseUrl => profile.base_url = value,
+                            ProfileField::ApiKey => profile.api_key = SecretString::new(value),
+                        },
+                    );
                     cx.notify();
                 },
             ));
@@ -252,13 +273,15 @@ impl ProvidersPage {
             subscriptions.push(cx.subscribe_in(
                 &state,
                 window,
-                move |_, input, event, window, cx| match event {
+                move |this, input, event, window, cx| match event {
                     InputEvent::Focus => {
                         binding.remember_focus(input.read(cx).value().as_ref());
                     }
                     InputEvent::Change => {
                         let value = input.read(cx).value().to_string();
-                        let Some(profile) = providers::find(&binding.profile_id, cx) else {
+                        let preferences = this.preference_handle.snapshot();
+                        let Some(profile) = providers::find_in(&binding.profile_id, &preferences)
+                        else {
                             return;
                         };
                         let Some(value) = binding.accepted_value(profile, value) else {
@@ -268,6 +291,7 @@ impl ProvidersPage {
                         providers::update_model(
                             &binding.profile_id,
                             &binding.config_id,
+                            &this.preference_handle,
                             cx,
                             |model| set_model_field(model, field, value),
                         );
@@ -275,7 +299,8 @@ impl ProvidersPage {
                     }
                     InputEvent::Blur | InputEvent::PressEnter { .. } => {
                         let value = input.read(cx).value().to_string();
-                        let duplicate = providers::find(&binding.profile_id, cx)
+                        let preferences = this.preference_handle.snapshot();
+                        let duplicate = providers::find_in(&binding.profile_id, &preferences)
                             .is_some_and(|profile| !binding.value_is_available(profile, &value));
                         if !duplicate {
                             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -297,13 +322,17 @@ impl ProvidersPage {
                                 t!("settings.providers.duplicate_model_id").to_string()
                             }
                         };
-                        cx.defer_in(window, move |_, window, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
                             input.update(cx, |input, cx| {
                                 input.set_value(previous.clone(), window, cx)
                             });
-                            providers::update_model(&profile_id, &config_id, cx, |model| {
-                                set_model_field(model, field, previous.clone())
-                            });
+                            providers::update_model(
+                                &profile_id,
+                                &config_id,
+                                &this.preference_handle,
+                                cx,
+                                |model| set_model_field(model, field, previous.clone()),
+                            );
                             window.push_notification((NotificationType::Error, message), cx);
                             cx.notify();
                         });
@@ -324,7 +353,8 @@ impl ProvidersPage {
             return;
         }
         self.selected = Some(id.clone());
-        let profile = providers::find(&id, cx).cloned();
+        let preferences = self.preference_handle.snapshot();
+        let profile = providers::find_in(&id, &preferences).cloned();
         self.name.update(cx, |state, cx| {
             state.set_value(profile.as_ref().map_or("", |p| p.name.as_str()), window, cx)
         });
@@ -365,7 +395,7 @@ impl ProvidersPage {
             models: Vec::new(),
         };
         let id = profile.id.clone();
-        providers::add(profile, cx);
+        providers::add(profile, &self.preference_handle, cx);
         self.select(id, window, cx);
     }
 
@@ -388,7 +418,7 @@ impl ProvidersPage {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
         }
-        providers::remove(id, cx);
+        providers::remove(id, &self.preference_handle, cx);
         if self.hovered.as_deref() == Some(id) {
             self.hovered = None;
         }
@@ -397,7 +427,8 @@ impl ProvidersPage {
             return;
         }
 
-        let next = providers::profiles(cx)
+        let preferences = self.preference_handle.snapshot();
+        let next = providers::profiles_from(&preferences)
             .first()
             .map(|profile| profile.id.clone());
         self.selected = None;
@@ -424,7 +455,7 @@ impl ProvidersPage {
             model_id: String::new(),
             display_name: None,
         };
-        providers::add_model(&profile_id, model.clone(), cx);
+        providers::add_model(&profile_id, model.clone(), &self.preference_handle, cx);
         self.push_model_editor(&profile_id, &model, window, cx);
         cx.notify();
     }
@@ -433,7 +464,7 @@ impl ProvidersPage {
         let Some(profile_id) = self.selected.clone() else {
             return;
         };
-        providers::remove_model(&profile_id, id, cx);
+        providers::remove_model(&profile_id, id, &self.preference_handle, cx);
         self.models.retain(|model| model.id != id);
         cx.notify();
     }
@@ -442,7 +473,9 @@ impl ProvidersPage {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        providers::update(&id, cx, |profile| profile.protocol = protocol);
+        providers::update(&id, &self.preference_handle, cx, |profile| {
+            profile.protocol = protocol
+        });
         cx.notify();
     }
 
@@ -454,7 +487,9 @@ impl ProvidersPage {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        providers::update(&id, cx, |profile| update(&mut profile.compatibility));
+        providers::update(&id, &self.preference_handle, cx, |profile| {
+            update(&mut profile.compatibility)
+        });
         cx.notify();
     }
 
@@ -567,13 +602,14 @@ fn dropdown_row(
     label: String,
     info: String,
     control: AnyElement,
+    hide_info: bool,
     cx: &App,
 ) -> impl IntoElement {
     h_flex()
         .items_center()
         .justify_between()
         .gap_4()
-        .child(super::ui::labelled(label, id, info, cx))
+        .child(super::ui::labelled(label, id, info, hide_info, cx))
         .child(control)
 }
 

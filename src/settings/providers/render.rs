@@ -132,7 +132,7 @@ impl ProvidersPage {
             return div().into_any_element();
         };
 
-        let profile = providers::find(&selected, cx);
+        let profile = providers::find_in(&selected, &self.preference_snapshot);
         let protocol = profile.map(|profile| profile.protocol).unwrap_or_default();
         let compatibility = profile.map(|profile| profile.compatibility.clone());
 
@@ -150,6 +150,7 @@ impl ProvidersPage {
                 t!("settings.providers.name").to_string(),
                 t!("settings.providers.name_desc").to_string(),
                 Input::new(&self.name),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(field(
@@ -157,6 +158,7 @@ impl ProvidersPage {
                 t!("settings.providers.base_url").to_string(),
                 t!("settings.providers.base_url_desc").to_string(),
                 Input::new(&self.base_url),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             // A two-option dropdown needs no column of its own: label left,
@@ -183,6 +185,7 @@ impl ProvidersPage {
                         },
                     )
                 },
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(field(
@@ -192,6 +195,7 @@ impl ProvidersPage {
                 Input::new(&self.api_key)
                     .content_type(InputContentType::Password)
                     .suffix(self.render_mask_toggle(cx)),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(self.render_models(cx))
@@ -219,6 +223,7 @@ impl ProvidersPage {
                         label(t!("settings.providers.models").to_string(), cx),
                         "provider-models",
                         t!("settings.providers.models_desc").to_string(),
+                        self.preference_snapshot.hide_settings_info_buttons,
                         cx,
                     ))
                     .child(
@@ -279,7 +284,14 @@ fn label(text: String, cx: &App) -> impl IntoElement {
 /// beside it.  The label sits in a row-height box so the form's first label
 /// lands on the same baseline as the first list row and nav item; the tighter
 /// gap keeps the label-to-input distance where it was.
-fn field(id: &str, label_text: String, info: String, input: Input, cx: &App) -> impl IntoElement {
+fn field(
+    id: &str,
+    label_text: String,
+    info: String,
+    input: Input,
+    hide_info: bool,
+    cx: &App,
+) -> impl IntoElement {
     v_flex()
         .gap_1()
         .child(
@@ -290,6 +302,7 @@ fn field(id: &str, label_text: String, info: String, input: Input, cx: &App) -> 
                     label(label_text, cx),
                     id,
                     info,
+                    hide_info,
                     cx,
                 )),
         )

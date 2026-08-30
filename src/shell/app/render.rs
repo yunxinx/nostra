@@ -46,7 +46,12 @@ impl ChatApp {
     fn render_sidebar_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .size_full()
-            .bg(glass::background(cx.theme().sidebar, cx))
+            .bg(glass::background(
+                cx.theme().sidebar,
+                self.preference_snapshot.glass_effect,
+                self.preference_snapshot.glass_tint_opacity,
+                cx,
+            ))
             .text_color(cx.theme().sidebar_foreground)
             .child(self.render_sidebar_top_row(cx))
             .child(self.render_sidebar_content(window, cx))

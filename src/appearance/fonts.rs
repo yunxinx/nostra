@@ -49,13 +49,16 @@ pub fn active(cx: &App) -> ComposerFont {
 }
 
 /// Switch the composer font, persist the choice, and repaint everywhere.
-pub fn set(font: ComposerFont, cx: &mut App) {
+pub fn set(
+    font: ComposerFont,
+    preference_handle: &crate::preferences::PreferenceHandle,
+    cx: &mut App,
+) {
     if active(cx) == font {
         return;
     }
     cx.set_global(ActiveComposerFont(font));
-    let handle = crate::preferences::handle(cx);
-    crate::preferences::update_with(cx, &handle, |prefs| prefs.composer_font = font);
+    crate::preferences::update_with(cx, preference_handle, |prefs| prefs.composer_font = font);
     cx.refresh_windows();
 }
 

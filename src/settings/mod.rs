@@ -206,6 +206,7 @@ struct SettingsWindow {
     glass_opacity: Entity<SliderState>,
     window_geometry: WindowGeometry,
     preference_handle: PreferenceHandle,
+    preference_snapshot: preferences::Preferences,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -217,7 +218,8 @@ impl SettingsWindow {
     ) -> Self {
         #[cfg(target_os = "macos")]
         let glass_opacity = {
-            let initial_opacity = glass::tint_opacity(cx) * 100.;
+            let initial_opacity =
+                glass::tint_opacity(preference_handle.snapshot().glass_tint_opacity, cx) * 100.;
             cx.new(|_| {
                 SliderState::new()
                     .min(glass::MIN_TINT_PERCENT)
@@ -229,6 +231,16 @@ impl SettingsWindow {
         let bounds_subscription = cx.observe_window_bounds(window, |this, window, _| {
             this.window_geometry = WindowGeometry::from_window(window);
         });
+        let preferences_for_observer = preference_handle.clone();
+        let preference_subscription =
+            cx.observe_global_in::<preferences::Prefs>(window, move |this, _, cx| {
+                let snapshot = preferences_for_observer.snapshot();
+                if this.preference_snapshot == snapshot {
+                    return;
+                }
+                this.preference_snapshot = snapshot;
+                cx.notify();
+            });
         let preferences_for_release = preference_handle.clone();
         cx.on_release(move |this, cx| {
             let geometry = this.window_geometry;
@@ -236,34 +248,45 @@ impl SettingsWindow {
                 prefs.settings_window = Some(geometry)
             });
             #[cfg(target_os = "macos")]
-            glass::commit_tint_preview(cx);
+            glass::commit_tint_preview(&preferences_for_release, cx);
         })
         .detach();
 
         let mut subscriptions = vec![bounds_subscription];
         #[cfg(target_os = "macos")]
+        let preference_handle_for_slider = preference_handle.clone();
         subscriptions.push(cx.subscribe_in(
             &glass_opacity,
             window,
-            |_, _, event: &SliderEvent, _, cx| match event {
+            move |_, _, event: &SliderEvent, _, cx| match event {
                 SliderEvent::Change(value) => {
                     glass::preview_tint_opacity(value.start() / 100., cx);
                 }
                 SliderEvent::Release(value) => {
-                    glass::persist_tint_opacity(value.start() / 100., cx);
+                    glass::persist_tint_opacity(
+                        value.start() / 100.,
+                        &preference_handle_for_slider,
+                        cx,
+                    );
                 }
             },
         ));
 
+        let preference_snapshot = preference_handle.snapshot();
         Self {
             focus_handle: cx.focus_handle(),
             active: Page::General,
-            providers: cx.new(|cx| providers::ProvidersPage::new(window, cx)),
+            providers: cx
+                .new(|cx| providers::ProvidersPage::new(preference_handle.clone(), window, cx)),
             #[cfg(target_os = "macos")]
             glass_opacity,
             window_geometry: WindowGeometry::from_window(window),
             preference_handle,
-            _subscriptions: subscriptions,
+            preference_snapshot,
+            _subscriptions: {
+                subscriptions.push(preference_subscription);
+                subscriptions
+            },
         }
     }
 
@@ -325,7 +348,12 @@ impl SettingsWindow {
             .w(NAV_WIDTH)
             .h_full()
             .flex_shrink_0()
-            .bg(glass::background(cx.theme().sidebar, cx))
+            .bg(glass::background(
+                cx.theme().sidebar,
+                self.preference_snapshot.glass_effect,
+                self.preference_snapshot.glass_tint_opacity,
+                cx,
+            ))
             .text_color(cx.theme().sidebar_foreground)
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
@@ -342,9 +370,13 @@ impl SettingsWindow {
 
     fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.active {
-            Page::General => general::render(cx, &self.preference_handle),
+            Page::General => {
+                general::render(cx, &self.preference_handle, &self.preference_snapshot)
+            }
             Page::Appearance => appearance::render(
                 cx,
+                &self.preference_handle,
+                &self.preference_snapshot,
                 #[cfg(target_os = "macos")]
                 &self.glass_opacity,
             ),

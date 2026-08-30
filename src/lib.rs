@@ -106,7 +106,8 @@ fn install_action_handlers(cx: &mut App) {
         } else {
             preferences::ThemeMode::Dark
         };
-        theme::set_mode(Some(next), cx);
+        let preference_handle = preferences::handle(cx);
+        theme::set_mode(Some(next), &preference_handle, cx);
     });
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| settings::open(cx));

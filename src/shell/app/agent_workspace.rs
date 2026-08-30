@@ -731,7 +731,7 @@ impl ChatApp {
     }
 
     pub(super) fn merged_agent_projects(&self, _cx: &App) -> Vec<ProjectSummary> {
-        let persisted = self.preference_handle.snapshot().agent_projects;
+        let persisted = self.preference_snapshot.agent_projects.clone();
         merge_persisted_projects(self.agent.projects(), &persisted)
     }
 

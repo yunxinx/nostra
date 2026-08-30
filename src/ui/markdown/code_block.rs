@@ -35,7 +35,11 @@ pub(super) struct FencedCode {
     pub(super) start: usize,
 }
 
-pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensions {
+pub(crate) fn extensions(
+    owner_id: u64,
+    source_offset: usize,
+    preference_state: PreferenceState,
+) -> MarkdownExtensions {
     let extensions = MarkdownExtensions::default().cjk_emphasis_compatibility();
     crate::ui::math::extend(extensions, owner_id, source_offset)
         .block_parser(move |node, cx| {
@@ -78,6 +82,7 @@ pub(crate) fn extensions(owner_id: u64, source_offset: usize) -> MarkdownExtensi
                 code,
                 node.attached_selectable_text_state(),
                 owner_id,
+                preference_state.clone(),
                 window,
                 cx,
             )
@@ -307,6 +312,7 @@ pub(super) fn render(
     code: &FencedCode,
     attached_text_state: Option<&SelectableTextState>,
     owner_id: u64,
+    preference_state: PreferenceState,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -328,8 +334,17 @@ pub(super) fn render(
         )
     });
 
-    let global_wrap = global_wrap_enabled(cx);
-    let global_wrap_revision = preferences::handle(cx).snapshot().code_block_wrap_revision;
+    let (global_wrap, global_wrap_revision, show_line_numbers) = {
+        let preferences = match preference_state.lock() {
+            Ok(preferences) => preferences,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        (
+            preferences.code_block_wrap,
+            preferences.code_block_wrap_revision,
+            preferences.code_block_line_numbers,
+        )
+    };
     let wrap_state_id: SharedString =
         format!("markdown-code-wrap-state-{owner_id}-{}", code.start).into();
     let wrap_state = window.use_keyed_state(wrap_state_id, cx, |_, _| {
@@ -341,7 +356,6 @@ pub(super) fn render(
     } else {
         global_wrap
     };
-    let show_line_numbers = line_numbers_enabled(cx);
     let number_width = line_count.max(1).to_string().len();
     let text_state = attached_text_state
         .cloned()

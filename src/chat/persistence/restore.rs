@@ -61,7 +61,13 @@ impl ChatView {
         let messages = state
             .messages
             .iter()
-            .map(|resolved| Message::from_canonical(resolved.message.clone(), cx))
+            .map(|resolved| {
+                Message::from_canonical_with_preferences(
+                    resolved.message.clone(),
+                    self.preference_state.clone(),
+                    cx,
+                )
+            })
             .collect::<Vec<_>>();
         let previous_len = self.messages.len();
         self.messages = messages;
@@ -77,8 +83,10 @@ impl ChatView {
 
         if let Some(model) = restored_model {
             self.selection = Some(model);
-            self.selection_available =
-                providers::selection_is_available(self.selection.as_ref(), cx);
+            self.selection_available = providers::selection_is_available_from(
+                self.selection.as_ref(),
+                &self.preference_snapshot,
+            );
             self.provider_catalog_revision = providers::catalog_revision();
         }
 

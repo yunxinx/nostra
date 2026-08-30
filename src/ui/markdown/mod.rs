@@ -2,7 +2,10 @@
 
 mod code_block;
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -26,6 +29,8 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::preferences;
+
+pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
 
 use self::code_block::extensions;
 #[cfg(test)]
@@ -121,11 +126,22 @@ pub(crate) struct MarkdownBody {
 }
 
 impl MarkdownBody {
-    pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
+    pub(crate) fn new_with_preferences(
+        source: &str,
+        owner_id: u64,
+        preference_state: PreferenceState,
+        cx: &mut App,
+    ) -> Self {
         Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
-            extensions: extensions(owner_id, 0),
+            extensions: extensions(owner_id, 0, preference_state),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
+        let preference_state = preferences::test_handle(cx).shared_preferences();
+        Self::new_with_preferences(source, owner_id, preference_state, cx)
     }
 
     pub(crate) fn push_str(&mut self, delta: &str, cx: &mut App) {
@@ -170,33 +186,41 @@ impl MarkdownBody {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn global_wrap_enabled(cx: &App) -> bool {
     preferences::handle(cx).snapshot().code_block_wrap
 }
 
+#[cfg(test)]
 pub(crate) fn line_numbers_enabled(cx: &App) -> bool {
     preferences::handle(cx).snapshot().code_block_line_numbers
 }
 
-pub(crate) fn user_message_markdown_enabled(cx: &App) -> bool {
-    preferences::handle(cx).snapshot().user_message_markdown
-}
-
-pub(crate) fn set_user_message_markdown(enabled: bool, cx: &mut App) {
-    if user_message_markdown_enabled(cx) == enabled {
+pub(crate) fn set_user_message_markdown(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().user_message_markdown == enabled {
         return;
     }
-    let handle = preferences::handle(cx);
-    preferences::update_with(cx, &handle, |prefs| prefs.user_message_markdown = enabled);
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.user_message_markdown = enabled
+    });
     cx.refresh_windows();
 }
 
-pub(crate) fn set_global_wrap(enabled: bool, cx: &mut App) {
-    if global_wrap_enabled(cx) == enabled {
+pub(crate) fn set_global_wrap(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().code_block_wrap == enabled {
         return;
     }
-    let handle = preferences::handle(cx);
-    preferences::update_with(cx, &handle, |prefs| reset_global_wrap(prefs, enabled));
+    preferences::update_with(cx, preference_handle, |prefs| {
+        reset_global_wrap(prefs, enabled)
+    });
     cx.refresh_windows();
 }
 
@@ -214,12 +238,17 @@ pub(crate) fn set_global_wrap_in_memory(enabled: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
-pub(crate) fn set_line_numbers(enabled: bool, cx: &mut App) {
-    if line_numbers_enabled(cx) == enabled {
+pub(crate) fn set_line_numbers(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().code_block_line_numbers == enabled {
         return;
     }
-    let handle = preferences::handle(cx);
-    preferences::update_with(cx, &handle, |prefs| prefs.code_block_line_numbers = enabled);
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.code_block_line_numbers = enabled
+    });
     cx.refresh_windows();
 }
 

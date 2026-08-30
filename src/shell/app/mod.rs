@@ -199,6 +199,7 @@ pub struct ChatApp {
     _subscriptions: Vec<Subscription>,
     session_services: SessionStores,
     preference_handle: PreferenceHandle,
+    preference_snapshot: Preferences,
     generation_service: Arc<dyn GenerationService>,
 }
 
@@ -280,6 +281,7 @@ impl ChatApp {
         let model_picker = cx.new(|cx| {
             ModelPicker::new(
                 prefs.last_model_selection.clone(),
+                preference_handle.clone(),
                 move |selection, cx| {
                     parent
                         .update(cx, |app, cx| app.select_model_from_picker(selection, cx))
@@ -330,9 +332,11 @@ impl ChatApp {
             _subscriptions: Vec::new(),
             session_services,
             preference_handle,
+            preference_snapshot: prefs.clone(),
             generation_service,
         };
         this.track_window_geometry(window, cx);
+        this.track_preferences(window, cx);
         this.track_system_appearance(window, cx);
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
@@ -356,8 +360,21 @@ impl ChatApp {
     /// Keep a "follow system" theme live after startup. The subscription is
     /// window-scoped and drops with the root view.
     fn track_system_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let sub = cx.observe_window_appearance(window, |_, window, cx| {
-            theme::sync_system_appearance(window, cx);
+        let sub = cx.observe_window_appearance(window, |this, window, cx| {
+            theme::sync_system_appearance(this.preference_snapshot.theme_mode, window, cx);
+        });
+        self._subscriptions.push(sub);
+    }
+
+    fn track_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let preference_handle = self.preference_handle.clone();
+        let sub = cx.observe_global_in::<preferences::Prefs>(window, move |this, _, cx| {
+            let snapshot = preference_handle.snapshot();
+            if this.preference_snapshot == snapshot {
+                return;
+            }
+            this.preference_snapshot = snapshot;
+            cx.notify();
         });
         self._subscriptions.push(sub);
     }
@@ -499,9 +516,10 @@ impl ChatApp {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
-        let view = ChatView::view_with_generation_service(
+        let view = ChatView::view_with_generation_service_and_preferences(
             self.session_services.chat_conversation(),
             self.generation_service.clone(),
+            self.preference_handle.clone(),
             window,
             cx,
         );
@@ -624,10 +642,11 @@ impl ChatApp {
             return;
         };
         self.invalidate_agent_selection_request();
-        let view = ChatView::project_view_with_generation_service(
+        let view = ChatView::project_view_with_generation_service_and_preferences(
             identity,
             self.session_services.project_conversation(),
             self.generation_service.clone(),
+            self.preference_handle.clone(),
             window,
             cx,
         );
@@ -679,10 +698,11 @@ impl ChatApp {
             Err(_) => return,
         };
         let request = self.begin_agent_selection_request();
-        let view = ChatView::project_view_with_generation_service(
+        let view = ChatView::project_view_with_generation_service_and_preferences(
             identity,
             self.session_services.project_conversation(),
             self.generation_service.clone(),
+            self.preference_handle.clone(),
             window,
             cx,
         );
@@ -1179,9 +1199,10 @@ impl ChatApp {
                     })
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
-        let view = ChatView::view_with_generation_service(
+        let view = ChatView::view_with_generation_service_and_preferences(
             self.session_services.chat_conversation(),
             self.generation_service.clone(),
+            self.preference_handle.clone(),
             window,
             cx,
         );

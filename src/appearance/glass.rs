@@ -22,10 +22,6 @@ pub fn init(cx: &mut App) {
     let _ = cx;
 }
 
-pub fn enabled(cx: &App) -> bool {
-    preferences::handle(cx).snapshot().glass_effect
-}
-
 pub fn window_background(enabled: bool) -> WindowBackgroundAppearance {
     #[cfg(target_os = "macos")]
     if enabled {
@@ -37,19 +33,18 @@ pub fn window_background(enabled: bool) -> WindowBackgroundAppearance {
 }
 
 /// Preserve the theme hue while exposing the native backdrop on macOS.
-pub fn background(color: Hsla, cx: &App) -> Hsla {
+pub fn background(color: Hsla, enabled: bool, persisted_opacity: f32, cx: &App) -> Hsla {
     #[cfg(target_os = "macos")]
-    if enabled(cx) {
-        return color.opacity(tint_opacity(cx));
+    if enabled {
+        return color.opacity(tint_opacity(persisted_opacity, cx));
     }
 
-    let _ = cx;
+    let _ = (enabled, persisted_opacity, cx);
     color
 }
 
 #[cfg(target_os = "macos")]
-pub fn tint_opacity(cx: &App) -> f32 {
-    let persisted = preferences::handle(cx).snapshot().glass_tint_opacity;
+pub fn tint_opacity(persisted: f32, cx: &App) -> f32 {
     let preview = cx
         .try_global::<GlassTintPreview>()
         .and_then(|preview| preview.0);
@@ -63,21 +58,27 @@ pub fn preview_tint_opacity(opacity: f32, cx: &mut App) {
 }
 
 #[cfg(target_os = "macos")]
-pub fn persist_tint_opacity(opacity: f32, cx: &mut App) {
+pub fn persist_tint_opacity(
+    opacity: f32,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
     let opacity = clamp_opacity(opacity);
     cx.global_mut::<GlassTintPreview>().0 = None;
-    let handle = preferences::handle(cx);
-    preferences::update_with(cx, &handle, |prefs| prefs.glass_tint_opacity = opacity);
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.glass_tint_opacity = opacity
+    });
 }
 
 /// Commit an in-progress drag when the settings window closes before the
 /// slider emits `Release`.
 #[cfg(target_os = "macos")]
-pub fn commit_tint_preview(cx: &mut App) {
+pub fn commit_tint_preview(preference_handle: &preferences::PreferenceHandle, cx: &mut App) {
     let preview = cx.global_mut::<GlassTintPreview>().0.take();
     if let Some(opacity) = preview {
-        let handle = preferences::handle(cx);
-        preferences::update_with(cx, &handle, |prefs| prefs.glass_tint_opacity = opacity);
+        preferences::update_with(cx, preference_handle, |prefs| {
+            prefs.glass_tint_opacity = opacity
+        });
     }
 }
 
@@ -124,9 +125,13 @@ pub fn root_background(color: Hsla) -> Hsla {
 
 /// Persist and apply the setting to every open window immediately.
 #[cfg(target_os = "macos")]
-pub fn set_enabled(enabled: bool, current_window: &mut Window, cx: &mut App) {
-    let handle = preferences::handle(cx);
-    preferences::update_with(cx, &handle, |prefs| prefs.glass_effect = enabled);
+pub fn set_enabled(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    current_window: &mut Window,
+    cx: &mut App,
+) {
+    preferences::update_with(cx, preference_handle, |prefs| prefs.glass_effect = enabled);
 
     let appearance = window_background(enabled);
     let current_id = current_window.window_handle().window_id();

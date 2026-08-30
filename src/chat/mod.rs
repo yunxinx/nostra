@@ -54,7 +54,7 @@ use crate::session::{
     SessionOperationGuard, SharedSessionStore,
 };
 use crate::ui::{
-    markdown::MarkdownBody,
+    markdown::{MarkdownBody, PreferenceState},
     reference_picker::{ChatReferenceComposer, ComposerEvent, ComposerStatus},
 };
 
@@ -63,13 +63,13 @@ use self::hover_reveal::hover_reveal_copy;
 pub use self::message::{Message, MessagePart, Role};
 use self::reasoning_card::ReasoningTrace;
 use self::render::copyable_text;
+pub(crate) use self::scrolling::set_smooth_scrolling;
 #[cfg(test)]
 use self::scrolling::{
     SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, reasoning_smooth_invalidations,
     record_reasoning_smooth_invalidation, reset_reasoning_smooth_invalidations,
 };
 use self::scrolling::{SmoothScrollState, smooth_scroll_animation_enabled};
-pub(crate) use self::scrolling::{set_smooth_scrolling, smooth_scrolling_enabled};
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 
@@ -148,6 +148,9 @@ pub struct ChatView {
     input_empty: bool,
     list_state: ListState,
     smooth_scroll: SmoothScrollState,
+    preference_snapshot: crate::preferences::Preferences,
+    preference_state: PreferenceState,
+    preference_handle: crate::preferences::PreferenceHandle,
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
@@ -193,7 +196,13 @@ pub struct ChatView {
 impl ChatView {
     #[cfg(test)]
     pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        Self::view_with_session_services(SessionStores::default().chat_conversation(), window, cx)
+        let preference_handle = crate::preferences::handle(cx);
+        Self::view_with_session_services_and_preferences(
+            SessionStores::default().chat_conversation(),
+            preference_handle,
+            window,
+            cx,
+        )
     }
 
     #[cfg(test)]
@@ -202,20 +211,38 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        let preference_handle = crate::preferences::handle(cx);
+        Self::view_with_session_services_and_preferences(
+            session_services,
+            preference_handle,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_with_session_services_and_preferences(
+        session_services: ConversationSessionServices,
+        preference_handle: crate::preferences::PreferenceHandle,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Chat,
                 session_services,
                 Arc::new(UnavailableGenerationService),
+                preference_handle,
                 window,
                 cx,
             )
         })
     }
 
-    pub(crate) fn view_with_generation_service(
+    pub(crate) fn view_with_generation_service_and_preferences(
         session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
+        preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -224,6 +251,7 @@ impl ChatView {
                 ConversationScope::Chat,
                 session_services,
                 generation_service,
+                preference_handle,
                 window,
                 cx,
             )
@@ -237,21 +265,41 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        let preference_handle = crate::preferences::handle(cx);
+        Self::project_view_with_session_services_and_preferences(
+            project,
+            session_services,
+            preference_handle,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_view_with_session_services_and_preferences(
+        project: ProjectIdentity,
+        session_services: ConversationSessionServices,
+        preference_handle: crate::preferences::PreferenceHandle,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Project(project),
                 session_services,
                 Arc::new(UnavailableGenerationService),
+                preference_handle,
                 window,
                 cx,
             )
         })
     }
 
-    pub(crate) fn project_view_with_generation_service(
+    pub(crate) fn project_view_with_generation_service_and_preferences(
         project: ProjectIdentity,
         session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
+        preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
@@ -260,6 +308,7 @@ impl ChatView {
                 ConversationScope::Project(project),
                 session_services,
                 generation_service,
+                preference_handle,
                 window,
                 cx,
             )
@@ -270,9 +319,13 @@ impl ChatView {
         scope: ConversationScope,
         session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
+        preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let preference_snapshot = preference_handle.snapshot();
+        let preference_state = preference_handle.shared_preferences();
+        let preferences_for_observer = preference_handle.clone();
         let placeholder: SharedString = match &scope {
             ConversationScope::Chat => t!("chat.placeholder").to_string(),
             ConversationScope::Project(_) => {
@@ -336,8 +389,9 @@ impl ChatView {
             }
         });
 
-        let selection = providers::last_selection(cx);
-        let selection_available = providers::selection_is_available(selection.as_ref(), cx);
+        let selection = providers::last_selection_from(&preference_snapshot);
+        let selection_available =
+            providers::selection_is_available_from(selection.as_ref(), &preference_snapshot);
         let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
@@ -367,6 +421,9 @@ impl ChatView {
             input_empty: true,
             list_state,
             smooth_scroll: SmoothScrollState::default(),
+            preference_snapshot,
+            preference_state: preference_state.clone(),
+            preference_handle,
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
@@ -393,7 +450,18 @@ impl ChatView {
                 NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
             ),
             next_turn_id: 1,
-            _subscriptions: vec![composer_subscription, subscription],
+            _subscriptions: vec![
+                composer_subscription,
+                subscription,
+                cx.observe_global_in::<crate::preferences::Prefs>(window, move |this, _, cx| {
+                    let snapshot = preferences_for_observer.snapshot();
+                    if this.preference_snapshot == snapshot {
+                        return;
+                    }
+                    this.preference_snapshot = snapshot;
+                    cx.notify();
+                }),
+            ],
             #[cfg(test)]
             materialized_message_indices: std::collections::BTreeSet::new(),
         }
@@ -456,7 +524,7 @@ impl ChatView {
             text: String::new(),
             replay: ProviderMetadata::default(),
             finished: false,
-            body: MarkdownBody::new("", ui_id, cx),
+            body: MarkdownBody::new_with_preferences("", ui_id, self.preference_state.clone(), cx),
         });
         last.parts.sort_by_key(MessagePart::content_index);
     }
@@ -590,7 +658,9 @@ impl ChatView {
             }
             reasoning.display.push_str(delta);
             trace
-                .get_or_insert_with(|| ReasoningTrace::new(*ui_id, cx))
+                .get_or_insert_with(|| {
+                    ReasoningTrace::new_with_preferences(*ui_id, self.preference_state.clone(), cx)
+                })
                 .push(delta, cx);
         }
     }
@@ -654,9 +724,10 @@ impl ChatView {
         } else if let Some(trace) = trace.as_mut() {
             trace.set_source(&snapshot.display, cx);
         } else {
-            *trace = Some(ReasoningTrace::completed(
+            *trace = Some(ReasoningTrace::completed_with_preferences(
                 snapshot.display.clone(),
                 *ui_id,
+                self.preference_state.clone(),
                 cx,
             ));
         }
@@ -839,7 +910,7 @@ impl ChatView {
         if !self.update_selection(selection.clone()) {
             return;
         }
-        providers::select_model(selection.clone(), cx);
+        providers::select_model(selection.clone(), &self.preference_handle, cx);
         cx.emit(ChatEvent::SelectionChanged(selection));
         cx.notify();
     }
@@ -865,12 +936,15 @@ impl ChatView {
         self.pending
     }
 
-    fn sync_selection_availability(&mut self, cx: &App) {
+    fn sync_selection_availability(&mut self) {
         let revision = providers::catalog_revision();
         if self.provider_catalog_revision == revision {
             return;
         }
-        self.selection_available = providers::selection_is_available(self.selection.as_ref(), cx);
+        self.selection_available = providers::selection_is_available_from(
+            self.selection.as_ref(),
+            &self.preference_snapshot,
+        );
         self.provider_catalog_revision = revision;
     }
 }

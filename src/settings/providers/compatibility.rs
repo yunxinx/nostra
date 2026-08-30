@@ -54,6 +54,7 @@ impl ProvidersPage {
                         ui::info_button(
                             "provider-compatibility",
                             t!("settings.providers.compatibility_desc").to_string(),
+                            self.preference_snapshot.hide_settings_info_buttons,
                             cx,
                         ),
                         |this, button| this.child(button),
@@ -112,6 +113,7 @@ impl ProvidersPage {
                         }
                     },
                 ),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(dropdown_row(
@@ -145,6 +147,7 @@ impl ProvidersPage {
                         }
                     },
                 ),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(dropdown_row(
@@ -179,6 +182,7 @@ impl ProvidersPage {
                         }
                     },
                 ),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(dropdown_row(
@@ -217,6 +221,7 @@ impl ProvidersPage {
                         }
                     },
                 ),
+                self.preference_snapshot.hide_settings_info_buttons,
                 cx,
             ))
             .child(self.render_compatibility_switch(
@@ -257,7 +262,13 @@ impl ProvidersPage {
         let weak = cx.weak_entity();
         h_flex()
             .justify_between()
-            .child(ui::labelled(text, id, info, cx))
+            .child(ui::labelled(
+                text,
+                id,
+                info,
+                self.preference_snapshot.hide_settings_info_buttons,
+                cx,
+            ))
             .child(
                 Switch::new(id)
                     .small()

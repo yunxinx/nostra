@@ -62,7 +62,11 @@ impl Message {
         }
     }
 
-    pub(super) fn from_canonical(message: LlmMessage, cx: &mut App) -> Self {
+    pub(super) fn from_canonical_with_preferences(
+        message: LlmMessage,
+        preference_state: PreferenceState,
+        cx: &mut App,
+    ) -> Self {
         let role = match message.role {
             crate::llm::Role::Assistant => Role::Assistant,
             _ => Role::User,
@@ -71,7 +75,14 @@ impl Message {
             .content
             .into_iter()
             .enumerate()
-            .map(|(index, block)| MessagePart::from_canonical(index, block, cx))
+            .map(|(index, block)| {
+                MessagePart::from_canonical_with_preferences(
+                    index,
+                    block,
+                    preference_state.clone(),
+                    cx,
+                )
+            })
             .collect();
         Self {
             ui_id: NEXT_MESSAGE_UI_ID.fetch_add(1, Ordering::Relaxed),
@@ -80,6 +91,12 @@ impl Message {
             provider_metadata: message.provider_metadata,
             error: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_canonical(message: LlmMessage, cx: &mut App) -> Self {
+        let preference_state = crate::preferences::test_handle(cx).shared_preferences();
+        Self::from_canonical_with_preferences(message, preference_state, cx)
     }
 
     pub(super) fn canonical(&self) -> LlmMessage {
@@ -97,7 +114,12 @@ impl Message {
         }
     }
 
-    pub(super) fn replace_with_canonical(&mut self, message: IndexedMessage, cx: &mut App) {
+    pub(super) fn replace_with_canonical_with_preferences(
+        &mut self,
+        message: IndexedMessage,
+        preference_state: PreferenceState,
+        cx: &mut App,
+    ) {
         let mut previous = std::mem::take(&mut self.parts)
             .into_iter()
             .map(|part| (part.content_index(), part))
@@ -107,7 +129,13 @@ impl Message {
             .into_iter()
             .map(|part| {
                 let old = previous.remove(&part.content_index);
-                MessagePart::reconcile(part.content_index, old, part.block, cx)
+                MessagePart::reconcile(
+                    part.content_index,
+                    old,
+                    part.block,
+                    preference_state.clone(),
+                    cx,
+                )
             })
             .collect();
         self.provider_metadata = message.provider_metadata;
@@ -135,7 +163,12 @@ impl Message {
 }
 
 impl MessagePart {
-    pub(super) fn from_canonical(index: usize, block: ContentBlock, cx: &mut App) -> Self {
+    pub(super) fn from_canonical_with_preferences(
+        index: usize,
+        block: ContentBlock,
+        preference_state: PreferenceState,
+        cx: &mut App,
+    ) -> Self {
         let ui_id = NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed);
         match block {
             ContentBlock::Text {
@@ -145,7 +178,12 @@ impl MessagePart {
                 content_index: index,
                 ui_id,
                 id: format!("terminal-text-{index}"),
-                body: MarkdownBody::new(&text, ui_id, cx),
+                body: MarkdownBody::new_with_preferences(
+                    &text,
+                    ui_id,
+                    preference_state.clone(),
+                    cx,
+                ),
                 text,
                 replay: provider_metadata,
                 finished: true,
@@ -155,8 +193,14 @@ impl MessagePart {
                 ui_id,
                 id: format!("terminal-reasoning-{index}"),
                 finished: true,
-                trace: (!reasoning.display.is_empty())
-                    .then(|| ReasoningTrace::completed(reasoning.display.clone(), ui_id, cx)),
+                trace: (!reasoning.display.is_empty()).then(|| {
+                    ReasoningTrace::completed_with_preferences(
+                        reasoning.display.clone(),
+                        ui_id,
+                        preference_state.clone(),
+                        cx,
+                    )
+                }),
                 reasoning,
             },
             ContentBlock::ToolCall { tool_call } => Self::ToolCall {
@@ -169,7 +213,12 @@ impl MessagePart {
             },
             ContentBlock::ToolResult { tool_result } => Self::ToolResult {
                 content_index: index,
-                body: MarkdownBody::new(&tool_result.content, ui_id, cx),
+                body: MarkdownBody::new_with_preferences(
+                    &tool_result.content,
+                    ui_id,
+                    preference_state,
+                    cx,
+                ),
                 tool_result,
             },
         }
@@ -214,6 +263,7 @@ impl MessagePart {
         index: usize,
         old: Option<Self>,
         block: ContentBlock,
+        preference_state: PreferenceState,
         cx: &mut App,
     ) -> Self {
         match (old, block) {
@@ -279,7 +329,7 @@ impl MessagePart {
                 },
                 tool_call: Some(tool_call),
             },
-            (_, block) => Self::from_canonical(index, block, cx),
+            (_, block) => Self::from_canonical_with_preferences(index, block, preference_state, cx),
         }
     }
 }

@@ -320,7 +320,7 @@ impl ThemeMode {
 pub type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
 
 struct PreferenceState {
-    preferences: Mutex<Preferences>,
+    preferences: Arc<Mutex<Preferences>>,
     saver: PreferenceSaver,
 }
 
@@ -347,7 +347,7 @@ impl PreferenceHandle {
     pub fn with_saver(prefs: Preferences, saver: PreferenceSaver) -> Self {
         Self {
             state: Arc::new(PreferenceState {
-                preferences: Mutex::new(prefs),
+                preferences: Arc::new(Mutex::new(prefs)),
                 saver,
             }),
         }
@@ -359,6 +359,13 @@ impl PreferenceHandle {
             Ok(prefs) => prefs.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         }
+    }
+
+    /// Share the live Provider snapshot with presentation state that is
+    /// constructed from this handle. Consumers never need to resolve the
+    /// foreground `Prefs` adapter to observe updates.
+    pub(crate) fn shared_preferences(&self) -> Arc<Mutex<Preferences>> {
+        Arc::clone(&self.state.preferences)
     }
 
     /// Replace the live snapshot and persist it through this Provider.
@@ -433,7 +440,16 @@ pub fn handle(cx: &App) -> PreferenceHandle {
     cx.global::<Prefs>().handle.clone()
 }
 
-/// The live preferences.
+#[cfg(test)]
+pub(crate) fn test_handle(cx: &App) -> PreferenceHandle {
+    cx.try_global::<Prefs>()
+        .map(|prefs| prefs.handle.clone())
+        .unwrap_or_else(|| PreferenceHandle::in_memory(Preferences::default()))
+}
+
+/// The live preferences for test assertions that exercise the foreground
+/// adapter. Production consumers receive an explicit snapshot or handle.
+#[cfg(test)]
 pub fn get(cx: &App) -> &Preferences {
     &cx.global::<Prefs>().preferences
 }

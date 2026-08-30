@@ -5,10 +5,14 @@ use gpui_component::{Sizable as _, switch::Switch};
 use rust_i18n::t;
 
 use super::ui;
-use crate::preferences::{Language, PreferenceHandle};
+use crate::preferences::{Language, PreferenceHandle, Preferences};
 use crate::{i18n, logging, preferences};
 
-pub(super) fn render(cx: &App, preference_handle: &PreferenceHandle) -> AnyElement {
+pub(super) fn render(
+    cx: &App,
+    preference_handle: &PreferenceHandle,
+    preferences: &Preferences,
+) -> AnyElement {
     let language_options: Vec<(SharedString, SharedString)> = Language::all()
         .iter()
         .map(|lang| (lang.key().into(), lang.label().into()))
@@ -23,20 +27,25 @@ pub(super) fn render(cx: &App, preference_handle: &PreferenceHandle) -> AnyEleme
                 ui::dropdown(
                     "language-dd",
                     language_options,
-                    i18n::current(cx).key().into(),
+                    preferences.language.key().into(),
                     |value, cx| i18n::change(Language::from_key(&value), cx),
                 ),
+                preferences.hide_settings_info_buttons,
                 cx,
             ),
-            detailed_logging_row(cx, preference_handle),
-            restore_last_chat_row(cx, preference_handle),
-            restore_last_workspace_row(cx, preference_handle),
+            detailed_logging_row(cx, preference_handle, preferences),
+            restore_last_chat_row(cx, preference_handle, preferences),
+            restore_last_workspace_row(cx, preference_handle, preferences),
         ],
         cx,
     )
 }
 
-fn detailed_logging_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyElement {
+fn detailed_logging_row(
+    cx: &App,
+    preference_handle: &PreferenceHandle,
+    preferences: &Preferences,
+) -> AnyElement {
     let preference_handle_for_click = preference_handle.clone();
     ui::row(
         "detailed-logging",
@@ -44,7 +53,7 @@ fn detailed_logging_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyEl
         Some(t!("settings.detailed_logging_desc").to_string()),
         Switch::new("detailed-logging-switch")
             .small()
-            .checked(preference_handle.snapshot().detailed_logging)
+            .checked(preferences.detailed_logging)
             .on_click(move |enabled, _, cx| {
                 logging::set_detailed(*enabled);
                 preferences::update_with(cx, &preference_handle_for_click, |prefs| {
@@ -53,11 +62,16 @@ fn detailed_logging_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyEl
                 cx.refresh_windows();
             })
             .into_any_element(),
+        preferences.hide_settings_info_buttons,
         cx,
     )
 }
 
-fn restore_last_chat_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyElement {
+fn restore_last_chat_row(
+    cx: &App,
+    preference_handle: &PreferenceHandle,
+    preferences: &Preferences,
+) -> AnyElement {
     let preference_handle_for_click = preference_handle.clone();
     ui::row(
         "restore-last-chat",
@@ -65,7 +79,7 @@ fn restore_last_chat_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyE
         Some(t!("settings.restore_last_chat_desc").to_string()),
         Switch::new("restore-last-chat-switch")
             .small()
-            .checked(preference_handle.snapshot().restore_last_chat_on_start)
+            .checked(preferences.restore_last_chat_on_start)
             .on_click(move |enabled, _, cx| {
                 preferences::update_with(cx, &preference_handle_for_click, |prefs| {
                     prefs.restore_last_chat_on_start = *enabled
@@ -73,11 +87,16 @@ fn restore_last_chat_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyE
                 cx.refresh_windows();
             })
             .into_any_element(),
+        preferences.hide_settings_info_buttons,
         cx,
     )
 }
 
-fn restore_last_workspace_row(cx: &App, preference_handle: &PreferenceHandle) -> AnyElement {
+fn restore_last_workspace_row(
+    cx: &App,
+    preference_handle: &PreferenceHandle,
+    preferences: &Preferences,
+) -> AnyElement {
     let preference_handle_for_click = preference_handle.clone();
     ui::row(
         "restore-last-workspace",
@@ -85,7 +104,7 @@ fn restore_last_workspace_row(cx: &App, preference_handle: &PreferenceHandle) ->
         Some(t!("settings.restore_last_workspace_desc").to_string()),
         Switch::new("restore-last-workspace-switch")
             .small()
-            .checked(preference_handle.snapshot().restore_last_workspace_on_start)
+            .checked(preferences.restore_last_workspace_on_start)
             .on_click(move |enabled, _, cx| {
                 preferences::update_with(cx, &preference_handle_for_click, |prefs| {
                     prefs.restore_last_workspace_on_start = *enabled
@@ -93,6 +112,7 @@ fn restore_last_workspace_row(cx: &App, preference_handle: &PreferenceHandle) ->
                 cx.refresh_windows();
             })
             .into_any_element(),
+        preferences.hide_settings_info_buttons,
         cx,
     )
 }

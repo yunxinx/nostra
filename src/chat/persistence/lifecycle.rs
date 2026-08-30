@@ -173,7 +173,7 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.sync_selection_availability(cx);
+        self.sync_selection_availability();
         if self.pending
             || self.persistence_pending
             || self.deletion_requested
@@ -334,8 +334,11 @@ impl ChatView {
             cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
         }
         let old_len = self.messages.len();
-        self.messages
-            .push(Message::from_canonical(request.user_message, cx));
+        self.messages.push(Message::from_canonical_with_preferences(
+            request.user_message,
+            self.preference_state.clone(),
+            cx,
+        ));
         self.messages.push(Message::empty(Role::Assistant));
         self.list_state.splice(old_len..old_len, 2);
         self.pending = true;
@@ -626,7 +629,11 @@ impl ChatView {
                 // Match pi's message lifecycle: deltas provide a responsive live
                 // projection, then the complete message_end snapshot becomes
                 // authoritative for both rendering and replay.
-                last.replace_with_canonical(message, cx);
+                last.replace_with_canonical_with_preferences(
+                    message,
+                    self.preference_state.clone(),
+                    cx,
+                );
             }
             last.error = turn_error;
             // Terminal fallback for a stream that never delivered its explicit
