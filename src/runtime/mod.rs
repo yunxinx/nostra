@@ -3,6 +3,7 @@
 mod capability;
 mod component;
 mod dependency;
+mod effect;
 
 pub use capability::{
     CapabilityId, CapabilityKey, CapabilityLease, ExclusiveCapabilitySlot, ExclusiveSlotError,
@@ -13,6 +14,7 @@ pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,
     DependencyResolverError, DependencySnapshot, PendingDependencies, ResolvedDependency,
 };
+pub use effect::{AsyncStop, DisposeError, EffectScope};
 
 #[cfg(test)]
 mod tests;

@@ -1,10 +1,21 @@
-use std::{cell::Cell, collections::HashSet, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    future::Future,
+    io,
+    pin::Pin,
+    rc::Rc,
+    task::{Context, Poll},
+};
+
+use futures::task::noop_waker_ref;
+use gpui::Subscription;
 
 use super::{
-    ActivationFingerprint, CapabilityId, CapabilityKey, ComponentGeneration, ComponentId,
-    DependencyDeclaration, DependencyResolution, DependencyResolver, DependencyResolverError,
-    DependencySnapshot, ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability,
-    ResolvedDependency, ScopeId,
+    ActivationFingerprint, AsyncStop, CapabilityId, CapabilityKey, ComponentGeneration,
+    ComponentId, DependencyDeclaration, DependencyResolution, DependencyResolver,
+    DependencyResolverError, DependencySnapshot, DisposeError, EffectScope,
+    ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability, ResolvedDependency, ScopeId,
 };
 
 #[test]
@@ -630,4 +641,286 @@ fn component_without_dependencies_is_ready_with_an_empty_fingerprint() {
 
     assert!(snapshot.activation_fingerprint().bindings().is_empty());
     assert!(snapshot.lease::<TestServiceCapability>().is_none());
+}
+
+fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+    let mut cx = Context::from_waker(noop_waker_ref());
+    future.poll(&mut cx)
+}
+
+#[derive(Clone)]
+struct TestQuiescenceBarrier {
+    attempts: Rc<Cell<usize>>,
+    released: Rc<Cell<bool>>,
+    events: Rc<RefCell<Vec<&'static str>>>,
+    started_event: &'static str,
+    finished_event: &'static str,
+}
+
+impl AsyncStop for TestQuiescenceBarrier {
+    fn stop(&mut self) -> Pin<Box<dyn Future<Output = Result<(), DisposeError>> + '_>> {
+        self.attempts.set(self.attempts.get() + 1);
+        self.events.borrow_mut().push(self.started_event);
+        let released = Rc::clone(&self.released);
+        let events = Rc::clone(&self.events);
+        let finished_event = self.finished_event;
+        Box::pin(futures::future::poll_fn(move |_| {
+            if released.get() {
+                events.borrow_mut().push(finished_event);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }))
+    }
+}
+
+struct FailingOnceStop {
+    failed: bool,
+    events: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl AsyncStop for FailingOnceStop {
+    fn stop(&mut self) -> Pin<Box<dyn Future<Output = Result<(), DisposeError>> + '_>> {
+        if !self.failed {
+            self.failed = true;
+            return Box::pin(async {
+                Err(DisposeError::new(io::Error::other(
+                    "test quiescence failure",
+                )))
+            });
+        }
+        let events = Rc::clone(&self.events);
+        Box::pin(async move {
+            events.borrow_mut().push("async-stop-finished");
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn effect_scope_disposes_sync_effects_in_reverse_order_once() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut scope = EffectScope::new();
+    for event in ["first", "second", "third"] {
+        let events = Rc::clone(&events);
+        scope.own_sync(move || events.borrow_mut().push(event));
+    }
+
+    futures::executor::block_on(scope.quiesce_and_dispose()).expect("dispose effect scope");
+    futures::executor::block_on(scope.quiesce_and_dispose()).expect("repeat disposal is a no-op");
+
+    assert_eq!(*events.borrow(), ["third", "second", "first"]);
+}
+
+#[test]
+fn failed_mount_rolls_back_owned_subscription_and_sync_effects() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut scope = EffectScope::new();
+    let first_events = Rc::clone(&events);
+    scope.own_sync(move || first_events.borrow_mut().push("first-undo"));
+    let subscription_events = Rc::clone(&events);
+    scope.own_resource(Subscription::new(move || {
+        subscription_events
+            .borrow_mut()
+            .push("subscription-dropped");
+    }));
+    let last_events = Rc::clone(&events);
+    scope.own_sync(move || last_events.borrow_mut().push("last-undo"));
+
+    let mount_result = Err::<(), _>("mount failed after acquiring resources");
+    let error = match mount_result {
+        Ok(()) => panic!("test mount must fail"),
+        Err(error) => {
+            futures::executor::block_on(scope.quiesce_and_dispose())
+                .expect("rollback acquired effects");
+            error
+        }
+    };
+
+    assert_eq!(error, "mount failed after acquiring resources");
+    assert_eq!(
+        *events.borrow(),
+        ["last-undo", "subscription-dropped", "first-undo"]
+    );
+}
+
+#[test]
+fn async_quiescence_blocks_earlier_effects_until_the_barrier_finishes() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let released = Rc::new(Cell::new(false));
+    let attempts = Rc::new(Cell::new(0));
+    let mut scope = EffectScope::new();
+    let first_events = Rc::clone(&events);
+    scope.own_sync(move || first_events.borrow_mut().push("first-undo"));
+    scope.own_async(TestQuiescenceBarrier {
+        attempts: Rc::clone(&attempts),
+        released: Rc::clone(&released),
+        events: Rc::clone(&events),
+        started_event: "async-stop-started",
+        finished_event: "async-stop-finished",
+    });
+    let last_events = Rc::clone(&events);
+    scope.own_sync(move || last_events.borrow_mut().push("last-undo"));
+
+    let mut dispose = Box::pin(scope.quiesce_and_dispose());
+    assert!(matches!(poll_once(dispose.as_mut()), Poll::Pending));
+    assert_eq!(*events.borrow(), ["last-undo", "async-stop-started"]);
+    assert_eq!(attempts.get(), 1);
+
+    released.set(true);
+    assert!(matches!(poll_once(dispose.as_mut()), Poll::Ready(Ok(()))));
+    drop(dispose);
+
+    assert_eq!(
+        *events.borrow(),
+        [
+            "last-undo",
+            "async-stop-started",
+            "async-stop-finished",
+            "first-undo",
+        ]
+    );
+}
+
+#[test]
+fn cancelling_disposal_keeps_the_async_barrier_owned_for_retry() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let released = Rc::new(Cell::new(false));
+    let attempts = Rc::new(Cell::new(0));
+    let mut scope = EffectScope::new();
+    let first_events = Rc::clone(&events);
+    scope.own_sync(move || first_events.borrow_mut().push("first-undo"));
+    scope.own_async(TestQuiescenceBarrier {
+        attempts: Rc::clone(&attempts),
+        released: Rc::clone(&released),
+        events: Rc::clone(&events),
+        started_event: "async-stop-started",
+        finished_event: "async-stop-finished",
+    });
+
+    {
+        let mut cancelled = Box::pin(scope.quiesce_and_dispose());
+        assert!(matches!(poll_once(cancelled.as_mut()), Poll::Pending));
+    }
+    assert_eq!(*events.borrow(), ["async-stop-started"]);
+    assert_eq!(attempts.get(), 1);
+
+    released.set(true);
+    futures::executor::block_on(scope.quiesce_and_dispose())
+        .expect("retry waits for the retained barrier");
+
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(
+        *events.borrow(),
+        [
+            "async-stop-started",
+            "async-stop-started",
+            "async-stop-finished",
+            "first-undo",
+        ]
+    );
+}
+
+#[test]
+fn failed_async_stop_retains_ownership_and_order_for_retry() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut scope = EffectScope::new();
+    let first_events = Rc::clone(&events);
+    scope.own_sync(move || first_events.borrow_mut().push("first-undo"));
+    scope.own_async(FailingOnceStop {
+        failed: false,
+        events: Rc::clone(&events),
+    });
+
+    let error = futures::executor::block_on(scope.quiesce_and_dispose())
+        .expect_err("first stop attempt fails");
+    assert_eq!(error.to_string(), "test quiescence failure");
+    assert!(events.borrow().is_empty());
+
+    futures::executor::block_on(scope.quiesce_and_dispose())
+        .expect("second stop attempt completes");
+    assert_eq!(*events.borrow(), ["async-stop-finished", "first-undo"]);
+}
+
+#[test]
+fn multiple_async_stops_run_serially_in_reverse_order() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let first_released = Rc::new(Cell::new(false));
+    let first_attempts = Rc::new(Cell::new(0));
+    let second_released = Rc::new(Cell::new(false));
+    let second_attempts = Rc::new(Cell::new(0));
+    let mut scope = EffectScope::new();
+    scope.own_async(TestQuiescenceBarrier {
+        attempts: Rc::clone(&first_attempts),
+        released: Rc::clone(&first_released),
+        events: Rc::clone(&events),
+        started_event: "first-stop-started",
+        finished_event: "first-stop-finished",
+    });
+    scope.own_async(TestQuiescenceBarrier {
+        attempts: Rc::clone(&second_attempts),
+        released: Rc::clone(&second_released),
+        events: Rc::clone(&events),
+        started_event: "second-stop-started",
+        finished_event: "second-stop-finished",
+    });
+
+    let mut dispose = Box::pin(scope.quiesce_and_dispose());
+    assert!(matches!(poll_once(dispose.as_mut()), Poll::Pending));
+    assert_eq!(*events.borrow(), ["second-stop-started"]);
+    assert_eq!(first_attempts.get(), 0);
+    assert_eq!(second_attempts.get(), 1);
+
+    second_released.set(true);
+    assert!(matches!(poll_once(dispose.as_mut()), Poll::Pending));
+    assert_eq!(
+        *events.borrow(),
+        [
+            "second-stop-started",
+            "second-stop-finished",
+            "first-stop-started",
+        ]
+    );
+    assert_eq!(first_attempts.get(), 1);
+
+    first_released.set(true);
+    assert!(matches!(poll_once(dispose.as_mut()), Poll::Ready(Ok(()))));
+    drop(dispose);
+    assert_eq!(
+        *events.borrow(),
+        [
+            "second-stop-started",
+            "second-stop-finished",
+            "first-stop-started",
+            "first-stop-finished",
+        ]
+    );
+}
+
+#[test]
+fn dropping_scope_after_cancel_does_not_cross_the_async_barrier() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let released = Rc::new(Cell::new(false));
+    let attempts = Rc::new(Cell::new(0));
+    let mut scope = EffectScope::new();
+    let first_events = Rc::clone(&events);
+    scope.own_sync(move || first_events.borrow_mut().push("first-undo"));
+    scope.own_async(TestQuiescenceBarrier {
+        attempts,
+        released,
+        events: Rc::clone(&events),
+        started_event: "async-stop-started",
+        finished_event: "async-stop-finished",
+    });
+    let last_events = Rc::clone(&events);
+    scope.own_sync(move || last_events.borrow_mut().push("last-undo"));
+
+    {
+        let mut cancelled = Box::pin(scope.quiesce_and_dispose());
+        assert!(matches!(poll_once(cancelled.as_mut()), Poll::Pending));
+    }
+    drop(scope);
+
+    assert_eq!(*events.borrow(), ["last-undo", "async-stop-started"]);
 }
