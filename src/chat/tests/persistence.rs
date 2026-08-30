@@ -1,6 +1,103 @@
 use super::*;
 
 #[gpui::test]
+fn public_turn_flow_emits_binding_and_persists_a_completed_terminal(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let generation = Arc::new(ScriptedGenerationService::completed(
+        scripted_completed_events(),
+    ));
+    let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
+    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
+    let _subscription = cx.update(|_, cx| {
+        let observed = observed.clone();
+        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
+            observed.borrow_mut().push(event.clone());
+        })
+    });
+    let selection = ModelSelection {
+        profile_id: "profile".into(),
+        model_id: "model".into(),
+    };
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            this.select_model(selection.clone(), cx);
+            assert!(this.submit("hello runtime".into(), window, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    let events = observed.borrow();
+    assert!(events.iter().any(|event| {
+        matches!(event, ChatEvent::TitleChanged(title) if title == "hello runtime")
+    }));
+    let session_id = events.iter().find_map(|event| match event {
+        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
+        _ => None,
+    });
+    drop(events);
+    let session_id = session_id.expect("durable begin emits a public session binding");
+    let state = catalog
+        .load_session(&session_id, None)
+        .expect("load the completed Chat turn");
+    assert_eq!(state.messages.len(), 2);
+    assert!(matches!(
+        &state.messages[1].message.content[..],
+        [ContentBlock::Text { text, .. }] if text == "scripted"
+    ));
+    assert!(matches!(
+        state.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Completed
+    ));
+}
+
+#[gpui::test]
+fn public_cancel_flow_persists_a_cancelled_terminal(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let generation = Arc::new(ScriptedGenerationService::pending());
+    let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
+    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
+    let _subscription = cx.update(|_, cx| {
+        let observed = observed.clone();
+        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
+            observed.borrow_mut().push(event.clone());
+        })
+    });
+    let selection = ModelSelection {
+        profile_id: "profile".into(),
+        model_id: "model".into(),
+    };
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            this.select_model(selection, cx);
+            assert!(this.submit("cancel runtime".into(), window, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| chat.update(cx, |this, _| this.cancel_reply()));
+    cx.run_until_parked();
+
+    let session_id = observed.borrow().iter().find_map(|event| match event {
+        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
+        _ => None,
+    });
+    let session_id = session_id.expect("durable begin emits a public session binding");
+    let state = catalog
+        .load_session(&session_id, None)
+        .expect("load the cancelled Chat turn");
+    assert!(matches!(
+        state.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Cancelled
+    ));
+}
+
+#[gpui::test]
 fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut TestAppContext) {
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());

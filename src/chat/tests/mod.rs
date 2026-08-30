@@ -1,7 +1,9 @@
 use std::{
     cell::RefCell,
+    future::Future,
+    pin::Pin,
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -13,8 +15,10 @@ use gpui::{
 use gpui_component::input::InputEvent;
 
 use crate::llm::{
-    ContentBlock, IndexedContentBlock, IndexedMessage, Message as LlmMessage, ModelSelection,
-    ProviderMetadata, ResponsesReplayMetadata,
+    ContentBlock, FinishReason, GatewayError, GenerationEvent, GenerationHandle, GenerationOutcome,
+    GenerationRequest, GenerationRunner, GenerationService, IndexedContentBlock, IndexedMessage,
+    Message as LlmMessage, ModelSelection, OutcomeStatus, Protocol, ProviderMetadata,
+    ResponsesReplayMetadata, Usage,
 };
 use crate::preferences;
 use crate::session::{
@@ -160,6 +164,152 @@ fn add_chat_window_with_session_services(
             .expect("Root must contain the ChatView")
     });
     (chat, cx)
+}
+
+fn add_chat_window_with_generation_service(
+    cx: &mut TestAppContext,
+    stores: SessionStores,
+    generation_service: Arc<dyn GenerationService>,
+) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
+    let session_services = stores.chat_conversation();
+    let preference_handle = cx.update(|cx| preferences::handle(cx));
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let chat = ChatView::view_with_generation_service_and_preferences(
+            session_services,
+            generation_service,
+            preference_handle,
+            window,
+            cx,
+        );
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    let chat = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ChatView>()
+            .expect("Root must contain the ChatView")
+    });
+    (chat, cx)
+}
+
+struct ScriptedGenerationService {
+    events: Arc<Vec<GenerationEvent>>,
+    pending: bool,
+}
+
+impl ScriptedGenerationService {
+    fn completed(events: Vec<GenerationEvent>) -> Self {
+        Self {
+            events: Arc::new(events),
+            pending: false,
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            events: Arc::new(Vec::new()),
+            pending: true,
+        }
+    }
+}
+
+impl GenerationService for ScriptedGenerationService {
+    fn start(&self, _: GenerationRequest) -> Result<GenerationHandle, GatewayError> {
+        Ok(GenerationHandle::from_runner(ScriptedGenerationRunner {
+            events: self.events.iter().cloned().collect(),
+            pending: self.pending,
+        }))
+    }
+}
+
+struct ScriptedGenerationRunner {
+    events: Vec<GenerationEvent>,
+    pending: bool,
+}
+
+impl GenerationRunner for ScriptedGenerationRunner {
+    fn run<'a>(
+        &'a mut self,
+        on_event: &'a mut dyn FnMut(GenerationEvent) -> bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        let events = std::mem::take(&mut self.events);
+        let pending = self.pending;
+        Box::pin(async move {
+            if pending {
+                std::future::pending::<()>().await;
+                return;
+            }
+            for event in events {
+                if !on_event(event) {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> Option<GenerationEvent> {
+        Some(GenerationEvent::Finished(Box::new(GenerationOutcome {
+            request_id: "scripted-cancel".into(),
+            profile_id: "profile".into(),
+            model_id: "model".into(),
+            protocol: Protocol::Responses,
+            status: OutcomeStatus::Cancelled,
+            finish_reason: None,
+            usage: Usage::default(),
+            response_id: None,
+            upstream_model: None,
+            time_to_first_event: None,
+            latency: Duration::ZERO,
+            message: None,
+            error: None,
+        })))
+    }
+}
+
+fn scripted_completed_events() -> Vec<GenerationEvent> {
+    vec![
+        GenerationEvent::TextStarted {
+            content_index: 0,
+            id: "text-0".into(),
+        },
+        GenerationEvent::TextDelta {
+            content_index: 0,
+            id: "text-0".into(),
+            delta: "scripted".into(),
+        },
+        GenerationEvent::TextFinished {
+            content_index: 0,
+            id: "text-0".into(),
+            replay: None,
+        },
+        GenerationEvent::Finished(Box::new(GenerationOutcome {
+            request_id: "scripted-complete".into(),
+            profile_id: "profile".into(),
+            model_id: "model".into(),
+            protocol: Protocol::Responses,
+            status: OutcomeStatus::Completed,
+            finish_reason: Some(FinishReason::Stop),
+            usage: Usage::default(),
+            response_id: Some("response".into()),
+            upstream_model: Some("model".into()),
+            time_to_first_event: None,
+            latency: Duration::ZERO,
+            message: Some(IndexedMessage {
+                role: crate::llm::Role::Assistant,
+                content: vec![IndexedContentBlock {
+                    content_index: 0,
+                    block: ContentBlock::Text {
+                        text: "scripted".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                }],
+                provider_metadata: ProviderMetadata::default(),
+            }),
+            error: None,
+        })),
+    ]
 }
 
 #[gpui::test]
