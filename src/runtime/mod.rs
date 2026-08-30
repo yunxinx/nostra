@@ -5,6 +5,7 @@ mod component;
 mod dependency;
 mod effect;
 mod reconcile;
+mod scope;
 
 pub use capability::{
     CapabilityId, CapabilityKey, CapabilityLease, ExclusiveCapabilitySlot, ExclusiveSlotError,
@@ -20,6 +21,7 @@ pub use reconcile::{
     ComponentLifecycle, DesiredRevision, DesiredRevisionExhausted, ReconcileFailure,
     ReconcileFailureKind, ReconcileStage, ReconcileStatus, ReconcileTarget, ScopeLocalReconciler,
 };
+pub use scope::{ScopeError, ScopeKind, ScopeState, ScopeTree};
 
 #[cfg(test)]
 mod tests;

@@ -16,7 +16,8 @@ use super::{
     ComponentId, ComponentLifecycle, DependencyDeclaration, DependencyResolution,
     DependencyResolver, DependencyResolverError, DependencySnapshot, DisposeError, EffectScope,
     ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability, ReconcileFailureKind,
-    ReconcileStage, ReconcileStatus, ResolvedDependency, ScopeId, ScopeLocalReconciler,
+    ReconcileStage, ReconcileStatus, ResolvedDependency, ScopeId, ScopeKind, ScopeLocalReconciler,
+    ScopeState, ScopeTree,
 };
 
 #[test]
@@ -696,6 +697,24 @@ impl AsyncStop for FailingOnceStop {
             events.borrow_mut().push("async-stop-finished");
             Ok(())
         })
+    }
+}
+
+struct DropObservedStop {
+    dropped: Rc<Cell<bool>>,
+    events: Rc<RefCell<Vec<&'static str>>>,
+}
+
+impl AsyncStop for DropObservedStop {
+    fn stop(&mut self) -> Pin<Box<dyn Future<Output = Result<(), DisposeError>> + '_>> {
+        self.events.borrow_mut().push("conversation-stop-started");
+        Box::pin(futures::future::pending())
+    }
+}
+
+impl Drop for DropObservedStop {
+    fn drop(&mut self) {
+        self.dropped.set(true);
     }
 }
 
@@ -1485,4 +1504,260 @@ fn unchanged_desired_state_does_not_start_another_transition() {
     assert_eq!(settled_revision, initial_revision);
     assert_eq!(*prepare_calls.borrow(), [1]);
     assert_eq!(*events.borrow(), ["publish-1"]);
+}
+
+fn scope_chain() -> (ScopeTree, ScopeId, ScopeId, ScopeId) {
+    let mut scopes = ScopeTree::new();
+    let application = scopes.application();
+    let window = scopes.create_window().expect("window scope");
+    let conversation = scopes
+        .create_conversation(window)
+        .expect("conversation scope");
+    (scopes, application, window, conversation)
+}
+
+#[test]
+fn application_capabilities_are_inherited_by_window_and_conversation_scopes() {
+    let (mut scopes, application, window, conversation) = scope_chain();
+
+    assert_eq!(scopes.kind(application), Some(ScopeKind::Application));
+    assert_eq!(scopes.kind(window), Some(ScopeKind::Window));
+    assert_eq!(scopes.kind(conversation), Some(ScopeKind::Conversation));
+    assert_eq!(scopes.parent(application), None);
+    assert_eq!(scopes.parent(window), Some(application));
+    assert_eq!(scopes.parent(conversation), Some(window));
+    let candidate = scopes
+        .capability_slot::<TestServiceCapability>(application)
+        .expect("application capability slot")
+        .prepare_candidate(DEFAULT_TEST_PROVIDER, || {
+            Ok::<_, ()>(TestService {
+                implementation: "application-default",
+            })
+        })
+        .expect("application Provider candidate");
+    scopes
+        .capability_slot::<TestServiceCapability>(application)
+        .expect("application capability slot")
+        .install(candidate)
+        .expect("install application Provider");
+
+    let from_window = scopes
+        .resolve::<TestServiceCapability>(window)
+        .expect("resolve from window")
+        .expect("inherited application Provider");
+    let from_conversation = scopes
+        .resolve::<TestServiceCapability>(conversation)
+        .expect("resolve from conversation")
+        .expect("inherited application Provider");
+
+    assert_eq!(from_window.scope(), application);
+    assert_eq!(from_conversation.scope(), application);
+    assert_eq!(from_window.handle().implementation, "application-default");
+    assert_eq!(
+        from_conversation.handle().implementation,
+        "application-default"
+    );
+    futures::executor::block_on(scopes.close(application)).expect("close inherited scopes");
+}
+
+#[test]
+fn nearest_child_provider_overrides_inherited_capabilities() {
+    let (mut scopes, application, window, conversation) = scope_chain();
+
+    for (scope, provider, implementation) in [
+        (application, DEFAULT_TEST_PROVIDER, "application"),
+        (window, ALTERNATE_TEST_PROVIDER, "window"),
+    ] {
+        let candidate = scopes
+            .capability_slot::<TestServiceCapability>(scope)
+            .expect("scoped capability slot")
+            .prepare_candidate(provider, || Ok::<_, ()>(TestService { implementation }))
+            .expect("scoped Provider candidate");
+        scopes
+            .capability_slot::<TestServiceCapability>(scope)
+            .expect("scoped capability slot")
+            .install(candidate)
+            .expect("install scoped Provider");
+    }
+
+    let inherited_window = scopes
+        .resolve::<TestServiceCapability>(conversation)
+        .expect("resolve window override")
+        .expect("window Provider");
+    assert_eq!(inherited_window.scope(), window);
+    assert_eq!(inherited_window.handle().implementation, "window");
+
+    let candidate = scopes
+        .capability_slot::<TestServiceCapability>(conversation)
+        .expect("conversation capability slot")
+        .prepare_candidate(DEFAULT_TEST_PROVIDER, || {
+            Ok::<_, ()>(TestService {
+                implementation: "conversation",
+            })
+        })
+        .expect("conversation Provider candidate");
+    scopes
+        .capability_slot::<TestServiceCapability>(conversation)
+        .expect("conversation capability slot")
+        .install(candidate)
+        .expect("install conversation Provider");
+
+    let nearest = scopes
+        .resolve::<TestServiceCapability>(conversation)
+        .expect("resolve conversation override")
+        .expect("conversation Provider");
+    assert_eq!(nearest.scope(), conversation);
+    assert_eq!(nearest.handle().implementation, "conversation");
+    futures::executor::block_on(scopes.close(application)).expect("close override scopes");
+}
+
+#[test]
+fn closing_a_parent_waits_for_children_and_is_idempotent() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let conversation_released = Rc::new(Cell::new(false));
+    let conversation_attempts = Rc::new(Cell::new(0));
+    let (mut scopes, application, window, conversation) = scope_chain();
+
+    for (scope, event) in [
+        (application, "application-undo"),
+        (window, "window-undo"),
+        (conversation, "conversation-undo"),
+    ] {
+        let events = Rc::clone(&events);
+        scopes
+            .own_sync(scope, move || events.borrow_mut().push(event))
+            .expect("scope-owned effect");
+    }
+    scopes
+        .own_async(
+            conversation,
+            TestQuiescenceBarrier {
+                attempts: Rc::clone(&conversation_attempts),
+                released: Rc::clone(&conversation_released),
+                events: Rc::clone(&events),
+                started_event: "conversation-stop-started",
+                finished_event: "conversation-stop-finished",
+            },
+        )
+        .expect("conversation quiescence barrier");
+
+    let mut close = Box::pin(scopes.close(application));
+    assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+    assert_eq!(conversation_attempts.get(), 1);
+    assert_eq!(*events.borrow(), ["conversation-stop-started"]);
+    drop(close);
+    assert_eq!(scopes.state(application), Some(ScopeState::Open));
+    assert_eq!(scopes.state(window), Some(ScopeState::Open));
+    assert_eq!(scopes.state(conversation), Some(ScopeState::Closing));
+
+    conversation_released.set(true);
+    futures::executor::block_on(scopes.close(application)).expect("retry parent close");
+    assert_eq!(conversation_attempts.get(), 2);
+    assert_eq!(scopes.state(application), Some(ScopeState::Closed));
+    assert_eq!(scopes.state(window), Some(ScopeState::Closed));
+    assert_eq!(scopes.state(conversation), Some(ScopeState::Closed));
+    assert_eq!(
+        *events.borrow(),
+        [
+            "conversation-stop-started",
+            "conversation-stop-started",
+            "conversation-stop-finished",
+            "conversation-undo",
+            "window-undo",
+            "application-undo",
+        ]
+    );
+
+    futures::executor::block_on(scopes.close(application)).expect("repeated close is a no-op");
+    assert_eq!(conversation_attempts.get(), 2);
+    assert_eq!(events.borrow().len(), 6);
+}
+
+#[test]
+fn failed_child_stop_keeps_parent_scopes_open_until_retry() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let (mut scopes, application, window, conversation) = scope_chain();
+
+    for (scope, event) in [
+        (application, "application-undo"),
+        (window, "window-undo"),
+        (conversation, "conversation-undo"),
+    ] {
+        let events = Rc::clone(&events);
+        scopes
+            .own_sync(scope, move || events.borrow_mut().push(event))
+            .expect("scope-owned effect");
+    }
+    scopes
+        .own_async(
+            conversation,
+            FailingOnceStop {
+                failed: false,
+                events: Rc::clone(&events),
+            },
+        )
+        .expect("conversation stop owner");
+
+    let error = futures::executor::block_on(scopes.close(application))
+        .expect_err("first child stop attempt fails");
+    assert!(matches!(
+        error,
+        super::ScopeError::Dispose { scope, .. } if scope == conversation
+    ));
+    assert_eq!(scopes.state(application), Some(ScopeState::Open));
+    assert_eq!(scopes.state(window), Some(ScopeState::Open));
+    assert_eq!(scopes.state(conversation), Some(ScopeState::Closing));
+    assert!(events.borrow().is_empty());
+
+    futures::executor::block_on(scopes.close(application)).expect("retry parent close");
+    assert_eq!(scopes.state(application), Some(ScopeState::Closed));
+    assert_eq!(scopes.state(window), Some(ScopeState::Closed));
+    assert_eq!(scopes.state(conversation), Some(ScopeState::Closed));
+    assert_eq!(
+        *events.borrow(),
+        [
+            "async-stop-finished",
+            "conversation-undo",
+            "window-undo",
+            "application-undo",
+        ]
+    );
+}
+
+#[test]
+fn dropping_a_tree_after_cancelled_close_does_not_cross_the_child_barrier() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let stop_dropped = Rc::new(Cell::new(false));
+    let (mut scopes, application, _window, conversation) = scope_chain();
+    let application_events = Rc::clone(&events);
+    scopes
+        .own_sync(application, move || {
+            application_events.borrow_mut().push("application-undo");
+        })
+        .expect("application effect");
+    let conversation_events = Rc::clone(&events);
+    scopes
+        .own_sync(conversation, move || {
+            conversation_events.borrow_mut().push("conversation-undo");
+        })
+        .expect("conversation effect");
+    scopes
+        .own_async(
+            conversation,
+            DropObservedStop {
+                dropped: Rc::clone(&stop_dropped),
+                events: Rc::clone(&events),
+            },
+        )
+        .expect("conversation quiescence barrier");
+
+    {
+        let mut close = Box::pin(scopes.close(application));
+        assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+    }
+    assert!(!stop_dropped.get());
+    drop(scopes);
+
+    assert!(stop_dropped.get());
+    assert_eq!(*events.borrow(), ["conversation-stop-started"]);
 }

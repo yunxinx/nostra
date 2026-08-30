@@ -83,6 +83,35 @@ impl EffectScope {
         }
     }
 
+    /// Releases effects until an asynchronous owner requires quiescence.
+    ///
+    /// Returns `false` after dropping that owner to request cancellation while
+    /// retaining every earlier effect that may still be in use.
+    pub(crate) fn release_for_drop(&mut self) -> bool {
+        self.state = EffectScopeState::Disposing;
+        let mut entries = mem::take(&mut self.entries);
+        while let Some(entry) = entries.pop() {
+            match entry {
+                EffectEntry::Sync(Some(undo)) => undo(),
+                EffectEntry::Sync(None) => {}
+                EffectEntry::Async(stop) => {
+                    drop(stop);
+                    crate::logging::error(
+                        "runtime.effect",
+                        format_args!(
+                            "effect scope dropped before quiescence; retaining {} earlier effects",
+                            entries.len()
+                        ),
+                    );
+                    mem::forget(entries);
+                    return false;
+                }
+            }
+        }
+        self.state = EffectScopeState::Disposed;
+        true
+    }
+
     #[track_caller]
     fn assert_accepting_effects(&self) {
         assert!(
@@ -103,27 +132,6 @@ impl fmt::Debug for EffectScope {
 
 impl Drop for EffectScope {
     fn drop(&mut self) {
-        let mut entries = mem::take(&mut self.entries);
-        while let Some(entry) = entries.pop() {
-            match entry {
-                EffectEntry::Sync(Some(undo)) => undo(),
-                EffectEntry::Sync(None) => {}
-                EffectEntry::Async(stop) => {
-                    drop(stop);
-                    // Drop cannot cross an unfinished quiescence barrier without
-                    // releasing dependencies that may still be in use.
-                    crate::logging::error(
-                        "runtime.effect",
-                        format_args!(
-                            "effect scope dropped before quiescence; retaining {} earlier effects",
-                            entries.len()
-                        ),
-                    );
-                    mem::forget(entries);
-                    return;
-                }
-            }
-        }
-        self.state = EffectScopeState::Disposed;
+        self.release_for_drop();
     }
 }
