@@ -5,8 +5,7 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let controller = cx.update(|_, cx| {
         chat.read_with(cx, |this, _| {
             this.session_controller
@@ -54,8 +53,7 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -125,8 +123,7 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
     store.notify_create_after_commit_for_test(committed_tx);
     let stores = SessionStores::with_chat_store(store);
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
@@ -184,8 +181,7 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
 
     let session_id = cx.update(|_, cx| {
         chat.update(cx, |this, _cx| {
@@ -222,7 +218,7 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
         .expect("load resolved state");
     assert_eq!(state.messages.len(), 1);
 
-    let (other, cx) = add_chat_window(cx);
+    let (other, cx) = add_chat_window_with_stores(cx, stores);
     let restored = cx.update(|_, cx| {
         other.update(cx, |this, cx| {
             this.restore_from_session(&session_id, &state, cx)
@@ -244,10 +240,8 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
 #[gpui::test]
 fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
-    });
-    let (chat, cx) = add_chat_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let dropped = Rc::new(std::cell::Cell::new(false));
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -278,11 +272,8 @@ fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppC
 #[gpui::test]
 fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
-    });
-
-    let (chat, cx) = add_chat_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -356,11 +347,8 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
 #[gpui::test]
 fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
-    });
-
-    let (chat, cx) = add_chat_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -400,11 +388,6 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
             assert!(this.persistence_pending);
         });
     });
-    let stores = cx.update(|_, cx| {
-        cx.try_global::<SessionStores>()
-            .expect("session stores")
-            .clone()
-    });
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
         let _ = finished_tx.send(stores.shutdown());
@@ -428,8 +411,7 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
 fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestAppContext) {
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
-    cx.update(|cx| cx.set_global(stores.clone()));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
     let dropped = Rc::new(std::cell::Cell::new(false));
 
     cx.update(|window, cx| {
@@ -510,8 +492,7 @@ fn preparing_the_chat_view_for_shutdown_persists_a_cancelled_terminal(cx: &mut T
     let config = LocalStoreConfig::new(root.path(), SessionDomain::Chat);
     let store = LocalSessionStore::open(config.clone()).expect("open local Chat store");
     let stores = SessionStores::with_chat_store(store);
-    cx.update(|cx| cx.set_global(stores.clone()));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
     let dropped = Rc::new(std::cell::Cell::new(false));
 
     cx.update(|window, cx| {
@@ -572,8 +553,7 @@ fn released_chat_retries_its_exact_cancelled_terminal_once(cx: &mut TestAppConte
     store.observe_append_success_for_test(append_tx);
     let stores = SessionStores::with_chat_store(store);
     let read_store = stores.chat().expect("Chat lifecycle capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let dropped = Rc::new(std::cell::Cell::new(false));
 
     cx.update(|window, cx| {
@@ -629,8 +609,7 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
     store.observe_append_success_for_test(append_tx);
     let stores = SessionStores::with_chat_store(store);
     let read_store = stores.chat().expect("Chat lifecycle capability");
-    cx.update(|cx| cx.set_global(stores));
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let user = LlmMessage {
         role: crate::llm::Role::User,
         content: vec![ContentBlock::Text {
@@ -707,17 +686,15 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
 #[gpui::test]
 fn terminal_persistence_failure_unblocks_chat_and_notifies_the_user(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        let mut store = InMemorySessionStore::new();
-        // The first turn uses atomic create-with-user; the first ordinary
-        // append is therefore the terminal batch. Both bounded attempts must
-        // fail to exercise the user-visible retry state.
-        store.fail_append_at_for_test(1);
-        store.fail_append_at_for_test(2);
-        cx.set_global(SessionStores::with_chat_store(store));
-    });
+    let mut store = InMemorySessionStore::new();
+    // The first turn uses atomic create-with-user; the first ordinary
+    // append is therefore the terminal batch. Both bounded attempts must
+    // fail to exercise the user-visible retry state.
+    store.fail_append_at_for_test(1);
+    store.fail_append_at_for_test(2);
+    let stores = SessionStores::with_chat_store(store);
 
-    let (chat, cx) = add_chat_window(cx);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -768,10 +745,8 @@ fn terminal_persistence_failure_unblocks_chat_and_notifies_the_user(cx: &mut Tes
 #[gpui::test]
 fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
-    });
-    let (chat, cx) = add_chat_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -823,10 +798,8 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
 #[gpui::test]
 fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_chat_store(InMemorySessionStore::new()));
-    });
-    let (chat, cx) = add_chat_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),

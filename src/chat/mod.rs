@@ -193,11 +193,15 @@ pub struct ChatView {
 impl ChatView {
     #[cfg(test)]
     pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        let session_services = cx
-            .try_global::<SessionStores>()
-            .cloned()
-            .unwrap_or_default()
-            .chat_conversation();
+        Self::view_with_session_services(SessionStores::default().chat_conversation(), window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_with_session_services(
+        session_services: ConversationSessionServices,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Chat,
@@ -227,16 +231,12 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub(crate) fn project_view(
+    pub(crate) fn project_view_with_session_services(
         project: ProjectIdentity,
+        session_services: ConversationSessionServices,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        let session_services = cx
-            .try_global::<SessionStores>()
-            .cloned()
-            .unwrap_or_default()
-            .project_conversation();
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Project(project),
