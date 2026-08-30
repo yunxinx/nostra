@@ -100,8 +100,6 @@ pub fn open_main_window(
     cx.spawn(async move |cx| {
         let stores = stores.await;
         let services = RuntimeServices::new(stores, preference_handle, generation_service);
-        let session_global = services.session_services().clone();
-        cx.update(|cx| cx.set_global(session_global));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
