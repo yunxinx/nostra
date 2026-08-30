@@ -46,10 +46,6 @@ pub fn profiles(cx: &App) -> &[ProviderProfile] {
     &preferences::get(cx).provider_profiles
 }
 
-pub fn snapshot(cx: &App) -> Vec<ProviderProfile> {
-    profiles(cx).to_vec()
-}
-
 pub fn last_selection(cx: &App) -> Option<ModelSelection> {
     preferences::get(cx).last_model_selection.clone()
 }

@@ -15,7 +15,10 @@ use http_client::HttpClient;
 use reqwest_client::ReqwestClient;
 
 use crate::{
-    llm::{GatewayGenerationService, GenerationService, HttpTransport, InMemoryMetrics},
+    llm::{
+        GatewayGenerationService, GenerationService, HttpTransport, InMemoryMetrics,
+        ProviderCatalogSnapshot,
+    },
     preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
     session::SessionStores,
 };
@@ -30,6 +33,21 @@ const LOCAL_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.loc
 const JSON_PREFERENCE_PROVIDER: ComponentId = ComponentId::new(JSON_PROVIDER_NAME);
 const GATEWAY_GENERATION_PROVIDER: ComponentId = ComponentId::new("nostra.generation.gateway");
 const LONG_TRANSITION_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Build the first-party generation Provider from an explicit catalog
+/// snapshot. The catalog is captured before the service is installed so every
+/// Consumer observes one validated routing view for its lifetime.
+pub(crate) fn default_generation_service(
+    catalog: ProviderCatalogSnapshot,
+    http_client: Arc<dyn HttpClient>,
+) -> Arc<dyn GenerationService> {
+    let metrics = Arc::new(InMemoryMetrics::new(256));
+    Arc::new(GatewayGenerationService::new(
+        catalog,
+        HttpTransport::new(http_client),
+        Some(metrics),
+    ))
+}
 
 pub struct SessionServicesCapability;
 
@@ -169,6 +187,7 @@ pub struct CompositionRootBuilder {
     preferences: PreferenceHandle,
     preference_provider: ComponentId,
     generation_service: Option<(ComponentId, Arc<dyn GenerationService>)>,
+    provider_catalog: Option<ProviderCatalogSnapshot>,
     http_client: Arc<dyn HttpClient>,
 }
 
@@ -202,6 +221,12 @@ impl CompositionRootBuilder {
     }
 
     #[must_use = "composition builders must be built to install their capabilities"]
+    pub fn with_provider_catalog(mut self, catalog: ProviderCatalogSnapshot) -> Self {
+        self.provider_catalog = Some(catalog);
+        self
+    }
+
+    #[must_use = "composition builders must be built to install their capabilities"]
     pub fn with_http_client(mut self, client: Arc<dyn HttpClient>) -> Self {
         self.http_client = client;
         self
@@ -214,17 +239,18 @@ impl CompositionRootBuilder {
             preferences: preference_handle,
             preference_provider,
             generation_service,
+            provider_catalog,
             http_client,
         } = self;
         let (generation_provider, generation_service): (ComponentId, Arc<dyn GenerationService>) =
             generation_service.unwrap_or_else(|| {
-                let metrics = Arc::new(InMemoryMetrics::new(256));
-                let service = GatewayGenerationService::new(
-                    preference_handle.snapshot().provider_profiles,
-                    HttpTransport::new(http_client),
-                    Some(metrics),
-                );
-                (GATEWAY_GENERATION_PROVIDER, Arc::new(service))
+                let catalog = provider_catalog.unwrap_or_else(|| {
+                    ProviderCatalogSnapshot::new(preference_handle.snapshot().provider_profiles)
+                });
+                (
+                    GATEWAY_GENERATION_PROVIDER,
+                    default_generation_service(catalog, http_client),
+                )
             });
         let application = ScopeTree::APPLICATION_SCOPE;
         let mut scopes = ScopeTree::new();
@@ -359,6 +385,7 @@ impl CompositionRoot {
             preferences: PreferenceHandle::json(Preferences::default()),
             preference_provider: JSON_PREFERENCE_PROVIDER,
             generation_service: None,
+            provider_catalog: None,
             http_client: Arc::new(ReqwestClient::new()),
         }
     }

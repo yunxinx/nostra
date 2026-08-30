@@ -7,7 +7,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use super::{
     Gateway, GatewayError, GenerateRequest, Generation, GenerationEvent, HttpTransport,
-    ModelSelection, OutcomeObserver, ProviderProfile,
+    ModelSelection, OutcomeObserver, ProviderCatalogSnapshot,
 };
 
 /// Request context accepted by a generation Provider.
@@ -67,31 +67,28 @@ pub trait GenerationRunner {
 
 /// First-party generation Provider backed by the existing Gateway.
 pub struct GatewayGenerationService {
-    profiles: Arc<[ProviderProfile]>,
+    catalog: ProviderCatalogSnapshot,
     gateway: Gateway,
 }
 
 impl GatewayGenerationService {
     #[must_use]
     pub fn new(
-        profiles: Vec<ProviderProfile>,
+        catalog: ProviderCatalogSnapshot,
         transport: HttpTransport,
         observer: Option<Arc<dyn OutcomeObserver>>,
     ) -> Self {
-        Self::from_gateway(profiles, Gateway::new(transport, observer))
+        Self::from_gateway(catalog, Gateway::new(transport, observer))
     }
 
     #[must_use]
-    pub fn from_gateway(profiles: Vec<ProviderProfile>, gateway: Gateway) -> Self {
-        Self {
-            profiles: Arc::from(profiles),
-            gateway,
-        }
+    pub fn from_gateway(catalog: ProviderCatalogSnapshot, gateway: Gateway) -> Self {
+        Self { catalog, gateway }
     }
 
     #[must_use]
-    pub fn catalog_snapshot(&self) -> &[ProviderProfile] {
-        &self.profiles
+    pub fn catalog_snapshot(&self) -> &ProviderCatalogSnapshot {
+        &self.catalog
     }
 }
 
@@ -99,7 +96,7 @@ impl GenerationService for GatewayGenerationService {
     fn start(&self, request: GenerationRequest) -> Result<GenerationHandle, GatewayError> {
         let generation =
             self.gateway
-                .prepare(&self.profiles, &request.selection, request.request)?;
+                .prepare(&self.catalog, &request.selection, request.request)?;
         Ok(GenerationHandle::from_runner(GatewayGenerationRunner {
             generation,
         }))
@@ -131,7 +128,8 @@ mod tests {
 
     use super::*;
     use crate::llm::{
-        CompatibilityProfile, InMemoryMetrics, ModelConfig, OutcomeStatus, Protocol, SecretString,
+        CompatibilityProfile, InMemoryMetrics, ModelConfig, OutcomeStatus, Protocol,
+        ProviderProfile, SecretString,
     };
 
     fn profile() -> ProviderProfile {
@@ -154,11 +152,11 @@ mod tests {
     fn gateway_service_resolves_the_catalog_before_creating_a_handle() {
         let metrics = Arc::new(InMemoryMetrics::new(8));
         let service = GatewayGenerationService::new(
-            vec![profile()],
+            ProviderCatalogSnapshot::new(vec![profile()]),
             HttpTransport::new(Arc::new(ReqwestClient::new())),
             Some(metrics.clone()),
         );
-        assert_eq!(service.catalog_snapshot().len(), 1);
+        assert_eq!(service.catalog_snapshot().profiles().len(), 1);
 
         let request = GenerationRequest::new(
             ModelSelection {
@@ -183,7 +181,7 @@ mod tests {
     #[test]
     fn gateway_service_rejects_selection_before_transport_is_used() {
         let service = GatewayGenerationService::new(
-            vec![profile()],
+            ProviderCatalogSnapshot::new(vec![profile()]),
             HttpTransport::new(Arc::new(ReqwestClient::new())),
             None,
         );

@@ -11,8 +11,10 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, Root, TitleBar};
 use rust_i18n::t;
+use std::sync::Arc;
 
 use crate::appearance::glass;
+use crate::llm::GenerationService;
 use crate::preferences::{Preferences, WindowGeometry};
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
@@ -82,7 +84,11 @@ const MIN_SIZE: Size<Pixels> = Size {
 };
 
 /// Open the main chat window and wire up per-window platform hooks.
-pub fn open_main_window(prefs: Preferences, cx: &mut App) {
+pub fn open_main_window(
+    prefs: Preferences,
+    generation_service: Arc<dyn GenerationService>,
+    cx: &mut App,
+) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
     // Opening SQLite catalogs and replaying a pending repair can scan every
     // source file. Keep that work off the application thread before the first
@@ -111,7 +117,8 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
         };
 
         let window = match cx.open_window(options, |window, cx| {
-            let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+            let app_view =
+                cx.new(|cx| ChatApp::new(prefs.clone(), generation_service.clone(), window, cx));
             cx.set_global(MainView(Some(app_view.downgrade())));
 
             // Default focus to the app root so global keybindings dispatch to it

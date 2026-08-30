@@ -11,13 +11,7 @@ mod tests;
 
 use self::buffer::*;
 
-use std::{
-    cell::RefCell,
-    collections::VecDeque,
-    rc::Rc,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, sync::Arc, time::Duration};
 
 use futures::future::{AbortHandle, Abortable};
 use gpui::{Context, Task};
@@ -26,19 +20,11 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::{
     chat::ChatView,
     llm::{
-        Gateway, GatewayError, GenerateRequest, GenerationEvent, GenerationOutcome, HttpTransport,
-        InMemoryMetrics, Message as LlmMessage, ModelSelection, OutcomeStatus,
+        GatewayError, GenerateRequest, GenerationEvent, GenerationHandle, GenerationOutcome,
+        GenerationRequest, GenerationService, Message as LlmMessage, ModelSelection, OutcomeStatus,
     },
-    providers,
     session::ChatTurnTerminal,
 };
-
-fn metrics() -> Arc<InMemoryMetrics> {
-    static METRICS: OnceLock<Arc<InMemoryMetrics>> = OnceLock::new();
-    METRICS
-        .get_or_init(|| Arc::new(InMemoryMetrics::new(256)))
-        .clone()
-}
 
 pub struct ReplyTask {
     _task: Task<()>,
@@ -75,33 +61,31 @@ impl ReplyTask {
 pub fn stream_reply(
     history: Vec<LlmMessage>,
     selection: Option<ModelSelection>,
+    generation_service: Arc<dyn GenerationService>,
     conversation_id: String,
     turn_id: String,
     cx: &mut Context<ChatView>,
 ) -> ReplyTask {
-    let profiles = providers::snapshot(cx);
-    let gateway = Gateway::new(HttpTransport::new(cx.http_client()), Some(metrics()));
     let prepared = selection
         .as_ref()
         .ok_or_else(|| GatewayError::configuration("model selection is unavailable"))
         .and_then(|selection| {
-            gateway.prepare(
-                &profiles,
-                selection,
+            generation_service.start(GenerationRequest::new(
+                selection.clone(),
                 GenerateRequest {
                     messages: history,
                     conversation_id,
                     turn_id,
                     ..GenerateRequest::default()
                 },
-            )
+            ))
         });
     let (abort, registration) = AbortHandle::new_pair();
     let task = cx.spawn(async move |view, cx| {
         let pending = Rc::new(RefCell::new(PendingDeltas::default()));
         let mut flush_task: Option<Task<()>> = None;
         let mut terminal: Option<GenerationOutcome> = None;
-        let mut generation = match prepared {
+        let mut generation: GenerationHandle = match prepared {
             Ok(generation) => generation,
             Err(error) => {
                 // Same card as an upstream failure. There is no response body to

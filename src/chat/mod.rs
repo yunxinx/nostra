@@ -42,8 +42,8 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::llm::{
-    ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
-    ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
+    ContentBlock, GatewayError, GenerationService, IndexedMessage, Message as LlmMessage,
+    ModelSelection, ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
 use crate::session::{
@@ -88,6 +88,21 @@ static NEXT_MESSAGE_UI_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
 
 type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSessionStore>>>;
+
+#[cfg(test)]
+struct UnavailableGenerationService;
+
+#[cfg(test)]
+impl GenerationService for UnavailableGenerationService {
+    fn start(
+        &self,
+        _: crate::llm::GenerationRequest,
+    ) -> Result<crate::llm::GenerationHandle, GatewayError> {
+        Err(GatewayError::configuration(
+            "test generation is unavailable",
+        ))
+    }
+}
 
 #[derive(Clone)]
 pub enum ChatEvent {
@@ -134,6 +149,7 @@ pub struct ChatView {
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
+    generation_service: Arc<dyn GenerationService>,
     pending: bool,
     reply_task: Option<assistant::ReplyTask>,
     #[cfg(test)]
@@ -173,19 +189,64 @@ pub struct ChatView {
 }
 
 impl ChatView {
+    #[cfg(test)]
     pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
-        cx.new(|cx| Self::new(ConversationScope::Chat, window, cx))
+        cx.new(|cx| {
+            Self::new(
+                ConversationScope::Chat,
+                Arc::new(UnavailableGenerationService),
+                window,
+                cx,
+            )
+        })
     }
 
+    pub(crate) fn view_with_generation_service(
+        generation_service: Arc<dyn GenerationService>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| Self::new(ConversationScope::Chat, generation_service, window, cx))
+    }
+
+    #[cfg(test)]
     pub(crate) fn project_view(
         project: ProjectIdentity,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::new(ConversationScope::Project(project), window, cx))
+        cx.new(|cx| {
+            Self::new(
+                ConversationScope::Project(project),
+                Arc::new(UnavailableGenerationService),
+                window,
+                cx,
+            )
+        })
     }
 
-    fn new(scope: ConversationScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn project_view_with_generation_service(
+        project: ProjectIdentity,
+        generation_service: Arc<dyn GenerationService>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            Self::new(
+                ConversationScope::Project(project),
+                generation_service,
+                window,
+                cx,
+            )
+        })
+    }
+
+    fn new(
+        scope: ConversationScope,
+        generation_service: Arc<dyn GenerationService>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let placeholder: SharedString = match &scope {
             ConversationScope::Chat => t!("chat.placeholder").to_string(),
             ConversationScope::Project(_) => {
@@ -291,6 +352,7 @@ impl ChatView {
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
+            generation_service,
             pending: false,
             reply_task: None,
             #[cfg(test)]

@@ -357,6 +357,7 @@ impl ChatView {
             assistant::stream_reply(
                 history,
                 Some(request.selection),
+                self.generation_service.clone(),
                 self.conversation_id.clone(),
                 request.turn_id,
                 cx,
@@ -366,6 +367,7 @@ impl ChatView {
         let reply_task = assistant::stream_reply(
             history,
             Some(request.selection),
+            self.generation_service.clone(),
             self.conversation_id.clone(),
             request.turn_id,
             cx,

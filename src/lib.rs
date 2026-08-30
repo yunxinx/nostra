@@ -44,6 +44,7 @@ use reqwest_client::ReqwestClient;
 
 use crate::appearance::{fonts, glass, theme};
 use crate::assets::NostraAssets;
+use crate::llm::ProviderCatalogSnapshot;
 use crate::shell::actions::{
     self, DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme,
 };
@@ -62,7 +63,10 @@ pub fn run() {
         logging::set_detailed(prefs.detailed_logging);
         logging::info("app.lifecycle", "application started");
         init(prefs.clone(), cx);
-        window::open_main_window(prefs, cx);
+        let catalog =
+            ProviderCatalogSnapshot::new(preferences::handle(cx).snapshot().provider_profiles);
+        let generation_service = runtime::default_generation_service(catalog, cx.http_client());
+        window::open_main_window(prefs, generation_service, cx);
     });
     logging::info("app.lifecycle", "application stopped");
     logging::shutdown();

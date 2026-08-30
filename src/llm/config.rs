@@ -6,6 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    sync::Arc,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -79,6 +80,54 @@ pub struct ProviderProfile {
     pub protocol: Protocol,
     pub compatibility: CompatibilityProfile,
     pub models: Vec<ModelConfig>,
+}
+
+/// Immutable provider catalog captured at a composition boundary.
+///
+/// Profile validation is performed once when the snapshot is created. Invalid
+/// profiles remain in the snapshot so settings can keep presenting repairable
+/// drafts; generation rejects a selection against the cached validation result.
+#[derive(Clone, Debug)]
+pub struct ProviderCatalogSnapshot {
+    profiles: Arc<[ProviderProfile]>,
+    validations: Arc<[Result<(), GatewayError>]>,
+}
+
+impl ProviderCatalogSnapshot {
+    #[must_use]
+    pub fn new(profiles: Vec<ProviderProfile>) -> Self {
+        let validations: Vec<_> = profiles.iter().map(ProviderProfile::validate).collect();
+        Self {
+            profiles: Arc::from(profiles),
+            validations: Arc::from(validations),
+        }
+    }
+
+    #[must_use]
+    pub fn profiles(&self) -> &[ProviderProfile] {
+        &self.profiles
+    }
+
+    /// Resolve a selection using the validation performed for this snapshot.
+    pub fn resolve_selection(
+        &self,
+        selection: &ModelSelection,
+    ) -> Result<(&ProviderProfile, &ModelConfig), GatewayError> {
+        let mut matching_profiles = self
+            .profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| profile.id == selection.profile_id);
+        let (profile_index, profile) = matching_profiles
+            .next()
+            .ok_or_else(|| GatewayError::configuration("selected provider is unavailable"))?;
+        if matching_profiles.next().is_some() {
+            return Err(GatewayError::configuration("provider IDs must be unique"));
+        }
+        self.validations[profile_index].clone()?;
+        let model = profile.resolve_model(&selection.model_id)?;
+        Ok((profile, model))
+    }
 }
 
 pub fn resolve_selection<'a>(
@@ -442,6 +491,65 @@ mod tests {
                 }
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_snapshot_caches_validation_and_keeps_repairable_profiles() {
+        let mut invalid = ProviderProfile {
+            id: "invalid".into(),
+            name: "Invalid".into(),
+            base_url: "https://example.com/v1/responses".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![ModelConfig {
+                id: "model".into(),
+                model_id: "vendor/model".into(),
+                display_name: None,
+            }],
+        };
+        let valid = ProviderProfile {
+            id: "valid".into(),
+            name: "Valid".into(),
+            base_url: "https://example.com/v1".into(),
+            api_key: SecretString::default(),
+            protocol: Protocol::Responses,
+            compatibility: CompatibilityProfile::default(),
+            models: vec![ModelConfig {
+                id: "model".into(),
+                model_id: "vendor/model".into(),
+                display_name: None,
+            }],
+        };
+        let snapshot = ProviderCatalogSnapshot::new(vec![invalid.clone(), valid]);
+
+        assert_eq!(snapshot.profiles().len(), 2);
+        assert!(
+            snapshot
+                .resolve_selection(&ModelSelection {
+                    profile_id: "invalid".into(),
+                    model_id: "model".into(),
+                })
+                .is_err()
+        );
+        assert!(
+            snapshot
+                .resolve_selection(&ModelSelection {
+                    profile_id: "valid".into(),
+                    model_id: "model".into(),
+                })
+                .is_ok()
+        );
+
+        invalid.base_url = "https://example.com/v1".into();
+        assert!(
+            snapshot
+                .resolve_selection(&ModelSelection {
+                    profile_id: "invalid".into(),
+                    model_id: "model".into(),
+                })
+                .is_err()
         );
     }
 }

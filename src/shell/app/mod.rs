@@ -36,7 +36,7 @@ use rust_i18n::t;
 
 use crate::appearance::{glass, theme};
 use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
-use crate::llm::ModelSelection;
+use crate::llm::{GenerationService, ModelSelection};
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
 use crate::session::{
     ChatSessionCatalogController, ProjectSessionStore as _, ResolvedSessionState, SessionId,
@@ -197,6 +197,7 @@ pub struct ChatApp {
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
     preference_handle: PreferenceHandle,
+    generation_service: Arc<dyn GenerationService>,
 }
 
 #[cfg(test)]
@@ -249,24 +250,37 @@ impl ChatApp {
     /// Build the root app view from persisted preferences.  Sidebar width is
     /// clamped into the allowed range, and a save-on-quit hook is registered
     /// so the current UI state survives across restarts.
-    pub fn new(prefs: Preferences, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::build(prefs, window, cx, preferences::handle(cx))
+    pub fn new(
+        prefs: Preferences,
+        generation_service: Arc<dyn GenerationService>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            prefs,
+            generation_service,
+            window,
+            cx,
+            preferences::handle(cx),
+        )
     }
 
     #[cfg(test)]
     pub(super) fn new_with_preference_saver(
         prefs: Preferences,
+        generation_service: Arc<dyn GenerationService>,
         window: &mut Window,
         cx: &mut Context<Self>,
         preference_saver: PreferenceSaver,
     ) -> Self {
         let preference_handle =
             PreferenceHandle::with_saver(prefs.clone(), preference_saver.clone());
-        Self::build(prefs, window, cx, preference_handle)
+        Self::build(prefs, generation_service, window, cx, preference_handle)
     }
 
     fn build(
         prefs: Preferences,
+        generation_service: Arc<dyn GenerationService>,
         window: &mut Window,
         cx: &mut Context<Self>,
         preference_handle: PreferenceHandle,
@@ -333,6 +347,7 @@ impl ChatApp {
             _quit_task: None,
             _subscriptions: Vec::new(),
             preference_handle,
+            generation_service,
         };
         this.track_window_geometry(window, cx);
         this.track_system_appearance(window, cx);
@@ -510,7 +525,8 @@ impl ChatApp {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
-        let view = ChatView::view(window, cx);
+        let view =
+            ChatView::view_with_generation_service(self.generation_service.clone(), window, cx);
         let sub = self.subscribe_conversation(&view, window, cx);
         let selection = view.read(cx).selection();
         self.conversations.push(Conversation {
@@ -630,7 +646,12 @@ impl ChatApp {
             return;
         };
         self.invalidate_agent_selection_request();
-        let view = ChatView::project_view(identity, window, cx);
+        let view = ChatView::project_view_with_generation_service(
+            identity,
+            self.generation_service.clone(),
+            window,
+            cx,
+        );
         let selection = view.read(cx).selection();
         let subscription = self.subscribe_agent_conversation(&view, window, cx);
         let target = view.entity_id();
@@ -681,7 +702,12 @@ impl ChatApp {
             Err(_) => return,
         };
         let request = self.begin_agent_selection_request();
-        let view = ChatView::project_view(identity, window, cx);
+        let view = ChatView::project_view_with_generation_service(
+            identity,
+            self.generation_service.clone(),
+            window,
+            cx,
+        );
         let app = cx.entity();
         let window_handle = window.window_handle();
         self.agent
@@ -1181,7 +1207,8 @@ impl ChatApp {
                     })
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
-        let view = ChatView::view(window, cx);
+        let view =
+            ChatView::view_with_generation_service(self.generation_service.clone(), window, cx);
         let restore_result = view.update(cx, |chat, cx| {
             chat.restore_from_session(&session_id, &state, cx)
         });

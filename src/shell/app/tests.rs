@@ -10,7 +10,11 @@ use std::{
 };
 
 use gpui::TestAppContext;
+use reqwest_client::ReqwestClient;
 
+use crate::llm::{
+    GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
+};
 use crate::session::{
     ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
     LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
@@ -19,6 +23,14 @@ use crate::session::{
 };
 
 use super::*;
+
+fn generation_service() -> Arc<dyn GenerationService> {
+    Arc::new(GatewayGenerationService::new(
+        ProviderCatalogSnapshot::new(Vec::new()),
+        HttpTransport::new(Arc::new(ReqwestClient::new())),
+        None,
+    ))
+}
 
 fn seed_persisted_conversation(
     stores: &SessionStores,
@@ -85,8 +97,9 @@ fn add_app_window_with_preferences_and_stores(
             cx.set_global(stores);
         }
     });
+    let generation_service = generation_service();
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let app = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+        let app = cx.new(|cx| ChatApp::new(prefs.clone(), generation_service.clone(), window, cx));
         Root::new(app, window, cx)
     });
     let app = root.read_with(cx, |root, _| {
@@ -110,9 +123,17 @@ fn add_app_window_with_saver(
         crate::preferences::init_global(prefs.clone(), cx);
         cx.set_global(stores);
     });
+    let generation_service = generation_service();
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let app = cx
-            .new(|cx| ChatApp::new_with_preference_saver(prefs.clone(), window, cx, saver.clone()));
+        let app = cx.new(|cx| {
+            ChatApp::new_with_preference_saver(
+                prefs.clone(),
+                generation_service.clone(),
+                window,
+                cx,
+                saver.clone(),
+            )
+        });
         Root::new(app, window, cx)
     });
     let app = root.read_with(cx, |root, _| {
