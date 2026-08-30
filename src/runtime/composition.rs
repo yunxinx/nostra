@@ -138,10 +138,18 @@ impl std::error::Error for CompositionBuildError {
 #[must_use = "composition builders must be built to install their capabilities"]
 pub struct CompositionRootBuilder {
     session_services: SessionStores,
+    provider: ComponentId,
 }
 
 impl CompositionRootBuilder {
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub const fn with_provider(mut self, provider: ComponentId) -> Self {
+        self.provider = provider;
+        self
+    }
+
     pub fn build(self) -> Result<CompositionRoot, CompositionBuildError> {
+        let provider = self.provider;
         let application = ScopeTree::APPLICATION_SCOPE;
         let mut scopes = ScopeTree::new();
         let session_services = {
@@ -149,9 +157,9 @@ impl CompositionRootBuilder {
                 Ok(slot) => slot,
                 Err(error) => unreachable!("new application scope is open: {error}"),
             };
-            let candidate = match slot.prepare_candidate(LOCAL_SESSION_PROVIDER, || {
-                Ok::<_, Infallible>(self.session_services)
-            }) {
+            let candidate = match slot
+                .prepare_candidate(provider, || Ok::<_, Infallible>(self.session_services))
+            {
                 Ok(candidate) => candidate,
                 Err(error) => match error {},
             };
@@ -166,7 +174,7 @@ impl CompositionRootBuilder {
 
         let snapshot = RuntimeSnapshot::new(
             [ComponentSnapshot::active(
-                LOCAL_SESSION_PROVIDER,
+                provider,
                 application,
                 StartupPolicy::MustActivate,
                 DesiredRevision::INITIAL,
@@ -191,6 +199,7 @@ impl CompositionRootBuilder {
         Ok(CompositionRoot {
             scopes,
             snapshot,
+            provider,
             session_services: Some(session_services),
         })
     }
@@ -200,13 +209,23 @@ impl CompositionRootBuilder {
 pub struct CompositionRoot {
     scopes: ScopeTree,
     snapshot: RuntimeSnapshot,
+    provider: ComponentId,
     session_services: Option<CapabilityLease<SessionServicesCapability>>,
 }
 
 impl CompositionRoot {
     #[must_use = "composition builders must be built to install their capabilities"]
     pub fn builder(session_services: SessionStores) -> CompositionRootBuilder {
-        CompositionRootBuilder { session_services }
+        CompositionRootBuilder {
+            session_services,
+            provider: LOCAL_SESSION_PROVIDER,
+        }
+    }
+
+    /// Open the first-party local session stores and install them as the
+    /// default session Provider.
+    pub fn open_default() -> Result<Self, CompositionBuildError> {
+        Self::builder(SessionStores::open_default()).build()
     }
 
     #[must_use]
@@ -230,7 +249,7 @@ impl CompositionRoot {
         self.session_services = None;
         self.snapshot = RuntimeSnapshot::new(
             [ComponentSnapshot::disposed(
-                LOCAL_SESSION_PROVIDER,
+                self.provider,
                 application,
                 StartupPolicy::MustActivate,
                 DesiredRevision::INITIAL,

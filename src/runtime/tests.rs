@@ -2455,3 +2455,41 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
         RuntimeComponentState::Active
     );
 }
+
+#[test]
+fn memory_session_provider_uses_the_same_typed_capability_consumer() {
+    const MEMORY_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.memory");
+
+    let mut root = CompositionRoot::builder(SessionStores::with_stores(
+        InMemorySessionStore::new(),
+        InMemorySessionStore::new(),
+    ))
+    .with_provider(MEMORY_SESSION_PROVIDER)
+    .build()
+    .expect("valid memory session composition");
+    let session_services = root
+        .session_services()
+        .expect("active memory session capability");
+
+    assert_eq!(session_services.provider(), MEMORY_SESSION_PROVIDER);
+    assert_eq!(session_services.generation(), ComponentGeneration::INITIAL);
+    assert!(session_services.handle().chat().is_ok());
+    assert!(session_services.handle().agent().is_ok());
+    assert_eq!(
+        root.snapshot().components()[0].component(),
+        MEMORY_SESSION_PROVIDER
+    );
+    root.snapshot()
+        .audit_startup()
+        .expect("memory session Provider satisfies startup audit");
+
+    futures::executor::block_on(root.close()).expect("close memory session composition");
+    assert_eq!(
+        root.snapshot().components()[0].component(),
+        MEMORY_SESSION_PROVIDER
+    );
+    assert_eq!(
+        root.snapshot().components()[0].state(),
+        RuntimeComponentState::Disposed
+    );
+}
