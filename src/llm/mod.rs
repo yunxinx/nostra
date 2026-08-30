@@ -11,6 +11,7 @@ mod gateway;
 mod metrics;
 mod model;
 mod protocol;
+mod service;
 mod transport;
 
 pub use config::{
@@ -28,6 +29,10 @@ pub use model::*;
 pub use protocol::{
     CompatibilityProfile, MaxTokensField, Protocol, ReasoningField, ResponsesInstructionsPolicy,
     SystemRolePolicy,
+};
+pub use service::{
+    GatewayGenerationService, GenerationHandle, GenerationRequest, GenerationRunner,
+    GenerationService,
 };
 pub use transport::HttpTransport;
 

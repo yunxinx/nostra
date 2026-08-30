@@ -1,11 +1,11 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     future::Future,
     io,
     pin::Pin,
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     task::{Context, Poll},
     thread,
     time::Duration,
@@ -14,6 +14,11 @@ use std::{
 use futures::task::noop_waker_ref;
 use gpui::Subscription;
 
+use crate::llm::{
+    FinishReason, GatewayError, GenerateRequest, GenerationEvent, GenerationHandle,
+    GenerationOutcome, GenerationRequest, GenerationRunner, GenerationService, OutcomeStatus,
+    Protocol, StreamMetadata,
+};
 use crate::preferences::{PreferenceHandle, Preferences};
 use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, SessionStoresError};
 
@@ -23,11 +28,11 @@ use super::{
     ComponentSnapshotViolation, CompositionRoot, ContributionRevision, DependencyDeclaration,
     DependencyResolution, DependencyResolver, DependencyResolverError, DependencySnapshot,
     DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError,
-    MissingDependencySnapshot, PreparedCapability, ReconcileFailureKind, ReconcileObserver,
-    ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic,
-    RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind,
-    ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId, SessionServicesCapability,
-    StartupPolicy,
+    GenerationCapability, MissingDependencySnapshot, PreparedCapability, ReconcileFailureKind,
+    ReconcileObserver, ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState,
+    RuntimeDiagnostic, RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId,
+    ScopeKind, ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId,
+    SessionServicesCapability, StartupPolicy,
 };
 
 #[test]
@@ -2298,6 +2303,183 @@ fn long_transition_is_diagnostic_without_changing_lifecycle_state() {
     assert_eq!(reconciler.active_desired(), Some(&1));
 }
 
+fn composition_component(snapshot: &RuntimeSnapshot, component: ComponentId) -> &ComponentSnapshot {
+    snapshot
+        .components()
+        .iter()
+        .find(|entry| entry.component() == component)
+        .expect("composition component is registered")
+}
+
+struct ScriptedGenerationService {
+    events: Vec<GenerationEvent>,
+}
+
+impl ScriptedGenerationService {
+    fn new(events: Vec<GenerationEvent>) -> Self {
+        Self { events }
+    }
+}
+
+struct ScriptedGenerationRunner {
+    events: VecDeque<GenerationEvent>,
+    finished: bool,
+}
+
+impl GenerationService for ScriptedGenerationService {
+    fn start(&self, _: GenerationRequest) -> Result<GenerationHandle, GatewayError> {
+        Ok(GenerationHandle::from_runner(ScriptedGenerationRunner {
+            events: self.events.clone().into(),
+            finished: false,
+        }))
+    }
+}
+
+impl GenerationRunner for ScriptedGenerationRunner {
+    fn run<'a>(
+        &'a mut self,
+        on_event: &'a mut dyn FnMut(GenerationEvent) -> bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        Box::pin(async move {
+            while let Some(event) = self.events.pop_front() {
+                let terminal = matches!(event, GenerationEvent::Finished(_));
+                if !on_event(event) {
+                    return;
+                }
+                self.finished = terminal;
+                if terminal {
+                    return;
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> Option<GenerationEvent> {
+        if self.finished {
+            return None;
+        }
+        self.finished = true;
+        Some(GenerationEvent::Finished(Box::new(GenerationOutcome {
+            request_id: "scripted-cancel".into(),
+            profile_id: "scripted".into(),
+            model_id: "scripted".into(),
+            protocol: Protocol::Responses,
+            status: OutcomeStatus::Cancelled,
+            finish_reason: None,
+            usage: Default::default(),
+            response_id: None,
+            upstream_model: None,
+            time_to_first_event: None,
+            latency: Duration::ZERO,
+            message: None,
+            error: None,
+        })))
+    }
+}
+
+fn scripted_request() -> GenerationRequest {
+    GenerationRequest::new(
+        crate::llm::ModelSelection {
+            profile_id: "scripted".into(),
+            model_id: "model".into(),
+        },
+        GenerateRequest {
+            conversation_id: "conversation".into(),
+            turn_id: "turn".into(),
+            ..GenerateRequest::default()
+        },
+    )
+}
+
+fn consume_generation(service: &dyn GenerationService) -> Vec<GenerationEvent> {
+    let mut handle = service
+        .start(scripted_request())
+        .expect("scripted generation starts");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let observed = Rc::clone(&events);
+    futures::executor::block_on(handle.run(|event| {
+        observed.borrow_mut().push(event);
+        true
+    }));
+    drop(observed);
+    Rc::try_unwrap(events)
+        .expect("consumer owns the scripted event list")
+        .into_inner()
+}
+
+fn scripted_completed_outcome() -> GenerationOutcome {
+    GenerationOutcome {
+        request_id: "scripted-request".into(),
+        profile_id: "scripted".into(),
+        model_id: "scripted".into(),
+        protocol: Protocol::Responses,
+        status: OutcomeStatus::Completed,
+        finish_reason: Some(FinishReason::Stop),
+        usage: Default::default(),
+        response_id: Some("response".into()),
+        upstream_model: Some("model".into()),
+        time_to_first_event: None,
+        latency: Duration::ZERO,
+        message: None,
+        error: None,
+    }
+}
+
+#[test]
+fn default_composition_installs_the_gateway_generation_provider() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let generation = root.generation().expect("active generation capability");
+
+    assert_eq!(
+        CapabilityId::of::<GenerationCapability>().name(),
+        "nostra.generation"
+    );
+    assert_eq!(
+        generation.provider(),
+        ComponentId::new("nostra.generation.gateway")
+    );
+    assert_eq!(generation.generation(), ComponentGeneration::INITIAL);
+    assert!(generation.handle().start(scripted_request()).is_err());
+
+    futures::executor::block_on(root.close()).expect("close generation composition");
+    assert!(root.generation().is_none());
+}
+
+#[test]
+fn scripted_generation_provider_uses_the_same_consumer_handle() {
+    const SCRIPTED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.scripted");
+    let scripted = Arc::new(ScriptedGenerationService::new(vec![
+        GenerationEvent::Started(StreamMetadata {
+            response_id: Some("response".into()),
+            upstream_model: Some("model".into()),
+        }),
+        GenerationEvent::Finished(Box::new(scripted_completed_outcome())),
+    ]));
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .with_generation_service(SCRIPTED_PROVIDER, scripted)
+        .build()
+        .expect("valid scripted composition");
+    let generation = root.generation().expect("active scripted capability");
+
+    assert_eq!(generation.provider(), SCRIPTED_PROVIDER);
+    assert_eq!(generation.generation(), ComponentGeneration::INITIAL);
+    let events = consume_generation(generation.handle().as_ref());
+    assert!(matches!(events.first(), Some(GenerationEvent::Started(_))));
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Finished(outcome))
+            if outcome.status == OutcomeStatus::Completed
+    ));
+
+    futures::executor::block_on(root.close()).expect("close scripted composition");
+    assert_eq!(
+        composition_component(root.snapshot(), SCRIPTED_PROVIDER).state(),
+        RuntimeComponentState::Disposed
+    );
+}
+
 #[test]
 fn default_composition_installs_stable_session_provider_and_passes_startup_audit() {
     let stores =
@@ -2328,37 +2510,45 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     snapshot
         .audit_startup()
         .expect("default required components are active");
-    assert_eq!(snapshot.components().len(), 2);
+    assert_eq!(snapshot.components().len(), 3);
+    let preferences_component =
+        composition_component(snapshot, ComponentId::new("nostra.preferences.json"));
+    let generation_component =
+        composition_component(snapshot, ComponentId::new("nostra.generation.gateway"));
+    let session_component =
+        composition_component(snapshot, ComponentId::new("nostra.session.local"));
+    assert_eq!(preferences_component.scope(), application);
     assert_eq!(
-        snapshot.components()[0].component(),
-        ComponentId::new("nostra.preferences.json")
-    );
-    assert_eq!(
-        snapshot.components()[1].component(),
-        ComponentId::new("nostra.session.local")
-    );
-    assert_eq!(snapshot.components()[0].scope(), application);
-    assert_eq!(
-        snapshot.components()[0].startup_policy(),
+        preferences_component.startup_policy(),
         StartupPolicy::MustActivate
     );
-    assert_eq!(
-        snapshot.components()[0].state(),
-        RuntimeComponentState::Active
-    );
-    assert!(snapshot.components()[0].dependencies().is_empty());
-    assert!(snapshot.components()[0].missing_dependencies().is_empty());
-    assert!(snapshot.components()[1].dependencies().is_empty());
-    assert!(snapshot.components()[1].missing_dependencies().is_empty());
+    assert_eq!(preferences_component.state(), RuntimeComponentState::Active);
+    assert_eq!(generation_component.state(), RuntimeComponentState::Active);
+    assert_eq!(session_component.state(), RuntimeComponentState::Active);
+    assert!(preferences_component.dependencies().is_empty());
+    assert!(preferences_component.missing_dependencies().is_empty());
+    assert!(generation_component.dependencies().is_empty());
+    assert!(generation_component.missing_dependencies().is_empty());
+    assert!(session_component.dependencies().is_empty());
+    assert!(session_component.missing_dependencies().is_empty());
 
     futures::executor::block_on(root.close()).expect("close default composition");
     assert!(root.session_services().is_none());
     assert_eq!(
-        root.snapshot().components()[0].state(),
+        composition_component(root.snapshot(), ComponentId::new("nostra.preferences.json"),)
+            .state(),
         RuntimeComponentState::Disposed
     );
     assert_eq!(
-        root.snapshot().components()[1].state(),
+        composition_component(
+            root.snapshot(),
+            ComponentId::new("nostra.generation.gateway"),
+        )
+        .state(),
+        RuntimeComponentState::Disposed
+    );
+    assert_eq!(
+        composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
         RuntimeComponentState::Disposed
     );
     futures::executor::block_on(root.close())
@@ -2451,7 +2641,7 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert!(first_close.is_err());
     assert!(root.session_services().is_some());
     assert_eq!(
-        root.snapshot().components()[1].state(),
+        composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
         RuntimeComponentState::Active
     );
 
@@ -2462,7 +2652,7 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert!(retry.is_err());
     assert!(root.session_services().is_some());
     assert_eq!(
-        root.snapshot().components()[1].state(),
+        composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
         RuntimeComponentState::Active
     );
 }
@@ -2487,7 +2677,7 @@ fn memory_session_provider_uses_the_same_typed_capability_consumer() {
     assert!(session_services.handle().chat().is_ok());
     assert!(session_services.handle().agent().is_ok());
     assert_eq!(
-        root.snapshot().components()[1].component(),
+        composition_component(root.snapshot(), MEMORY_SESSION_PROVIDER,).component(),
         MEMORY_SESSION_PROVIDER
     );
     root.snapshot()
@@ -2496,11 +2686,11 @@ fn memory_session_provider_uses_the_same_typed_capability_consumer() {
 
     futures::executor::block_on(root.close()).expect("close memory session composition");
     assert_eq!(
-        root.snapshot().components()[1].component(),
+        composition_component(root.snapshot(), MEMORY_SESSION_PROVIDER,).component(),
         MEMORY_SESSION_PROVIDER
     );
     assert_eq!(
-        root.snapshot().components()[1].state(),
+        composition_component(root.snapshot(), MEMORY_SESSION_PROVIDER,).state(),
         RuntimeComponentState::Disposed
     );
 }
@@ -2551,7 +2741,7 @@ fn in_memory_preference_provider_uses_the_same_capability_consumer() {
         .update_in_memory(|prefs| prefs.language = Preferences::default().language);
     assert_eq!(lease.handle().snapshot(), preferences.snapshot());
     assert_eq!(
-        root.snapshot().components()[0].component(),
+        composition_component(root.snapshot(), MEMORY_PREFERENCE_PROVIDER,).component(),
         MEMORY_PREFERENCE_PROVIDER
     );
     root.snapshot()

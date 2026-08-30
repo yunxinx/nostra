@@ -11,8 +11,14 @@ use std::{
     time::Duration,
 };
 
-use crate::preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences};
-use crate::session::SessionStores;
+use http_client::HttpClient;
+use reqwest_client::ReqwestClient;
+
+use crate::{
+    llm::{GatewayGenerationService, GenerationService, HttpTransport, InMemoryMetrics},
+    preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
+    session::SessionStores,
+};
 
 use super::{
     AsyncStop, CapabilityKey, CapabilityLease, ComponentId, ComponentSnapshot,
@@ -22,6 +28,7 @@ use super::{
 
 const LOCAL_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.local");
 const JSON_PREFERENCE_PROVIDER: ComponentId = ComponentId::new(JSON_PROVIDER_NAME);
+const GATEWAY_GENERATION_PROVIDER: ComponentId = ComponentId::new("nostra.generation.gateway");
 const LONG_TRANSITION_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct SessionServicesCapability;
@@ -39,6 +46,15 @@ impl CapabilityKey for PreferenceCapability {
     type Handle = PreferenceHandle;
 
     const NAME: &'static str = "nostra.preferences";
+}
+
+/// Application-scoped model generation capability.
+pub struct GenerationCapability;
+
+impl CapabilityKey for GenerationCapability {
+    type Handle = Arc<dyn GenerationService>;
+
+    const NAME: &'static str = "nostra.generation";
 }
 
 #[derive(Debug)]
@@ -152,6 +168,8 @@ pub struct CompositionRootBuilder {
     provider: ComponentId,
     preferences: PreferenceHandle,
     preference_provider: ComponentId,
+    generation_service: Option<(ComponentId, Arc<dyn GenerationService>)>,
+    http_client: Arc<dyn HttpClient>,
 }
 
 impl CompositionRootBuilder {
@@ -173,9 +191,41 @@ impl CompositionRootBuilder {
         self
     }
 
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub fn with_generation_service(
+        mut self,
+        provider: ComponentId,
+        service: Arc<dyn GenerationService>,
+    ) -> Self {
+        self.generation_service = Some((provider, service));
+        self
+    }
+
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub fn with_http_client(mut self, client: Arc<dyn HttpClient>) -> Self {
+        self.http_client = client;
+        self
+    }
+
     pub fn build(self) -> Result<CompositionRoot, CompositionBuildError> {
-        let provider = self.provider;
-        let preference_provider = self.preference_provider;
+        let CompositionRootBuilder {
+            session_services: session_store,
+            provider,
+            preferences: preference_handle,
+            preference_provider,
+            generation_service,
+            http_client,
+        } = self;
+        let (generation_provider, generation_service): (ComponentId, Arc<dyn GenerationService>) =
+            generation_service.unwrap_or_else(|| {
+                let metrics = Arc::new(InMemoryMetrics::new(256));
+                let service = GatewayGenerationService::new(
+                    preference_handle.snapshot().provider_profiles,
+                    HttpTransport::new(http_client),
+                    Some(metrics),
+                );
+                (GATEWAY_GENERATION_PROVIDER, Arc::new(service))
+            });
         let application = ScopeTree::APPLICATION_SCOPE;
         let mut scopes = ScopeTree::new();
         let session_services = {
@@ -183,12 +233,11 @@ impl CompositionRootBuilder {
                 Ok(slot) => slot,
                 Err(error) => unreachable!("new application scope is open: {error}"),
             };
-            let candidate = match slot
-                .prepare_candidate(provider, || Ok::<_, Infallible>(self.session_services))
-            {
-                Ok(candidate) => candidate,
-                Err(error) => match error {},
-            };
+            let candidate =
+                match slot.prepare_candidate(provider, || Ok::<_, Infallible>(session_store)) {
+                    Ok(candidate) => candidate,
+                    Err(error) => match error {},
+                };
             if let Err(error) = slot.install(candidate) {
                 unreachable!("new capability slot accepts its initial Provider: {error}");
             }
@@ -203,7 +252,7 @@ impl CompositionRootBuilder {
                 Err(error) => unreachable!("new application scope is open: {error}"),
             };
             let candidate = match slot.prepare_candidate(preference_provider, || {
-                Ok::<_, Infallible>(self.preferences)
+                Ok::<_, Infallible>(preference_handle)
             }) {
                 Ok(candidate) => candidate,
                 Err(error) => match error {},
@@ -214,6 +263,25 @@ impl CompositionRootBuilder {
             match slot.current() {
                 Some(lease) => lease,
                 None => unreachable!("installed preference capability remains available"),
+            }
+        };
+        let generation = {
+            let slot = match scopes.capability_slot::<GenerationCapability>(application) {
+                Ok(slot) => slot,
+                Err(error) => unreachable!("new application scope is open: {error}"),
+            };
+            let candidate = match slot.prepare_candidate(generation_provider, || {
+                Ok::<_, Infallible>(generation_service)
+            }) {
+                Ok(candidate) => candidate,
+                Err(error) => match error {},
+            };
+            if let Err(error) = slot.install(candidate) {
+                unreachable!("new capability slot accepts its initial Provider: {error}");
+            }
+            match slot.current() {
+                Some(lease) => lease,
+                None => unreachable!("installed generation capability remains available"),
             }
         };
 
@@ -228,6 +296,13 @@ impl CompositionRootBuilder {
                 ),
                 ComponentSnapshot::active(
                     preference_provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+                ComponentSnapshot::active(
+                    generation_provider,
                     application,
                     StartupPolicy::MustActivate,
                     DesiredRevision::INITIAL,
@@ -257,6 +332,8 @@ impl CompositionRootBuilder {
             session_services: Some(session_services),
             preference_provider,
             preferences: Some(preferences),
+            generation_provider,
+            generation: Some(generation),
         })
     }
 }
@@ -269,6 +346,8 @@ pub struct CompositionRoot {
     session_services: Option<CapabilityLease<SessionServicesCapability>>,
     preference_provider: ComponentId,
     preferences: Option<CapabilityLease<PreferenceCapability>>,
+    generation_provider: ComponentId,
+    generation: Option<CapabilityLease<GenerationCapability>>,
 }
 
 impl CompositionRoot {
@@ -279,6 +358,8 @@ impl CompositionRoot {
             provider: LOCAL_SESSION_PROVIDER,
             preferences: PreferenceHandle::json(Preferences::default()),
             preference_provider: JSON_PREFERENCE_PROVIDER,
+            generation_service: None,
+            http_client: Arc::new(ReqwestClient::new()),
         }
     }
 
@@ -306,6 +387,11 @@ impl CompositionRoot {
     }
 
     #[must_use]
+    pub fn generation(&self) -> Option<&CapabilityLease<GenerationCapability>> {
+        self.generation.as_ref()
+    }
+
+    #[must_use]
     pub const fn snapshot(&self) -> &RuntimeSnapshot {
         &self.snapshot
     }
@@ -315,6 +401,7 @@ impl CompositionRoot {
         self.scopes.close(application).await?;
         self.session_services = None;
         self.preferences = None;
+        self.generation = None;
         self.snapshot = RuntimeSnapshot::new(
             [
                 ComponentSnapshot::disposed(
@@ -326,6 +413,13 @@ impl CompositionRoot {
                 ),
                 ComponentSnapshot::disposed(
                     self.preference_provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+                ComponentSnapshot::disposed(
+                    self.generation_provider,
                     application,
                     StartupPolicy::MustActivate,
                     DesiredRevision::INITIAL,
