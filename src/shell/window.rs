@@ -11,12 +11,12 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, Root, TitleBar};
 use rust_i18n::t;
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use crate::appearance::glass;
 use crate::llm::GenerationService;
 use crate::preferences::{Preferences, WindowGeometry};
-use crate::runtime::RuntimeServices;
+use crate::runtime::{ComponentId, CompositionRoot, QUIT_FALLBACK_TIMEOUT};
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
@@ -99,7 +99,31 @@ pub fn open_main_window(
 
     cx.spawn(async move |cx| {
         let stores = stores.await;
-        let services = RuntimeServices::new(stores, preference_handle, generation_service);
+        let composition = match CompositionRoot::builder(stores)
+            .with_preferences(preference_handle)
+            .with_generation_service(
+                ComponentId::new("nostra.generation.gateway"),
+                generation_service,
+            )
+            .build()
+        {
+            Ok(composition) => composition,
+            Err(error) => {
+                crate::logging::error(
+                    "runtime.composition",
+                    format_args!("failed to build application composition: {error}"),
+                );
+                return;
+            }
+        };
+        let Some(services) = composition.services() else {
+            crate::logging::error(
+                "runtime.composition",
+                "application composition did not expose active services",
+            );
+            return;
+        };
+        let composition = Rc::new(RefCell::new(Some(composition)));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
@@ -156,6 +180,46 @@ pub fn open_main_window(
                 format_args!("failed to finish main-window setup: {error:?}"),
             );
         }
+
+        let composition_for_quit = Rc::clone(&composition);
+        cx.update(|cx| {
+            App::on_app_quit(cx, move |cx| {
+                let composition = composition_for_quit.borrow_mut().take();
+                let task = composition.as_ref().map(|composition_ref| {
+                    let coordinator = composition_ref.exit_coordinator();
+                    let snapshot = composition_ref
+                        .preferences()
+                        .map(|lease| lease.handle().snapshot())
+                        .unwrap_or_default();
+                    cx.background_executor()
+                        .spawn(coordinator.run(snapshot, QUIT_FALLBACK_TIMEOUT))
+                });
+                async move {
+                    if let Some(mut composition) = composition {
+                        let Some(task) = task else {
+                            return;
+                        };
+                        let report = task.await;
+                        if let Some(error) = report.dispose_error() {
+                            crate::logging::error(
+                                "runtime.composition",
+                                format_args!("failed to close application composition: {error}"),
+                            );
+                        }
+                        if report.session.is_err() {
+                            return;
+                        }
+                        if let Err(error) = composition.close_after_exit().await {
+                            crate::logging::error(
+                                "runtime.composition",
+                                format_args!("failed to close application composition: {error}"),
+                            );
+                        }
+                    }
+                }
+            })
+            .detach();
+        });
     })
     .detach();
 }

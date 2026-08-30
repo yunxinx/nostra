@@ -6,14 +6,10 @@ mod render;
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::Duration,
 };
 
-use futures::future;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyElement, App, AppContext as _, Context, DragMoveEvent, ElementId, EmptyView, Entity,
@@ -38,7 +34,9 @@ use crate::appearance::{glass, theme};
 use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
 use crate::llm::{GenerationService, ModelSelection};
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
-use crate::runtime::RuntimeServices;
+use crate::runtime::{
+    ExitCoordinator, NORMAL_EXIT_TIMEOUT, QUIT_FALLBACK_TIMEOUT, RuntimeServices,
+};
 use crate::session::{
     ChatSessionCatalogController, ProjectSessionStore as _, ResolvedSessionState, SessionId,
     SessionLifecycleStore as _, SessionStores,
@@ -57,12 +55,6 @@ const RESIZE_HANDLE_WIDTH: Pixels = px(6.);
 
 /// Duration of the sidebar collapse/expand animation.
 const SIDEBAR_ANIM: Duration = Duration::from_millis(220);
-
-/// GPUI waits 200 ms for quit observers. Keep the fallback storage budget
-/// below that ceiling so preference persistence is not abandoned behind a
-/// longer session timeout. Normal menu/window exits use the five-second
-/// pre-quit path before asking GPUI to terminate.
-const APP_QUIT_STORAGE_BUDGET: Duration = Duration::from_millis(150);
 
 /// x-coordinate where the main column's floating content (model pill) should
 /// start when the sidebar is fully collapsed. Equals the width of the fixed
@@ -194,13 +186,13 @@ pub struct ChatApp {
     /// Background task resolving the native folder picker for a new Agent
     /// work project.
     _folder_task: Option<Task<()>>,
-    shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
     session_services: SessionStores,
     preference_handle: PreferenceHandle,
     preference_snapshot: Preferences,
     generation_service: Arc<dyn GenerationService>,
+    exit_coordinator: Arc<ExitCoordinator>,
 }
 
 /// Identity of a sidebar row.  Drafts (unbound views) are addressed by their
@@ -222,9 +214,7 @@ use agent_workspace::AgentWorkspace;
 use history_sidebar::ChatHistorySidebar;
 
 struct ExitWork {
-    stores: SessionStores,
     snapshot: Preferences,
-    preference_handle: PreferenceHandle,
 }
 
 struct Conversation {
@@ -268,6 +258,7 @@ impl ChatApp {
         let session_services = services.session_services().clone();
         let preference_handle = services.preference_handle().clone();
         let generation_service = services.generation_service();
+        let exit_coordinator = services.exit_coordinator();
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
@@ -327,13 +318,13 @@ impl ChatApp {
             _agent_delete_task: None,
             agent_deleting_projects: HashSet::new(),
             _folder_task: None,
-            shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),
             session_services,
             preference_handle,
             preference_snapshot: prefs.clone(),
             generation_service,
+            exit_coordinator,
         };
         this.track_window_geometry(window, cx);
         this.track_preferences(window, cx);
@@ -386,7 +377,7 @@ impl ChatApp {
     /// shutdown; gpui awaits the returned task before exiting.
     fn register_save_on_quit(&self, cx: &mut Context<Self>) {
         let app = cx.entity();
-        let shutdown_completed = Arc::clone(&self.shutdown_completed);
+        let exit_coordinator = self.exit_coordinator.clone();
         // Register on App itself, not Context<ChatApp>. The Context helper
         // captures only a weak entity and native main-window close can release
         // that entity before the platform dispatches application shutdown.
@@ -395,27 +386,15 @@ impl ChatApp {
             // Keep the coordinator entity alive in the returned future while
             // detached terminal workers and the final store barrier finish.
             let keepalive = app.clone();
-            let shutdown_completed = Arc::clone(&shutdown_completed);
-            let work = (!shutdown_completed.load(Ordering::Acquire))
-                .then(|| app.update(cx, |this, cx| this.prepare_exit_work(cx)));
+            let exit_coordinator = exit_coordinator.clone();
+            let work = app.update(cx, |this, cx| this.prepare_exit_work(cx));
             let executor = cx.background_executor().clone();
+            let ExitWork { snapshot } = work;
+            let task = executor.spawn(exit_coordinator.run(snapshot, QUIT_FALLBACK_TIMEOUT));
             async move {
                 let _keepalive = keepalive;
-                let Some(ExitWork {
-                    stores,
-                    snapshot,
-                    preference_handle,
-                }) = work
-                else {
-                    return;
-                };
-                let session_task = executor
-                    .spawn(async move { stores.shutdown_with_timeout(APP_QUIT_STORAGE_BUDGET) });
-                let preferences_task =
-                    executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
-                let (sessions, preferences) = future::join(session_task, preferences_task).await;
-                log_exit_results(sessions, preferences);
-                shutdown_completed.store(true, Ordering::Release);
+                let report = task.await;
+                log_exit_results(&report);
             }
         })
         .detach();
@@ -437,7 +416,6 @@ impl ChatApp {
                 .view
                 .update(cx, |chat, cx| chat.prepare_for_shutdown(cx));
         }
-        let stores = self.session_services.clone();
         let sidebar_width = self.sidebar_width.as_f32();
         let sidebar_collapsed = self.collapsed;
         let window = self.window_geometry;
@@ -446,31 +424,21 @@ impl ChatApp {
             prefs.sidebar_collapsed = sidebar_collapsed;
             prefs.window = window;
         });
-        ExitWork {
-            stores,
-            snapshot,
-            preference_handle: self.preference_handle.clone(),
-        }
+        ExitWork { snapshot }
     }
 
     pub(crate) fn request_quit(&mut self, cx: &mut Context<Self>) {
         if self._quit_task.is_some() {
             return;
         }
-        let ExitWork {
-            stores,
-            snapshot,
-            preference_handle,
-        } = self.prepare_exit_work(cx);
+        let ExitWork { snapshot } = self.prepare_exit_work(cx);
+        let exit_coordinator = self.exit_coordinator.clone();
         let executor = cx.background_executor().clone();
-        let session_task = executor.spawn(async move { stores.shutdown() });
-        let preferences_task =
-            executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
-        let shutdown_completed = Arc::clone(&self.shutdown_completed);
         self._quit_task = Some(cx.spawn(async move |_, cx| {
-            let (sessions, preferences) = future::join(session_task, preferences_task).await;
-            log_exit_results(sessions, preferences);
-            shutdown_completed.store(true, Ordering::Release);
+            let report = executor
+                .spawn(exit_coordinator.run(snapshot, NORMAL_EXIT_TIMEOUT))
+                .await;
+            log_exit_results(&report);
             cx.update(|cx| cx.quit());
         }));
     }
@@ -1618,20 +1586,17 @@ impl ChatApp {
     }
 }
 
-fn log_exit_results(
-    sessions: Result<(), crate::session::SessionStoresError>,
-    preferences: anyhow::Result<()>,
-) {
-    if let Err(error) = sessions {
+fn log_exit_results(report: &crate::runtime::ExitReport) {
+    if let Err(error) = &report.session {
         crate::logging::error(
             "session.shutdown",
-            format_args!("failed to shut down session stores before exit: {error:?}"),
+            format_args!("failed to shut down session stores before exit: {error}"),
         );
     }
-    if let Err(error) = preferences {
+    if let Err(error) = &report.preferences {
         crate::logging::error(
             "preferences",
-            format_args!("failed to save preferences during exit: {error:?}"),
+            format_args!("failed to save preferences during exit: {error}"),
         );
     }
 }

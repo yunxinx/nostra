@@ -1,15 +1,6 @@
 //! Default application composition and typed root capabilities.
 
-use std::{
-    convert::Infallible,
-    fmt,
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, Waker},
-    thread,
-    time::Duration,
-};
+use std::{convert::Infallible, fmt, sync::Arc, time::Duration};
 
 use http_client::HttpClient;
 use reqwest_client::ReqwestClient;
@@ -24,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    AsyncStop, CapabilityKey, CapabilityLease, ComponentId, ComponentSnapshot,
-    ComponentSnapshotDetails, DesiredRevision, DisposeError, RuntimeSnapshot, RuntimeSnapshotError,
+    CapabilityKey, CapabilityLease, ComponentId, ComponentSnapshot, ComponentSnapshotDetails,
+    DesiredRevision, ExitCoordinator, NORMAL_EXIT_TIMEOUT, RuntimeSnapshot, RuntimeSnapshotError,
     ScopeError, ScopeId, ScopeTree, StartupAuditError, StartupPolicy,
 };
 
@@ -33,6 +24,17 @@ const LOCAL_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.loc
 const JSON_PREFERENCE_PROVIDER: ComponentId = ComponentId::new(JSON_PROVIDER_NAME);
 const GATEWAY_GENERATION_PROVIDER: ComponentId = ComponentId::new("nostra.generation.gateway");
 const LONG_TRANSITION_THRESHOLD: Duration = Duration::from_secs(30);
+
+fn default_preference_handle() -> PreferenceHandle {
+    #[cfg(test)]
+    {
+        PreferenceHandle::in_memory(Preferences::default())
+    }
+    #[cfg(not(test))]
+    {
+        PreferenceHandle::json(Preferences::default())
+    }
+}
 
 /// Build the first-party generation Provider from an explicit catalog
 /// snapshot. The catalog is captured before the service is installed so every
@@ -84,6 +86,7 @@ pub struct RuntimeServices {
     session_services: SessionStores,
     preference_handle: PreferenceHandle,
     generation_service: Arc<dyn GenerationService>,
+    exit_coordinator: Arc<ExitCoordinator>,
 }
 
 impl RuntimeServices {
@@ -92,11 +95,13 @@ impl RuntimeServices {
         session_services: SessionStores,
         preference_handle: PreferenceHandle,
         generation_service: Arc<dyn GenerationService>,
+        exit_coordinator: Arc<ExitCoordinator>,
     ) -> Self {
         Self {
             session_services,
             preference_handle,
             generation_service,
+            exit_coordinator,
         }
     }
 
@@ -126,9 +131,8 @@ impl RuntimeServices {
     }
 
     #[must_use]
-    pub fn with_preference_handle(mut self, preference_handle: PreferenceHandle) -> Self {
-        self.preference_handle = preference_handle;
-        self
+    pub fn exit_coordinator(&self) -> Arc<ExitCoordinator> {
+        Arc::clone(&self.exit_coordinator)
     }
 }
 
@@ -136,87 +140,6 @@ impl RuntimeServices {
 pub enum CompositionBuildError {
     Snapshot(RuntimeSnapshotError),
     Startup(StartupAuditError),
-}
-
-struct SessionShutdownOwner {
-    stores: SessionStores,
-    state: Option<Arc<SessionShutdownState>>,
-}
-
-#[derive(Default)]
-struct SessionShutdownState {
-    status: Mutex<SessionShutdownStatus>,
-}
-
-#[derive(Default)]
-struct SessionShutdownStatus {
-    result: Option<Result<(), Arc<str>>>,
-    waker: Option<Waker>,
-}
-
-impl SessionShutdownState {
-    fn finish(&self, result: Result<(), Arc<str>>) {
-        let waker = {
-            let mut status = match self.status.lock() {
-                Ok(status) => status,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            status.result = Some(result);
-            status.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
-}
-
-struct SessionShutdownFuture {
-    state: Arc<SessionShutdownState>,
-}
-
-impl Future for SessionShutdownFuture {
-    type Output = Result<(), DisposeError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut status = match self.state.status.lock() {
-            Ok(status) => status,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        match &status.result {
-            Some(Ok(())) => Poll::Ready(Ok(())),
-            Some(Err(error)) => Poll::Ready(Err(DisposeError::msg(error.to_string()))),
-            None => {
-                status.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-impl AsyncStop for SessionShutdownOwner {
-    fn stop(&mut self) -> Pin<Box<dyn Future<Output = Result<(), DisposeError>> + '_>> {
-        let state = if let Some(state) = &self.state {
-            Arc::clone(state)
-        } else {
-            let state = Arc::new(SessionShutdownState::default());
-            let worker_state = Arc::clone(&state);
-            let stores = self.stores.clone();
-            let spawn_result = thread::Builder::new()
-                .name("nostra-runtime-session-shutdown".to_string())
-                .spawn(move || {
-                    let result = stores
-                        .shutdown()
-                        .map_err(|error| Arc::<str>::from(error.to_string()));
-                    worker_state.finish(result);
-                });
-            if let Err(error) = spawn_result {
-                state.finish(Err(Arc::from(error.to_string())));
-            }
-            self.state = Some(Arc::clone(&state));
-            state
-        };
-        Box::pin(SessionShutdownFuture { state })
-    }
 }
 
 impl fmt::Display for CompositionBuildError {
@@ -368,6 +291,11 @@ impl CompositionRootBuilder {
             }
         };
 
+        let exit_coordinator = Arc::new(ExitCoordinator::new(
+            session_services.handle().clone(),
+            preferences.handle().clone(),
+        ));
+
         let snapshot = RuntimeSnapshot::new(
             [
                 ComponentSnapshot::active(
@@ -400,14 +328,6 @@ impl CompositionRootBuilder {
             .audit_startup()
             .map_err(CompositionBuildError::Startup)?;
 
-        let shutdown_owner = SessionShutdownOwner {
-            stores: session_services.handle().clone(),
-            state: None,
-        };
-        if let Err(error) = scopes.own_async(application, shutdown_owner) {
-            unreachable!("new application scope is open: {error}");
-        }
-
         Ok(CompositionRoot {
             scopes,
             snapshot,
@@ -417,6 +337,7 @@ impl CompositionRootBuilder {
             preferences: Some(preferences),
             generation_provider,
             generation: Some(generation),
+            exit_coordinator,
         })
     }
 }
@@ -431,6 +352,7 @@ pub struct CompositionRoot {
     preferences: Option<CapabilityLease<PreferenceCapability>>,
     generation_provider: ComponentId,
     generation: Option<CapabilityLease<GenerationCapability>>,
+    exit_coordinator: Arc<ExitCoordinator>,
 }
 
 impl CompositionRoot {
@@ -439,7 +361,7 @@ impl CompositionRoot {
         CompositionRootBuilder {
             session_services,
             provider: LOCAL_SESSION_PROVIDER,
-            preferences: PreferenceHandle::json(Preferences::default()),
+            preferences: default_preference_handle(),
             preference_provider: JSON_PREFERENCE_PROVIDER,
             generation_service: None,
             provider_catalog: None,
@@ -483,7 +405,13 @@ impl CompositionRoot {
             self.session_services()?.handle().clone(),
             self.preferences()?.handle().clone(),
             self.generation()?.handle().clone(),
+            self.exit_coordinator(),
         ))
+    }
+
+    #[must_use]
+    pub fn exit_coordinator(&self) -> Arc<ExitCoordinator> {
+        Arc::clone(&self.exit_coordinator)
     }
 
     #[must_use]
@@ -492,6 +420,38 @@ impl CompositionRoot {
     }
 
     pub async fn close(&mut self) -> Result<(), ScopeError> {
+        let application = self.scopes.application();
+        let snapshot = self
+            .preferences
+            .as_ref()
+            .map(|lease| lease.handle().snapshot())
+            .unwrap_or_default();
+        let report = self
+            .exit_coordinator
+            .run_blocking(snapshot, NORMAL_EXIT_TIMEOUT);
+        if let Err(error) = &report.preferences {
+            crate::logging::error(
+                "preferences",
+                format_args!("failed to save preferences during composition close: {error}"),
+            );
+        }
+        if let Some(source) = report.session_dispose_error() {
+            return Err(ScopeError::Dispose {
+                scope: application,
+                source,
+            });
+        }
+        self.close_scopes().await
+    }
+
+    /// Close runtime scopes after the exit coordinator has completed. The
+    /// application quit observer uses this split form so its blocking durable
+    /// work remains on a background executor.
+    pub(crate) async fn close_after_exit(&mut self) -> Result<(), ScopeError> {
+        self.close_scopes().await
+    }
+
+    async fn close_scopes(&mut self) -> Result<(), ScopeError> {
         let application = self.scopes.application();
         self.scopes.close(application).await?;
         self.session_services = None;

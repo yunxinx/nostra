@@ -6,6 +6,7 @@ mod composition;
 mod dependency;
 mod diagnostics;
 mod effect;
+mod exit;
 mod reconcile;
 mod scope;
 
@@ -30,6 +31,7 @@ pub use diagnostics::{
     TransitionSnapshot,
 };
 pub use effect::{AsyncStop, DisposeError, EffectScope};
+pub use exit::{ExitCoordinator, ExitReport, NORMAL_EXIT_TIMEOUT, QUIT_FALLBACK_TIMEOUT};
 pub use reconcile::{
     ComponentLifecycle, DesiredRevision, DesiredRevisionExhausted, ReconcileFailure,
     ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus, ReconcileTarget,

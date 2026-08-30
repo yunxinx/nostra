@@ -5,7 +5,11 @@ use std::{
     io,
     pin::Pin,
     rc::Rc,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     task::{Context, Poll},
     thread,
     time::Duration,
@@ -2654,6 +2658,84 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert_eq!(
         composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
         RuntimeComponentState::Active
+    );
+}
+
+#[test]
+fn exit_coordinator_runs_both_durable_providers_once() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let mut chat = InMemorySessionStore::new();
+    chat.observe_shutdown_for_test(started_tx, None);
+    let stores = SessionStores::with_chat_store(chat);
+    let saves = Arc::new(AtomicUsize::new(0));
+    let saves_for_provider = Arc::clone(&saves);
+    let preferences = PreferenceHandle::with_saver(
+        Preferences::default(),
+        Arc::new(move |_| {
+            saves_for_provider.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }),
+    );
+    let coordinator = super::ExitCoordinator::new(stores, preferences);
+
+    let first = futures::executor::block_on(
+        coordinator.run(Preferences::default(), super::NORMAL_EXIT_TIMEOUT),
+    );
+    assert!(first.is_success());
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("exit coordinator shuts down the Chat domain");
+    assert_eq!(saves.load(Ordering::SeqCst), 1);
+
+    let second = futures::executor::block_on(coordinator.run(
+        Preferences {
+            sidebar_collapsed: true,
+            ..Preferences::default()
+        },
+        super::QUIT_FALLBACK_TIMEOUT,
+    ));
+    assert_eq!(second, first);
+    assert_eq!(saves.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn exit_coordinator_aggregates_session_and_preference_failures() {
+    let preferences = PreferenceHandle::with_saver(
+        Preferences::default(),
+        Arc::new(|_| Err(anyhow::anyhow!("preference write failed"))),
+    );
+    let coordinator = super::ExitCoordinator::new(
+        SessionStores::with_chat_store(InMemorySessionStore::new()),
+        preferences,
+    );
+    let report = futures::executor::block_on(
+        coordinator.run(Preferences::default(), Duration::from_secs(1)),
+    );
+    assert!(report.session.is_ok());
+    assert!(matches!(
+        report.preferences,
+        Err(ref error) if error.as_ref() == "preference write failed"
+    ));
+    assert!(!report.is_success());
+}
+
+#[test]
+fn composition_close_releases_scopes_when_preference_save_fails() {
+    let preferences = PreferenceHandle::with_saver(
+        Preferences::default(),
+        Arc::new(|_| Err(anyhow::anyhow!("preference write failed"))),
+    );
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .with_preferences(preferences)
+        .build()
+        .expect("valid composition");
+
+    futures::executor::block_on(root.close())
+        .expect("a preference save failure does not leave runtime scopes active");
+    assert!(root.services().is_none());
+    assert_eq!(
+        composition_component(root.snapshot(), ComponentId::new("nostra.preferences.json")).state(),
+        RuntimeComponentState::Disposed
     );
 }
 
