@@ -4,9 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use gpui::Global;
-
 use super::super::{
     ChatMessageReferenceStore, LocalSessionStore, ProjectSessionStore, SessionCatalogStore,
     SessionDomain, SessionStore,
@@ -46,9 +43,6 @@ impl Default for SessionStores {
         }
     }
 }
-
-#[cfg(test)]
-impl Global for SessionStores {}
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum SessionStoresError {

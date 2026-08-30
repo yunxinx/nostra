@@ -128,9 +128,6 @@ fn add_app_window_with_preferences_and_stores(
         gpui_component::init(cx);
         crate::appearance::fonts::init(prefs.composer_font, cx);
         crate::preferences::init_global(prefs.clone(), cx);
-        if let Some(stores) = stores {
-            cx.set_global(stores);
-        }
     });
     let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
     let services = composed_services(cx, session_services, preference_handle);
@@ -157,7 +154,6 @@ fn add_app_window_with_saver(
         gpui_component::init(cx);
         crate::appearance::fonts::init(prefs.composer_font, cx);
         crate::preferences::init_global(prefs.clone(), cx);
-        cx.set_global(stores.clone());
     });
     let preference_handle =
         crate::preferences::PreferenceHandle::with_saver(prefs.clone(), saver.clone());
