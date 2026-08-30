@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
         Arc,
@@ -9,13 +9,13 @@ use std::{
     time::Duration,
 };
 
-use gpui::TestAppContext;
+use gpui::{Global, TestAppContext};
 use reqwest_client::ReqwestClient;
 
 use crate::llm::{
     GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
 };
-use crate::runtime::RuntimeServices;
+use crate::runtime::{ComponentId, CompositionRoot, RuntimeServices};
 use crate::session::{
     ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
     LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
@@ -24,6 +24,39 @@ use crate::session::{
 };
 
 use super::*;
+
+type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
+
+struct TestCompositionRoot(RefCell<Option<CompositionRoot>>);
+
+impl Global for TestCompositionRoot {}
+
+impl Drop for TestCompositionRoot {
+    fn drop(&mut self) {
+        if let Some(mut root) = self.0.get_mut().take() {
+            let _ = futures::executor::block_on(root.close());
+        }
+    }
+}
+
+fn composed_services(
+    cx: &mut TestAppContext,
+    session_services: SessionStores,
+    preference_handle: crate::preferences::PreferenceHandle,
+) -> RuntimeServices {
+    let generation_service = generation_service();
+    let root = CompositionRoot::builder(session_services.clone())
+        .with_preferences(preference_handle)
+        .with_generation_service(
+            ComponentId::new("nostra.generation.test"),
+            generation_service,
+        )
+        .build()
+        .expect("valid test composition");
+    let services = root.services().expect("active test services");
+    cx.update(|cx| cx.set_global(TestCompositionRoot(RefCell::new(Some(root)))));
+    services
+}
 
 fn generation_service() -> Arc<dyn GenerationService> {
     Arc::new(GatewayGenerationService::new(
@@ -99,9 +132,8 @@ fn add_app_window_with_preferences_and_stores(
             cx.set_global(stores);
         }
     });
-    let generation_service = generation_service();
     let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
-    let services = RuntimeServices::new(session_services, preference_handle, generation_service);
+    let services = composed_services(cx, session_services, preference_handle);
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
         Root::new(app, window, cx)
@@ -118,7 +150,7 @@ fn add_app_window_with_preferences_and_stores(
 fn add_app_window_with_saver(
     cx: &mut TestAppContext,
     stores: SessionStores,
-    saver: super::PreferenceSaver,
+    saver: PreferenceSaver,
 ) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
     let prefs = Preferences::default();
     cx.update(|cx| {
@@ -127,22 +159,11 @@ fn add_app_window_with_saver(
         crate::preferences::init_global(prefs.clone(), cx);
         cx.set_global(stores.clone());
     });
-    let generation_service = generation_service();
-    let services = RuntimeServices::new(
-        stores.clone(),
-        crate::preferences::PreferenceHandle::in_memory(prefs.clone()),
-        generation_service,
-    );
+    let preference_handle =
+        crate::preferences::PreferenceHandle::with_saver(prefs.clone(), saver.clone());
+    let services = composed_services(cx, stores.clone(), preference_handle);
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let app = cx.new(|cx| {
-            ChatApp::new_with_preference_saver(
-                prefs.clone(),
-                services.clone(),
-                window,
-                cx,
-                saver.clone(),
-            )
-        });
+        let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
         Root::new(app, window, cx)
     });
     let app = root.read_with(cx, |root, _| {
@@ -165,7 +186,7 @@ fn app_shutdown_hook_survives_release_of_the_main_view(cx: &mut TestAppContext) 
     let stores = SessionStores::with_stores(chat, agent);
     let preferences_saved = Arc::new(AtomicBool::new(false));
     let preferences_saved_for_test = Arc::clone(&preferences_saved);
-    let saver: super::PreferenceSaver = Arc::new(move |_| {
+    let saver: PreferenceSaver = Arc::new(move |_| {
         preferences_saved_for_test.store(true, Ordering::Release);
         Ok(())
     });
@@ -197,7 +218,7 @@ fn native_close_enters_the_pre_quit_durability_barrier(cx: &mut TestAppContext) 
     agent.observe_shutdown_for_test(agent_started_tx, None);
     let preferences_saved = Arc::new(AtomicBool::new(false));
     let preferences_saved_for_test = Arc::clone(&preferences_saved);
-    let saver: super::PreferenceSaver = Arc::new(move |_| {
+    let saver: PreferenceSaver = Arc::new(move |_| {
         preferences_saved_for_test.store(true, Ordering::Release);
         Ok(())
     });

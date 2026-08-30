@@ -202,9 +202,6 @@ pub struct ChatApp {
     generation_service: Arc<dyn GenerationService>,
 }
 
-#[cfg(test)]
-type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
-
 /// Identity of a sidebar row.  Drafts (unbound views) are addressed by their
 /// view entity; persisted catalog rows are addressed by their session id so the
 /// row stays stable whether or not the session is currently opened.
@@ -259,24 +256,6 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::build(prefs, services, window, cx)
-    }
-
-    #[cfg(test)]
-    pub(super) fn new_with_preference_saver(
-        prefs: Preferences,
-        services: RuntimeServices,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        preference_saver: PreferenceSaver,
-    ) -> Self {
-        let preference_handle =
-            PreferenceHandle::with_saver(prefs.clone(), preference_saver.clone());
-        Self::build(
-            prefs,
-            services.with_preference_handle(preference_handle),
-            window,
-            cx,
-        )
     }
 
     fn build(
