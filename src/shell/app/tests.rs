@@ -15,6 +15,7 @@ use reqwest_client::ReqwestClient;
 use crate::llm::{
     GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
 };
+use crate::runtime::RuntimeServices;
 use crate::session::{
     ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
     LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
@@ -89,6 +90,7 @@ fn add_app_window_with_preferences_and_stores(
     prefs: Preferences,
     stores: Option<SessionStores>,
 ) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
+    let session_services = stores.clone().unwrap_or_default();
     cx.update(|cx| {
         gpui_component::init(cx);
         crate::appearance::fonts::init(prefs.composer_font, cx);
@@ -98,8 +100,10 @@ fn add_app_window_with_preferences_and_stores(
         }
     });
     let generation_service = generation_service();
+    let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
+    let services = RuntimeServices::new(session_services, preference_handle, generation_service);
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let app = cx.new(|cx| ChatApp::new(prefs.clone(), generation_service.clone(), window, cx));
+        let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
         Root::new(app, window, cx)
     });
     let app = root.read_with(cx, |root, _| {
@@ -121,14 +125,19 @@ fn add_app_window_with_saver(
         gpui_component::init(cx);
         crate::appearance::fonts::init(prefs.composer_font, cx);
         crate::preferences::init_global(prefs.clone(), cx);
-        cx.set_global(stores);
+        cx.set_global(stores.clone());
     });
     let generation_service = generation_service();
+    let services = RuntimeServices::new(
+        stores.clone(),
+        crate::preferences::PreferenceHandle::in_memory(prefs.clone()),
+        generation_service,
+    );
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let app = cx.new(|cx| {
             ChatApp::new_with_preference_saver(
                 prefs.clone(),
-                generation_service.clone(),
+                services.clone(),
                 window,
                 cx,
                 saver.clone(),

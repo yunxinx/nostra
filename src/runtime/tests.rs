@@ -2723,6 +2723,29 @@ fn default_composition_exposes_the_json_preference_provider() {
 }
 
 #[test]
+fn composition_services_project_the_active_handles_as_one_bundle() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let services = root.services().expect("active runtime services");
+
+    assert!(services.session_services().chat().is_err());
+    assert_eq!(
+        services.preference_handle().snapshot(),
+        Preferences::default()
+    );
+    assert!(
+        services
+            .generation_service()
+            .start(scripted_request())
+            .is_err()
+    );
+
+    futures::executor::block_on(root.close()).expect("close runtime services composition");
+    assert!(root.services().is_none());
+}
+
+#[test]
 fn in_memory_preference_provider_uses_the_same_capability_consumer() {
     const MEMORY_PREFERENCE_PROVIDER: ComponentId = ComponentId::new("nostra.preferences.memory");
     let preferences = PreferenceHandle::in_memory(Preferences::default());

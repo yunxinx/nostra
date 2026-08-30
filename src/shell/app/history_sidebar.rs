@@ -27,7 +27,7 @@ use rust_i18n::t;
 use crate::preferences;
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, SessionCatalogStore, SessionDomain,
-    SessionId, SessionLifecycleStore, SessionStores, SessionSummary,
+    SessionId, SessionLifecycleStore, SessionSummary,
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmation;
 
@@ -190,11 +190,7 @@ impl ChatApp {
         ) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.history.load_state =
-                HistoryLoadState::Error(t!("sidebar.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.session_services.clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(error) => {
@@ -263,9 +259,7 @@ impl ChatApp {
         let Some(cursor) = self.history.next_cursor.clone() else {
             return;
         };
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -321,9 +315,7 @@ impl ChatApp {
         session_id: SessionId,
         cx: &mut Context<Self>,
     ) {
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -409,9 +401,7 @@ impl ChatApp {
             self.confirming = None;
         }
 
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let store = match stores.chat() {
             Ok(store) => store,
             Err(error) => {

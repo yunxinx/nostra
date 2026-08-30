@@ -75,6 +75,53 @@ impl CapabilityKey for GenerationCapability {
     const NAME: &'static str = "nostra.generation";
 }
 
+/// The application-scoped handles projected from a composition root.
+///
+/// Consumers receive this cloneable bundle at construction time instead of
+/// resolving capability Providers through the foreground application context.
+#[derive(Clone)]
+pub struct RuntimeServices {
+    session_services: SessionStores,
+    preference_handle: PreferenceHandle,
+    generation_service: Arc<dyn GenerationService>,
+}
+
+impl RuntimeServices {
+    #[must_use]
+    pub fn new(
+        session_services: SessionStores,
+        preference_handle: PreferenceHandle,
+        generation_service: Arc<dyn GenerationService>,
+    ) -> Self {
+        Self {
+            session_services,
+            preference_handle,
+            generation_service,
+        }
+    }
+
+    #[must_use]
+    pub fn session_services(&self) -> &SessionStores {
+        &self.session_services
+    }
+
+    #[must_use]
+    pub fn preference_handle(&self) -> &PreferenceHandle {
+        &self.preference_handle
+    }
+
+    #[must_use]
+    pub fn generation_service(&self) -> Arc<dyn GenerationService> {
+        Arc::clone(&self.generation_service)
+    }
+
+    #[must_use]
+    pub fn with_preference_handle(mut self, preference_handle: PreferenceHandle) -> Self {
+        self.preference_handle = preference_handle;
+        self
+    }
+}
+
 #[derive(Debug)]
 pub enum CompositionBuildError {
     Snapshot(RuntimeSnapshotError),
@@ -416,6 +463,17 @@ impl CompositionRoot {
     #[must_use]
     pub fn generation(&self) -> Option<&CapabilityLease<GenerationCapability>> {
         self.generation.as_ref()
+    }
+
+    /// Project the active application capabilities into the bundle consumed by
+    /// the foreground shell. A partially closed root cannot produce services.
+    #[must_use]
+    pub fn services(&self) -> Option<RuntimeServices> {
+        Some(RuntimeServices::new(
+            self.session_services()?.handle().clone(),
+            self.preferences()?.handle().clone(),
+            self.generation()?.handle().clone(),
+        ))
     }
 
     #[must_use]

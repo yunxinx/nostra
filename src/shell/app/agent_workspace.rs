@@ -28,7 +28,7 @@ use crate::llm::{ContentBlock, Role};
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
     ProjectCatalogPage, ProjectCatalogQuery, ProjectSessionStore, ProjectSummary, SessionId,
-    SessionStores, SessionSummary,
+    SessionSummary,
 };
 
 const AGENT_ROW_HEIGHT: Pixels = px(32.);
@@ -438,11 +438,7 @@ impl ChatApp {
         ) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.projects_load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
@@ -494,9 +490,7 @@ impl ChatApp {
         let Some(cursor) = self.agent.projects_next_cursor.clone() else {
             return;
         };
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
@@ -554,11 +548,7 @@ impl ChatApp {
         {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.session_list_mut(&project_id).load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
@@ -628,9 +618,7 @@ impl ChatApp {
             return;
         };
         let generation = list.generation;
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
@@ -697,11 +685,7 @@ impl ChatApp {
         ) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.session_load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {

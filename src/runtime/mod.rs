@@ -17,7 +17,7 @@ pub use component::{ComponentGeneration, ComponentId, ScopeId};
 pub(crate) use composition::default_generation_service;
 pub use composition::{
     CompositionBuildError, CompositionRoot, CompositionRootBuilder, GenerationCapability,
-    PreferenceCapability, SessionServicesCapability,
+    PreferenceCapability, RuntimeServices, SessionServicesCapability,
 };
 pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,

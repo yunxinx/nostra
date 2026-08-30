@@ -66,7 +66,8 @@ pub fn run() {
         let catalog =
             ProviderCatalogSnapshot::new(preferences::handle(cx).snapshot().provider_profiles);
         let generation_service = runtime::default_generation_service(catalog, cx.http_client());
-        window::open_main_window(prefs, generation_service, cx);
+        let preference_handle = preferences::handle(cx);
+        window::open_main_window(prefs, generation_service, preference_handle, cx);
     });
     logging::info("app.lifecycle", "application stopped");
     logging::shutdown();

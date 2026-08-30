@@ -16,6 +16,7 @@ use std::sync::Arc;
 use crate::appearance::glass;
 use crate::llm::GenerationService;
 use crate::preferences::{Preferences, WindowGeometry};
+use crate::runtime::RuntimeServices;
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
@@ -87,6 +88,7 @@ const MIN_SIZE: Size<Pixels> = Size {
 pub fn open_main_window(
     prefs: Preferences,
     generation_service: Arc<dyn GenerationService>,
+    preference_handle: crate::preferences::PreferenceHandle,
     cx: &mut App,
 ) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
@@ -97,7 +99,9 @@ pub fn open_main_window(
 
     cx.spawn(async move |cx| {
         let stores = stores.await;
-        cx.update(|cx| cx.set_global(stores));
+        let services = RuntimeServices::new(stores, preference_handle, generation_service);
+        let session_global = services.session_services().clone();
+        cx.update(|cx| cx.set_global(session_global));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
@@ -117,8 +121,7 @@ pub fn open_main_window(
         };
 
         let window = match cx.open_window(options, |window, cx| {
-            let app_view =
-                cx.new(|cx| ChatApp::new(prefs.clone(), generation_service.clone(), window, cx));
+            let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
             cx.set_global(MainView(Some(app_view.downgrade())));
 
             // Default focus to the app root so global keybindings dispatch to it

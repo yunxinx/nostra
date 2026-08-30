@@ -38,6 +38,7 @@ use crate::appearance::{glass, theme};
 use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
 use crate::llm::{GenerationService, ModelSelection};
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
+use crate::runtime::RuntimeServices;
 use crate::session::{
     ChatSessionCatalogController, ProjectSessionStore as _, ResolvedSessionState, SessionId,
     SessionLifecycleStore as _, SessionStores,
@@ -196,6 +197,7 @@ pub struct ChatApp {
     shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
+    session_services: SessionStores,
     preference_handle: PreferenceHandle,
     generation_service: Arc<dyn GenerationService>,
 }
@@ -222,7 +224,7 @@ use agent_workspace::AgentWorkspace;
 use history_sidebar::ChatHistorySidebar;
 
 struct ExitWork {
-    stores: Option<SessionStores>,
+    stores: SessionStores,
     snapshot: Preferences,
     preference_handle: PreferenceHandle,
 }
@@ -252,39 +254,40 @@ impl ChatApp {
     /// so the current UI state survives across restarts.
     pub fn new(
         prefs: Preferences,
-        generation_service: Arc<dyn GenerationService>,
+        services: RuntimeServices,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(
-            prefs,
-            generation_service,
-            window,
-            cx,
-            preferences::handle(cx),
-        )
+        Self::build(prefs, services, window, cx)
     }
 
     #[cfg(test)]
     pub(super) fn new_with_preference_saver(
         prefs: Preferences,
-        generation_service: Arc<dyn GenerationService>,
+        services: RuntimeServices,
         window: &mut Window,
         cx: &mut Context<Self>,
         preference_saver: PreferenceSaver,
     ) -> Self {
         let preference_handle =
             PreferenceHandle::with_saver(prefs.clone(), preference_saver.clone());
-        Self::build(prefs, generation_service, window, cx, preference_handle)
+        Self::build(
+            prefs,
+            services.with_preference_handle(preference_handle),
+            window,
+            cx,
+        )
     }
 
     fn build(
         prefs: Preferences,
-        generation_service: Arc<dyn GenerationService>,
+        services: RuntimeServices,
         window: &mut Window,
         cx: &mut Context<Self>,
-        preference_handle: PreferenceHandle,
     ) -> Self {
+        let session_services = services.session_services().clone();
+        let preference_handle = services.preference_handle().clone();
+        let generation_service = services.generation_service();
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
@@ -346,6 +349,7 @@ impl ChatApp {
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),
+            session_services,
             preference_handle,
             generation_service,
         };
@@ -409,12 +413,8 @@ impl ChatApp {
                 else {
                     return;
                 };
-                let session_task = executor.spawn(async move {
-                    match stores {
-                        Some(stores) => stores.shutdown_with_timeout(APP_QUIT_STORAGE_BUDGET),
-                        None => Ok(()),
-                    }
-                });
+                let session_task = executor
+                    .spawn(async move { stores.shutdown_with_timeout(APP_QUIT_STORAGE_BUDGET) });
                 let preferences_task =
                     executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
                 let (sessions, preferences) = future::join(session_task, preferences_task).await;
@@ -441,7 +441,7 @@ impl ChatApp {
                 .view
                 .update(cx, |chat, cx| chat.prepare_for_shutdown(cx));
         }
-        let stores = cx.try_global::<SessionStores>().cloned();
+        let stores = self.session_services.clone();
         let sidebar_width = self.sidebar_width.as_f32();
         let sidebar_collapsed = self.collapsed;
         let window = self.window_geometry;
@@ -467,12 +467,7 @@ impl ChatApp {
             preference_handle,
         } = self.prepare_exit_work(cx);
         let executor = cx.background_executor().clone();
-        let session_task = executor.spawn(async move {
-            match stores {
-                Some(stores) => stores.shutdown(),
-                None => Ok(()),
-            }
-        });
+        let session_task = executor.spawn(async move { stores.shutdown() });
         let preferences_task =
             executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
         let shutdown_completed = Arc::clone(&self.shutdown_completed);
@@ -694,9 +689,7 @@ impl ChatApp {
         let Some(identity) = self.project_identity(&project_id, cx) else {
             return;
         };
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
@@ -841,9 +834,7 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let Ok(mut store) = stores.agent() else {
             return;
         };
@@ -899,9 +890,7 @@ impl ChatApp {
             );
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let Ok(project_store) = stores.agent_projects() else {
             return;
         };
@@ -1118,9 +1107,7 @@ impl ChatApp {
             return;
         }
 
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.session_services.clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(error) => {
