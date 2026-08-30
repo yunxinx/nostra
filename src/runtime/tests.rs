@@ -13,9 +13,10 @@ use gpui::Subscription;
 
 use super::{
     ActivationFingerprint, AsyncStop, CapabilityId, CapabilityKey, ComponentGeneration,
-    ComponentId, DependencyDeclaration, DependencyResolution, DependencyResolver,
-    DependencyResolverError, DependencySnapshot, DisposeError, EffectScope,
-    ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability, ResolvedDependency, ScopeId,
+    ComponentId, ComponentLifecycle, DependencyDeclaration, DependencyResolution,
+    DependencyResolver, DependencyResolverError, DependencySnapshot, DisposeError, EffectScope,
+    ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability, ReconcileFailureKind,
+    ReconcileStage, ReconcileStatus, ResolvedDependency, ScopeId, ScopeLocalReconciler,
 };
 
 #[test]
@@ -923,4 +924,565 @@ fn dropping_scope_after_cancel_does_not_cross_the_async_barrier() {
     drop(scope);
 
     assert_eq!(*events.borrow(), ["last-undo", "async-stop-started"]);
+}
+
+struct PrepareTransitionGuard {
+    in_flight: Rc<Cell<usize>>,
+}
+
+impl Drop for PrepareTransitionGuard {
+    fn drop(&mut self) {
+        self.in_flight.set(self.in_flight.get() - 1);
+    }
+}
+
+struct RevisionStopBarrier {
+    revision: u8,
+    attempts: Rc<Cell<usize>>,
+    released: Rc<Cell<bool>>,
+    events: Rc<RefCell<Vec<String>>>,
+}
+
+struct BlockedStop {
+    revision: u8,
+    released: Rc<Cell<bool>>,
+    attempts: Rc<Cell<usize>>,
+}
+
+impl AsyncStop for RevisionStopBarrier {
+    fn stop(&mut self) -> Pin<Box<dyn Future<Output = Result<(), DisposeError>> + '_>> {
+        self.attempts.set(self.attempts.get() + 1);
+        self.events
+            .borrow_mut()
+            .push(format!("stop-start-{}", self.revision));
+        let revision = self.revision;
+        let released = Rc::clone(&self.released);
+        let events = Rc::clone(&self.events);
+        Box::pin(futures::future::poll_fn(move |_| {
+            if released.get() {
+                events.borrow_mut().push(format!("stop-finish-{revision}"));
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }))
+    }
+}
+
+struct RevisionLifecycle {
+    prepare_calls: Rc<RefCell<Vec<u8>>>,
+    events: Rc<RefCell<Vec<String>>>,
+    in_flight: Rc<Cell<usize>>,
+    max_in_flight: Rc<Cell<usize>>,
+    blocked_prepare: Option<(u8, Rc<Cell<bool>>)>,
+    blocked_stop: Option<BlockedStop>,
+    fail_first_stop: Option<(u8, Rc<RefCell<Vec<&'static str>>>)>,
+    fail_prepare: Option<u8>,
+    fail_activation_once: Option<(u8, Rc<Cell<bool>>)>,
+}
+
+impl RevisionLifecycle {
+    fn new(events: Rc<RefCell<Vec<String>>>) -> Self {
+        Self {
+            prepare_calls: Rc::new(RefCell::new(Vec::new())),
+            events,
+            in_flight: Rc::new(Cell::new(0)),
+            max_in_flight: Rc::new(Cell::new(0)),
+            blocked_prepare: None,
+            blocked_stop: None,
+            fail_first_stop: None,
+            fail_prepare: None,
+            fail_activation_once: None,
+        }
+    }
+}
+
+impl ComponentLifecycle<u8> for RevisionLifecycle {
+    type Prepared = u8;
+
+    fn prepare<'a>(
+        &'a mut self,
+        _revision: super::DesiredRevision,
+        desired: &'a u8,
+        effects: &'a mut EffectScope,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self::Prepared>> + 'a>> {
+        let desired = *desired;
+        self.prepare_calls.borrow_mut().push(desired);
+        let in_flight = self.in_flight.get() + 1;
+        self.in_flight.set(in_flight);
+        self.max_in_flight
+            .set(self.max_in_flight.get().max(in_flight));
+        let guard = PrepareTransitionGuard {
+            in_flight: Rc::clone(&self.in_flight),
+        };
+        let events = Rc::clone(&self.events);
+        let prepare_release = self
+            .blocked_prepare
+            .as_ref()
+            .filter(|(revision, _)| *revision == desired)
+            .map(|(_, released)| Rc::clone(released));
+        let fail_prepare = self.fail_prepare == Some(desired);
+
+        Box::pin(async move {
+            if let Some(released) = prepare_release {
+                futures::future::poll_fn(move |_| {
+                    if released.get() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            if fail_prepare {
+                let events = Rc::clone(&events);
+                effects.own_sync(move || {
+                    events
+                        .borrow_mut()
+                        .push(format!("candidate-undo-{desired}"));
+                });
+                return Err(anyhow::anyhow!("candidate preparation failed"));
+            }
+            drop(guard);
+            Ok(desired)
+        })
+    }
+
+    fn activate<'a>(
+        &'a mut self,
+        _revision: super::DesiredRevision,
+        desired: &'a u8,
+        prepared: Self::Prepared,
+        effects: &'a mut EffectScope,
+    ) -> anyhow::Result<()> {
+        let desired = *desired;
+        let events = Rc::clone(&self.events);
+        let stop_barrier = self
+            .blocked_stop
+            .as_ref()
+            .filter(|stop| stop.revision == desired)
+            .map(|stop| (Rc::clone(&stop.released), Rc::clone(&stop.attempts)));
+        let failing_stop_events = self
+            .fail_first_stop
+            .as_ref()
+            .filter(|(revision, _)| *revision == desired)
+            .map(|(_, events)| Rc::clone(events));
+        let fail_activation = self
+            .fail_activation_once
+            .as_ref()
+            .filter(|(revision, _)| *revision == desired)
+            .map(|(_, failed)| Rc::clone(failed));
+
+        if prepared != desired {
+            anyhow::bail!("prepared revision does not match desired revision");
+        }
+        let undo_events = Rc::clone(&events);
+        effects.own_sync(move || {
+            undo_events.borrow_mut().push(format!("undo-{desired}"));
+        });
+        if let Some((released, attempts)) = stop_barrier {
+            effects.own_async(RevisionStopBarrier {
+                revision: desired,
+                attempts,
+                released,
+                events: Rc::clone(&events),
+            });
+        }
+        if let Some(events) = failing_stop_events {
+            effects.own_async(FailingOnceStop {
+                failed: false,
+                events,
+            });
+        }
+        if fail_activation.is_some_and(|failed| !failed.replace(true)) {
+            anyhow::bail!("candidate activation failed");
+        }
+        events.borrow_mut().push(format!("publish-{desired}"));
+        Ok(())
+    }
+}
+
+const RECONCILE_COMPONENT: ComponentId = ComponentId::new("nostra.test.reconcile");
+
+#[test]
+fn desired_changes_during_one_transition_are_serialized_and_converge() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let first_mount_released = Rc::new(Cell::new(false));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    lifecycle.blocked_prepare = Some((1, Rc::clone(&first_mount_released)));
+    let prepare_calls = Rc::clone(&lifecycle.prepare_calls);
+    let max_in_flight = Rc::clone(&lifecycle.max_in_flight);
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+
+    let mut reconcile = Box::pin(reconciler.reconcile(&mut lifecycle));
+    assert!(matches!(poll_once(reconcile.as_mut()), Poll::Pending));
+    target
+        .set_desired(Some(2))
+        .expect("second desired revision");
+    target
+        .set_desired(Some(3))
+        .expect("latest desired revision");
+
+    assert_eq!(*prepare_calls.borrow(), [1]);
+    assert_eq!(max_in_flight.get(), 1);
+
+    first_mount_released.set(true);
+    let Poll::Ready(ReconcileStatus::Settled { active, .. }) = poll_once(reconcile.as_mut()) else {
+        panic!("reconciliation must settle on the latest desired revision");
+    };
+    assert!(active);
+    drop(reconcile);
+
+    assert_eq!(reconciler.active_desired(), Some(&3));
+    assert_eq!(*prepare_calls.borrow(), [1, 3]);
+    assert_eq!(max_in_flight.get(), 1);
+    assert_eq!(*events.borrow(), ["publish-3"]);
+}
+
+#[test]
+fn successor_is_not_published_until_old_quiescence_completes() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let old_stop_released = Rc::new(Cell::new(false));
+    let old_stop_attempts = Rc::new(Cell::new(0));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    lifecycle.blocked_stop = Some(BlockedStop {
+        revision: 1,
+        released: Rc::clone(&old_stop_released),
+        attempts: Rc::clone(&old_stop_attempts),
+    });
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    target
+        .set_desired(Some(2))
+        .expect("successor desired revision");
+
+    let mut replace = Box::pin(reconciler.reconcile(&mut lifecycle));
+    assert!(matches!(poll_once(replace.as_mut()), Poll::Pending));
+    assert_eq!(old_stop_attempts.get(), 1);
+    assert_eq!(*events.borrow(), ["publish-1", "stop-start-1"]);
+
+    old_stop_released.set(true);
+    assert!(matches!(
+        poll_once(replace.as_mut()),
+        Poll::Ready(ReconcileStatus::Settled { active: true, .. })
+    ));
+    drop(replace);
+
+    assert_eq!(reconciler.active_desired(), Some(&2));
+    assert_eq!(
+        *events.borrow(),
+        [
+            "publish-1",
+            "stop-start-1",
+            "stop-finish-1",
+            "undo-1",
+            "publish-2",
+        ]
+    );
+}
+
+struct TypedSlotLifecycle {
+    slot: Rc<RefCell<ExclusiveCapabilitySlot<TestServiceCapability>>>,
+}
+
+impl ComponentLifecycle<ComponentId> for TypedSlotLifecycle {
+    type Prepared = PreparedCapability<TestServiceCapability>;
+
+    fn prepare<'a>(
+        &'a mut self,
+        _revision: super::DesiredRevision,
+        desired: &'a ComponentId,
+        _effects: &'a mut EffectScope,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self::Prepared>> + 'a>> {
+        let implementation = match *desired {
+            DEFAULT_TEST_PROVIDER => "built-in-default",
+            ALTERNATE_TEST_PROVIDER => "alternate",
+            _ => return Box::pin(async { anyhow::bail!("unknown test Provider") }),
+        };
+        let candidate = self.slot.borrow().prepare_candidate(*desired, || {
+            Ok::<_, anyhow::Error>(TestService { implementation })
+        });
+        Box::pin(async move { candidate })
+    }
+
+    fn activate<'a>(
+        &'a mut self,
+        _revision: super::DesiredRevision,
+        _desired: &'a ComponentId,
+        prepared: Self::Prepared,
+        effects: &'a mut EffectScope,
+    ) -> anyhow::Result<()> {
+        let registration = self.slot.borrow_mut().install(prepared)?;
+        let slot = Rc::clone(&self.slot);
+        effects.own_sync(move || {
+            slot.borrow_mut().revoke(&registration);
+        });
+        Ok(())
+    }
+}
+
+#[test]
+fn activation_consumes_a_typed_capability_candidate_without_cloning() {
+    let slot = Rc::new(RefCell::new(ExclusiveCapabilitySlot::new(TEST_SCOPE)));
+    let mut lifecycle = TypedSlotLifecycle {
+        slot: Rc::clone(&slot),
+    };
+    let mut reconciler =
+        ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(DEFAULT_TEST_PROVIDER));
+    let target = reconciler.target();
+
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    let initial = slot.borrow().current().expect("initial typed Provider");
+    assert_eq!(initial.provider(), DEFAULT_TEST_PROVIDER);
+    assert_eq!(initial.generation(), ComponentGeneration::INITIAL);
+
+    target
+        .set_desired(Some(ALTERNATE_TEST_PROVIDER))
+        .expect("alternate typed Provider revision");
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    let successor = slot.borrow().current().expect("successor typed Provider");
+    assert_eq!(successor.provider(), ALTERNATE_TEST_PROVIDER);
+    assert_eq!(successor.generation().get(), 2);
+}
+
+#[test]
+fn failed_candidate_preparation_preserves_the_active_generation() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    let prepare_calls = Rc::clone(&lifecycle.prepare_calls);
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    lifecycle.fail_prepare = Some(2);
+    target
+        .set_desired(Some(2))
+        .expect("failing candidate revision");
+
+    let ReconcileStatus::Failed(failure) =
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("failed candidate preparation must be diagnostic");
+    };
+
+    assert_eq!(failure.stage(), ReconcileStage::Preparing);
+    assert_eq!(failure.kind(), ReconcileFailureKind::Error);
+    assert_eq!(reconciler.active_desired(), Some(&1));
+    assert_eq!(*prepare_calls.borrow(), [1, 2]);
+    assert_eq!(*events.borrow(), ["publish-1", "candidate-undo-2"]);
+}
+
+#[test]
+fn cancelled_failure_rollback_keeps_candidate_effects_and_reports_the_barrier() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let rollback_released = Rc::new(Cell::new(false));
+    let rollback_attempts = Rc::new(Cell::new(0));
+    let activation_failed = Rc::new(Cell::new(false));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    lifecycle.blocked_stop = Some(BlockedStop {
+        revision: 2,
+        released: Rc::clone(&rollback_released),
+        attempts: Rc::clone(&rollback_attempts),
+    });
+    lifecycle.fail_activation_once = Some((2, Rc::clone(&activation_failed)));
+    target
+        .set_desired(Some(2))
+        .expect("failing activation revision");
+
+    {
+        let mut cancelled = Box::pin(reconciler.reconcile(&mut lifecycle));
+        assert!(matches!(poll_once(cancelled.as_mut()), Poll::Pending));
+    }
+
+    let failure = reconciler
+        .last_failure()
+        .expect("cancelled rollback remains diagnostic");
+    assert_eq!(failure.stage(), ReconcileStage::RollingBack);
+    assert_eq!(failure.kind(), ReconcileFailureKind::Interrupted);
+    assert_eq!(reconciler.active_desired(), None);
+    assert_eq!(rollback_attempts.get(), 1);
+    assert_eq!(*events.borrow(), ["publish-1", "undo-1", "stop-start-2"]);
+
+    assert_eq!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Failed(failure)
+    );
+    assert_eq!(rollback_attempts.get(), 1);
+
+    target
+        .set_desired(None)
+        .expect("new desired revision authorizes rollback retry");
+    rollback_released.set(true);
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: false, .. }
+    ));
+    assert_eq!(rollback_attempts.get(), 2);
+    assert_eq!(
+        *events.borrow(),
+        [
+            "publish-1",
+            "undo-1",
+            "stop-start-2",
+            "stop-start-2",
+            "stop-finish-2",
+            "undo-2",
+        ]
+    );
+}
+
+#[test]
+fn cancelled_stop_retains_effect_ownership_until_explicit_retry() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let stop_released = Rc::new(Cell::new(false));
+    let stop_attempts = Rc::new(Cell::new(0));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    lifecycle.blocked_stop = Some(BlockedStop {
+        revision: 1,
+        released: Rc::clone(&stop_released),
+        attempts: Rc::clone(&stop_attempts),
+    });
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    target
+        .set_desired(None)
+        .expect("component removal revision");
+
+    {
+        let mut cancelled = Box::pin(reconciler.reconcile(&mut lifecycle));
+        assert!(matches!(poll_once(cancelled.as_mut()), Poll::Pending));
+    }
+
+    assert_eq!(reconciler.active_desired(), Some(&1));
+    assert_eq!(stop_attempts.get(), 1);
+    assert_eq!(*events.borrow(), ["publish-1", "stop-start-1"]);
+
+    let ReconcileStatus::Failed(failure) =
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("an interrupted stop must remain failed until explicitly retried");
+    };
+    assert_eq!(failure.stage(), ReconcileStage::Stopping);
+    assert_eq!(failure.kind(), ReconcileFailureKind::Interrupted);
+    assert_eq!(stop_attempts.get(), 1);
+
+    target.retry().expect("explicit stop retry");
+    stop_released.set(true);
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: false, .. }
+    ));
+
+    assert_eq!(stop_attempts.get(), 2);
+    assert_eq!(reconciler.active_desired(), None);
+    assert_eq!(
+        *events.borrow(),
+        [
+            "publish-1",
+            "stop-start-1",
+            "stop-start-1",
+            "stop-finish-1",
+            "undo-1",
+        ]
+    );
+}
+
+#[test]
+fn failed_stop_does_not_retry_without_a_new_request_revision() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let stop_events = Rc::new(RefCell::new(Vec::new()));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    lifecycle.fail_first_stop = Some((1, Rc::clone(&stop_events)));
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    target
+        .set_desired(None)
+        .expect("component removal revision");
+
+    let ReconcileStatus::Failed(first_failure) =
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("first stop attempt must report its failure");
+    };
+    assert_eq!(first_failure.stage(), ReconcileStage::Stopping);
+    assert_eq!(first_failure.kind(), ReconcileFailureKind::Error);
+    assert_eq!(reconciler.active_desired(), Some(&1));
+    assert!(stop_events.borrow().is_empty());
+
+    assert_eq!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Failed(first_failure)
+    );
+    assert_eq!(reconciler.active_desired(), Some(&1));
+    assert!(stop_events.borrow().is_empty());
+
+    target.retry().expect("explicit retry revision");
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: false, .. }
+    ));
+    assert_eq!(*stop_events.borrow(), ["async-stop-finished"]);
+    assert_eq!(*events.borrow(), ["publish-1", "undo-1"]);
+}
+
+#[test]
+fn unchanged_desired_state_does_not_start_another_transition() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut lifecycle = RevisionLifecycle::new(Rc::clone(&events));
+    let prepare_calls = Rc::clone(&lifecycle.prepare_calls);
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let target = reconciler.target();
+
+    let ReconcileStatus::Settled {
+        revision: initial_revision,
+        active: true,
+    } = futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("initial desired state must activate");
+    };
+    let unchanged_revision = target
+        .set_desired(Some(1))
+        .expect("unchanged desired state");
+    let ReconcileStatus::Settled {
+        revision: settled_revision,
+        active: true,
+    } = futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("unchanged desired state must stay active");
+    };
+
+    assert_eq!(unchanged_revision, initial_revision);
+    assert_eq!(settled_revision, initial_revision);
+    assert_eq!(*prepare_calls.borrow(), [1]);
+    assert_eq!(*events.borrow(), ["publish-1"]);
 }
