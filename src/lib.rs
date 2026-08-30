@@ -11,11 +11,13 @@
 //! * `settings` — the standalone settings window.
 //! * [`llm`] — the UI-independent model generation gateway.
 //! * [`preferences`] — persisted user settings and the live `Prefs` global.
+//! * [`runtime`] — typed identities and composition primitives.
+//! * [`session`] — durable conversation facts and storage capabilities.
 //! * `providers`, `i18n`, `assets` — provider profiles, locale management, and
 //!   embedded assets.
 //!
-//! Only `llm` and `preferences` are part of the crate's public surface; the rest
-//! are internal and linked here as plain names.
+//! The linked modules form the crate's public surface; the rest are internal
+//! and linked here as plain names.
 
 mod appearance;
 mod assets;
@@ -26,6 +28,7 @@ mod logging;
 mod paths;
 pub mod preferences;
 mod providers;
+pub mod runtime;
 pub mod session;
 mod settings;
 mod shell;
