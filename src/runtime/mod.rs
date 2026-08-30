@@ -3,6 +3,7 @@
 mod capability;
 mod component;
 mod dependency;
+mod diagnostics;
 mod effect;
 mod reconcile;
 mod scope;
@@ -16,10 +17,17 @@ pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,
     DependencyResolverError, DependencySnapshot, PendingDependencies, ResolvedDependency,
 };
+pub use diagnostics::{
+    ComponentSnapshot, ComponentSnapshotDetails, ComponentSnapshotViolation, ContributionRevision,
+    MissingDependencySnapshot, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
+    RuntimeSnapshot, RuntimeSnapshotError, ScopedComponentId, StartupAuditError, StartupPolicy,
+    TransitionSnapshot,
+};
 pub use effect::{AsyncStop, DisposeError, EffectScope};
 pub use reconcile::{
     ComponentLifecycle, DesiredRevision, DesiredRevisionExhausted, ReconcileFailure,
-    ReconcileFailureKind, ReconcileStage, ReconcileStatus, ReconcileTarget, ScopeLocalReconciler,
+    ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus, ReconcileTarget,
+    ReconcileTransition, ScopeLocalReconciler,
 };
 pub use scope::{ScopeError, ScopeKind, ScopeState, ScopeTree};
 

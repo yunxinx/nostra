@@ -1,6 +1,6 @@
 //! Serialized component reconciliation within one runtime scope.
 
-use std::{cell::RefCell, fmt, future::Future, pin::Pin, rc::Rc};
+use std::{cell::RefCell, fmt, future::Future, pin::Pin, rc::Rc, time::Instant};
 
 use super::{ComponentId, EffectScope, ScopeId};
 
@@ -103,6 +103,42 @@ pub enum ReconcileStage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReconcileTransition {
+    scope: ScopeId,
+    component: ComponentId,
+    revision: DesiredRevision,
+    stage: ReconcileStage,
+    started_at: Instant,
+}
+
+impl ReconcileTransition {
+    #[must_use]
+    pub const fn scope(self) -> ScopeId {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn component(self) -> ComponentId {
+        self.component
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> DesiredRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn stage(self) -> ReconcileStage {
+        self.stage
+    }
+
+    #[must_use]
+    pub const fn started_at(self) -> Instant {
+        self.started_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReconcileFailureKind {
     Error,
     Interrupted,
@@ -165,6 +201,48 @@ impl fmt::Display for ReconcileFailure {
 }
 
 impl std::error::Error for ReconcileFailure {}
+
+#[derive(Clone)]
+#[must_use = "the observer keeps in-flight reconciliation diagnostics accessible"]
+pub struct ReconcileObserver {
+    scope: ScopeId,
+    component: ComponentId,
+    transition: Rc<RefCell<Option<ReconcileTransition>>>,
+    last_failure: Rc<RefCell<Option<ReconcileFailure>>>,
+}
+
+impl ReconcileObserver {
+    #[must_use]
+    pub const fn scope(&self) -> ScopeId {
+        self.scope
+    }
+
+    #[must_use]
+    pub const fn component(&self) -> ComponentId {
+        self.component
+    }
+
+    #[must_use]
+    pub fn transition(&self) -> Option<ReconcileTransition> {
+        *self.transition.borrow()
+    }
+
+    #[must_use]
+    pub fn last_failure(&self) -> Option<ReconcileFailure> {
+        self.last_failure.borrow().clone()
+    }
+}
+
+impl fmt::Debug for ReconcileObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReconcileObserver")
+            .field("scope", &self.scope)
+            .field("component", &self.component)
+            .field("transition", &self.transition())
+            .field("last_failure", &self.last_failure())
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use = "reconciliation failures must remain visible to the runtime"]
@@ -236,17 +314,30 @@ struct CandidateMount<D, P> {
 }
 
 struct TransitionGuard {
-    diagnostics: Rc<RefCell<Option<ReconcileFailure>>>,
+    transition_state: Rc<RefCell<Option<ReconcileTransition>>>,
+    transition: ReconcileTransition,
+    last_failure: Rc<RefCell<Option<ReconcileFailure>>>,
     interrupted: Option<ReconcileFailure>,
 }
 
 impl TransitionGuard {
     fn new(
-        diagnostics: Rc<RefCell<Option<ReconcileFailure>>>,
+        transition_state: Rc<RefCell<Option<ReconcileTransition>>>,
+        transition: ReconcileTransition,
+        last_failure: Rc<RefCell<Option<ReconcileFailure>>>,
         interrupted: ReconcileFailure,
     ) -> Self {
+        let mut current = transition_state.borrow_mut();
+        assert!(
+            current.is_none(),
+            "one reconciler cannot start concurrent transitions"
+        );
+        *current = Some(transition);
+        drop(current);
         Self {
-            diagnostics,
+            transition_state,
+            transition,
+            last_failure,
             interrupted: Some(interrupted),
         }
     }
@@ -258,8 +349,13 @@ impl TransitionGuard {
 
 impl Drop for TransitionGuard {
     fn drop(&mut self) {
+        let mut current = self.transition_state.borrow_mut();
+        if current.as_ref() == Some(&self.transition) {
+            *current = None;
+        }
+        drop(current);
         if let Some(failure) = self.interrupted.take() {
-            *self.diagnostics.borrow_mut() = Some(failure);
+            *self.last_failure.borrow_mut() = Some(failure);
         }
     }
 }
@@ -272,6 +368,7 @@ pub struct ScopeLocalReconciler<D, P> {
     active: Option<ActiveMount<D>>,
     candidate: Option<CandidateMount<D, P>>,
     stop_attempt: Option<DesiredRevision>,
+    current_transition: Rc<RefCell<Option<ReconcileTransition>>>,
     last_failure: Rc<RefCell<Option<ReconcileFailure>>>,
 }
 
@@ -289,6 +386,7 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
             active: None,
             candidate: None,
             stop_attempt: None,
+            current_transition: Rc::new(RefCell::new(None)),
             last_failure: Rc::new(RefCell::new(None)),
         }
     }
@@ -305,6 +403,15 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
 
     pub fn target(&self) -> ReconcileTarget<D> {
         self.target.clone()
+    }
+
+    pub fn observer(&self) -> ReconcileObserver {
+        ReconcileObserver {
+            scope: self.scope,
+            component: self.component,
+            transition: Rc::clone(&self.current_transition),
+            last_failure: Rc::clone(&self.last_failure),
+        }
     }
 
     #[must_use]
@@ -442,6 +549,8 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
                         }
 
                         let candidate_revision = candidate.revision;
+                        let guard =
+                            self.transition_guard(candidate_revision, ReconcileStage::Activating);
                         let activation_result = {
                             let Some(candidate) = self.candidate.as_mut() else {
                                 unreachable!("candidate ownership was checked above");
@@ -456,6 +565,7 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
                                 &mut candidate.effects,
                             )
                         };
+                        guard.complete();
                         match activation_result {
                             Ok(()) => {
                                 let Some(candidate) = self.candidate.take() else {
@@ -554,7 +664,16 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
         revision: DesiredRevision,
         stage: ReconcileStage,
     ) -> TransitionGuard {
+        let transition = ReconcileTransition {
+            scope: self.scope,
+            component: self.component,
+            revision,
+            stage,
+            started_at: Instant::now(),
+        };
         TransitionGuard::new(
+            Rc::clone(&self.current_transition),
+            transition,
             Rc::clone(&self.last_failure),
             self.failure(
                 revision,

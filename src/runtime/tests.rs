@@ -6,6 +6,7 @@ use std::{
     pin::Pin,
     rc::Rc,
     task::{Context, Poll},
+    time::Duration,
 };
 
 use futures::task::noop_waker_ref;
@@ -13,11 +14,14 @@ use gpui::Subscription;
 
 use super::{
     ActivationFingerprint, AsyncStop, CapabilityId, CapabilityKey, ComponentGeneration,
-    ComponentId, ComponentLifecycle, DependencyDeclaration, DependencyResolution,
-    DependencyResolver, DependencyResolverError, DependencySnapshot, DisposeError, EffectScope,
-    ExclusiveCapabilitySlot, ExclusiveSlotError, PreparedCapability, ReconcileFailureKind,
-    ReconcileStage, ReconcileStatus, ResolvedDependency, ScopeId, ScopeKind, ScopeLocalReconciler,
-    ScopeState, ScopeTree,
+    ComponentId, ComponentLifecycle, ComponentSnapshot, ComponentSnapshotDetails,
+    ComponentSnapshotViolation, ContributionRevision, DependencyDeclaration, DependencyResolution,
+    DependencyResolver, DependencyResolverError, DependencySnapshot, DesiredRevision, DisposeError,
+    EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError, MissingDependencySnapshot,
+    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
+    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
+    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
+    ScopeTree, ScopedComponentId, StartupPolicy,
 };
 
 #[test]
@@ -323,6 +327,29 @@ fn resolved_binding<K: CapabilityKey>(fingerprint: &ActivationFingerprint) -> Re
         .copied()
         .find(|binding| binding.capability() == CapabilityId::of::<K>())
         .expect("resolved capability binding")
+}
+
+fn resolved_test_service_binding() -> ResolvedDependency {
+    let mut service_slot = ExclusiveCapabilitySlot::new(TEST_SCOPE);
+    let service = prepare_selected_test_provider(&service_slot, DEFAULT_TEST_PROVIDER)
+        .expect("built-in default candidate");
+    service_slot
+        .install(service)
+        .expect("install built-in default");
+    resolved_test_service_binding_from(&service_slot)
+}
+
+fn resolved_test_service_binding_from(
+    service_slot: &ExclusiveCapabilitySlot<TestServiceCapability>,
+) -> ResolvedDependency {
+    let mut resolver = DependencyResolver::new();
+    resolver
+        .include(service_slot)
+        .expect("unique test service source");
+    let snapshot = ready_snapshot(
+        resolver.resolve(&[DependencyDeclaration::required::<TestServiceCapability>()]),
+    );
+    resolved_binding::<TestServiceCapability>(snapshot.activation_fingerprint())
 }
 
 #[derive(Default)]
@@ -1121,7 +1148,62 @@ impl ComponentLifecycle<u8> for RevisionLifecycle {
     }
 }
 
+struct ObservedActivationLifecycle {
+    observer: ReconcileObserver,
+    observed_stage: Rc<Cell<Option<ReconcileStage>>>,
+}
+
+impl ComponentLifecycle<u8> for ObservedActivationLifecycle {
+    type Prepared = u8;
+
+    fn prepare<'a>(
+        &'a mut self,
+        _revision: DesiredRevision,
+        desired: &'a u8,
+        _effects: &'a mut EffectScope,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Self::Prepared>> + 'a>> {
+        Box::pin(futures::future::ready(Ok(*desired)))
+    }
+
+    fn activate<'a>(
+        &'a mut self,
+        _revision: DesiredRevision,
+        desired: &'a u8,
+        prepared: Self::Prepared,
+        _effects: &'a mut EffectScope,
+    ) -> anyhow::Result<()> {
+        if prepared != *desired {
+            anyhow::bail!("prepared revision does not match desired revision");
+        }
+        self.observed_stage.set(
+            self.observer
+                .transition()
+                .map(|transition| transition.stage()),
+        );
+        Ok(())
+    }
+}
+
 const RECONCILE_COMPONENT: ComponentId = ComponentId::new("nostra.test.reconcile");
+
+#[test]
+fn activation_transition_is_observable_until_publication_finishes() {
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let observer = reconciler.observer();
+    let observed_stage = Rc::new(Cell::new(None));
+    let mut lifecycle = ObservedActivationLifecycle {
+        observer: observer.clone(),
+        observed_stage: Rc::clone(&observed_stage),
+    };
+
+    assert!(matches!(
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
+        ReconcileStatus::Settled { active: true, .. }
+    ));
+    assert_eq!(observed_stage.get(), Some(ReconcileStage::Activating));
+    assert!(observer.transition().is_none());
+    assert!(observer.last_failure().is_none());
+}
 
 #[test]
 fn desired_changes_during_one_transition_are_serialized_and_converge() {
@@ -1385,6 +1467,7 @@ fn cancelled_stop_retains_effect_ownership_until_explicit_retry() {
     });
     let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
     let target = reconciler.target();
+    let observer = reconciler.observer();
     assert!(matches!(
         futures::executor::block_on(reconciler.reconcile(&mut lifecycle)),
         ReconcileStatus::Settled { active: true, .. }
@@ -1396,8 +1479,41 @@ fn cancelled_stop_retains_effect_ownership_until_explicit_retry() {
     {
         let mut cancelled = Box::pin(reconciler.reconcile(&mut lifecycle));
         assert!(matches!(poll_once(cancelled.as_mut()), Poll::Pending));
+        let transition = observer
+            .transition()
+            .expect("stopping transition remains observable");
+        assert_eq!(transition.stage(), ReconcileStage::Stopping);
+        let snapshot = RuntimeSnapshot::new(
+            [ComponentSnapshot::transitioning(
+                StartupPolicy::MustActivate,
+                &observer,
+                transition.started_at() + Duration::from_secs(11),
+                ComponentSnapshotDetails::default(),
+            )
+            .expect("quiescing component snapshot")],
+            [],
+            Duration::from_secs(10),
+        )
+        .expect("unique runtime component identities");
+        assert_eq!(
+            snapshot.components()[0].state(),
+            RuntimeComponentState::Quiescing
+        );
+        assert!(matches!(
+            snapshot.diagnostics(),
+            [RuntimeDiagnostic::LongTransition {
+                stage: ReconcileStage::Stopping,
+                ..
+            }]
+        ));
     }
 
+    assert!(observer.transition().is_none());
+    let observed_failure = observer
+        .last_failure()
+        .expect("cancelled stop remains observable");
+    assert_eq!(observed_failure.stage(), ReconcileStage::Stopping);
+    assert_eq!(observed_failure.kind(), ReconcileFailureKind::Interrupted);
     assert_eq!(reconciler.active_desired(), Some(&1));
     assert_eq!(stop_attempts.get(), 1);
     assert_eq!(*events.borrow(), ["publish-1", "stop-start-1"]);
@@ -1760,4 +1876,418 @@ fn dropping_a_tree_after_cancelled_close_does_not_cross_the_child_barrier() {
 
     assert!(stop_dropped.get());
     assert_eq!(*events.borrow(), ["conversation-stop-started"]);
+}
+
+#[test]
+fn startup_audit_aggregates_required_pending_and_failed_components() {
+    const FAILED_COMPONENT: ComponentId = ComponentId::new("nostra.test.startup-failed");
+    const PENDING_COMPONENT: ComponentId = ComponentId::new("nostra.test.startup-pending");
+    const BLOCKING_COMPONENT: ComponentId = ComponentId::new("nostra.test.startup-blocker");
+    let pending = ComponentSnapshot::pending(
+        PENDING_COMPONENT,
+        TEST_SCOPE,
+        StartupPolicy::MustActivate,
+        DesiredRevision::INITIAL,
+        ComponentSnapshotDetails::new(
+            [],
+            [
+                MissingDependencySnapshot::blocked_by(
+                    CapabilityId::of::<ForegroundCapability>(),
+                    [ScopedComponentId::new(BLOCKING_COMPONENT, ScopeId::new(8))],
+                ),
+                MissingDependencySnapshot::direct(CapabilityId::of::<TestServiceCapability>()),
+            ],
+            RuntimeResourceCounts::default(),
+        ),
+    );
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut lifecycle = RevisionLifecycle::new(events);
+    lifecycle.fail_prepare = Some(1);
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, FAILED_COMPONENT, Some(1));
+    let ReconcileStatus::Failed(failure) =
+        futures::executor::block_on(reconciler.reconcile(&mut lifecycle))
+    else {
+        panic!("failed component must remain diagnostic");
+    };
+    let failed = ComponentSnapshot::failed(
+        StartupPolicy::MustActivate,
+        failure,
+        ComponentSnapshotDetails::new(
+            [resolved_test_service_binding()],
+            [],
+            RuntimeResourceCounts::new(4, 2, 3, 1),
+        ),
+    );
+    let snapshot = RuntimeSnapshot::new(
+        [pending, failed],
+        [ContributionRevision::new(
+            CapabilityId::of::<TestCatalogCapability>(),
+            3,
+        )],
+        Duration::from_secs(30),
+    )
+    .expect("unique runtime snapshot identities");
+
+    let error = snapshot
+        .audit_startup()
+        .expect_err("required pending and failed components block startup");
+    assert_eq!(error.blockers().len(), 2);
+    assert_eq!(error.blockers()[0].component(), FAILED_COMPONENT);
+    assert_eq!(error.blockers()[0].state(), RuntimeComponentState::Failed);
+    assert_eq!(error.blockers()[0].dependencies().len(), 1);
+    assert_eq!(
+        error.blockers()[0].dependencies()[0].provider(),
+        DEFAULT_TEST_PROVIDER
+    );
+    assert_eq!(
+        error.blockers()[0].dependencies()[0].generation(),
+        ComponentGeneration::INITIAL
+    );
+    assert_eq!(
+        error.blockers()[0].resource_counts(),
+        RuntimeResourceCounts::new(4, 2, 3, 1)
+    );
+    assert_eq!(error.blockers()[1].component(), PENDING_COMPONENT);
+    assert_eq!(error.blockers()[1].state(), RuntimeComponentState::Pending);
+    assert_eq!(
+        error.blockers()[1]
+            .missing_dependencies()
+            .iter()
+            .map(MissingDependencySnapshot::capability)
+            .collect::<Vec<_>>(),
+        [
+            CapabilityId::of::<ForegroundCapability>(),
+            CapabilityId::of::<TestServiceCapability>(),
+        ]
+    );
+    assert_eq!(
+        error.blockers()[1].missing_dependencies()[0].blocking_chain(),
+        [ScopedComponentId::new(BLOCKING_COMPONENT, ScopeId::new(8))]
+    );
+    assert_eq!(
+        snapshot.contribution_revisions(),
+        [ContributionRevision::new(
+            CapabilityId::of::<TestCatalogCapability>(),
+            3,
+        )]
+    );
+    let message = error.to_string();
+    assert!(message.contains(FAILED_COMPONENT.as_str()));
+    assert!(message.contains(PENDING_COMPONENT.as_str()));
+    assert!(message.contains(BLOCKING_COMPONENT.as_str()));
+    assert!(message.contains(ForegroundCapability::NAME));
+    assert!(message.contains("candidate preparation failed"));
+}
+
+#[test]
+fn allowed_pending_components_remain_visible_without_blocking_startup() {
+    const ACTIVE_COMPONENT: ComponentId = ComponentId::new("nostra.test.startup-active");
+    const ON_DEMAND_COMPONENT: ComponentId = ComponentId::new("nostra.test.startup-on-demand");
+    let snapshot = RuntimeSnapshot::new(
+        [
+            ComponentSnapshot::active(
+                ACTIVE_COMPONENT,
+                TEST_SCOPE,
+                StartupPolicy::MustActivate,
+                DesiredRevision::INITIAL,
+                ComponentSnapshotDetails::default(),
+            ),
+            ComponentSnapshot::pending(
+                ON_DEMAND_COMPONENT,
+                TEST_SCOPE,
+                StartupPolicy::AllowedPending,
+                DesiredRevision::INITIAL,
+                ComponentSnapshotDetails::new(
+                    [],
+                    [MissingDependencySnapshot::direct(CapabilityId::of::<
+                        TestServiceCapability,
+                    >())],
+                    RuntimeResourceCounts::default(),
+                ),
+            ),
+        ],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect("unique runtime snapshot identities");
+
+    snapshot
+        .audit_startup()
+        .expect("allowed pending component does not block startup");
+    assert_eq!(snapshot.components().len(), 2);
+    assert_eq!(
+        snapshot.components()[1].state(),
+        RuntimeComponentState::Pending
+    );
+    assert_eq!(
+        snapshot.components()[1].startup_policy(),
+        StartupPolicy::AllowedPending
+    );
+}
+
+#[test]
+fn runtime_snapshot_rejects_duplicate_component_identities() {
+    const COMPONENT: ComponentId = ComponentId::new("nostra.test.duplicate-snapshot");
+    let error = RuntimeSnapshot::new(
+        [
+            ComponentSnapshot::active(
+                COMPONENT,
+                TEST_SCOPE,
+                StartupPolicy::MustActivate,
+                DesiredRevision::INITIAL,
+                ComponentSnapshotDetails::default(),
+            ),
+            ComponentSnapshot::pending(
+                COMPONENT,
+                TEST_SCOPE,
+                StartupPolicy::MustActivate,
+                DesiredRevision::INITIAL,
+                ComponentSnapshotDetails::default(),
+            ),
+        ],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect_err("one scoped component cannot have contradictory states");
+
+    assert_eq!(
+        error,
+        RuntimeSnapshotError::DuplicateComponent {
+            component: COMPONENT,
+            scope: TEST_SCOPE,
+        }
+    );
+}
+
+#[test]
+fn runtime_snapshot_rejects_inconsistent_component_details() {
+    const COMPONENT: ComponentId = ComponentId::new("nostra.test.invalid-snapshot");
+    let missing = CapabilityId::of::<TestServiceCapability>();
+    let active_error = RuntimeSnapshot::new(
+        [ComponentSnapshot::active(
+            COMPONENT,
+            TEST_SCOPE,
+            StartupPolicy::MustActivate,
+            DesiredRevision::INITIAL,
+            ComponentSnapshotDetails::new(
+                [],
+                [MissingDependencySnapshot::direct(missing)],
+                RuntimeResourceCounts::default(),
+            ),
+        )],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect_err("an active component cannot report a missing dependency");
+    assert_eq!(
+        active_error,
+        RuntimeSnapshotError::InvalidComponent {
+            component: COMPONENT,
+            scope: TEST_SCOPE,
+            violation: ComponentSnapshotViolation::MissingDependencyInState {
+                state: RuntimeComponentState::Active,
+                capability: missing,
+            },
+        }
+    );
+
+    let retained_counts = RuntimeResourceCounts::new(1, 1, 1, 1);
+    let disposed_error = RuntimeSnapshot::new(
+        [ComponentSnapshot::disposed(
+            COMPONENT,
+            TEST_SCOPE,
+            StartupPolicy::AllowedPending,
+            DesiredRevision::INITIAL,
+            ComponentSnapshotDetails::new([], [], retained_counts),
+        )],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect_err("a disposed component cannot retain owned resources");
+    assert_eq!(
+        disposed_error,
+        RuntimeSnapshotError::InvalidComponent {
+            component: COMPONENT,
+            scope: TEST_SCOPE,
+            violation: ComponentSnapshotViolation::OwnedResourcesInState {
+                state: RuntimeComponentState::Disposed,
+                counts: retained_counts,
+            },
+        }
+    );
+
+    let conflicting_error = RuntimeSnapshot::new(
+        [ComponentSnapshot::pending(
+            COMPONENT,
+            TEST_SCOPE,
+            StartupPolicy::MustActivate,
+            DesiredRevision::INITIAL,
+            ComponentSnapshotDetails::new(
+                [resolved_test_service_binding()],
+                [MissingDependencySnapshot::direct(missing)],
+                RuntimeResourceCounts::default(),
+            ),
+        )],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect_err("one capability cannot be both resolved and missing");
+    assert_eq!(
+        conflicting_error,
+        RuntimeSnapshotError::InvalidComponent {
+            component: COMPONENT,
+            scope: TEST_SCOPE,
+            violation: ComponentSnapshotViolation::ResolvedAndMissing {
+                capability: missing,
+            },
+        }
+    );
+
+    let mut service_slot = ExclusiveCapabilitySlot::new(TEST_SCOPE);
+    let default = prepare_selected_test_provider(&service_slot, DEFAULT_TEST_PROVIDER)
+        .expect("built-in default candidate");
+    service_slot
+        .install(default)
+        .expect("install built-in default");
+    let first_generation = resolved_test_service_binding_from(&service_slot);
+    let alternate = prepare_selected_test_provider(&service_slot, ALTERNATE_TEST_PROVIDER)
+        .expect("alternate candidate");
+    service_slot
+        .replace(alternate)
+        .expect("replace built-in default");
+    let second_generation = resolved_test_service_binding_from(&service_slot);
+    assert_eq!(first_generation.generation(), ComponentGeneration::INITIAL);
+    assert_eq!(second_generation.generation().get(), 2);
+    let duplicate_binding_error = RuntimeSnapshot::new(
+        [ComponentSnapshot::active(
+            COMPONENT,
+            TEST_SCOPE,
+            StartupPolicy::MustActivate,
+            DesiredRevision::INITIAL,
+            ComponentSnapshotDetails::new(
+                [first_generation, second_generation],
+                [],
+                RuntimeResourceCounts::default(),
+            ),
+        )],
+        [],
+        Duration::from_secs(30),
+    )
+    .expect_err("one capability cannot resolve to multiple Provider generations");
+    assert_eq!(
+        duplicate_binding_error,
+        RuntimeSnapshotError::InvalidComponent {
+            component: COMPONENT,
+            scope: TEST_SCOPE,
+            violation: ComponentSnapshotViolation::DuplicateResolvedDependency {
+                capability: missing,
+            },
+        }
+    );
+}
+
+#[test]
+fn runtime_snapshot_rejects_duplicate_contribution_revisions() {
+    let registry = CapabilityId::of::<TestCatalogCapability>();
+    let error = RuntimeSnapshot::new(
+        [],
+        [
+            ContributionRevision::new(registry, 1),
+            ContributionRevision::new(registry, 2),
+        ],
+        Duration::from_secs(30),
+    )
+    .expect_err("one registry cannot publish contradictory revisions");
+
+    assert_eq!(
+        error,
+        RuntimeSnapshotError::DuplicateContributionRevision { registry }
+    );
+}
+
+#[test]
+fn long_transition_is_diagnostic_without_changing_lifecycle_state() {
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let prepare_released = Rc::new(Cell::new(false));
+    let mut lifecycle = RevisionLifecycle::new(events);
+    lifecycle.blocked_prepare = Some((1, Rc::clone(&prepare_released)));
+    let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    let observer = reconciler.observer();
+    let mut reconcile = Box::pin(reconciler.reconcile(&mut lifecycle));
+
+    assert!(matches!(poll_once(reconcile.as_mut()), Poll::Pending));
+    let transition = observer
+        .transition()
+        .expect("pending preparation remains observable");
+    assert_eq!(transition.stage(), ReconcileStage::Preparing);
+    let details = ComponentSnapshotDetails::new(
+        [resolved_test_service_binding()],
+        [],
+        RuntimeResourceCounts::new(3, 1, 1, 0),
+    );
+    let snapshot = RuntimeSnapshot::new(
+        [ComponentSnapshot::transitioning(
+            StartupPolicy::MustActivate,
+            &observer,
+            transition.started_at() + Duration::from_secs(11),
+            details,
+        )
+        .expect("transitioning component snapshot")],
+        [ContributionRevision::new(
+            CapabilityId::of::<TestCatalogCapability>(),
+            7,
+        )],
+        Duration::from_secs(10),
+    )
+    .expect("unique runtime snapshot identities");
+
+    assert_eq!(
+        snapshot.components()[0].state(),
+        RuntimeComponentState::Preparing
+    );
+    assert_eq!(snapshot.components()[0].dependencies().len(), 1);
+    assert_eq!(
+        snapshot.components()[0].dependencies()[0].generation(),
+        ComponentGeneration::INITIAL
+    );
+    assert!(snapshot.components()[0].missing_dependencies().is_empty());
+    assert_eq!(
+        snapshot.components()[0].resource_counts(),
+        RuntimeResourceCounts::new(3, 1, 1, 0)
+    );
+    assert_eq!(
+        snapshot.components()[0]
+            .transition()
+            .expect("preparing transition snapshot")
+            .started_at(),
+        transition.started_at()
+    );
+    assert!(observer.last_failure().is_none());
+    assert!(matches!(poll_once(reconcile.as_mut()), Poll::Pending));
+    let [
+        RuntimeDiagnostic::LongTransition {
+            component,
+            scope,
+            revision,
+            stage,
+            elapsed,
+        },
+    ] = snapshot.diagnostics()
+    else {
+        panic!("one long-transition diagnostic is required");
+    };
+    assert_eq!(*component, RECONCILE_COMPONENT);
+    assert_eq!(*scope, TEST_SCOPE);
+    assert_eq!(*revision, DesiredRevision::INITIAL);
+    assert_eq!(*stage, ReconcileStage::Preparing);
+    assert_eq!(*elapsed, Duration::from_secs(11));
+
+    prepare_released.set(true);
+    assert!(matches!(
+        poll_once(reconcile.as_mut()),
+        Poll::Ready(ReconcileStatus::Settled { active: true, .. })
+    ));
+    drop(reconcile);
+    assert!(observer.transition().is_none());
+    assert_eq!(reconciler.active_desired(), Some(&1));
 }
