@@ -37,7 +37,7 @@ use rust_i18n::t;
 use crate::appearance::{glass, theme};
 use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
 use crate::llm::ModelSelection;
-use crate::preferences::{self, Preferences, WindowGeometry, WorkspaceMode};
+use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
 use crate::session::{
     ChatSessionCatalogController, ProjectSessionStore as _, ResolvedSessionState, SessionId,
     SessionLifecycleStore as _, SessionStores,
@@ -196,10 +196,11 @@ pub struct ChatApp {
     shutdown_completed: Arc<AtomicBool>,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
-    preference_saver: PreferenceSaver,
+    preference_handle: PreferenceHandle,
 }
 
-type PreferenceSaver = Arc<dyn Fn(Preferences) -> anyhow::Result<()> + Send + Sync>;
+#[cfg(test)]
+type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
 
 /// Identity of a sidebar row.  Drafts (unbound views) are addressed by their
 /// view entity; persisted catalog rows are addressed by their session id so the
@@ -222,7 +223,7 @@ use history_sidebar::ChatHistorySidebar;
 struct ExitWork {
     stores: Option<SessionStores>,
     snapshot: Preferences,
-    preference_saver: PreferenceSaver,
+    preference_handle: PreferenceHandle,
 }
 
 struct Conversation {
@@ -249,28 +250,26 @@ impl ChatApp {
     /// clamped into the allowed range, and a save-on-quit hook is registered
     /// so the current UI state survives across restarts.
     pub fn new(prefs: Preferences, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_with_preference_saver(
-            prefs,
-            window,
-            cx,
-            Arc::new(|prefs| preferences::save(&prefs)),
-        )
+        Self::build(prefs, window, cx, preferences::handle(cx))
     }
 
+    #[cfg(test)]
     pub(super) fn new_with_preference_saver(
         prefs: Preferences,
         window: &mut Window,
         cx: &mut Context<Self>,
         preference_saver: PreferenceSaver,
     ) -> Self {
-        Self::build(prefs, window, cx, preference_saver)
+        let preference_handle =
+            PreferenceHandle::with_saver(prefs.clone(), preference_saver.clone());
+        Self::build(prefs, window, cx, preference_handle)
     }
 
     fn build(
         prefs: Preferences,
         window: &mut Window,
         cx: &mut Context<Self>,
-        preference_saver: PreferenceSaver,
+        preference_handle: PreferenceHandle,
     ) -> Self {
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
@@ -333,7 +332,7 @@ impl ChatApp {
             shutdown_completed: Arc::new(AtomicBool::new(false)),
             _quit_task: None,
             _subscriptions: Vec::new(),
-            preference_saver,
+            preference_handle,
         };
         this.track_window_geometry(window, cx);
         this.track_system_appearance(window, cx);
@@ -390,7 +389,7 @@ impl ChatApp {
                 let Some(ExitWork {
                     stores,
                     snapshot,
-                    preference_saver,
+                    preference_handle,
                 }) = work
                 else {
                     return;
@@ -401,7 +400,8 @@ impl ChatApp {
                         None => Ok(()),
                     }
                 });
-                let preferences_task = executor.spawn(async move { preference_saver(snapshot) });
+                let preferences_task =
+                    executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
                 let (sessions, preferences) = future::join(session_task, preferences_task).await;
                 log_exit_results(sessions, preferences);
                 shutdown_completed.store(true, Ordering::Release);
@@ -438,7 +438,7 @@ impl ChatApp {
         ExitWork {
             stores,
             snapshot,
-            preference_saver: Arc::clone(&self.preference_saver),
+            preference_handle: self.preference_handle.clone(),
         }
     }
 
@@ -449,7 +449,7 @@ impl ChatApp {
         let ExitWork {
             stores,
             snapshot,
-            preference_saver,
+            preference_handle,
         } = self.prepare_exit_work(cx);
         let executor = cx.background_executor().clone();
         let session_task = executor.spawn(async move {
@@ -458,7 +458,8 @@ impl ChatApp {
                 None => Ok(()),
             }
         });
-        let preferences_task = executor.spawn(async move { preference_saver(snapshot) });
+        let preferences_task =
+            executor.spawn(async move { preference_handle.save_snapshot(&snapshot) });
         let shutdown_completed = Arc::clone(&self.shutdown_completed);
         self._quit_task = Some(cx.spawn(async move |_, cx| {
             let (sessions, preferences) = future::join(session_task, preferences_task).await;
@@ -533,7 +534,7 @@ impl ChatApp {
     fn project_identity(
         &self,
         project_id: &str,
-        cx: &App,
+        _cx: &App,
     ) -> Option<crate::session::ProjectIdentity> {
         self.agent
             .projects()
@@ -548,15 +549,16 @@ impl ChatApp {
                 .ok()
             })
             .or_else(|| {
-                crate::preferences::get(cx)
+                self.preference_handle
+                    .snapshot()
                     .agent_projects
-                    .iter()
+                    .into_iter()
                     .find(|project| project.project_id == project_id)
                     .and_then(|project| {
                         crate::session::ProjectIdentity::from_parts(
-                            project.project_id.clone(),
-                            project.canonical_path.clone(),
-                            project.display_name.clone(),
+                            project.project_id,
+                            project.canonical_path,
+                            project.display_name,
                         )
                         .ok()
                     })
@@ -1315,11 +1317,12 @@ impl ChatApp {
             .find(|project| project.canonical_path == canonical)
             .map(|project| project.project_id.clone())
             .or_else(|| {
-                crate::preferences::get(cx)
+                self.preference_handle
+                    .snapshot()
                     .agent_projects
-                    .iter()
+                    .into_iter()
                     .find(|record| record.canonical_path == canonical)
-                    .map(|record| record.project_id.clone())
+                    .map(|record| record.project_id)
             });
 
         let project_id = existing_id.unwrap_or_else(|| {
@@ -1330,7 +1333,7 @@ impl ChatApp {
                 .unwrap_or_else(|| canonical.to_string_lossy().into_owned());
             let identity =
                 crate::session::ProjectIdentity::new(canonical.clone(), display_name.clone());
-            preferences::update(cx, |prefs| {
+            preferences::update_with(cx, &self.preference_handle, |prefs| {
                 prefs
                     .agent_projects
                     .push(crate::preferences::AgentProjectRecord {

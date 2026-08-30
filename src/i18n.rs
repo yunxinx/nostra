@@ -18,7 +18,7 @@ pub fn init(lang: Language) {
 
 /// The language currently persisted in preferences.
 pub fn current(cx: &App) -> Language {
-    preferences::get(cx).language
+    preferences::handle(cx).snapshot().language
 }
 
 /// Switch the UI language: persist, retranslate native menus and window
@@ -28,7 +28,8 @@ pub fn change(lang: Language, cx: &mut App) {
     if current(cx) == lang {
         return;
     }
-    preferences::update(cx, |p| p.language = lang);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |p| p.language = lang);
     set_locale(lang);
     window::install_menus(cx);
     crate::settings::refresh_native_title(cx);

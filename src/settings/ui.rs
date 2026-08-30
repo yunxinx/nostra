@@ -105,11 +105,16 @@ pub(super) fn info_button(id: &str, text: String, cx: &App) -> Option<AnyElement
 }
 
 pub(super) fn info_buttons_hidden(cx: &App) -> bool {
-    preferences::get(cx).hide_settings_info_buttons
+    preferences::handle(cx)
+        .snapshot()
+        .hide_settings_info_buttons
 }
 
 pub(super) fn set_info_buttons_hidden(hidden: bool, cx: &mut App) {
-    preferences::update(cx, |prefs| prefs.hide_settings_info_buttons = hidden);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| {
+        prefs.hide_settings_info_buttons = hidden
+    });
     cx.refresh_windows();
 }
 

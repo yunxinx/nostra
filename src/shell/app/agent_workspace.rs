@@ -746,11 +746,9 @@ impl ChatApp {
         cx.notify();
     }
 
-    pub(super) fn merged_agent_projects(&self, cx: &App) -> Vec<ProjectSummary> {
-        merge_persisted_projects(
-            self.agent.projects(),
-            &crate::preferences::get(cx).agent_projects,
-        )
+    pub(super) fn merged_agent_projects(&self, _cx: &App) -> Vec<ProjectSummary> {
+        let persisted = self.preference_handle.snapshot().agent_projects;
+        merge_persisted_projects(self.agent.projects(), &persisted)
     }
 
     // ---------- Agent sidebar rendering ----------

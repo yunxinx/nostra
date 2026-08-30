@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 
+use crate::preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences};
 use crate::session::SessionStores;
 
 use super::{
@@ -20,6 +21,7 @@ use super::{
 };
 
 const LOCAL_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.local");
+const JSON_PREFERENCE_PROVIDER: ComponentId = ComponentId::new(JSON_PROVIDER_NAME);
 const LONG_TRANSITION_THRESHOLD: Duration = Duration::from_secs(30);
 
 pub struct SessionServicesCapability;
@@ -28,6 +30,15 @@ impl CapabilityKey for SessionServicesCapability {
     type Handle = SessionStores;
 
     const NAME: &'static str = "nostra.session.services";
+}
+
+/// Application-scoped preference storage capability.
+pub struct PreferenceCapability;
+
+impl CapabilityKey for PreferenceCapability {
+    type Handle = PreferenceHandle;
+
+    const NAME: &'static str = "nostra.preferences";
 }
 
 #[derive(Debug)]
@@ -139,6 +150,8 @@ impl std::error::Error for CompositionBuildError {
 pub struct CompositionRootBuilder {
     session_services: SessionStores,
     provider: ComponentId,
+    preferences: PreferenceHandle,
+    preference_provider: ComponentId,
 }
 
 impl CompositionRootBuilder {
@@ -148,8 +161,21 @@ impl CompositionRootBuilder {
         self
     }
 
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub fn with_preferences(mut self, preferences: PreferenceHandle) -> Self {
+        self.preferences = preferences;
+        self
+    }
+
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub const fn with_preferences_provider(mut self, provider: ComponentId) -> Self {
+        self.preference_provider = provider;
+        self
+    }
+
     pub fn build(self) -> Result<CompositionRoot, CompositionBuildError> {
         let provider = self.provider;
+        let preference_provider = self.preference_provider;
         let application = ScopeTree::APPLICATION_SCOPE;
         let mut scopes = ScopeTree::new();
         let session_services = {
@@ -171,15 +197,43 @@ impl CompositionRootBuilder {
                 None => unreachable!("installed session capability remains available"),
             }
         };
+        let preferences = {
+            let slot = match scopes.capability_slot::<PreferenceCapability>(application) {
+                Ok(slot) => slot,
+                Err(error) => unreachable!("new application scope is open: {error}"),
+            };
+            let candidate = match slot.prepare_candidate(preference_provider, || {
+                Ok::<_, Infallible>(self.preferences)
+            }) {
+                Ok(candidate) => candidate,
+                Err(error) => match error {},
+            };
+            if let Err(error) = slot.install(candidate) {
+                unreachable!("new capability slot accepts its initial Provider: {error}");
+            }
+            match slot.current() {
+                Some(lease) => lease,
+                None => unreachable!("installed preference capability remains available"),
+            }
+        };
 
         let snapshot = RuntimeSnapshot::new(
-            [ComponentSnapshot::active(
-                provider,
-                application,
-                StartupPolicy::MustActivate,
-                DesiredRevision::INITIAL,
-                ComponentSnapshotDetails::default(),
-            )],
+            [
+                ComponentSnapshot::active(
+                    provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+                ComponentSnapshot::active(
+                    preference_provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+            ],
             [],
             LONG_TRANSITION_THRESHOLD,
         )
@@ -201,6 +255,8 @@ impl CompositionRootBuilder {
             snapshot,
             provider,
             session_services: Some(session_services),
+            preference_provider,
+            preferences: Some(preferences),
         })
     }
 }
@@ -211,6 +267,8 @@ pub struct CompositionRoot {
     snapshot: RuntimeSnapshot,
     provider: ComponentId,
     session_services: Option<CapabilityLease<SessionServicesCapability>>,
+    preference_provider: ComponentId,
+    preferences: Option<CapabilityLease<PreferenceCapability>>,
 }
 
 impl CompositionRoot {
@@ -219,13 +277,17 @@ impl CompositionRoot {
         CompositionRootBuilder {
             session_services,
             provider: LOCAL_SESSION_PROVIDER,
+            preferences: PreferenceHandle::json(Preferences::default()),
+            preference_provider: JSON_PREFERENCE_PROVIDER,
         }
     }
 
     /// Open the first-party local session stores and install them as the
     /// default session Provider.
     pub fn open_default() -> Result<Self, CompositionBuildError> {
-        Self::builder(SessionStores::open_default()).build()
+        Self::builder(SessionStores::open_default())
+            .with_preferences(PreferenceHandle::json(crate::preferences::load()))
+            .build()
     }
 
     #[must_use]
@@ -239,6 +301,11 @@ impl CompositionRoot {
     }
 
     #[must_use]
+    pub fn preferences(&self) -> Option<&CapabilityLease<PreferenceCapability>> {
+        self.preferences.as_ref()
+    }
+
+    #[must_use]
     pub const fn snapshot(&self) -> &RuntimeSnapshot {
         &self.snapshot
     }
@@ -247,14 +314,24 @@ impl CompositionRoot {
         let application = self.scopes.application();
         self.scopes.close(application).await?;
         self.session_services = None;
+        self.preferences = None;
         self.snapshot = RuntimeSnapshot::new(
-            [ComponentSnapshot::disposed(
-                self.provider,
-                application,
-                StartupPolicy::MustActivate,
-                DesiredRevision::INITIAL,
-                ComponentSnapshotDetails::default(),
-            )],
+            [
+                ComponentSnapshot::disposed(
+                    self.provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+                ComponentSnapshot::disposed(
+                    self.preference_provider,
+                    application,
+                    StartupPolicy::MustActivate,
+                    DesiredRevision::INITIAL,
+                    ComponentSnapshotDetails::default(),
+                ),
+            ],
             [],
             LONG_TRANSITION_THRESHOLD,
         )

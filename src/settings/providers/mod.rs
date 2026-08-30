@@ -112,6 +112,7 @@ pub(super) struct ProvidersPage {
     layout: Entity<ResizableState>,
     /// Restored list width, used as the split's initial size on first render.
     list_width: Pixels,
+    preference_handle: preferences::PreferenceHandle,
     /// Wire-format switches stay folded away until asked for.
     compatibility_open: bool,
     /// Row the pointer is over, so its remove button can appear.
@@ -163,7 +164,10 @@ impl ProvidersPage {
             models: Vec::new(),
             placeholders,
             layout: cx.new(|_| ResizableState::default()),
-            list_width: clamp_list_width(px(preferences::get(cx).provider_list_width)),
+            preference_handle: preferences::handle(cx),
+            list_width: clamp_list_width(px(preferences::handle(cx)
+                .snapshot()
+                .provider_list_width)),
             compatibility_open: false,
             hovered: None,
             confirming: None,

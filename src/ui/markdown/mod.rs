@@ -171,22 +171,23 @@ impl MarkdownBody {
 }
 
 pub(crate) fn global_wrap_enabled(cx: &App) -> bool {
-    preferences::get(cx).code_block_wrap
+    preferences::handle(cx).snapshot().code_block_wrap
 }
 
 pub(crate) fn line_numbers_enabled(cx: &App) -> bool {
-    preferences::get(cx).code_block_line_numbers
+    preferences::handle(cx).snapshot().code_block_line_numbers
 }
 
 pub(crate) fn user_message_markdown_enabled(cx: &App) -> bool {
-    preferences::get(cx).user_message_markdown
+    preferences::handle(cx).snapshot().user_message_markdown
 }
 
 pub(crate) fn set_user_message_markdown(enabled: bool, cx: &mut App) {
     if user_message_markdown_enabled(cx) == enabled {
         return;
     }
-    preferences::update(cx, |prefs| prefs.user_message_markdown = enabled);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| prefs.user_message_markdown = enabled);
     cx.refresh_windows();
 }
 
@@ -194,7 +195,8 @@ pub(crate) fn set_global_wrap(enabled: bool, cx: &mut App) {
     if global_wrap_enabled(cx) == enabled {
         return;
     }
-    preferences::update(cx, |prefs| reset_global_wrap(prefs, enabled));
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| reset_global_wrap(prefs, enabled));
     cx.refresh_windows();
 }
 
@@ -216,7 +218,8 @@ pub(crate) fn set_line_numbers(enabled: bool, cx: &mut App) {
     if line_numbers_enabled(cx) == enabled {
         return;
     }
-    preferences::update(cx, |prefs| prefs.code_block_line_numbers = enabled);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| prefs.code_block_line_numbers = enabled);
     cx.refresh_windows();
 }
 

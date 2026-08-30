@@ -54,7 +54,8 @@ pub fn set(font: ComposerFont, cx: &mut App) {
         return;
     }
     cx.set_global(ActiveComposerFont(font));
-    crate::preferences::update(cx, |prefs| prefs.composer_font = font);
+    let handle = crate::preferences::handle(cx);
+    crate::preferences::update_with(cx, &handle, |prefs| prefs.composer_font = font);
     cx.refresh_windows();
 }
 

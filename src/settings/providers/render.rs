@@ -23,6 +23,7 @@ use crate::{llm::Protocol, preferences, providers};
 impl Render for ProvidersPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_placeholders(window, cx);
+        let preference_handle = self.preference_handle.clone();
 
         // Two independently scrolling columns with a draggable divider.  The
         // group fills the content area, so neither column relies on the
@@ -32,14 +33,16 @@ impl Render for ProvidersPage {
             // Fires once per drag, on mouse-up, so the divider persists at the
             // same granularity as the main window's sidebar — without a write
             // per intermediate mouse-move.
-            .on_resize(|state, _, cx| {
+            .on_resize(move |state, _, cx| {
                 let Some(width) = state.read(cx).sizes().first().copied() else {
                     return;
                 };
                 if let Some(width) =
-                    changed_list_width(preferences::get(cx).provider_list_width, width)
+                    changed_list_width(preference_handle.snapshot().provider_list_width, width)
                 {
-                    preferences::update(cx, |prefs| prefs.provider_list_width = width);
+                    preferences::update_with(cx, &preference_handle, |prefs| {
+                        prefs.provider_list_width = width
+                    });
                 }
             })
             .child(

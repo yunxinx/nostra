@@ -57,7 +57,9 @@ impl SmoothScrollState {
 }
 
 pub(crate) fn smooth_scrolling_enabled(cx: &App) -> bool {
-    crate::preferences::get(cx).smooth_chat_scrolling
+    crate::preferences::handle(cx)
+        .snapshot()
+        .smooth_chat_scrolling
 }
 
 pub(super) fn smooth_scroll_animation_enabled(window: &Window, cx: &App) -> bool {
@@ -68,6 +70,7 @@ pub(crate) fn set_smooth_scrolling(enabled: bool, cx: &mut App) {
     if smooth_scrolling_enabled(cx) == enabled {
         return;
     }
-    crate::preferences::update(cx, |prefs| prefs.smooth_chat_scrolling = enabled);
+    let handle = crate::preferences::handle(cx);
+    crate::preferences::update_with(cx, &handle, |prefs| prefs.smooth_chat_scrolling = enabled);
     cx.refresh_windows();
 }

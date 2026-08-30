@@ -329,7 +329,7 @@ pub(super) fn render(
     });
 
     let global_wrap = global_wrap_enabled(cx);
-    let global_wrap_revision = preferences::get(cx).code_block_wrap_revision;
+    let global_wrap_revision = preferences::handle(cx).snapshot().code_block_wrap_revision;
     let wrap_state_id: SharedString =
         format!("markdown-code-wrap-state-{owner_id}-{}", code.start).into();
     let wrap_state = window.use_keyed_state(wrap_state_id, cx, |_, _| {

@@ -75,9 +75,11 @@ fn init(prefs: preferences::Preferences, cx: &mut App) {
 
     // The Prefs global is the single source of truth at runtime; seed it
     // before any subsystem reads or writes settings.
-    i18n::init(prefs.language);
-    fonts::init(prefs.composer_font, cx);
     preferences::init_global(prefs.clone(), cx);
+    let preference_handle = preferences::handle(cx);
+    let current = preference_handle.snapshot();
+    i18n::init(current.language);
+    fonts::init(current.composer_font, cx);
     glass::init(cx);
     theme::init(&prefs, cx);
 

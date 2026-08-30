@@ -15,7 +15,8 @@ pub use capability::{
 };
 pub use component::{ComponentGeneration, ComponentId, ScopeId};
 pub use composition::{
-    CompositionBuildError, CompositionRoot, CompositionRootBuilder, SessionServicesCapability,
+    CompositionBuildError, CompositionRoot, CompositionRootBuilder, PreferenceCapability,
+    SessionServicesCapability,
 };
 pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,

@@ -23,7 +23,7 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn enabled(cx: &App) -> bool {
-    preferences::get(cx).glass_effect
+    preferences::handle(cx).snapshot().glass_effect
 }
 
 pub fn window_background(enabled: bool) -> WindowBackgroundAppearance {
@@ -49,7 +49,7 @@ pub fn background(color: Hsla, cx: &App) -> Hsla {
 
 #[cfg(target_os = "macos")]
 pub fn tint_opacity(cx: &App) -> f32 {
-    let persisted = preferences::get(cx).glass_tint_opacity;
+    let persisted = preferences::handle(cx).snapshot().glass_tint_opacity;
     let preview = cx
         .try_global::<GlassTintPreview>()
         .and_then(|preview| preview.0);
@@ -66,7 +66,8 @@ pub fn preview_tint_opacity(opacity: f32, cx: &mut App) {
 pub fn persist_tint_opacity(opacity: f32, cx: &mut App) {
     let opacity = clamp_opacity(opacity);
     cx.global_mut::<GlassTintPreview>().0 = None;
-    preferences::update(cx, |prefs| prefs.glass_tint_opacity = opacity);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| prefs.glass_tint_opacity = opacity);
 }
 
 /// Commit an in-progress drag when the settings window closes before the
@@ -75,7 +76,8 @@ pub fn persist_tint_opacity(opacity: f32, cx: &mut App) {
 pub fn commit_tint_preview(cx: &mut App) {
     let preview = cx.global_mut::<GlassTintPreview>().0.take();
     if let Some(opacity) = preview {
-        preferences::update(cx, |prefs| prefs.glass_tint_opacity = opacity);
+        let handle = preferences::handle(cx);
+        preferences::update_with(cx, &handle, |prefs| prefs.glass_tint_opacity = opacity);
     }
 }
 
@@ -123,7 +125,8 @@ pub fn root_background(color: Hsla) -> Hsla {
 /// Persist and apply the setting to every open window immediately.
 #[cfg(target_os = "macos")]
 pub fn set_enabled(enabled: bool, current_window: &mut Window, cx: &mut App) {
-    preferences::update(cx, |prefs| prefs.glass_effect = enabled);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |prefs| prefs.glass_effect = enabled);
 
     let appearance = window_background(enabled);
     let current_id = current_window.window_handle().window_id();

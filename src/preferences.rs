@@ -10,6 +10,7 @@
 use std::{
     io::Write as _,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use gpui::{App, Global, Window};
@@ -23,8 +24,11 @@ use crate::{
 const FILE_NAME: &str = "preferences.json";
 pub const DEFAULT_GLASS_TINT_OPACITY: f32 = 0.85;
 
+/// Stable identity of the first-party JSON preference Provider.
+pub const JSON_PROVIDER_NAME: &str = "nostra.preferences.json";
+
 /// Snapshot of user preferences that survives across restarts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preferences {
     /// Sidebar width in the expanded state.
@@ -313,12 +317,98 @@ impl ThemeMode {
     }
 }
 
-/// App-global holding the live preferences: the single source of truth
-/// between startup and quit.  UI state that only matters at exit (sidebar
-/// geometry, window bounds) is written back by `ChatApp` on quit; settings
-/// changes go through [`update`] and persist immediately.
+pub type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
+
+struct PreferenceState {
+    preferences: Mutex<Preferences>,
+    saver: PreferenceSaver,
+}
+
+/// Explicit application-scoped preference handle. The handle owns the
+/// Provider state and keeps persistence behind a narrow read/write boundary.
+/// Clones refer to the same live snapshot and Provider.
+#[derive(Clone)]
+pub struct PreferenceHandle {
+    state: Arc<PreferenceState>,
+}
+
+impl PreferenceHandle {
+    /// Build the default JSON-backed Provider.
+    pub fn json(prefs: Preferences) -> Self {
+        Self::with_saver(prefs, Arc::new(save))
+    }
+
+    /// Build a volatile Provider for tests and process-local compositions.
+    pub fn in_memory(prefs: Preferences) -> Self {
+        Self::with_saver(prefs, Arc::new(|_| Ok(())))
+    }
+
+    /// Build a Provider with an explicit persistence boundary.
+    pub fn with_saver(prefs: Preferences, saver: PreferenceSaver) -> Self {
+        Self {
+            state: Arc::new(PreferenceState {
+                preferences: Mutex::new(prefs),
+                saver,
+            }),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Preferences {
+        match self.state.preferences.lock() {
+            Ok(prefs) => prefs.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Replace the live snapshot and persist it through this Provider.
+    /// The live mutation remains applied if persistence fails.
+    pub fn replace(&self, prefs: Preferences) -> anyhow::Result<()> {
+        {
+            let mut current = match self.state.preferences.lock() {
+                Ok(current) => current,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *current = prefs.clone();
+        }
+        (self.state.saver)(&prefs)
+    }
+
+    /// Replace the live snapshot without invoking persistence.
+    pub fn replace_in_memory(&self, prefs: Preferences) {
+        let mut current = match self.state.preferences.lock() {
+            Ok(current) => current,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *current = prefs;
+    }
+
+    /// Mutate the live snapshot and persist it through this Provider.
+    pub fn update(&self, f: impl FnOnce(&mut Preferences)) -> anyhow::Result<()> {
+        let mut prefs = self.snapshot();
+        f(&mut prefs);
+        self.replace(prefs)
+    }
+
+    /// Mutate the live snapshot without persistence.
+    pub fn update_in_memory(&self, f: impl FnOnce(&mut Preferences)) {
+        let mut prefs = self.snapshot();
+        f(&mut prefs);
+        self.replace_in_memory(prefs);
+    }
+
+    /// Persist an already prepared snapshot, without changing live state.
+    pub fn save_snapshot(&self, prefs: &Preferences) -> anyhow::Result<()> {
+        (self.state.saver)(prefs)
+    }
+}
+
+/// App-global foreground adapter for the explicit preference capability.
+/// Render code can continue to borrow a stable snapshot while composition
+/// consumers receive the cloneable [`PreferenceHandle`].
 pub struct Prefs {
     preferences: Preferences,
+    handle: PreferenceHandle,
 }
 
 impl Global for Prefs {}
@@ -326,7 +416,21 @@ impl Global for Prefs {}
 /// Seed the [`Prefs`] global from the loaded preferences.  Must run during
 /// app init, before any UI reads settings.
 pub fn init_global(prefs: Preferences, cx: &mut App) {
-    cx.set_global(Prefs { preferences: prefs });
+    init_global_with_handle(PreferenceHandle::json(prefs), cx);
+}
+
+/// Seed the foreground adapter from an explicitly selected Provider.
+pub fn init_global_with_handle(handle: PreferenceHandle, cx: &mut App) {
+    let preferences = handle.snapshot();
+    cx.set_global(Prefs {
+        preferences,
+        handle,
+    });
+}
+
+/// Clone the active preference capability handle.
+pub fn handle(cx: &App) -> PreferenceHandle {
+    cx.global::<Prefs>().handle.clone()
 }
 
 /// The live preferences.
@@ -341,10 +445,18 @@ pub fn get(cx: &App) -> &Preferences {
 /// last-written).  Save errors are logged and otherwise ignored — a failed
 /// write never breaks the running app.
 pub fn update(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
+    let handle = handle(cx);
+    update_with(cx, &handle, f);
+}
+
+/// Mutate through an explicit handle while keeping the foreground adapter in
+/// sync and notifying GPUI global observers.
+pub fn update_with(cx: &mut App, handle: &PreferenceHandle, f: impl FnOnce(&mut Preferences)) {
     let prefs = cx.global_mut::<Prefs>();
+    prefs.handle = handle.clone();
     f(&mut prefs.preferences);
     let snapshot = prefs.preferences.clone();
-    let result = save(&snapshot);
+    let result = handle.replace(snapshot);
     if let Err(e) = result {
         crate::logging::error(
             "preferences",
@@ -382,16 +494,33 @@ pub fn remove_agent_project(project_id: &str, cx: &mut App) {
 /// global observation without writing to the user's configuration directory.
 #[cfg(test)]
 pub(crate) fn update_in_memory(cx: &mut App, f: impl FnOnce(&mut Preferences)) {
-    f(&mut cx.global_mut::<Prefs>().preferences);
+    let handle = handle(cx);
+    update_with_in_memory(cx, &handle, f);
+}
+
+/// Mutate through an explicit handle without persistence while keeping the
+/// foreground adapter in sync.
+pub fn update_with_in_memory(
+    cx: &mut App,
+    handle: &PreferenceHandle,
+    f: impl FnOnce(&mut Preferences),
+) {
+    let prefs = cx.global_mut::<Prefs>();
+    prefs.handle = handle.clone();
+    f(&mut prefs.preferences);
+    handle.replace_in_memory(prefs.preferences.clone());
 }
 
 /// Fold exit-time state into the live preferences and return the merged
 /// snapshot.  Unlike [`update`] this does not spawn a save — quit hooks run
 /// the flush themselves so gpui can await it before the process exits.
 pub fn snapshot_with(cx: &mut App, f: impl FnOnce(&mut Preferences)) -> Preferences {
-    let prefs = &mut cx.global_mut::<Prefs>().preferences;
-    f(prefs);
-    prefs.clone()
+    let handle = handle(cx);
+    let prefs = cx.global_mut::<Prefs>();
+    f(&mut prefs.preferences);
+    let snapshot = prefs.preferences.clone();
+    handle.replace_in_memory(snapshot.clone());
+    snapshot
 }
 
 /// Full path where preferences are stored.  `None` on platforms where no
@@ -445,6 +574,7 @@ fn save_to_path(path: &Path, prefs: &Preferences) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn incomplete_or_unknown_schema_is_rejected() {
@@ -536,6 +666,45 @@ mod tests {
         .expect("serialize");
         unknown_geometry["window"]["legacy_scale"] = serde_json::Value::from(2);
         assert!(serde_json::from_value::<Preferences>(unknown_geometry).is_err());
+    }
+
+    #[test]
+    fn explicit_preference_handle_preserves_snapshot_and_save_boundary() {
+        let saves = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&saves);
+        let handle = PreferenceHandle::with_saver(
+            Preferences::default(),
+            Arc::new(move |prefs| {
+                assert!(prefs.sidebar_collapsed);
+                observed.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        );
+
+        handle
+            .update(|prefs| prefs.sidebar_collapsed = true)
+            .expect("custom Provider accepts the snapshot");
+        assert!(handle.snapshot().sidebar_collapsed);
+        assert_eq!(saves.load(Ordering::Relaxed), 1);
+
+        handle.update_in_memory(|prefs| prefs.sidebar_collapsed = false);
+        assert!(!handle.snapshot().sidebar_collapsed);
+        assert_eq!(saves.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn preference_handle_keeps_live_state_when_save_fails() {
+        let handle = PreferenceHandle::with_saver(
+            Preferences::default(),
+            Arc::new(|_| Err(anyhow::anyhow!("save failed"))),
+        );
+
+        assert!(
+            handle
+                .update(|prefs| prefs.detailed_logging = true)
+                .is_err()
+        );
+        assert!(handle.snapshot().detailed_logging);
     }
 
     #[test]

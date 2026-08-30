@@ -359,7 +359,7 @@ impl ChatApp {
     /// enabled the preference and the session is still present in the catalog.
     /// This is a cancellable background selection that never creates a draft.
     fn maybe_restore_last_chat_on_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prefs = preferences::get(cx);
+        let prefs = self.preference_handle.snapshot();
         if !prefs.restore_last_chat_on_start {
             return;
         }
@@ -383,11 +383,11 @@ impl ChatApp {
     /// startup restore can re-target it next launch.  Only persisted sessions
     /// are recorded; drafts never have a session id.
     pub(super) fn record_active_session(&self, session_id: &SessionId, cx: &mut Context<Self>) {
-        let current = preferences::get(cx).last_active_chat_session.as_ref();
-        if current == Some(session_id) {
+        let current = self.preference_handle.snapshot().last_active_chat_session;
+        if current.as_ref() == Some(session_id) {
             return;
         }
-        preferences::update(cx, |prefs| {
+        preferences::update_with(cx, &self.preference_handle, |prefs| {
             prefs.last_active_chat_session = Some(session_id.clone());
         });
     }

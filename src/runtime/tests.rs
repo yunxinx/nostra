@@ -14,6 +14,7 @@ use std::{
 use futures::task::noop_waker_ref;
 use gpui::Subscription;
 
+use crate::preferences::{PreferenceHandle, Preferences};
 use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, SessionStoresError};
 
 use super::{
@@ -2327,9 +2328,13 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     snapshot
         .audit_startup()
         .expect("default required components are active");
-    assert_eq!(snapshot.components().len(), 1);
+    assert_eq!(snapshot.components().len(), 2);
     assert_eq!(
         snapshot.components()[0].component(),
+        ComponentId::new("nostra.preferences.json")
+    );
+    assert_eq!(
+        snapshot.components()[1].component(),
         ComponentId::new("nostra.session.local")
     );
     assert_eq!(snapshot.components()[0].scope(), application);
@@ -2343,11 +2348,17 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     );
     assert!(snapshot.components()[0].dependencies().is_empty());
     assert!(snapshot.components()[0].missing_dependencies().is_empty());
+    assert!(snapshot.components()[1].dependencies().is_empty());
+    assert!(snapshot.components()[1].missing_dependencies().is_empty());
 
     futures::executor::block_on(root.close()).expect("close default composition");
     assert!(root.session_services().is_none());
     assert_eq!(
         root.snapshot().components()[0].state(),
+        RuntimeComponentState::Disposed
+    );
+    assert_eq!(
+        root.snapshot().components()[1].state(),
         RuntimeComponentState::Disposed
     );
     futures::executor::block_on(root.close())
@@ -2440,7 +2451,7 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert!(first_close.is_err());
     assert!(root.session_services().is_some());
     assert_eq!(
-        root.snapshot().components()[0].state(),
+        root.snapshot().components()[1].state(),
         RuntimeComponentState::Active
     );
 
@@ -2451,7 +2462,7 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert!(retry.is_err());
     assert!(root.session_services().is_some());
     assert_eq!(
-        root.snapshot().components()[0].state(),
+        root.snapshot().components()[1].state(),
         RuntimeComponentState::Active
     );
 }
@@ -2476,7 +2487,7 @@ fn memory_session_provider_uses_the_same_typed_capability_consumer() {
     assert!(session_services.handle().chat().is_ok());
     assert!(session_services.handle().agent().is_ok());
     assert_eq!(
-        root.snapshot().components()[0].component(),
+        root.snapshot().components()[1].component(),
         MEMORY_SESSION_PROVIDER
     );
     root.snapshot()
@@ -2485,11 +2496,66 @@ fn memory_session_provider_uses_the_same_typed_capability_consumer() {
 
     futures::executor::block_on(root.close()).expect("close memory session composition");
     assert_eq!(
-        root.snapshot().components()[0].component(),
+        root.snapshot().components()[1].component(),
         MEMORY_SESSION_PROVIDER
     );
     assert_eq!(
-        root.snapshot().components()[0].state(),
+        root.snapshot().components()[1].state(),
         RuntimeComponentState::Disposed
     );
+}
+
+#[test]
+fn default_composition_exposes_the_json_preference_provider() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition with unavailable session domains");
+    let preferences = root
+        .preferences()
+        .expect("active preference capability")
+        .handle()
+        .clone();
+
+    assert_eq!(
+        root.preferences().expect("preference lease").provider(),
+        ComponentId::new("nostra.preferences.json")
+    );
+    assert_eq!(
+        root.preferences().expect("preference lease").generation(),
+        ComponentGeneration::INITIAL
+    );
+    assert_eq!(preferences.snapshot(), Preferences::default());
+    preferences.update_in_memory(|prefs| prefs.sidebar_collapsed = true);
+    assert!(preferences.snapshot().sidebar_collapsed);
+
+    futures::executor::block_on(root.close()).expect("close preference composition");
+    assert!(root.preferences().is_none());
+}
+
+#[test]
+fn in_memory_preference_provider_uses_the_same_capability_consumer() {
+    const MEMORY_PREFERENCE_PROVIDER: ComponentId = ComponentId::new("nostra.preferences.memory");
+    let preferences = PreferenceHandle::in_memory(Preferences::default());
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .with_preferences(preferences.clone())
+        .with_preferences_provider(MEMORY_PREFERENCE_PROVIDER)
+        .build()
+        .expect("valid in-memory preference composition");
+
+    let lease = root
+        .preferences()
+        .expect("active memory preference capability");
+    assert_eq!(lease.provider(), MEMORY_PREFERENCE_PROVIDER);
+    lease
+        .handle()
+        .update_in_memory(|prefs| prefs.language = Preferences::default().language);
+    assert_eq!(lease.handle().snapshot(), preferences.snapshot());
+    assert_eq!(
+        root.snapshot().components()[0].component(),
+        MEMORY_PREFERENCE_PROVIDER
+    );
+    root.snapshot()
+        .audit_startup()
+        .expect("memory preference Provider satisfies startup audit");
+    futures::executor::block_on(root.close()).expect("close memory preference composition");
 }

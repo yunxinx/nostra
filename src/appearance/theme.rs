@@ -52,13 +52,14 @@ pub fn init(prefs: &Preferences, cx: &mut App) {
 /// Change the theme mode preference (`None` = follow system), persist it,
 /// and apply it to all windows.
 pub fn set_mode(mode: Option<preferences::ThemeMode>, cx: &mut App) {
-    preferences::update(cx, |p| p.theme_mode = mode);
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |p| p.theme_mode = mode);
     apply_mode(mode, cx);
 }
 
 /// The persisted mode preference (`None` = follow system).
 pub fn mode_preference(cx: &App) -> Option<preferences::ThemeMode> {
-    preferences::get(cx).theme_mode
+    preferences::handle(cx).snapshot().theme_mode
 }
 
 /// Apply a system appearance change when the user has chosen to follow the
@@ -87,7 +88,8 @@ pub fn select_theme(name: &str, cx: &mut App) {
     let dark_slot = config.mode.is_dark();
     let saved: String = config.name.to_string();
     apply_theme_config(config, cx);
-    preferences::update(cx, |p| {
+    let handle = preferences::handle(cx);
+    preferences::update_with(cx, &handle, |p| {
         let slot = if dark_slot {
             &mut p.dark_theme
         } else {

@@ -27,7 +27,7 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::appearance::glass;
-use crate::preferences::{self, WindowGeometry};
+use crate::preferences::{self, PreferenceHandle, WindowGeometry};
 use crate::shell::window;
 use crate::ui::consume_button_key;
 
@@ -77,8 +77,10 @@ pub fn open(cx: &mut App) {
         }
     }
 
+    let preference_handle = preferences::handle(cx);
+    let saved_preferences = preference_handle.snapshot();
     let bounds = window::restored_bounds(
-        preferences::get(cx).settings_window,
+        saved_preferences.settings_window,
         PREFERRED_SIZE,
         MIN_SIZE,
         cx,
@@ -89,7 +91,7 @@ pub fn open(cx: &mut App) {
         window_min_size: Some(MIN_SIZE),
         kind: WindowKind::Normal,
         #[cfg(target_os = "macos")]
-        window_background: glass::window_background(preferences::get(cx).glass_effect),
+        window_background: glass::window_background(saved_preferences.glass_effect),
         #[cfg(target_os = "linux")]
         window_background: WindowBackgroundAppearance::Transparent,
         #[cfg(target_os = "linux")]
@@ -98,7 +100,7 @@ pub fn open(cx: &mut App) {
     };
 
     match cx.open_window(options, |window, cx| {
-        let view = cx.new(|cx| SettingsWindow::new(window, cx));
+        let view = cx.new(|cx| SettingsWindow::new(window, cx, preference_handle.clone()));
 
         // Focus the root so global keybindings (quit, toggle theme, …)
         // dispatch while this window is frontmost — same pattern as the
@@ -203,11 +205,16 @@ struct SettingsWindow {
     #[cfg(target_os = "macos")]
     glass_opacity: Entity<SliderState>,
     window_geometry: WindowGeometry,
+    preference_handle: PreferenceHandle,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsWindow {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        preference_handle: PreferenceHandle,
+    ) -> Self {
         #[cfg(target_os = "macos")]
         let glass_opacity = {
             let initial_opacity = glass::tint_opacity(cx) * 100.;
@@ -222,9 +229,12 @@ impl SettingsWindow {
         let bounds_subscription = cx.observe_window_bounds(window, |this, window, _| {
             this.window_geometry = WindowGeometry::from_window(window);
         });
-        cx.on_release(|this, cx| {
+        let preferences_for_release = preference_handle.clone();
+        cx.on_release(move |this, cx| {
             let geometry = this.window_geometry;
-            preferences::update(cx, |prefs| prefs.settings_window = Some(geometry));
+            preferences::update_with(cx, &preferences_for_release, |prefs| {
+                prefs.settings_window = Some(geometry)
+            });
             #[cfg(target_os = "macos")]
             glass::commit_tint_preview(cx);
         })
@@ -252,6 +262,7 @@ impl SettingsWindow {
             #[cfg(target_os = "macos")]
             glass_opacity,
             window_geometry: WindowGeometry::from_window(window),
+            preference_handle,
             _subscriptions: subscriptions,
         }
     }
@@ -331,7 +342,7 @@ impl SettingsWindow {
 
     fn render_content(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.active {
-            Page::General => general::render(cx),
+            Page::General => general::render(cx, &self.preference_handle),
             Page::Appearance => appearance::render(
                 cx,
                 #[cfg(target_os = "macos")]
