@@ -520,8 +520,12 @@ impl ChatApp {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
-        let view =
-            ChatView::view_with_generation_service(self.generation_service.clone(), window, cx);
+        let view = ChatView::view_with_generation_service(
+            self.session_services.chat_conversation(),
+            self.generation_service.clone(),
+            window,
+            cx,
+        );
         let sub = self.subscribe_conversation(&view, window, cx);
         let selection = view.read(cx).selection();
         self.conversations.push(Conversation {
@@ -643,6 +647,7 @@ impl ChatApp {
         self.invalidate_agent_selection_request();
         let view = ChatView::project_view_with_generation_service(
             identity,
+            self.session_services.project_conversation(),
             self.generation_service.clone(),
             window,
             cx,
@@ -697,6 +702,7 @@ impl ChatApp {
         let request = self.begin_agent_selection_request();
         let view = ChatView::project_view_with_generation_service(
             identity,
+            self.session_services.project_conversation(),
             self.generation_service.clone(),
             window,
             cx,
@@ -1194,8 +1200,12 @@ impl ChatApp {
                     })
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
-        let view =
-            ChatView::view_with_generation_service(self.generation_service.clone(), window, cx);
+        let view = ChatView::view_with_generation_service(
+            self.session_services.chat_conversation(),
+            self.generation_service.clone(),
+            window,
+            cx,
+        );
         let restore_result = view.update(cx, |chat, cx| {
             chat.restore_from_session(&session_id, &state, cx)
         });

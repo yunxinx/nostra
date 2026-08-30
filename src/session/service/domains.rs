@@ -11,7 +11,8 @@ use super::super::{
     SessionDomain, SessionStore,
 };
 use super::capabilities::{
-    SharedAgentProjectStore, SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
+    ConversationSessionServices, SharedAgentProjectStore, SharedChatReferenceStore,
+    SharedSessionCatalog, SharedSessionStore,
 };
 use super::core::{
     SESSION_MAINTENANCE_TIMEOUT, SESSION_OPEN_TIMEOUT, SESSION_SHUTDOWN_TIMEOUT, SharedStoreCore,
@@ -152,6 +153,11 @@ impl SessionStores {
             .map(SharedChatReferenceStore::from_core)
     }
 
+    /// Project the Chat-domain capabilities consumed by a Chat conversation.
+    pub fn chat_conversation(&self) -> ConversationSessionServices {
+        ConversationSessionServices::new(self.chat(), None)
+    }
+
     pub fn agent(&self) -> Result<SharedSessionStore, SessionStoresError> {
         self.core(SessionDomain::Agent)
             .map(|core| SharedSessionStore::from_core(core, SessionDomain::Agent))
@@ -170,6 +176,12 @@ impl SessionStores {
     pub fn agent_projects(&self) -> Result<SharedAgentProjectStore, SessionStoresError> {
         self.core(SessionDomain::Agent)
             .map(SharedAgentProjectStore::from_core)
+    }
+
+    /// Project the Agent lifecycle capability and Chat reference reader used
+    /// by a project conversation.
+    pub fn project_conversation(&self) -> ConversationSessionServices {
+        ConversationSessionServices::new(self.agent(), self.chat_references().ok())
     }
 
     pub fn flush(&self) -> Result<(), SessionStoresError> {

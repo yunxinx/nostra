@@ -23,7 +23,7 @@ use std::{
 use chrono::{Datelike as _, TimeZone as _};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, InteractiveElement as _,
+    AppContext as _, ClickEvent, Context, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
@@ -407,13 +407,6 @@ fn role_label(role: Role) -> SharedString {
     .into()
 }
 
-fn chat_reference_store(cx: &App) -> Option<SharedChatReferenceStore> {
-    cx.try_global::<crate::session::SessionStores>()
-        .cloned()?
-        .chat_references()
-        .ok()
-}
-
 // ---------------------------------------------------------------------------
 // Composer
 // ---------------------------------------------------------------------------
@@ -438,6 +431,7 @@ struct CompletionState {
 pub(crate) struct ChatReferenceComposer {
     input: Entity<TextareaState>,
     references_enabled: bool,
+    reference_store: Option<SharedChatReferenceStore>,
     status: Rc<Cell<ComposerStatus>>,
     completion: CompletionState,
     drafts: Vec<ChatReferenceDraft>,
@@ -456,27 +450,49 @@ pub(crate) struct ChatReferenceComposer {
 impl ChatReferenceComposer {
     #[allow(dead_code)]
     pub(crate) fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::with_references(Rc::new(Cell::new(ComposerStatus::default())), window, cx)
+        Self::with_references(
+            Rc::new(Cell::new(ComposerStatus::default())),
+            None,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_reference_store(
+        reference_store: Option<SharedChatReferenceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_references(
+            Rc::new(Cell::new(ComposerStatus::default())),
+            reference_store,
+            window,
+            cx,
+        )
     }
 
     pub(crate) fn chat(
         status: Rc<Cell<ComposerStatus>>,
+        reference_store: Option<SharedChatReferenceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(false, status, window, cx)
+        Self::build(false, reference_store, status, window, cx)
     }
 
     pub(crate) fn with_references(
         status: Rc<Cell<ComposerStatus>>,
+        reference_store: Option<SharedChatReferenceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::build(true, status, window, cx)
+        Self::build(true, reference_store, status, window, cx)
     }
 
     fn build(
         references_enabled: bool,
+        reference_store: Option<SharedChatReferenceStore>,
         status: Rc<Cell<ComposerStatus>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -517,6 +533,7 @@ impl ChatReferenceComposer {
         Self {
             input,
             references_enabled,
+            reference_store,
             status,
             completion: CompletionState {
                 token: None,
@@ -644,7 +661,7 @@ impl ChatReferenceComposer {
             // Blank query: no store call; the popup shows the typing hint.
             return;
         };
-        let Some(store) = chat_reference_store(cx) else {
+        let Some(store) = self.reference_store.clone() else {
             self.completion.search.fail(generation);
             cx.notify();
             return;
@@ -841,7 +858,7 @@ impl ChatReferenceComposer {
         if self.selected.contains(&kind) || self.pending.contains(&row.reference) {
             return;
         }
-        let Some(store) = chat_reference_store(cx) else {
+        let Some(store) = self.reference_store.clone() else {
             self.confirm_error = Some(ReferenceConfirmError::Read);
             cx.notify();
             return;

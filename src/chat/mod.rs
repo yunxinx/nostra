@@ -46,10 +46,12 @@ use crate::llm::{
     ModelSelection, ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
+#[cfg(test)]
+use crate::session::SessionStores;
 use crate::session::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
-    ConversationScope, ProjectIdentity, SessionId, SessionOperationGuard, SessionStores,
-    SharedSessionStore,
+    ConversationScope, ConversationSessionServices, ProjectIdentity, SessionId,
+    SessionOperationGuard, SharedSessionStore,
 };
 use crate::ui::{
     markdown::MarkdownBody,
@@ -191,9 +193,15 @@ pub struct ChatView {
 impl ChatView {
     #[cfg(test)]
     pub fn view(window: &mut Window, cx: &mut App) -> Entity<Self> {
+        let session_services = cx
+            .try_global::<SessionStores>()
+            .cloned()
+            .unwrap_or_default()
+            .chat_conversation();
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Chat,
+                session_services,
                 Arc::new(UnavailableGenerationService),
                 window,
                 cx,
@@ -202,11 +210,20 @@ impl ChatView {
     }
 
     pub(crate) fn view_with_generation_service(
+        session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::new(ConversationScope::Chat, generation_service, window, cx))
+        cx.new(|cx| {
+            Self::new(
+                ConversationScope::Chat,
+                session_services,
+                generation_service,
+                window,
+                cx,
+            )
+        })
     }
 
     #[cfg(test)]
@@ -215,9 +232,15 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        let session_services = cx
+            .try_global::<SessionStores>()
+            .cloned()
+            .unwrap_or_default()
+            .project_conversation();
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Project(project),
+                session_services,
                 Arc::new(UnavailableGenerationService),
                 window,
                 cx,
@@ -227,6 +250,7 @@ impl ChatView {
 
     pub(crate) fn project_view_with_generation_service(
         project: ProjectIdentity,
+        session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
         window: &mut Window,
         cx: &mut App,
@@ -234,6 +258,7 @@ impl ChatView {
         cx.new(|cx| {
             Self::new(
                 ConversationScope::Project(project),
+                session_services,
                 generation_service,
                 window,
                 cx,
@@ -243,6 +268,7 @@ impl ChatView {
 
     fn new(
         scope: ConversationScope,
+        session_services: ConversationSessionServices,
         generation_service: Arc<dyn GenerationService>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -256,12 +282,18 @@ impl ChatView {
         .into();
         let composer_status = Rc::new(Cell::new(ComposerStatus::default()));
         let composer = cx.new(|cx| match &scope {
-            ConversationScope::Chat => {
-                ChatReferenceComposer::chat(composer_status.clone(), window, cx)
-            }
-            ConversationScope::Project(_) => {
-                ChatReferenceComposer::with_references(composer_status.clone(), window, cx)
-            }
+            ConversationScope::Chat => ChatReferenceComposer::chat(
+                composer_status.clone(),
+                session_services.references(),
+                window,
+                cx,
+            ),
+            ConversationScope::Project(_) => ChatReferenceComposer::with_references(
+                composer_status.clone(),
+                session_services.references(),
+                window,
+                cx,
+            ),
         });
         let input = composer.read(cx).input();
 
@@ -309,33 +341,19 @@ impl ChatView {
         let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
-        let (session_controller, session_store, session_unavailable) = match cx
-            .try_global::<SessionStores>()
-        {
-            Some(stores) => {
-                let lifecycle = match &scope {
-                    ConversationScope::Chat => stores.chat(),
-                    ConversationScope::Project(_) => stores.agent(),
-                };
-                match lifecycle {
-                    Ok(store) => {
-                        let controller = match &scope {
-                            ConversationScope::Chat => ChatSessionController::new(store.clone()),
-                            ConversationScope::Project(project) => {
-                                ChatSessionController::for_project(store.clone(), project.clone())
-                            }
-                        };
-                        (Some(Arc::new(Mutex::new(controller))), Some(store), None)
-                    }
-                    Err(error) => (None, None, Some(error.to_string())),
+        let (session_controller, session_store, session_unavailable) =
+            match session_services.lifecycle() {
+                Ok(store) => {
+                    let controller = match &scope {
+                        ConversationScope::Chat => ChatSessionController::new(store.clone()),
+                        ConversationScope::Project(project) => {
+                            ChatSessionController::for_project(store.clone(), project.clone())
+                        }
+                    };
+                    (Some(Arc::new(Mutex::new(controller))), Some(store), None)
                 }
-            }
-            None => (
-                None,
-                None,
-                Some("Chat session storage has not been initialized".to_string()),
-            ),
-        };
+                Err(error) => (None, None, Some(error.to_string())),
+            };
         Self {
             window_handle: window.window_handle(),
             messages: Vec::new(),

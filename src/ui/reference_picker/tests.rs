@@ -377,7 +377,12 @@ fn seed_global_stores(cx: &mut TestAppContext, seed: impl FnOnce(&mut InMemorySe
 }
 
 fn new_composer(cx: &mut gpui::VisualTestContext) -> gpui::Entity<ChatReferenceComposer> {
-    cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)))
+    let reference_store = cx.update(|_, cx| cx.global::<SessionStores>().chat_references().ok());
+    cx.update(|window, cx| {
+        cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        })
+    })
 }
 
 /// `set_value` suppresses change events, so drive the same path real typing
@@ -649,9 +654,12 @@ fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
     let composer_cell: std::rc::Rc<
         std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
     > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let reference_store = cx.update(|cx| cx.global::<SessionStores>().chat_references().ok());
     let cell = composer_cell.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {
-        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        let composer = cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        });
         composer.update(cx, |composer, cx| composer.focus_input(window, cx));
         *cell.borrow_mut() = Some(composer.clone());
         let host = cx.new(|_| ComposerHost(composer));
@@ -705,9 +713,12 @@ fn tab_expands_session_and_enter_confirms_message(cx: &mut TestAppContext) {
     let composer_cell: std::rc::Rc<
         std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
     > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let reference_store = cx.update(|cx| cx.global::<SessionStores>().chat_references().ok());
     let cell = composer_cell.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {
-        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        let composer = cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        });
         composer.update(cx, |composer, cx| composer.focus_input(window, cx));
         *cell.borrow_mut() = Some(composer.clone());
         let host = cx.new(|_| ComposerHost(composer));

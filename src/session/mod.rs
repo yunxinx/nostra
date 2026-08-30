@@ -50,8 +50,8 @@ pub use reference::{
     ReferencedContentBlock, ReferencedMessage,
 };
 pub use service::{
-    SessionStores, SessionStoresError, SharedAgentProjectStore, SharedChatReferenceStore,
-    SharedSessionCatalog, SharedSessionStore,
+    ConversationSessionServices, SessionStores, SessionStoresError, SharedAgentProjectStore,
+    SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
 };
 pub use tree::{
     ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,

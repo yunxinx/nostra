@@ -5,9 +5,40 @@ use super::super::{
     ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, ProjectIdentity,
     ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore,
     SessionDomain, SessionError, SessionFlushStore, SessionId, SessionLifecycleStore,
-    SessionReadStore, SessionStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
+    SessionReadStore, SessionStore, SessionStoresError, SessionSummary, SessionTreeSnapshot,
+    SessionTreeStore,
 };
 use super::core::{OperationPermit, SessionOperationGuard, SharedStoreCore};
+
+/// Session capabilities needed by one conversation and its optional reference
+/// completion surface. The lifecycle store is scoped to Chat or Agent, while
+/// references always read from the Chat domain.
+#[derive(Clone)]
+pub struct ConversationSessionServices {
+    lifecycle: Result<SharedSessionStore, SessionStoresError>,
+    references: Option<SharedChatReferenceStore>,
+}
+
+impl ConversationSessionServices {
+    pub(super) fn new(
+        lifecycle: Result<SharedSessionStore, SessionStoresError>,
+        references: Option<SharedChatReferenceStore>,
+    ) -> Self {
+        Self {
+            lifecycle,
+            references,
+        }
+    }
+
+    pub fn lifecycle(&self) -> Result<SharedSessionStore, SessionStoresError> {
+        self.lifecycle.clone()
+    }
+
+    #[must_use]
+    pub fn references(&self) -> Option<SharedChatReferenceStore> {
+        self.references.clone()
+    }
+}
 
 /// Mutable lifecycle capability for one session domain.
 ///

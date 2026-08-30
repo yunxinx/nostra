@@ -20,7 +20,7 @@ use crate::{
         ProviderCatalogSnapshot,
     },
     preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
-    session::SessionStores,
+    session::{ConversationSessionServices, SessionStores},
 };
 
 use super::{
@@ -103,6 +103,16 @@ impl RuntimeServices {
     #[must_use]
     pub fn session_services(&self) -> &SessionStores {
         &self.session_services
+    }
+
+    #[must_use]
+    pub fn chat_conversation(&self) -> ConversationSessionServices {
+        self.session_services.chat_conversation()
+    }
+
+    #[must_use]
+    pub fn project_conversation(&self) -> ConversationSessionServices {
+        self.session_services.project_conversation()
     }
 
     #[must_use]
