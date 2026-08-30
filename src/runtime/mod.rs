@@ -2,6 +2,7 @@
 
 mod capability;
 mod component;
+mod composition;
 mod dependency;
 mod diagnostics;
 mod effect;
@@ -13,6 +14,9 @@ pub use capability::{
     PreparedCapability, ProviderRegistration,
 };
 pub use component::{ComponentGeneration, ComponentId, ScopeId};
+pub use composition::{
+    CompositionBuildError, CompositionRoot, CompositionRootBuilder, SessionServicesCapability,
+};
 pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,
     DependencyResolverError, DependencySnapshot, PendingDependencies, ResolvedDependency,

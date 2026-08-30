@@ -5,23 +5,28 @@ use std::{
     io,
     pin::Pin,
     rc::Rc,
+    sync::mpsc,
     task::{Context, Poll},
+    thread,
     time::Duration,
 };
 
 use futures::task::noop_waker_ref;
 use gpui::Subscription;
 
+use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, SessionStoresError};
+
 use super::{
     ActivationFingerprint, AsyncStop, CapabilityId, CapabilityKey, ComponentGeneration,
     ComponentId, ComponentLifecycle, ComponentSnapshot, ComponentSnapshotDetails,
-    ComponentSnapshotViolation, ContributionRevision, DependencyDeclaration, DependencyResolution,
-    DependencyResolver, DependencyResolverError, DependencySnapshot, DesiredRevision, DisposeError,
-    EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError, MissingDependencySnapshot,
-    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
-    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
-    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
-    ScopeTree, ScopedComponentId, StartupPolicy,
+    ComponentSnapshotViolation, CompositionRoot, ContributionRevision, DependencyDeclaration,
+    DependencyResolution, DependencyResolver, DependencyResolverError, DependencySnapshot,
+    DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError,
+    MissingDependencySnapshot, PreparedCapability, ReconcileFailureKind, ReconcileObserver,
+    ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic,
+    RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind,
+    ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId, SessionServicesCapability,
+    StartupPolicy,
 };
 
 #[test]
@@ -2290,4 +2295,163 @@ fn long_transition_is_diagnostic_without_changing_lifecycle_state() {
     drop(reconcile);
     assert!(observer.transition().is_none());
     assert_eq!(reconciler.active_desired(), Some(&1));
+}
+
+#[test]
+fn default_composition_installs_stable_session_provider_and_passes_startup_audit() {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let mut root = CompositionRoot::builder(stores)
+        .build()
+        .expect("valid default composition");
+    let application = root.application_scope();
+    let session_services = root
+        .session_services()
+        .expect("active default session capability");
+
+    assert_eq!(application, ScopeId::new(0));
+    assert_eq!(
+        CapabilityId::of::<SessionServicesCapability>().name(),
+        "nostra.session.services"
+    );
+    assert_eq!(
+        session_services.provider(),
+        ComponentId::new("nostra.session.local")
+    );
+    assert_eq!(session_services.scope(), application);
+    assert_eq!(session_services.generation(), ComponentGeneration::INITIAL);
+    assert!(session_services.handle().chat().is_ok());
+    assert!(session_services.handle().agent().is_ok());
+
+    let snapshot = root.snapshot();
+    snapshot
+        .audit_startup()
+        .expect("default required components are active");
+    assert_eq!(snapshot.components().len(), 1);
+    assert_eq!(
+        snapshot.components()[0].component(),
+        ComponentId::new("nostra.session.local")
+    );
+    assert_eq!(snapshot.components()[0].scope(), application);
+    assert_eq!(
+        snapshot.components()[0].startup_policy(),
+        StartupPolicy::MustActivate
+    );
+    assert_eq!(
+        snapshot.components()[0].state(),
+        RuntimeComponentState::Active
+    );
+    assert!(snapshot.components()[0].dependencies().is_empty());
+    assert!(snapshot.components()[0].missing_dependencies().is_empty());
+
+    futures::executor::block_on(root.close()).expect("close default composition");
+    assert!(root.session_services().is_none());
+    assert_eq!(
+        root.snapshot().components()[0].state(),
+        RuntimeComponentState::Disposed
+    );
+    futures::executor::block_on(root.close())
+        .expect("closing an already closed composition is idempotent");
+}
+
+#[test]
+fn default_composition_preserves_independent_session_domain_availability() {
+    let mut chat_root =
+        CompositionRoot::builder(SessionStores::with_chat_store(InMemorySessionStore::new()))
+            .build()
+            .expect("Chat-only default composition");
+    let chat_services = chat_root
+        .session_services()
+        .expect("active Chat-only session capability")
+        .handle();
+    assert!(chat_services.chat().is_ok());
+    assert!(matches!(
+        chat_services.agent(),
+        Err(SessionStoresError::DomainUnavailable {
+            domain: SessionDomain::Agent,
+            ..
+        })
+    ));
+    chat_root
+        .snapshot()
+        .audit_startup()
+        .expect("an unavailable Agent domain does not hide healthy Chat services");
+    futures::executor::block_on(chat_root.close()).expect("close Chat-only composition");
+
+    let mut agent_root =
+        CompositionRoot::builder(SessionStores::with_agent_store(InMemorySessionStore::new()))
+            .build()
+            .expect("Agent-only default composition");
+    let agent_services = agent_root
+        .session_services()
+        .expect("active Agent-only session capability")
+        .handle();
+    assert!(agent_services.agent().is_ok());
+    assert!(matches!(
+        agent_services.chat(),
+        Err(SessionStoresError::DomainUnavailable {
+            domain: SessionDomain::Chat,
+            ..
+        })
+    ));
+    agent_root
+        .snapshot()
+        .audit_startup()
+        .expect("an unavailable Chat domain does not hide healthy Agent services");
+    futures::executor::block_on(agent_root.close()).expect("close Agent-only composition");
+}
+
+#[test]
+fn default_composition_close_waits_for_session_shutdown_owner() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let mut chat = InMemorySessionStore::new();
+    chat.observe_shutdown_for_test(started_tx, Some(release_rx));
+    let mut root = CompositionRoot::builder(SessionStores::with_chat_store(chat))
+        .build()
+        .expect("valid default composition");
+
+    let release_worker = thread::spawn(move || {
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("composition close must invoke the session shutdown owner");
+        release_tx.send(()).expect("release session shutdown");
+    });
+
+    futures::executor::block_on(root.close()).expect("close waits for session shutdown");
+    release_worker.join().expect("session shutdown observer");
+    assert!(root.session_services().is_none());
+}
+
+#[test]
+fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
+    let (started_tx, started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    let mut chat = InMemorySessionStore::new();
+    chat.observe_shutdown_for_test(started_tx, Some(release_rx));
+    let mut root = CompositionRoot::builder(SessionStores::with_chat_store(chat))
+        .build()
+        .expect("valid default composition");
+
+    let first_close = futures::executor::block_on(root.close());
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("shutdown owner must start before reporting timeout");
+    assert!(first_close.is_err());
+    assert!(root.session_services().is_some());
+    assert_eq!(
+        root.snapshot().components()[0].state(),
+        RuntimeComponentState::Active
+    );
+
+    release_tx
+        .send(())
+        .expect("release timed-out shutdown worker");
+    let retry = futures::executor::block_on(root.close());
+    assert!(retry.is_err());
+    assert!(root.session_services().is_some());
+    assert_eq!(
+        root.snapshot().components()[0].state(),
+        RuntimeComponentState::Active
+    );
 }

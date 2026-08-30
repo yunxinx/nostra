@@ -117,8 +117,10 @@ pub struct ScopeTree {
 }
 
 impl ScopeTree {
+    pub(crate) const APPLICATION_SCOPE: ScopeId = ScopeId::new(0);
+
     pub fn new() -> Self {
-        let application = ScopeId::new(0);
+        let application = Self::APPLICATION_SCOPE;
         Self {
             application,
             next_id: Some(1),
