@@ -1,6 +1,6 @@
 //! Typed capability identities, leases, and exclusive Provider slots.
 
-use std::{any::TypeId, fmt, marker::PhantomData, sync::Arc};
+use std::{any::TypeId, cmp::Ordering, fmt, marker::PhantomData, sync::Arc};
 
 use super::component::{ComponentGeneration, ComponentId, ScopeId, has_supported_name_characters};
 
@@ -38,6 +38,20 @@ impl CapabilityId {
     #[must_use]
     pub fn is<K: CapabilityKey>(self) -> bool {
         self.key_type == TypeId::of::<K>()
+    }
+}
+
+impl PartialOrd for CapabilityId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CapabilityId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.name
+            .cmp(other.name)
+            .then_with(|| self.key_type.cmp(&other.key_type))
     }
 }
 
