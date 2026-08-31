@@ -29,15 +29,16 @@ use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, Session
 use super::{
     ActivationFingerprint, AsyncStop, CHAT_WORKSPACE_ID, CapabilityId, CapabilityKey,
     ComponentGeneration, ComponentId, ComponentLifecycle, ComponentSnapshot,
-    ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionRoot, ContributionRevision,
-    DependencyDeclaration, DependencyResolution, DependencyResolver, DependencyResolverError,
-    DependencySnapshot, DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot,
-    ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot, PROJECT_WORKSPACE_ID,
-    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
-    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
-    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
-    ScopeTree, ScopedComponentId, SessionServicesCapability, StartupPolicy, WorkspaceDefinition,
-    WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
+    ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionRoot, ContributionDefinition,
+    ContributionId, ContributionKey, ContributionRegistry, ContributionRegistryError,
+    ContributionRevision, DependencyDeclaration, DependencyResolution, DependencyResolver,
+    DependencyResolverError, DependencySnapshot, DesiredRevision, DisposeError, EffectScope,
+    ExclusiveCapabilitySlot, ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot,
+    PROJECT_WORKSPACE_ID, PreparedCapability, ReconcileFailureKind, ReconcileObserver,
+    ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic,
+    RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind,
+    ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId, SessionServicesCapability,
+    StartupPolicy, WorkspaceDefinition, WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
 };
 
 const WORKSPACE_ROOT: ScopeId = ScopeId::new(100);
@@ -48,6 +49,35 @@ const WORKSPACE_MISSING_PARENT: ScopeId = ScopeId::new(999);
 const CHAT_WORKSPACE: WorkspaceId = CHAT_WORKSPACE_ID;
 const PROJECT_WORKSPACE: WorkspaceId = PROJECT_WORKSPACE_ID;
 const NOTES_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.notes");
+
+struct MarkdownContributionKey;
+
+impl ContributionKey for MarkdownContributionKey {
+    type Value = &'static str;
+
+    const NAME: &'static str = "nostra.markdown.test";
+}
+
+const MARKDOWN_CJK: ContributionId = ContributionId::new("nostra.markdown.cjk");
+const MARKDOWN_MATH: ContributionId = ContributionId::new("nostra.markdown.math");
+const MARKDOWN_CODE: ContributionId = ContributionId::new("nostra.markdown.fenced-code");
+const MARKDOWN_SCOPE: ScopeId = ScopeId::new(299);
+
+struct EmptyContributionKey;
+
+impl ContributionKey for EmptyContributionKey {
+    type Value = ();
+
+    const NAME: &'static str = "";
+}
+
+struct UnstableContributionKey;
+
+impl ContributionKey for UnstableContributionKey {
+    type Value = ();
+
+    const NAME: &'static str = "Nostra Markdown";
+}
 
 #[test]
 fn workspace_ids_are_stable_value_keys() {
@@ -71,6 +101,25 @@ fn workspace_ids_reject_empty_names() {
 #[should_panic(expected = "workspace ID contains an unsupported character")]
 fn workspace_ids_reject_unstable_names() {
     let _ = WorkspaceId::new("Nostra Workspace");
+}
+
+#[test]
+fn contribution_registry_names_are_stable() {
+    let registry = ContributionRegistry::<MarkdownContributionKey>::new(WORKSPACE_ROOT);
+
+    assert_eq!(registry.name(), MarkdownContributionKey::NAME);
+}
+
+#[test]
+#[should_panic(expected = "contribution registry name must not be empty")]
+fn contribution_registries_reject_empty_names() {
+    let _ = ContributionRegistry::<EmptyContributionKey>::new(WORKSPACE_ROOT);
+}
+
+#[test]
+#[should_panic(expected = "contribution registry name contains an unsupported character")]
+fn contribution_registries_reject_unstable_names() {
+    let _ = ContributionRegistry::<UnstableContributionKey>::new(WORKSPACE_ROOT);
 }
 
 #[test]
@@ -408,6 +457,183 @@ fn child_workspace_definitions_shadow_and_restore_ancestors() {
             .get(NOTES_WORKSPACE)
             .map(WorkspaceDefinition::order),
         Some(30)
+    );
+}
+
+#[test]
+fn contribution_snapshot_order_is_stable_and_scope_local_duplicates_fail() {
+    let root = ScopeId::new(200);
+    let mut registry = ContributionRegistry::<MarkdownContributionKey>::new(root);
+    let registrations = registry
+        .register_batch(
+            root,
+            [
+                ContributionDefinition::new(MARKDOWN_MATH, 20, "math"),
+                ContributionDefinition::new(MARKDOWN_CJK, 10, "cjk"),
+                ContributionDefinition::new(MARKDOWN_CODE, 20, "code"),
+            ],
+        )
+        .expect("register markdown contributions as one batch");
+
+    assert_eq!(registrations.len(), 3);
+    assert_eq!(registry.revision(), 1);
+    let snapshot = registry.snapshot(root).expect("markdown snapshot");
+    assert_eq!(
+        snapshot
+            .contributions()
+            .iter()
+            .map(|contribution| contribution.id())
+            .collect::<Vec<_>>(),
+        vec![MARKDOWN_CJK, MARKDOWN_CODE, MARKDOWN_MATH]
+    );
+    assert_eq!(
+        snapshot.get(MARKDOWN_MATH).map(|entry| *entry.value()),
+        Some("math")
+    );
+
+    let duplicate = registry.register(
+        root,
+        ContributionDefinition::new(MARKDOWN_MATH, 1, "replacement"),
+    );
+    assert!(matches!(
+        duplicate,
+        Err(ContributionRegistryError::DuplicateContribution {
+            scope,
+            id: MARKDOWN_MATH,
+        }) if scope == root
+    ));
+    assert_eq!(registry.revision(), snapshot.revision());
+    let unchanged = registry.snapshot(root).expect("unchanged snapshot");
+    assert_eq!(unchanged.revision(), snapshot.revision());
+    assert_eq!(
+        unchanged
+            .contributions()
+            .iter()
+            .map(|entry| (entry.id(), *entry.value()))
+            .collect::<Vec<_>>(),
+        snapshot
+            .contributions()
+            .iter()
+            .map(|entry| (entry.id(), *entry.value()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn contribution_batch_validation_is_atomic_and_exact_undo_is_generation_safe() {
+    let root = ScopeId::new(201);
+    let mut registry = ContributionRegistry::<MarkdownContributionKey>::new(root);
+    let initial = registry.register(
+        MARKDOWN_SCOPE,
+        ContributionDefinition::new(MARKDOWN_CJK, 10, "cjk"),
+    );
+    assert!(matches!(
+        initial,
+        Err(ContributionRegistryError::UnknownScope {
+            scope: MARKDOWN_SCOPE
+        })
+    ));
+
+    let first = registry
+        .register(root, ContributionDefinition::new(MARKDOWN_CJK, 10, "first"))
+        .expect("register initial contribution");
+    let before = registry
+        .snapshot(root)
+        .expect("snapshot before invalid batch");
+    let invalid_batch = registry.register_batch(
+        root,
+        [
+            ContributionDefinition::new(MARKDOWN_MATH, 20, "math"),
+            ContributionDefinition::new(MARKDOWN_MATH, 30, "duplicate"),
+        ],
+    );
+    assert!(matches!(
+        invalid_batch,
+        Err(ContributionRegistryError::DuplicateContribution {
+            scope,
+            id: MARKDOWN_MATH,
+        }) if scope == root
+    ));
+    let after_invalid_batch = registry
+        .snapshot(root)
+        .expect("snapshot after invalid batch");
+    assert_eq!(after_invalid_batch.revision(), before.revision());
+    assert_eq!(
+        after_invalid_batch.contributions().len(),
+        before.contributions().len()
+    );
+    assert_eq!(
+        after_invalid_batch
+            .get(MARKDOWN_CJK)
+            .map(|entry| *entry.value()),
+        Some("first")
+    );
+
+    assert!(registry.revoke(&first).expect("revoke first contribution"));
+    let successor = registry
+        .register(
+            root,
+            ContributionDefinition::new(MARKDOWN_CJK, 40, "successor"),
+        )
+        .expect("register successor contribution");
+    assert!(!registry.revoke(&first).expect("stale revoke is ignored"));
+    assert_eq!(
+        registry
+            .snapshot(root)
+            .expect("successor snapshot")
+            .get(MARKDOWN_CJK)
+            .map(|entry| *entry.value()),
+        Some("successor")
+    );
+    assert!(
+        registry
+            .revoke(&successor)
+            .expect("revoke successor contribution")
+    );
+    assert!(
+        registry
+            .snapshot(root)
+            .expect("empty contribution snapshot")
+            .contributions()
+            .is_empty()
+    );
+}
+
+#[test]
+fn child_contribution_overrides_restore_and_unload_without_residue() {
+    let root = ScopeId::new(202);
+    let child = ScopeId::new(203);
+    let mut registry = ContributionRegistry::<MarkdownContributionKey>::new(root);
+    registry
+        .register(
+            root,
+            ContributionDefinition::new(MARKDOWN_MATH, 20, "parent"),
+        )
+        .expect("register parent contribution");
+    registry.add_scope(child, root).expect("add child scope");
+    let override_registration = registry
+        .register(
+            child,
+            ContributionDefinition::new(MARKDOWN_MATH, 10, "child"),
+        )
+        .expect("register child override");
+    let child_snapshot = registry.snapshot(child).expect("child snapshot");
+    assert_eq!(
+        child_snapshot
+            .get(MARKDOWN_MATH)
+            .map(|entry| *entry.value()),
+        Some("child")
+    );
+
+    assert!(
+        registry
+            .revoke(&override_registration)
+            .expect("unload child override")
+    );
+    let restored = registry.snapshot(child).expect("restored parent snapshot");
+    assert_eq!(
+        restored.get(MARKDOWN_MATH).map(|entry| *entry.value()),
+        Some("parent")
     );
 }
 

@@ -3,6 +3,7 @@
 mod capability;
 mod component;
 mod composition;
+mod contribution;
 mod dependency;
 mod diagnostics;
 mod effect;
@@ -20,6 +21,11 @@ pub(crate) use composition::default_generation_service;
 pub use composition::{
     CompositionBuildError, CompositionRoot, CompositionRootBuilder, ConversationScopeHandle,
     GenerationCapability, PreferenceCapability, RuntimeServices, SessionServicesCapability,
+};
+pub use contribution::{
+    ContributionDefinition, ContributionId, ContributionKey, ContributionRegistration,
+    ContributionRegistry, ContributionRegistryError, ContributionSnapshot,
+    ContributionSnapshotEntry,
 };
 pub use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,
