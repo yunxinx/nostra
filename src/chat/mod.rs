@@ -708,8 +708,7 @@ impl ChatView {
         if !self.runtime_snapshot.is_generating() {
             return;
         }
-        self.runtime
-            .update(cx, |runtime, _| runtime.cancel_generation());
+        self.runtime.update(cx, |runtime, _| runtime.request_stop());
     }
 
     #[cfg(test)]

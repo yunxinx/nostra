@@ -98,6 +98,57 @@ fn public_cancel_flow_persists_a_cancelled_terminal(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn repeated_cancel_requests_persist_one_cancelled_terminal(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let generation = Arc::new(ScriptedGenerationService::pending());
+    let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
+    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
+    let _subscription = cx.update(|_, cx| {
+        let observed = observed.clone();
+        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
+            observed.borrow_mut().push(event.clone());
+        })
+    });
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            this.select_model(
+                ModelSelection {
+                    profile_id: "profile".into(),
+                    model_id: "model".into(),
+                },
+                cx,
+            );
+            assert!(this.submit("cancel exactly once".into(), window, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.cancel_reply(cx);
+            this.cancel_reply(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let session_id = observed.borrow().iter().find_map(|event| match event {
+        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
+        _ => None,
+    });
+    let session_id = session_id.expect("durable begin emits a public session binding");
+    let state = catalog
+        .load_session(&session_id, None)
+        .expect("load the cancelled Chat turn");
+    assert!(matches!(
+        state.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Cancelled
+    ));
+}
+
+#[gpui::test]
 fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut TestAppContext) {
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
@@ -140,6 +191,99 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
             "a user-requested deletion is not a persistence failure"
         );
     });
+}
+
+#[gpui::test]
+fn repeated_delete_requests_share_one_delete_and_scope_close(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
+    let controller =
+        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller_guard = controller.lock().expect("hold controller");
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            this.selection = Some(ModelSelection {
+                profile_id: "profile".into(),
+                model_id: "model-a".into(),
+            });
+            this.selection_available = true;
+            this.provider_catalog_revision = crate::providers::catalog_revision();
+            assert!(this.submit("delete once".into(), window, cx));
+            assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
+            assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
+        });
+    });
+    drop(controller_guard);
+    cx.run_until_parked();
+
+    assert!(
+        catalog
+            .list_sessions(SessionDomain::Chat, CatalogQuery::first_page())
+            .expect("list Chat sessions after repeated deletion")
+            .sessions
+            .is_empty(),
+        "repeated deletion left an orphan session"
+    );
+    cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            assert!(!this.runtime_snapshot_for_test(app).deletion_pending());
+            assert!(!this.runtime_scope_is_open_for_test(app));
+        });
+    });
+}
+
+#[gpui::test]
+fn closing_a_conversation_scope_waits_for_terminal_persistence(cx: &mut TestAppContext) {
+    init_app(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let (chat, cx) = add_chat_window_with_stores(cx, stores);
+    let dropped = Rc::new(std::cell::Cell::new(false));
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            assert!(this.start_durable_pending_reply_for_test(Rc::clone(&dropped), window, cx));
+        });
+    });
+    cx.run_until_parked();
+    let session_id = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            assert!(this.runtime_snapshot_for_test(app).is_generating());
+            this.durable_session_id_for_test()
+                .expect("durable Chat session id")
+        })
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.close_scope(cx);
+            this.close_scope(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        dropped.get(),
+        "closing a conversation scope releases the active generation task"
+    );
+    cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            assert!(
+                !this.runtime_scope_is_open_for_test(app),
+                "scope remained open after terminal persistence settled"
+            );
+        });
+    });
+    let state = catalog
+        .load_session(&session_id, None)
+        .expect("load the scope-closed Chat turn");
+    assert!(matches!(
+        state.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Cancelled
+    ));
 }
 
 #[gpui::test]
@@ -592,6 +736,7 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
     let mut store = InMemorySessionStore::new();
     store.fail_next_delete_for_test();
     let stores = SessionStores::with_chat_store(store);
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let generation = Arc::new(ScriptedGenerationService::pending());
     let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
     let selection = ModelSelection {
@@ -606,6 +751,78 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
         });
     });
     cx.run_until_parked();
+    let first_session_id = cx.update(|_, cx| {
+        chat.read_with(cx, |this, _app| {
+            this.durable_session_id_for_test()
+                .expect("first durable Chat session id")
+        })
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            let runtime = this.runtime_snapshot_for_test(cx);
+            assert!(!runtime.is_generating());
+            assert!(!runtime.has_pending_turn());
+            assert!(!runtime.has_terminal_retry_pending());
+            assert!(this.submit("second turn".into(), window, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            assert!(this.runtime_snapshot_for_test(app).is_generating());
+        });
+    });
+    let first = catalog
+        .load_session(&first_session_id, None)
+        .expect("restore the terminal retried by the next submit");
+    assert!(matches!(
+        first.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Cancelled
+    ));
+}
+
+#[gpui::test]
+fn failed_delete_preserves_an_uncommitted_cancelled_terminal_for_exact_retry(
+    cx: &mut TestAppContext,
+) {
+    init_app(cx);
+    let mut store = InMemorySessionStore::new();
+    store.fail_next_delete_for_test();
+    // The first turn's terminal has two bounded attempts. Fail both, then
+    // allow the next submit to retry that exact terminal before it begins.
+    store.fail_append_at_for_test(1);
+    store.fail_append_at_for_test(2);
+    let stores = SessionStores::with_chat_store(store);
+    let catalog = stores.chat_catalog().expect("Chat catalog capability");
+    let generation = Arc::new(ScriptedGenerationService::pending());
+    let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
+    let selection = ModelSelection {
+        profile_id: "profile".into(),
+        model_id: "model".into(),
+    };
+
+    cx.update(|window, cx| {
+        chat.update(cx, |this, cx| {
+            this.select_model(selection, cx);
+            assert!(this.submit("first turn".into(), window, cx));
+        });
+    });
+    cx.run_until_parked();
+    let first_session_id = cx.update(|_, cx| {
+        chat.read_with(cx, |this, _app| {
+            this.durable_session_id_for_test()
+                .expect("first durable Chat session id")
+        })
+    });
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -625,11 +842,13 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
     });
     cx.run_until_parked();
 
-    cx.update(|_, cx| {
-        chat.read_with(cx, |this, app| {
-            assert!(this.runtime_snapshot_for_test(app).is_generating());
-        });
-    });
+    let first = catalog
+        .load_session(&first_session_id, None)
+        .expect("restore the cancelled terminal retried by the next submit");
+    assert!(matches!(
+        first.turn_results.as_slice(),
+        [result] if result.result.status == TurnStatus::Cancelled
+    ));
 }
 
 #[gpui::test]

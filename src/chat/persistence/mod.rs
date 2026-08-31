@@ -2,7 +2,7 @@ mod lifecycle;
 pub(crate) mod restore;
 
 use super::conversation_runtime::{
-    ChatSessionControllerHandle, ConversationRuntime, PendingBeginRequest,
+    ChatSessionControllerHandle, ConversationQuiescence, ConversationRuntime, PendingBeginRequest,
 };
 
 use futures::channel::oneshot;
@@ -77,6 +77,7 @@ impl TurnPersistenceCoordinator {
         request: PendingBeginRequest,
         pending_terminal: Option<(String, ChatTurnTerminal)>,
         operation_guard: SessionOperationGuard,
+        quiescence: ConversationQuiescence,
         cx: &mut Context<ConversationRuntime>,
     ) -> (Self, oneshot::Receiver<BeginPersistenceOutcome>) {
         let attempted_terminal_retry = pending_terminal.is_some();
@@ -84,7 +85,9 @@ impl TurnPersistenceCoordinator {
         let (begin_tx, begin_rx) = oneshot::channel();
         let (command_tx, command_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
+        let work = quiescence.begin_work();
         cx.background_spawn(async move {
+            let _work = work;
             let mut terminal_committed = false;
             let begin = (|| {
                 let mut controller = controller
@@ -157,11 +160,14 @@ impl TurnPersistenceCoordinator {
         controller: ChatSessionControllerHandle,
         turn_id: String,
         operation_guard: SessionOperationGuard,
+        quiescence: ConversationQuiescence,
         cx: &mut Context<ConversationRuntime>,
     ) -> Self {
         let (command_tx, command_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
+        let work = quiescence.begin_work();
         cx.background_spawn(async move {
+            let _work = work;
             let result = match command_rx.await {
                 Ok(terminal) => {
                     persist_terminal_with_retry(&controller, &operation_guard, &turn_id, &terminal)

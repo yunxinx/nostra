@@ -79,6 +79,7 @@ impl ConversationRuntime {
             request.clone(),
             pending_terminal,
             operation_guard,
+            self.quiescence.clone(),
             cx,
         );
         self.terminal_persistence = Some(coordinator);
@@ -273,7 +274,7 @@ impl ConversationRuntime {
         self.publish_state(cx);
     }
 
-    pub(super) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::chat) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
         if self.shutdown_requested {
             return;
         }
@@ -323,6 +324,9 @@ impl ConversationRuntime {
     pub(super) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
         if self.deletion_pending {
             return ChatDeleteRequest::Pending;
+        }
+        if self.shutdown_requested {
+            return ChatDeleteRequest::Rejected;
         }
         let Some(controller) = self.session_controller.clone() else {
             return ChatDeleteRequest::RemoveNow;
@@ -376,7 +380,9 @@ impl ConversationRuntime {
         self.cancel_and_release_generation();
         self.generating = false;
         self.deletion_pending = true;
+        let work = self.quiescence.begin_work();
         let background = cx.background_spawn(async move {
+            let _work = work;
             let mut controller = controller
                 .lock()
                 .map_err(|_| "conversation session controller lock is poisoned".to_string())?;
@@ -387,16 +393,15 @@ impl ConversationRuntime {
                     .map_err(|error| error.to_string())
             })
         });
-        let task = cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let result = background.await;
             let _ = this.update(cx, |this, cx| {
-                this._deletion_task = None;
                 match result {
                     Ok(()) => this.close_scope_after_delete(cx),
                     Err(error) => {
                         this.deletion_pending = false;
                         this.deletion_requested = false;
-                        this.pending_turn_id = None;
+                        this.delete_completion_requested = false;
                         this.terminal_persistence = None;
                         this.generating = false;
                         crate::logging::error(
@@ -411,42 +416,15 @@ impl ConversationRuntime {
                 }
                 this.publish_state(cx);
             });
-        });
-        self._deletion_task = Some(task);
+        })
+        .detach();
         self.publish_state(cx);
         ChatDeleteRequest::Pending
     }
 
     fn close_scope_after_delete(&mut self, cx: &mut Context<Self>) {
-        if self._scope_close_task.is_some() {
-            return;
-        }
-        let scope = self.scope.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = scope.close().await;
-            let _ = this.update(cx, |this, cx| {
-                this._scope_close_task = None;
-                this.deletion_pending = false;
-                match result {
-                    Ok(()) => {
-                        this.publish_event(ConversationRuntimeEvent::DeleteCompleted, cx);
-                    }
-                    Err(error) => {
-                        this.deletion_requested = false;
-                        crate::logging::error(
-                            "runtime.scope",
-                            format_args!("conversation scope close failed after deletion: {error}"),
-                        );
-                        this.publish_event(
-                            ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Delete),
-                            cx,
-                        );
-                    }
-                }
-                this.publish_state(cx);
-            });
-        });
-        self._scope_close_task = Some(task);
+        self.delete_completion_requested = true;
+        self.close_scope_after_quiescence(cx);
     }
 
     fn new_terminal_coordinator(
@@ -468,17 +446,19 @@ impl ConversationRuntime {
             controller,
             turn_id.to_string(),
             operation_guard,
+            self.quiescence.clone(),
             cx,
         ))
     }
 
     fn persist_terminal_detached(
-        &self,
+        &mut self,
         coordinator: TurnPersistenceCoordinator,
         terminal: ChatTurnTerminal,
         turn_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
+        let retry_terminal = terminal.clone();
         let result = match coordinator.persist(terminal) {
             Ok(result) => result,
             Err(error) => {
@@ -492,21 +472,56 @@ impl ConversationRuntime {
                 return;
             }
         };
-        cx.background_spawn(async move {
-            match result.await {
-                Ok(Ok(()))
-                | Ok(Err(TerminalPersistenceError::Finish(
-                    ChatSessionControllerError::Deleted,
-                ))) => {}
-                Ok(Err(error)) => crate::logging::error(
-                    "chat.persistence",
-                    format_args!(
-                        "detached conversation terminal persistence failed; turn_id={}: {error}",
-                        turn_id.as_deref().unwrap_or("pending-begin")
-                    ),
-                ),
-                Err(_) => {}
-            }
+        cx.spawn(async move |this, cx| {
+            let result = result
+                .await
+                .unwrap_or(Err(TerminalPersistenceError::WorkerDisconnected));
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(())
+                    | Err(TerminalPersistenceError::Finish(
+                        ChatSessionControllerError::Deleted,
+                    )) => {
+                        if this.pending_turn_id.as_deref() == turn_id.as_deref() {
+                            this.pending_turn_id = None;
+                        }
+                        if this
+                            .pending_terminal
+                            .as_ref()
+                            .is_some_and(|(pending_turn_id, _)| {
+                                Some(pending_turn_id.as_str()) == turn_id.as_deref()
+                            })
+                        {
+                            this.pending_terminal = None;
+                        }
+                    }
+                    Err(error) => {
+                        crate::logging::error(
+                            "chat.persistence",
+                            format_args!(
+                                "detached conversation terminal persistence failed; turn_id={}: {error}",
+                                turn_id.as_deref().unwrap_or("pending-begin")
+                            ),
+                        );
+                        if let Some(turn_id) = turn_id.clone()
+                            && this
+                                .pending_turn_id
+                                .as_deref()
+                                .is_none_or(|pending_turn_id| pending_turn_id == turn_id)
+                            && this
+                                .pending_terminal
+                                .as_ref()
+                                .is_none_or(|(pending_turn_id, _)| pending_turn_id == &turn_id)
+                        {
+                            if this.pending_turn_id.as_deref() == Some(turn_id.as_str()) {
+                                this.pending_turn_id = None;
+                            }
+                            this.pending_terminal = Some((turn_id, retry_terminal.clone()));
+                        }
+                    }
+                }
+                this.publish_state(cx);
+            });
         })
         .detach();
     }
@@ -515,7 +530,7 @@ impl ConversationRuntime {
 impl ChatView {
     pub(crate) fn close_scope(&self, cx: &mut Context<Self>) {
         self.runtime
-            .update(cx, |runtime, cx| runtime.close_scope_detached(cx));
+            .update(cx, |runtime, cx| runtime.close_scope(cx));
     }
 
     pub(in crate::chat) fn handle_runtime_event(

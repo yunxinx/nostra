@@ -1,7 +1,8 @@
 //! Runtime ownership for one durable conversation.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use futures::channel::oneshot;
 use gpui::{Context, EventEmitter, Task};
 
 use crate::{
@@ -20,6 +21,71 @@ use crate::llm::{
 };
 
 pub(super) type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSessionStore>>>;
+
+#[derive(Clone, Default)]
+pub(super) struct ConversationQuiescence {
+    state: Arc<Mutex<ConversationQuiescenceState>>,
+}
+
+#[derive(Default)]
+struct ConversationQuiescenceState {
+    active_work: usize,
+    idle_waiters: Vec<oneshot::Sender<()>>,
+}
+
+pub(super) struct ConversationWorkLease {
+    quiescence: ConversationQuiescence,
+}
+
+impl ConversationQuiescence {
+    pub(super) fn begin_work(&self) -> ConversationWorkLease {
+        let mut state = self.lock_state();
+        state.active_work = state.active_work.saturating_add(1);
+        ConversationWorkLease {
+            quiescence: self.clone(),
+        }
+    }
+
+    pub(super) async fn wait_until_idle(&self) {
+        loop {
+            let receiver = {
+                let mut state = self.lock_state();
+                if state.active_work == 0 {
+                    return;
+                }
+                let (sender, receiver) = oneshot::channel();
+                state.idle_waiters.push(sender);
+                receiver
+            };
+            let _ = receiver.await;
+        }
+    }
+
+    fn release_work(&self) {
+        let waiters = {
+            let mut state = self.lock_state();
+            state.active_work = state.active_work.saturating_sub(1);
+            (state.active_work == 0).then(|| std::mem::take(&mut state.idle_waiters))
+        };
+        if let Some(waiters) = waiters {
+            for waiter in waiters {
+                let _ = waiter.send(());
+            }
+        }
+    }
+
+    fn lock_state(&self) -> MutexGuard<'_, ConversationQuiescenceState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ConversationWorkLease {
+    fn drop(&mut self) {
+        self.quiescence.release_work();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct ConversationRequestGeneration(u64);
@@ -223,8 +289,8 @@ pub(crate) struct ConversationRuntime {
     pub(super) _persistence_task: Option<Task<()>>,
     pub(super) deletion_requested: bool,
     pub(super) deletion_pending: bool,
-    pub(super) _deletion_task: Option<Task<()>>,
-    pub(super) _scope_close_task: Option<Task<()>>,
+    pub(super) delete_completion_requested: bool,
+    pub(super) scope_close_requested: bool,
     pub(super) shutdown_requested: bool,
     pub(super) pending_turn_id: Option<String>,
     pub(super) terminal_persistence: Option<TurnPersistenceCoordinator>,
@@ -234,6 +300,7 @@ pub(crate) struct ConversationRuntime {
     pub(super) request_generation: ConversationRequestGeneration,
     pub(super) generating: bool,
     pub(super) reply_task: Option<ReplyTask>,
+    pub(super) quiescence: ConversationQuiescence,
 }
 
 impl ConversationRuntime {
@@ -264,8 +331,8 @@ impl ConversationRuntime {
             _persistence_task: None,
             deletion_requested: false,
             deletion_pending: false,
-            _deletion_task: None,
-            _scope_close_task: None,
+            delete_completion_requested: false,
+            scope_close_requested: false,
             shutdown_requested: false,
             pending_turn_id: None,
             terminal_persistence: None,
@@ -275,6 +342,7 @@ impl ConversationRuntime {
             request_generation: ConversationRequestGeneration::none(),
             generating: false,
             reply_task: None,
+            quiescence: ConversationQuiescence::default(),
         }
     }
 
@@ -355,15 +423,48 @@ impl ConversationRuntime {
         });
     }
 
-    pub(super) fn close_scope_detached(&self, cx: &mut Context<Self>) {
+    pub(super) fn close_scope(&mut self, cx: &mut Context<Self>) {
+        self.prepare_for_shutdown(cx);
+        self.close_scope_after_quiescence(cx);
+    }
+
+    pub(super) fn close_scope_after_quiescence(&mut self, cx: &mut Context<Self>) {
+        if self.scope_close_requested {
+            return;
+        }
+        self.scope_close_requested = true;
         let scope = self.scope.clone();
-        cx.spawn(async move |_this, _cx| {
-            if let Err(error) = scope.close().await {
-                crate::logging::error(
-                    "runtime.scope",
-                    format_args!("conversation scope close failed: {error}"),
-                );
-            }
+        let quiescence = self.quiescence.clone();
+        cx.spawn(async move |this, cx| {
+            let result = close_scope_when_quiescent(quiescence, scope).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.scope_close_requested = false;
+                    if this.delete_completion_requested {
+                        this.delete_completion_requested = false;
+                        this.deletion_pending = false;
+                        this.publish_event(ConversationRuntimeEvent::DeleteCompleted, cx);
+                    }
+                    this.publish_state(cx);
+                }
+                Err(error) => {
+                    this.scope_close_requested = false;
+                    if this.delete_completion_requested {
+                        this.delete_completion_requested = false;
+                        this.deletion_pending = false;
+                        this.deletion_requested = false;
+                        this.publish_event(
+                            ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Delete),
+                            cx,
+                        );
+                    }
+                    crate::logging::error(
+                        "runtime.scope",
+                        format_args!("conversation scope close failed: {error}"),
+                    );
+                    this.publish_state(cx);
+                }
+            });
         })
         .detach();
     }
@@ -396,7 +497,7 @@ impl ConversationRuntime {
         }
     }
 
-    pub(super) fn cancel_generation(&mut self) {
+    pub(super) fn request_stop(&mut self) {
         if let Some(reply_task) = &self.reply_task {
             reply_task.cancel();
         }
@@ -454,6 +555,14 @@ impl ConversationRuntime {
     }
 }
 
+async fn close_scope_when_quiescent(
+    quiescence: ConversationQuiescence,
+    scope: ConversationScopeHandle,
+) -> Result<(), crate::runtime::ScopeError> {
+    quiescence.wait_until_idle().await;
+    scope.close().await
+}
+
 fn terminal_failure(
     status: crate::llm::OutcomeStatus,
     error: Option<GatewayError>,
@@ -471,7 +580,11 @@ impl EventEmitter<ConversationRuntimeEvent> for ConversationRuntime {}
 
 #[cfg(test)]
 mod tests {
-    use super::ConversationRequestGeneration;
+    use gpui::TestAppContext;
+
+    use super::{
+        ConversationQuiescence, ConversationRequestGeneration, close_scope_when_quiescent,
+    };
 
     #[test]
     fn request_generations_advance_monotonically() {
@@ -489,5 +602,29 @@ mod tests {
         let maximum = ConversationRequestGeneration(u64::MAX);
 
         assert!(maximum.next().is_none());
+    }
+
+    #[gpui::test]
+    fn scope_close_waits_for_active_durable_work(cx: &mut TestAppContext) {
+        let scope = crate::runtime::ConversationScopeHandle::for_test();
+        let quiescence = ConversationQuiescence::default();
+        let work = quiescence.begin_work();
+        let close_scope = scope.clone();
+
+        cx.foreground_executor()
+            .spawn(async move {
+                close_scope_when_quiescent(quiescence, close_scope)
+                    .await
+                    .expect("test scope close succeeds");
+            })
+            .detach();
+        cx.run_until_parked();
+
+        assert!(scope.is_open(), "active durable work keeps the scope open");
+
+        drop(work);
+        cx.run_until_parked();
+
+        assert!(!scope.is_open(), "scope closes after durable work settles");
     }
 }
