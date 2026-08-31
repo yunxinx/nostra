@@ -256,6 +256,92 @@ fn workspace_registration_revoke_is_exact_idempotent_and_stale_safe() {
 }
 
 #[test]
+fn default_composition_workspace_contributions_unload_without_registry_residue() {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let preferences = crate::preferences::PreferenceHandle::in_memory(Preferences::default());
+    let mut root = CompositionRoot::builder(stores)
+        .with_preferences(preferences)
+        .build()
+        .expect("default composition with in-memory stores");
+
+    let application = root.application_scope();
+    let window = root.window_scope();
+    let mut registry = WorkspaceRegistry::new(application);
+    let chat = registry
+        .register(application, WorkspaceDefinition::new(CHAT_WORKSPACE, 10))
+        .expect("register the built-in Chat contribution");
+    let project = registry
+        .register(application, WorkspaceDefinition::new(PROJECT_WORKSPACE, 20))
+        .expect("register the built-in Project contribution");
+    registry
+        .add_scope(window, application)
+        .expect("add the composition window scope");
+
+    let builtins = registry
+        .snapshot(window)
+        .expect("built-in workspace snapshot");
+    assert_eq!(
+        builtins
+            .definitions()
+            .iter()
+            .map(WorkspaceDefinition::id)
+            .collect::<Vec<_>>(),
+        vec![CHAT_WORKSPACE, PROJECT_WORKSPACE]
+    );
+
+    let replacement = WorkspaceId::new("nostra.workspace.test");
+    let replacement_registration = registry
+        .register(window, WorkspaceDefinition::new(replacement, 30))
+        .expect("register a replacement test workspace contribution");
+    let with_replacement = registry
+        .snapshot(window)
+        .expect("snapshot with replacement workspace");
+    assert_eq!(
+        with_replacement
+            .get(replacement)
+            .map(WorkspaceDefinition::id),
+        Some(replacement)
+    );
+
+    assert!(
+        registry
+            .revoke(&replacement_registration)
+            .expect("unload replacement workspace contribution")
+    );
+    assert!(
+        registry
+            .snapshot(window)
+            .expect("snapshot after replacement unload")
+            .get(replacement)
+            .is_none()
+    );
+
+    assert!(registry.revoke(&chat).expect("unload Chat contribution"));
+    assert!(
+        registry
+            .snapshot(window)
+            .expect("snapshot after Chat unload")
+            .get(CHAT_WORKSPACE)
+            .is_none()
+    );
+    assert!(
+        registry
+            .revoke(&project)
+            .expect("unload Project contribution")
+    );
+    assert!(
+        registry
+            .snapshot(window)
+            .expect("empty snapshot after built-in unload")
+            .definitions()
+            .is_empty()
+    );
+
+    futures::executor::block_on(root.close()).expect("close default composition");
+}
+
+#[test]
 fn child_workspace_definitions_shadow_and_restore_ancestors() {
     let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
     registry

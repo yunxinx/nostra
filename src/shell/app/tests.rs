@@ -62,6 +62,20 @@ fn composed_services(
     services
 }
 
+fn default_composed_services(
+    cx: &mut TestAppContext,
+    session_services: SessionStores,
+    preference_handle: crate::preferences::PreferenceHandle,
+) -> RuntimeServices {
+    let root = CompositionRoot::builder(session_services)
+        .with_preferences(preference_handle)
+        .build()
+        .expect("valid default composition");
+    let services = root.services().expect("active default services");
+    cx.update(|cx| cx.set_global(TestCompositionRoot(RefCell::new(Some(root)))));
+    services
+}
+
 fn generation_service() -> Arc<dyn GenerationService> {
     Arc::new(GatewayGenerationService::new(
         ProviderCatalogSnapshot::new(Vec::new()),
@@ -135,6 +149,30 @@ fn add_app_window_with_preferences_and_stores(
     });
     let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
     let services = composed_services(cx, session_services, preference_handle);
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
+        Root::new(app, window, cx)
+    });
+    let app = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ChatApp>()
+            .expect("Root must contain the ChatApp")
+    });
+    (app, cx)
+}
+
+fn add_app_window_with_default_composition(
+    cx: &mut TestAppContext,
+) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
+    let prefs = Preferences::default();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::appearance::fonts::init(prefs.composer_font, cx);
+        crate::preferences::init_global(prefs.clone(), cx);
+    });
+    let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
+    let services = default_composed_services(cx, SessionStores::default(), preference_handle);
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
         Root::new(app, window, cx)
@@ -824,7 +862,7 @@ fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContex
 
 #[gpui::test]
 fn workspace_host_registers_and_owns_the_builtin_workspaces(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
+    let (app, cx) = add_app_window_with_default_composition(cx);
 
     app.read_with(cx, |this, cx| {
         let definitions = this.workspace_host.registry_snapshot().definitions();
