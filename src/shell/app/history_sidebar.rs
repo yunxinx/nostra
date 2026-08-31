@@ -894,10 +894,10 @@ impl ChatApp {
         target: SidebarTarget,
         visible: bool,
         confirming: bool,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let weak = cx.weak_entity();
         let workspace = self.chat_workspace.downgrade();
+        let project_workspace = self.project_workspace.downgrade();
         let is_chat_target = matches!(target, SidebarTarget::View(_) | SidebarTarget::Session(_));
         let (trigger_id, confirm_id, trigger_debug_selector, delete_label, confirm_title): (
             ElementId,
@@ -964,12 +964,12 @@ impl ChatApp {
                 if is_chat_target {
                     self.chat_workspace_snapshot.delete_confirmation()
                 } else {
-                    self.delete_confirmation.clone()
+                    self.project_workspace_snapshot.delete_confirmation()
                 },
             )
             .on_open_change({
-                let weak = weak.clone();
                 let workspace = workspace.clone();
+                let project_workspace = project_workspace.clone();
                 move |open: &bool, window, cx| {
                     if *open {
                         return;
@@ -981,19 +981,17 @@ impl ChatApp {
                             })
                             .ok();
                     } else {
-                        weak.update(cx, |this, cx| {
-                            if this.confirming == Some(target_for_open.clone()) {
-                                this.confirming = None;
-                                cx.notify();
-                            }
-                        })
-                        .ok();
+                        project_workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.clear_delete_confirmation(&target_for_open, window, cx)
+                            })
+                            .ok();
                     }
                 }
             })
             .on_confirm({
-                let weak = weak.clone();
                 let workspace = workspace.clone();
+                let project_workspace = project_workspace.clone();
                 move |window, cx| {
                     if is_chat_target {
                         workspace
@@ -1006,10 +1004,15 @@ impl ChatApp {
                             })
                             .ok();
                     } else {
-                        weak.update(cx, |this, cx| {
-                            this.confirm_delete_target(target_for_confirm.clone(), window, cx);
-                        })
-                        .ok();
+                        project_workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.confirm_delete_target(
+                                    target_for_confirm.clone(),
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .ok();
                     }
                 }
             })
@@ -1018,8 +1021,8 @@ impl ChatApp {
             trigger
                 .when(!visible, |this| this.invisible())
                 .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-                    let weak = weak.clone();
                     let workspace = workspace.clone();
+                    let project_workspace = project_workspace.clone();
                     let target = target.clone();
                     let delete_label = delete_label.clone();
                     menu.item(
@@ -1036,10 +1039,15 @@ impl ChatApp {
                                         })
                                         .ok();
                                 } else {
-                                    weak.update(cx, |this, cx| {
-                                        this.begin_delete_confirmation(target.clone(), window, cx)
-                                    })
-                                    .ok();
+                                    project_workspace
+                                        .update(cx, |workspace, cx| {
+                                            workspace.begin_delete_confirmation(
+                                                target.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
                                 }
                             },
                         ),

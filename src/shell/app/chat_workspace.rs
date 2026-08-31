@@ -1,7 +1,5 @@
 //! Chat workspace instance state and lifecycle.
 
-use std::collections::HashMap;
-
 use gpui::{App, Context, Entity, Subscription, Task, Window};
 use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
@@ -17,7 +15,11 @@ use crate::session::{
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
-use super::{SidebarTarget, history_sidebar::ChatHistorySidebar};
+use super::{
+    SidebarTarget,
+    conversation_host::{Conversation, ConversationHost, ConversationHostSnapshot},
+    history_sidebar::ChatHistorySidebar,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SelectionRequest(u64);
@@ -42,55 +44,11 @@ impl SelectionEpoch {
     }
 }
 
-pub(super) struct Conversation {
-    pub(super) view: Entity<ChatView>,
-    pub(super) title: gpui::SharedString,
-    pub(super) selection: Option<ModelSelection>,
-    pub(super) session_id: Option<SessionId>,
-    pub(super) _subscription: Subscription,
-}
-
-/// Immutable projection consumed by the root render path.
-#[derive(Clone)]
-pub(super) struct ChatConversationSnapshot {
-    view: Entity<ChatView>,
-    title: gpui::SharedString,
-    selection: Option<ModelSelection>,
-    session_id: Option<SessionId>,
-    is_generating: bool,
-}
-
-impl ChatConversationSnapshot {
-    pub(super) fn view(&self) -> Entity<ChatView> {
-        self.view.clone()
-    }
-
-    pub(super) fn title(&self) -> gpui::SharedString {
-        self.title.clone()
-    }
-
-    pub(super) fn selection(&self) -> Option<ModelSelection> {
-        self.selection.clone()
-    }
-
-    pub(super) fn session_id(&self) -> Option<SessionId> {
-        self.session_id.clone()
-    }
-
-    pub(super) fn is_generating(&self) -> bool {
-        self.is_generating
-    }
-
-    pub(super) fn target(&self) -> gpui::EntityId {
-        self.view.entity_id()
-    }
-}
+pub(super) type ChatConversationSnapshot = super::conversation_host::ConversationSnapshot<()>;
 
 #[derive(Clone)]
 pub(super) struct ChatWorkspaceSnapshot {
-    conversations: Vec<ChatConversationSnapshot>,
-    opened_session_index: HashMap<SessionId, gpui::EntityId>,
-    active: Option<gpui::EntityId>,
+    conversations: ConversationHostSnapshot<()>,
     history: ChatHistorySidebar,
     hovered: Option<SidebarTarget>,
     confirming: Option<SidebarTarget>,
@@ -100,9 +58,7 @@ pub(super) struct ChatWorkspaceSnapshot {
 impl ChatWorkspaceSnapshot {
     pub(super) fn empty() -> Self {
         Self {
-            conversations: Vec::new(),
-            opened_session_index: HashMap::new(),
-            active: None,
+            conversations: ConversationHostSnapshot::empty(),
             history: ChatHistorySidebar::new(),
             hovered: None,
             confirming: None,
@@ -111,44 +67,34 @@ impl ChatWorkspaceSnapshot {
     }
 
     pub(super) fn conversations(&self) -> &[ChatConversationSnapshot] {
-        &self.conversations
+        self.conversations.conversations()
     }
 
     pub(super) fn active(&self) -> Option<gpui::EntityId> {
-        self.active
+        self.conversations.active()
     }
 
     pub(super) fn active_view(&self) -> Option<Entity<ChatView>> {
-        self.active.and_then(|target| {
-            self.conversations
-                .iter()
-                .find(|conversation| conversation.target() == target)
-                .map(ChatConversationSnapshot::view)
-        })
+        self.conversations.active_view()
     }
 
     pub(super) fn active_session_id(&self) -> Option<SessionId> {
-        self.active.and_then(|target| {
-            self.conversations
-                .iter()
-                .find(|conversation| conversation.target() == target)
-                .and_then(ChatConversationSnapshot::session_id)
-        })
+        self.conversations.active_session_id()
     }
 
     pub(super) fn conversation(&self, target: gpui::EntityId) -> Option<&ChatConversationSnapshot> {
-        self.conversations
-            .iter()
-            .find(|conversation| conversation.target() == target)
+        self.conversations.conversation(target)
     }
 
     pub(super) fn opened_target(&self, session_id: &SessionId) -> Option<gpui::EntityId> {
-        self.opened_session_index.get(session_id).copied()
+        self.conversations.opened_target(session_id)
     }
 
-    #[allow(dead_code)]
-    pub(super) fn opened_session_index(&self) -> &HashMap<SessionId, gpui::EntityId> {
-        &self.opened_session_index
+    #[cfg(test)]
+    pub(super) fn opened_session_index(
+        &self,
+    ) -> &std::collections::HashMap<SessionId, gpui::EntityId> {
+        self.conversations.opened_session_index()
     }
 
     pub(super) fn history(&self) -> &ChatHistorySidebar {
@@ -175,9 +121,7 @@ struct SessionRestore {
 }
 
 pub(super) struct ChatWorkspace {
-    pub(super) conversations: Vec<Conversation>,
-    pub(super) opened_session_index: HashMap<SessionId, gpui::EntityId>,
-    pub(super) active: Option<gpui::EntityId>,
+    pub(super) conversations: ConversationHost<()>,
     pub(super) selection_epoch: SelectionEpoch,
     pub(super) _selection_task: Option<Task<()>>,
     pub(super) history: ChatHistorySidebar,
@@ -203,9 +147,7 @@ impl ChatWorkspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let mut workspace = Self {
-            conversations: Vec::new(),
-            opened_session_index: HashMap::new(),
-            active: None,
+            conversations: ConversationHost::new(),
             selection_epoch: SelectionEpoch::default(),
             _selection_task: None,
             history: ChatHistorySidebar::new(),
@@ -233,19 +175,7 @@ impl ChatWorkspace {
 
     fn publish_snapshot_with(&mut self, cx: &App) {
         self.snapshot = ChatWorkspaceSnapshot {
-            conversations: self
-                .conversations
-                .iter()
-                .map(|conversation| ChatConversationSnapshot {
-                    view: conversation.view.clone(),
-                    title: conversation.title.clone(),
-                    selection: conversation.selection.clone(),
-                    session_id: conversation.session_id.clone(),
-                    is_generating: conversation.view.read(cx).is_generating(),
-                })
-                .collect(),
-            opened_session_index: self.opened_session_index.clone(),
-            active: self.active,
+            conversations: self.conversations.snapshot(cx),
             history: self.history.clone(),
             hovered: self.hovered.clone(),
             confirming: self.confirming.clone(),
@@ -283,7 +213,7 @@ impl ChatWorkspace {
     }
 
     pub(super) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
-        for conversation in &self.conversations {
+        for conversation in self.conversations.conversations() {
             conversation
                 .view
                 .update(cx, |chat, cx| chat.prepare_for_shutdown(cx));
@@ -310,46 +240,27 @@ impl ChatWorkspace {
         );
         let subscription = self.subscribe_conversation(&view, window, cx);
         let selection = view.read(cx).selection();
-        self.conversations.push(Conversation {
+        self.conversations.push_and_activate(Conversation {
             view,
+            metadata: (),
             title,
             selection,
             session_id: None,
             _subscription: subscription,
         });
-        self.active = self
-            .conversations
-            .last()
-            .map(|conversation| conversation.view.entity_id());
         self.notify_changed(cx);
     }
 
     pub(super) fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .conversations
-            .get(index)
-            .map(|conversation| conversation.view.entity_id())
-        else {
-            return;
-        };
         self.invalidate_selection_request();
-        if self.active != Some(target) {
-            self.active = Some(target);
+        if self.conversations.select_index(index) {
             self.notify_changed(cx);
         }
     }
 
     pub(super) fn select_target(&mut self, target: gpui::EntityId, cx: &mut Context<Self>) {
-        if !self
-            .conversations
-            .iter()
-            .any(|conversation| conversation.view.entity_id() == target)
-        {
-            return;
-        }
         self.invalidate_selection_request();
-        if self.active != Some(target) {
-            self.active = Some(target);
+        if self.conversations.select_target(target) {
             self.notify_changed(cx);
         }
     }
@@ -360,7 +271,7 @@ impl ChatWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(target) = self.opened_session_index.get(&session_id).copied() {
+        if let Some(target) = self.conversations.opened_target(&session_id) {
             self.select_target(target, cx);
             return;
         }
@@ -414,8 +325,8 @@ impl ChatWorkspace {
         if !self.selection_epoch.is_current(restore.request) {
             return;
         }
-        if let Some(target) = self.opened_session_index.get(&restore.session_id).copied() {
-            self.active = Some(target);
+        if let Some(target) = self.conversations.opened_target(&restore.session_id) {
+            self.conversations.set_active(target);
             self.record_active_session(&restore.session_id, cx);
             self.notify_changed(cx);
             return;
@@ -463,17 +374,14 @@ impl ChatWorkspace {
             return;
         }
         let subscription = self.subscribe_conversation(&view, window, cx);
-        let target = view.entity_id();
-        self.conversations.push(Conversation {
+        self.conversations.push_and_activate(Conversation {
             selection: view.read(cx).selection(),
             view,
+            metadata: (),
             title,
             session_id: Some(restore.session_id.clone()),
             _subscription: subscription,
         });
-        self.opened_session_index
-            .insert(restore.session_id.clone(), target);
-        self.active = Some(target);
         self.record_active_session(&restore.session_id, cx);
         self.notify_changed(cx);
     }
@@ -496,26 +404,22 @@ impl ChatWorkspace {
     ) -> Subscription {
         cx.subscribe_in(view, window, |workspace, view, event, window, cx| {
             let target = view.entity_id();
-            let Some(index) = workspace
-                .conversations
-                .iter()
-                .position(|conversation| conversation.view.entity_id() == target)
-            else {
+            let Some(index) = workspace.conversations.conversation_index(target) else {
                 return;
             };
             match event {
                 ChatEvent::TitleChanged(title) => {
-                    workspace.conversations[index].title = title.clone()
+                    workspace.conversations.conversations_mut()[index].title = title.clone()
                 }
                 ChatEvent::SelectionChanged(selection) => {
-                    workspace.conversations[index].selection = Some(selection.clone());
+                    workspace.conversations.conversations_mut()[index].selection =
+                        Some(selection.clone());
                 }
                 ChatEvent::SessionBound(session_id) => {
-                    if workspace.conversations[index].session_id.as_ref() != Some(session_id) {
-                        workspace.conversations[index].session_id = Some(session_id.clone());
-                        workspace
-                            .opened_session_index
-                            .insert(session_id.clone(), target);
+                    if workspace
+                        .conversations
+                        .bind_session(target, session_id.clone())
+                    {
                         workspace.refresh_history_summary(session_id.clone(), cx);
                         workspace.record_active_session(session_id, cx);
                     }
@@ -537,14 +441,10 @@ impl ChatWorkspace {
         selection: ModelSelection,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(target) = self.active else {
+        let Some(target) = self.conversations.active() else {
             return false;
         };
-        let Some(conversation) = self
-            .conversations
-            .iter()
-            .find(|conversation| conversation.view.entity_id() == target)
-        else {
+        let Some(conversation) = self.conversations.conversation(target) else {
             return false;
         };
         conversation
@@ -564,17 +464,13 @@ impl ChatWorkspace {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
         }
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.view.entity_id() == target)
-        else {
+        let Some(conversation) = self.conversations.conversation(target) else {
             if was_confirming {
                 self.notify_changed(cx);
             }
             return;
         };
-        let request = self.conversations[index]
+        let request = conversation
             .view
             .update(cx, |chat, cx| chat.request_delete(cx));
         if request == ChatDeleteRequest::RemoveNow {
@@ -592,36 +488,24 @@ impl ChatWorkspace {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
-            .conversations
-            .iter()
-            .position(|conversation| conversation.view.entity_id() == target)
-        else {
-            return;
-        };
-        if self.active == Some(target) {
+        let was_active = self.conversations.active() == Some(target);
+        if was_active {
             self.invalidate_selection_request();
         }
-        let removed = self.conversations.remove(index);
-        if removed.session_id.is_none() {
-            removed.view.update(cx, |chat, cx| chat.close_scope(cx));
+        let Some(removed) = self.conversations.remove(target) else {
+            return;
+        };
+        if removed.conversation.session_id.is_none() {
+            removed
+                .conversation
+                .view
+                .update(cx, |chat, cx| chat.close_scope(cx));
         }
-        if let Some(session_id) = &removed.session_id {
-            self.opened_session_index.remove(session_id);
+        if let Some(session_id) = &removed.conversation.session_id {
             self.history.remove(session_id);
         }
-        if self.active == Some(target) {
-            self.active = self
-                .conversations
-                .get(index)
-                .map(|conversation| conversation.view.entity_id())
-                .or_else(|| {
-                    index.checked_sub(1).and_then(|index| {
-                        self.conversations
-                            .get(index)
-                            .map(|conversation| conversation.view.entity_id())
-                    })
-                });
+        if removed.was_active {
+            self.conversations.select_neighbor(removed.index);
         }
         self.notify_changed(cx);
     }
@@ -666,7 +550,7 @@ impl ChatWorkspace {
         match target {
             SidebarTarget::View(entity) => self.delete_conversation(entity, window, cx),
             SidebarTarget::Session(session_id) => {
-                if let Some(entity) = self.opened_session_index.get(&session_id).copied() {
+                if let Some(entity) = self.conversations.opened_target(&session_id) {
                     self.delete_conversation(entity, window, cx);
                 } else {
                     self.delete_unopened_session(session_id, window, cx);
