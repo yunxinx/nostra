@@ -13,7 +13,11 @@ use crate::{
     },
 };
 
+use super::assistant::ReplyTask;
 use super::persistence::TurnPersistenceCoordinator;
+use crate::llm::{
+    GatewayError, GenerationOutcome, IndexedMessage, ReasoningContent, ReplayMetadata, ToolCall,
+};
 
 pub(super) type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSessionStore>>>;
 
@@ -128,6 +132,13 @@ pub(super) struct StartedConversationTurn {
     pub session_id: SessionId,
 }
 
+#[derive(Clone)]
+pub(super) struct FinishedConversationTurn {
+    pub generation: ConversationRequestGeneration,
+    pub message: Option<IndexedMessage>,
+    pub error: Option<GatewayError>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ConversationRuntimeFailure {
     Begin,
@@ -140,8 +151,65 @@ pub(super) enum ConversationRuntimeFailure {
 pub(super) enum ConversationRuntimeEvent {
     StateChanged(ConversationRuntimeSnapshot),
     TurnStarted(Box<StartedConversationTurn>),
+    StreamBatch {
+        generation: ConversationRequestGeneration,
+        events: Vec<ConversationStreamEvent>,
+    },
+    GenerationRequestFailed {
+        generation: ConversationRequestGeneration,
+        error: GatewayError,
+    },
+    GenerationFinished(Box<FinishedConversationTurn>),
     Failure(ConversationRuntimeFailure),
     DeleteCompleted,
+}
+
+#[derive(Clone)]
+pub(super) enum ConversationStreamEvent {
+    TextStarted {
+        content_index: usize,
+        id: String,
+    },
+    TextDelta {
+        content_index: usize,
+        id: String,
+        delta: String,
+    },
+    TextFinished {
+        content_index: usize,
+        id: String,
+        replay: Option<ReplayMetadata>,
+    },
+    ReasoningStarted {
+        content_index: usize,
+        id: String,
+    },
+    ReasoningDelta {
+        content_index: usize,
+        id: String,
+        delta: String,
+    },
+    ReasoningFinished {
+        content_index: usize,
+        id: String,
+        replay: Option<ReplayMetadata>,
+    },
+    ReasoningSnapshotUpdated {
+        content_index: usize,
+        id: String,
+        reasoning: ReasoningContent,
+    },
+    ToolCallStarted {
+        content_index: usize,
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolCallFinished {
+        content_index: usize,
+        index: usize,
+        tool_call: Box<ToolCall>,
+    },
 }
 
 pub(crate) struct ConversationRuntime {
@@ -165,6 +233,7 @@ pub(crate) struct ConversationRuntime {
     pub(super) next_turn_id: u64,
     pub(super) request_generation: ConversationRequestGeneration,
     pub(super) generating: bool,
+    pub(super) reply_task: Option<ReplyTask>,
 }
 
 impl ConversationRuntime {
@@ -205,6 +274,7 @@ impl ConversationRuntime {
             next_turn_id: 1,
             request_generation: ConversationRequestGeneration::none(),
             generating: false,
+            reply_task: None,
         }
     }
 
@@ -232,11 +302,6 @@ impl ConversationRuntime {
     #[must_use]
     pub(super) fn supports_references(&self) -> bool {
         self.conversation.descriptor().supports_references()
-    }
-
-    #[must_use]
-    pub fn generation_service(&self) -> Arc<dyn GenerationService> {
-        Arc::clone(&self.generation_service)
     }
 
     #[cfg(test)]
@@ -302,6 +367,104 @@ impl ConversationRuntime {
         })
         .detach();
     }
+
+    pub(super) fn start_generation(
+        &mut self,
+        history: Vec<LlmMessage>,
+        selection: ModelSelection,
+        session_id: String,
+        turn_id: String,
+        generation: ConversationRequestGeneration,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.request_generation || !self.generating {
+            return;
+        }
+        match super::assistant::stream_reply(
+            super::assistant::ReplyRequest {
+                history,
+                selection,
+                generation_service: Arc::clone(&self.generation_service),
+                conversation_id: session_id,
+                turn_id,
+                request_generation: generation,
+            },
+            cx,
+        ) {
+            Ok(reply_task) => self.reply_task = Some(reply_task),
+            Err(error) => self.finish_generation_request_failed(generation, error, cx),
+        }
+    }
+
+    pub(super) fn cancel_generation(&mut self) {
+        if let Some(reply_task) = &self.reply_task {
+            reply_task.cancel();
+        }
+    }
+
+    pub(super) fn cancel_and_release_generation(&mut self) {
+        if let Some(reply_task) = self.reply_task.take() {
+            reply_task.cancel();
+        }
+    }
+
+    pub(super) fn finish_generation_request_failed(
+        &mut self,
+        generation: ConversationRequestGeneration,
+        error: GatewayError,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.request_generation {
+            return;
+        }
+        let terminal = ChatTurnTerminal::request_failed(&error);
+        self.publish_event(
+            ConversationRuntimeEvent::GenerationRequestFailed { generation, error },
+            cx,
+        );
+        self.reply_task = None;
+        self.finish_terminal(generation, terminal, cx);
+    }
+
+    pub(super) fn finish_generation(
+        &mut self,
+        generation: ConversationRequestGeneration,
+        outcome: GenerationOutcome,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.request_generation {
+            return;
+        }
+        let terminal = ChatTurnTerminal::from_generation(&outcome);
+        let error = terminal_failure(
+            outcome.status,
+            outcome.error.clone(),
+            outcome.request_id.clone(),
+        );
+        self.publish_event(
+            ConversationRuntimeEvent::GenerationFinished(Box::new(FinishedConversationTurn {
+                generation,
+                message: outcome.message.clone(),
+                error: error.clone(),
+            })),
+            cx,
+        );
+        self.reply_task = None;
+        self.finish_terminal(generation, terminal, cx);
+    }
+}
+
+fn terminal_failure(
+    status: crate::llm::OutcomeStatus,
+    error: Option<GatewayError>,
+    request_id: String,
+) -> Option<GatewayError> {
+    (status == crate::llm::OutcomeStatus::Failed).then(|| {
+        let mut error =
+            error.unwrap_or_else(|| GatewayError::provider("provider request failed", None));
+        error.request_id.get_or_insert(request_id);
+        error
+    })
 }
 
 impl EventEmitter<ConversationRuntimeEvent> for ConversationRuntime {}

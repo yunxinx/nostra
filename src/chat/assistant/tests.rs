@@ -1,4 +1,5 @@
 use super::*;
+use unicode_segmentation::UnicodeSegmentation as _;
 
 #[test]
 fn pending_deltas_coalesce_adjacent_kinds_and_preserve_order() {

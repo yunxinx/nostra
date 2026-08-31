@@ -1,14 +1,12 @@
 use super::*;
 
-use std::sync::Arc;
-
 use gpui::{AppContext as _, Context, Window};
 use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
 
 use crate::{
     chat::{
-        ChatDeleteRequest, ChatEvent, ChatView, Message, Role, assistant,
+        ChatDeleteRequest, ChatEvent, ChatView, Message, Role,
         conversation_runtime::{
             BeginTurnAdmissionError, ConversationRequestGeneration, ConversationRuntime,
             ConversationRuntimeEvent, ConversationRuntimeFailure, ConversationRuntimeSnapshot,
@@ -17,8 +15,8 @@ use crate::{
         derive_title, is_replayable,
     },
     llm::{
-        ContentBlock, GatewayError, GenerationService, IndexedMessage, Message as LlmMessage,
-        ModelSelection, ProviderMetadata,
+        ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
+        ProviderMetadata,
     },
     session::{ChatSessionControllerError, ChatTurnTerminal},
 };
@@ -170,7 +168,7 @@ impl ConversationRuntime {
         );
     }
 
-    pub(super) fn finish_terminal(
+    pub(in crate::chat) fn finish_terminal(
         &mut self,
         generation: ConversationRequestGeneration,
         terminal: ChatTurnTerminal,
@@ -317,6 +315,7 @@ impl ConversationRuntime {
                 ),
             }
         }
+        self.cancel_and_release_generation();
         self.generating = false;
         self.publish_state(cx);
     }
@@ -374,6 +373,7 @@ impl ConversationRuntime {
                 ),
             }
         }
+        self.cancel_and_release_generation();
         self.generating = false;
         self.deletion_pending = true;
         let background = cx.background_spawn(async move {
@@ -521,7 +521,6 @@ impl ChatView {
     pub(in crate::chat) fn handle_runtime_event(
         &mut self,
         runtime_snapshot: ConversationRuntimeSnapshot,
-        generation_service: Arc<dyn GenerationService>,
         event: &ConversationRuntimeEvent,
         cx: &mut Context<Self>,
     ) {
@@ -535,7 +534,24 @@ impl ChatView {
                 if turn.request.request_generation != runtime_snapshot.request_generation() {
                     return;
                 }
-                self.start_runtime_turn(generation_service, (**turn).clone(), cx);
+                self.start_runtime_turn((**turn).clone(), cx);
+            }
+            ConversationRuntimeEvent::StreamBatch { generation, events } => {
+                if *generation == runtime_snapshot.request_generation() {
+                    self.apply_stream_batch(events, cx);
+                }
+            }
+            ConversationRuntimeEvent::GenerationRequestFailed { generation, error } => {
+                if *generation == runtime_snapshot.request_generation() {
+                    self.finish_reply_visual(None, Some(error.clone()), cx);
+                }
+            }
+            ConversationRuntimeEvent::GenerationFinished(turn) => {
+                if turn.generation == runtime_snapshot.request_generation() {
+                    self.follow_stream();
+                    self.finish_reply_visual(turn.message.clone(), turn.error.clone(), cx);
+                    cx.notify();
+                }
             }
             ConversationRuntimeEvent::Failure(failure) => {
                 self.notify_runtime_failure(*failure, cx);
@@ -544,12 +560,7 @@ impl ChatView {
         }
     }
 
-    fn start_runtime_turn(
-        &mut self,
-        generation_service: Arc<dyn GenerationService>,
-        turn: StartedConversationTurn,
-        cx: &mut Context<Self>,
-    ) {
+    fn start_runtime_turn(&mut self, turn: StartedConversationTurn, cx: &mut Context<Self>) {
         let request = turn.request;
         if self.messages.is_empty() {
             cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
@@ -571,30 +582,24 @@ impl ChatView {
             .filter(is_replayable)
             .collect();
         #[cfg(test)]
-        let reply_task = if let Some(dropped) = self.next_reply_drop_flag.take() {
-            assistant::ReplyTask::pending_for_test(dropped, cx)
-        } else {
-            assistant::stream_reply(
+        let pending_drop = self.next_reply_drop_flag.take();
+        self.runtime.update(cx, move |runtime, cx| {
+            #[cfg(test)]
+            if let Some(dropped) = pending_drop {
+                runtime.reply_task = Some(super::super::assistant::ReplyTask::pending_for_test(
+                    dropped, cx,
+                ));
+                return;
+            }
+            runtime.start_generation(
                 history,
-                Some(request.selection),
-                Arc::clone(&generation_service),
+                request.selection,
                 turn.session_id.to_string(),
                 request.turn_id,
                 request.request_generation,
                 cx,
-            )
-        };
-        #[cfg(not(test))]
-        let reply_task = assistant::stream_reply(
-            history,
-            Some(request.selection),
-            generation_service,
-            turn.session_id.to_string(),
-            request.turn_id,
-            request.request_generation,
-            cx,
-        );
-        self.reply_task = Some(reply_task);
+            );
+        });
         if self.composer_revision == request.composer_revision {
             self.input_empty = true;
             let composer = self.composer.clone();
@@ -609,12 +614,65 @@ impl ChatView {
         cx.notify();
     }
 
+    fn apply_stream_batch(
+        &mut self,
+        events: &[super::super::conversation_runtime::ConversationStreamEvent],
+        cx: &mut Context<Self>,
+    ) {
+        for event in events {
+            match event {
+                super::super::conversation_runtime::ConversationStreamEvent::TextStarted {
+                    content_index,
+                    id,
+                } => self.start_stream_text(*content_index, id.clone(), cx),
+                super::super::conversation_runtime::ConversationStreamEvent::TextDelta {
+                    content_index,
+                    id,
+                    delta,
+                } => self.append_stream_text(*content_index, id.clone(), delta, cx),
+                super::super::conversation_runtime::ConversationStreamEvent::TextFinished {
+                    content_index,
+                    id,
+                    replay,
+                } => self.finish_stream_text(*content_index, id, replay.clone()),
+                super::super::conversation_runtime::ConversationStreamEvent::ReasoningStarted {
+                    content_index,
+                    id,
+                } => self.start_stream_reasoning(*content_index, id.clone()),
+                super::super::conversation_runtime::ConversationStreamEvent::ReasoningDelta {
+                    content_index,
+                    id,
+                    delta,
+                } => self.append_stream_reasoning(*content_index, id.clone(), delta, cx),
+                super::super::conversation_runtime::ConversationStreamEvent::ReasoningFinished {
+                    content_index,
+                    id,
+                    replay,
+                } => self.finish_stream_reasoning(*content_index, id, replay.clone()),
+                super::super::conversation_runtime::ConversationStreamEvent::ReasoningSnapshotUpdated {
+                    content_index,
+                    id,
+                    reasoning,
+                } => self.update_stream_reasoning_snapshot(*content_index, id, reasoning.clone(), cx),
+                super::super::conversation_runtime::ConversationStreamEvent::ToolCallStarted {
+                    content_index,
+                    index,
+                    id,
+                    name,
+                } => self.start_stream_tool_call(*content_index, *index, id.clone(), name.clone()),
+                super::super::conversation_runtime::ConversationStreamEvent::ToolCallFinished {
+                    content_index,
+                    index,
+                    tool_call,
+                } => self.finish_stream_tool_call(*content_index, *index, (**tool_call).clone()),
+            }
+        }
+        self.finish_stream_batch(cx);
+    }
+
     pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
         self.runtime
             .update(cx, |runtime, cx| runtime.prepare_for_shutdown(cx));
-        if let Some(reply) = self.reply_task.take() {
-            reply.cancel();
-        }
         cx.notify();
     }
 
@@ -622,11 +680,6 @@ impl ChatView {
         let request = self
             .runtime
             .update(cx, |runtime, cx| runtime.request_delete(cx));
-        if request == ChatDeleteRequest::Pending
-            && let Some(reply) = self.reply_task.take()
-        {
-            reply.cancel();
-        }
         cx.notify();
         request
     }
@@ -693,21 +746,7 @@ impl ChatView {
         cx.notify();
     }
 
-    pub(in crate::chat) fn finish_reply_request_failed(
-        &mut self,
-        generation: ConversationRequestGeneration,
-        error: GatewayError,
-        cx: &mut Context<Self>,
-    ) {
-        self.finish_reply_with_terminal(
-            generation,
-            None,
-            ChatTurnTerminal::request_failed(&error),
-            Some(error),
-            cx,
-        );
-    }
-
+    #[cfg(test)]
     pub(in crate::chat) fn finish_reply_with_terminal(
         &mut self,
         generation: ConversationRequestGeneration,
@@ -762,7 +801,6 @@ impl ChatView {
             last.error = turn_error;
             last.finish_reasoning(None);
         }
-        self.reply_task = None;
         self.remeasure_latest_message();
     }
 }

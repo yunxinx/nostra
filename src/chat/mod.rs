@@ -162,7 +162,6 @@ pub struct ChatView {
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
-    reply_task: Option<assistant::ReplyTask>,
     #[cfg(test)]
     next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     composer_revision: u64,
@@ -271,7 +270,7 @@ impl ChatView {
                 ComposerEvent::Submit(text) => {
                     this.submit(text.clone(), window, cx);
                 }
-                ComposerEvent::Stop => this.cancel_reply(),
+                ComposerEvent::Stop => this.cancel_reply(cx),
             },
         );
 
@@ -304,10 +303,8 @@ impl ChatView {
         list_state.set_follow_mode(FollowMode::Tail);
         let runtime_snapshot = runtime.read(cx).snapshot();
         let runtime_subscription = cx.subscribe(&runtime, |this, runtime, event, cx| {
-            let (runtime_snapshot, generation_service) = runtime.read_with(cx, |runtime, _| {
-                (runtime.snapshot(), runtime.generation_service())
-            });
-            this.handle_runtime_event(runtime_snapshot, generation_service, event, cx);
+            let runtime_snapshot = runtime.read(cx).snapshot();
+            this.handle_runtime_event(runtime_snapshot, event, cx);
         });
         Self {
             window_handle: window.window_handle(),
@@ -330,7 +327,6 @@ impl ChatView {
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
-            reply_task: None,
             #[cfg(test)]
             next_reply_drop_flag: None,
             composer_revision: 0,
@@ -708,13 +704,17 @@ impl ChatView {
         cx.notify();
     }
 
-    pub fn cancel_reply(&mut self) {
+    pub fn cancel_reply(&mut self, cx: &mut Context<Self>) {
         if !self.runtime_snapshot.is_generating() {
             return;
         }
-        if let Some(reply) = &self.reply_task {
-            reply.cancel();
-        }
+        self.runtime
+            .update(cx, |runtime, _| runtime.cancel_generation());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_reply_task_for_test(&self, cx: &App) -> bool {
+        self.runtime.read(cx).reply_task.is_some()
     }
 
     /// The transcript turn with `ui_id`, or `None` once the view is dropped or
@@ -764,7 +764,9 @@ impl ChatView {
             runtime.generating = true;
             runtime.publish_state(cx);
         });
-        self.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
+        self.runtime.update(cx, |runtime, cx| {
+            runtime.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
+        });
     }
 
     #[cfg(test)]

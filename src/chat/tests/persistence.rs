@@ -80,7 +80,7 @@ fn public_cancel_flow_persists_a_cancelled_terminal(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    cx.update(|_, cx| chat.update(cx, |this, _| this.cancel_reply()));
+    cx.update(|_, cx| chat.update(cx, |this, cx| this.cancel_reply(cx)));
     cx.run_until_parked();
 
     let session_id = observed.borrow().iter().find_map(|event| match event {
@@ -251,13 +251,13 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
         .expect("list Chat sessions after deletion");
     assert!(page.sessions.is_empty(), "delete left an orphan session");
     cx.update(|window, cx| {
-        chat.read_with(cx, |this, _| {
+        chat.read_with(cx, |this, app| {
             assert!(
                 this.messages.is_empty(),
                 "a deleted durable begin must not publish a visible turn"
             );
             assert!(
-                this.reply_task.is_none(),
+                !this.has_reply_task_for_test(app),
                 "a deleted durable begin must not start the provider"
             );
         });
@@ -504,7 +504,7 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
                 this.runtime_snapshot_for_test(app).is_generating(),
                 "provider generation should still be active"
             );
-            assert!(this.reply_task.is_some());
+            assert!(this.has_reply_task_for_test(app));
             this.durable_session_id_for_test()
                 .expect("durable Chat session id")
         })
@@ -669,6 +669,10 @@ fn preparing_the_chat_view_for_shutdown_persists_a_cancelled_terminal(cx: &mut T
     });
     drop(chat);
     cx.run_until_parked();
+    assert!(
+        dropped.get(),
+        "shutdown should release the active generation task"
+    );
     stores
         .shutdown()
         .expect("shutdown waits for release-triggered terminal persistence");
@@ -894,7 +898,7 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
             assert!(this.submit("original draft".into(), window, cx));
             assert!(this.runtime_snapshot_for_test(cx).persistence_pending());
             assert!(this.messages.is_empty());
-            assert!(this.reply_task.is_none());
+            assert!(!this.has_reply_task_for_test(cx));
             assert_eq!(this.input.read(cx).value(), "original draft");
 
             // A foreground edit made while the durable begin is queued must
