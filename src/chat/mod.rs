@@ -7,6 +7,7 @@
 //! that need more than markdown prose.
 
 mod assistant;
+pub(crate) mod conversation_runtime;
 mod error_card;
 mod hover_reveal;
 mod message;
@@ -19,7 +20,7 @@ use std::{
     cell::Cell,
     rc::Rc,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -29,12 +30,11 @@ use gpui::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
     FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
     ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Task, Window, div, list, point, px,
+    Window, div, list, point, px,
 };
 use gpui_component::{
-    ActiveTheme, ElementExt as _, StyledExt as _, WindowExt as _, h_flex,
+    ActiveTheme, ElementExt as _, StyledExt as _, h_flex,
     input::{InputEvent, RopeExt as _, TextareaState},
-    notification::NotificationType,
     scroll::ScrollableElement as _,
     text::{TextView, TextViewStyle},
     v_flex,
@@ -42,21 +42,21 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::llm::{
-    ContentBlock, GatewayError, GenerationService, IndexedMessage, Message as LlmMessage,
-    ModelSelection, ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
+    ContentBlock, GenerationService, IndexedMessage, Message as LlmMessage, ModelSelection,
+    ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
 };
 use crate::providers;
 #[cfg(test)]
 use crate::session::SessionStores;
-use crate::session::{
-    ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
-    ConversationContext, SessionId, SessionOperationGuard, SharedSessionStore,
-};
+use crate::session::{ConversationContext, SessionId};
 use crate::ui::{
     markdown::{MarkdownBody, PreferenceState},
     reference_picker::{ChatReferenceComposer, ComposerEvent, ComposerStatus},
 };
+#[cfg(test)]
+use crate::{llm::GatewayError, session::ChatTurnTerminal};
 
+use self::conversation_runtime::{ConversationRuntime, ConversationRuntimeSnapshot};
 use self::error_card::TurnError;
 use self::hover_reveal::hover_reveal_copy;
 pub use self::message::{Message, MessagePart, Role};
@@ -84,11 +84,8 @@ const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 /// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
 
-static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_UI_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
-
-type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSessionStore>>>;
 
 #[cfg(test)]
 struct UnavailableGenerationService;
@@ -119,6 +116,16 @@ pub enum ChatEvent {
 pub(crate) enum ChatDeleteRequest {
     RemoveNow,
     Pending,
+    Rejected,
+}
+
+pub(crate) fn create_conversation_runtime(
+    scope: crate::runtime::ConversationScopeHandle,
+    conversation: ConversationContext,
+    generation_service: Arc<dyn GenerationService>,
+    cx: &mut App,
+) -> Entity<ConversationRuntime> {
+    cx.new(|_| ConversationRuntime::new(scope, conversation, generation_service))
 }
 
 pub struct ChatView {
@@ -127,7 +134,9 @@ pub struct ChatView {
     input: Entity<TextareaState>,
     composer: Entity<ChatReferenceComposer>,
     composer_status: Rc<Cell<ComposerStatus>>,
-    conversation: ConversationContext,
+    references_enabled: bool,
+    runtime: Entity<ConversationRuntime>,
+    runtime_snapshot: ConversationRuntimeSnapshot,
     /// Placeholder text currently installed in the input state.  Compared
     /// against the live translation each frame so a language switch updates
     /// the composer without rebuilding it (and without notify loops).
@@ -153,40 +162,10 @@ pub struct ChatView {
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
-    generation_service: Arc<dyn GenerationService>,
-    pending: bool,
     reply_task: Option<assistant::ReplyTask>,
     #[cfg(test)]
     next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
-    session_controller: Option<ChatSessionControllerHandle>,
-    /// Reservation source kept separate from the controller mutex so the UI
-    /// can make a queued write visible to shutdown before background work has
-    /// a chance to acquire the controller.
-    session_store: Option<SharedSessionStore>,
-    session_unavailable: Option<String>,
-    persistence_pending: bool,
-    _persistence_task: Option<Task<()>>,
-    /// Sticky once permanent deletion has been accepted. It prevents a
-    /// durable begin that was already queued from starting provider work
-    /// before the deletion callback removes the view.
-    deletion_requested: bool,
-    deletion_pending: bool,
-    _deletion_task: Option<Task<()>>,
-    /// Prevents a durable begin callback from starting provider work after the
-    /// application has entered its pre-quit durability barrier.
-    shutdown_requested: bool,
     composer_revision: u64,
-    /// Active turn id retained until the durable terminal write settles.
-    pending_turn_id: Option<String>,
-    /// A detached persistence worker owns the reservation after durable begin.
-    /// Releasing this view signals cancellation but cannot drop the terminal
-    /// write that shutdown is waiting for.
-    terminal_persistence: Option<persistence::TurnPersistenceCoordinator>,
-    /// Terminal fact retained for an automatic retry on the next submit after
-    /// a transient catalog/JSONL failure.
-    pending_terminal: Option<(String, ChatTurnTerminal)>,
-    conversation_id: String,
-    next_turn_id: u64,
     _subscriptions: Vec<Subscription>,
     #[cfg(test)]
     materialized_message_indices: std::collections::BTreeSet<usize>,
@@ -226,89 +205,35 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| {
-            Self::new(
-                conversation,
-                Arc::new(UnavailableGenerationService),
-                preference_handle,
-                window,
-                cx,
-            )
-        })
+        let runtime = create_conversation_runtime(
+            crate::runtime::ConversationScopeHandle::for_test(),
+            conversation,
+            Arc::new(UnavailableGenerationService),
+            cx,
+        );
+        Self::view_with_generation_service_and_preferences(runtime, preference_handle, window, cx)
     }
 
     pub(crate) fn view_with_generation_service_and_preferences(
-        conversation: ConversationContext,
-        generation_service: Arc<dyn GenerationService>,
+        runtime: Entity<ConversationRuntime>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| {
-            Self::new(
-                conversation,
-                generation_service,
-                preference_handle,
-                window,
-                cx,
-            )
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn project_view_with_session_services(
-        conversation: ConversationContext,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<Self> {
-        let preference_handle = crate::preferences::handle(cx);
-        Self::project_view_with_session_services_and_preferences(
-            conversation,
-            preference_handle,
-            window,
-            cx,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn project_view_with_session_services_and_preferences(
-        conversation: ConversationContext,
-        preference_handle: crate::preferences::PreferenceHandle,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<Self> {
-        cx.new(|cx| {
-            Self::new(
-                conversation,
-                Arc::new(UnavailableGenerationService),
-                preference_handle,
-                window,
-                cx,
-            )
-        })
+        cx.new(|cx| Self::new(runtime, preference_handle, window, cx))
     }
 
     pub(crate) fn project_view_with_generation_service_and_preferences(
-        conversation: ConversationContext,
-        generation_service: Arc<dyn GenerationService>,
+        runtime: Entity<ConversationRuntime>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| {
-            Self::new(
-                conversation,
-                generation_service,
-                preference_handle,
-                window,
-                cx,
-            )
-        })
+        Self::view_with_generation_service_and_preferences(runtime, preference_handle, window, cx)
     }
 
     fn new(
-        conversation: ConversationContext,
-        generation_service: Arc<dyn GenerationService>,
+        runtime: Entity<ConversationRuntime>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -316,7 +241,8 @@ impl ChatView {
         let preference_snapshot = preference_handle.snapshot();
         let preference_state = preference_handle.shared_preferences();
         let preferences_for_observer = preference_handle.clone();
-        let references_enabled = conversation.descriptor().supports_references();
+        let references_enabled = runtime.read(cx).supports_references();
+        let references = runtime.read(cx).references();
         let placeholder: SharedString = if references_enabled {
             t!("reference_picker.composer_placeholder").to_string()
         } else {
@@ -328,17 +254,12 @@ impl ChatView {
             if references_enabled {
                 ChatReferenceComposer::with_references(
                     composer_status.clone(),
-                    conversation.references(),
+                    references.clone(),
                     window,
                     cx,
                 )
             } else {
-                ChatReferenceComposer::chat(
-                    composer_status.clone(),
-                    conversation.references(),
-                    window,
-                    cx,
-                )
+                ChatReferenceComposer::chat(composer_status.clone(), references, window, cx)
             }
         });
         let input = composer.read(cx).input();
@@ -357,13 +278,6 @@ impl ChatView {
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.composer_revision = this.composer_revision.saturating_add(1);
-                // After an edit that lands the caret on the last line
-                // (typing at the end, or pasting a block of text), snap
-                // the composer viewport to the bottom.  The component's
-                // own paste follow-scroll computes against the previous
-                // frame's layout, so pasting many lines into a shorter
-                // document clamps its scroll target to zero and the view
-                // stays stuck at the top.
                 let (input_empty, cursor_line, lines_len, x) = {
                     let state = input.read(cx);
                     (
@@ -388,24 +302,22 @@ impl ChatView {
         let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
-        let (session_controller, session_store, session_unavailable) =
-            match conversation.lifecycle() {
-                Ok(store) => {
-                    let controller = ChatSessionController::with_descriptor(
-                        store.clone(),
-                        conversation.descriptor().clone(),
-                    );
-                    (Some(Arc::new(Mutex::new(controller))), Some(store), None)
-                }
-                Err(error) => (None, None, Some(error.to_string())),
-            };
+        let runtime_snapshot = runtime.read(cx).snapshot();
+        let runtime_subscription = cx.subscribe(&runtime, |this, runtime, event, cx| {
+            let (runtime_snapshot, generation_service) = runtime.read_with(cx, |runtime, _| {
+                (runtime.snapshot(), runtime.generation_service())
+            });
+            this.handle_runtime_event(runtime_snapshot, generation_service, event, cx);
+        });
         Self {
             window_handle: window.window_handle(),
             messages: Vec::new(),
             input,
             composer,
             composer_status,
-            conversation,
+            references_enabled,
+            runtime,
+            runtime_snapshot,
             placeholder,
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
@@ -418,32 +330,14 @@ impl ChatView {
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
-            generation_service,
-            pending: false,
             reply_task: None,
             #[cfg(test)]
             next_reply_drop_flag: None,
-            session_controller,
-            session_store,
-            session_unavailable,
-            persistence_pending: false,
-            _persistence_task: None,
-            deletion_requested: false,
-            deletion_pending: false,
-            _deletion_task: None,
-            shutdown_requested: false,
             composer_revision: 0,
-            pending_turn_id: None,
-            terminal_persistence: None,
-            pending_terminal: None,
-            conversation_id: format!(
-                "conversation-{}",
-                NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
-            ),
-            next_turn_id: 1,
             _subscriptions: vec![
                 composer_subscription,
                 subscription,
+                runtime_subscription,
                 cx.observe_global_in::<crate::preferences::Prefs>(window, move |this, _, cx| {
                     let snapshot = preferences_for_observer.snapshot();
                     if this.preference_snapshot == snapshot {
@@ -458,6 +352,36 @@ impl ChatView {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn project_view_with_session_services(
+        conversation: ConversationContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let preference_handle = crate::preferences::handle(cx);
+        Self::project_view_with_session_services_and_preferences(
+            conversation,
+            preference_handle,
+            window,
+            cx,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_view_with_session_services_and_preferences(
+        conversation: ConversationContext,
+        preference_handle: crate::preferences::PreferenceHandle,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::view_with_session_services_and_preferences(
+            conversation,
+            preference_handle,
+            window,
+            cx,
+        )
+    }
+
     pub(crate) fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |composer, cx| composer.focus_input(window, cx));
@@ -469,13 +393,7 @@ impl ChatView {
     }
 
     pub(crate) fn has_in_flight_work(&self) -> bool {
-        self.pending
-            || self.persistence_pending
-            || self.deletion_requested
-            || self.deletion_pending
-            || self.pending_turn_id.is_some()
-            || self.terminal_persistence.is_some()
-            || self.pending_terminal.is_some()
+        self.runtime_snapshot.has_in_flight_work()
     }
 
     /// Force the newest message into view.  Used right after the user sends a
@@ -791,7 +709,7 @@ impl ChatView {
     }
 
     pub fn cancel_reply(&mut self) {
-        if !self.pending {
+        if !self.runtime_snapshot.is_generating() {
             return;
         }
         if let Some(reply) = &self.reply_task {
@@ -838,8 +756,104 @@ impl ChatView {
         dropped: std::rc::Rc<std::cell::Cell<bool>>,
         cx: &mut Context<Self>,
     ) {
-        self.pending = true;
+        self.runtime.update(cx, |runtime, cx| {
+            runtime.request_generation = runtime
+                .current_generation()
+                .next()
+                .expect("test request generation");
+            runtime.generating = true;
+            runtime.publish_state(cx);
+        });
         self.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn session_controller_for_test(
+        &self,
+        cx: &App,
+    ) -> conversation_runtime::ChatSessionControllerHandle {
+        self.runtime.read(cx).session_controller_for_test()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seed_pending_turn_for_test(
+        &mut self,
+        user_message: LlmMessage,
+        selection: ModelSelection,
+        turn_id: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) -> crate::session::ChatTurnStart {
+        let turn_id = turn_id.into();
+        let start = self
+            .session_controller_for_test(cx)
+            .lock()
+            .expect("test controller lock")
+            .begin_turn(user_message.clone(), selection, turn_id.clone())
+            .expect("persist test turn begin");
+        self.mark_turn_pending_for_test(start.session_id.clone(), turn_id, cx);
+        self.messages.push(Message::from_canonical_with_preferences(
+            user_message,
+            self.preference_state.clone(),
+            cx,
+        ));
+        self.messages.push(Message::empty(Role::Assistant));
+        start
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_turn_pending_for_test(
+        &mut self,
+        session_id: SessionId,
+        turn_id: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.runtime.update(cx, |runtime, cx| {
+            runtime.mark_turn_pending_for_test(session_id, turn_id, cx)
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_generating_for_test(&mut self, cx: &mut Context<Self>) {
+        self.runtime
+            .update(cx, |runtime, cx| runtime.mark_generating_for_test(cx));
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn runtime_snapshot_for_test(
+        &self,
+        cx: &App,
+    ) -> ConversationRuntimeSnapshot {
+        self.runtime.read(cx).snapshot()
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn runtime_scope_is_open_for_test(&self, cx: &App) -> bool {
+        self.runtime.read(cx).scope.is_open()
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn request_generation_for_test(
+        &self,
+        cx: &App,
+    ) -> conversation_runtime::ConversationRequestGeneration {
+        self.runtime.read(cx).current_generation()
+    }
+
+    #[cfg(test)]
+    pub(in crate::chat) fn finish_current_reply_with_terminal_for_test(
+        &mut self,
+        message: Option<IndexedMessage>,
+        terminal: ChatTurnTerminal,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.request_generation_for_test(cx);
+        self.finish_reply_with_terminal(generation, message, terminal, error, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_turn_id_for_test(&self, cx: &App) -> u64 {
+        self.runtime.read(cx).next_turn_id
     }
 
     #[cfg(test)]
@@ -861,7 +875,7 @@ impl ChatView {
 
     #[cfg(test)]
     pub(crate) fn durable_session_id_for_test(&self) -> Option<crate::session::SessionId> {
-        self.conversation_id.parse().ok()
+        self.runtime_snapshot.session_id().cloned()
     }
 
     #[cfg(test)]
@@ -881,18 +895,22 @@ impl ChatView {
             profile_id: "fixture-profile".into(),
             model_id: "fixture-model".into(),
         };
-        let controller = self
-            .session_controller
-            .as_ref()
-            .expect("test Chat store should be available");
-        let mut controller = controller.lock().expect("test controller lock");
-        let start = controller
-            .begin_turn(user_message, selection, "fixture-turn")
-            .expect("persist test turn");
-        controller
-            .finish_turn("fixture-turn", &ChatTurnTerminal::cancelled())
-            .expect("persist test terminal");
-        self.conversation_id = start.session_id.to_string();
+        let start = self.runtime.update(cx, |runtime, cx| {
+            let controller = runtime
+                .session_controller
+                .as_ref()
+                .expect("test Chat store should be available");
+            let mut controller = controller.lock().expect("test controller lock");
+            let start = controller
+                .begin_turn(user_message, selection, "fixture-turn")
+                .expect("persist test turn");
+            controller
+                .finish_turn("fixture-turn", &ChatTurnTerminal::cancelled())
+                .expect("persist test terminal");
+            runtime.session_id = Some(start.session_id.clone());
+            runtime.publish_state(cx);
+            start
+        });
         cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
         start.session_id
     }
@@ -924,7 +942,7 @@ impl ChatView {
     /// workspace sidebar to annotate the row without deriving other row data
     /// from the view.
     pub(crate) fn is_generating(&self) -> bool {
-        self.pending
+        self.runtime_snapshot.is_generating()
     }
 
     fn sync_selection_availability(&mut self) {

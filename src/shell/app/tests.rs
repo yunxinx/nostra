@@ -10,6 +10,7 @@ use std::{
 };
 
 use gpui::{Global, TestAppContext};
+use gpui_component::WindowExt as _;
 use reqwest_client::ReqwestClient;
 
 use crate::llm::{
@@ -375,6 +376,11 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     });
     cx.run_until_parked();
     assert!(first_removed.iter().all(|view| view.upgrade().is_none()));
+    cx.update(|_, cx| {
+        app.read_with(cx, |this, _| {
+            assert_eq!(this.runtime_services.scope_count(), 3)
+        });
+    });
 
     let second_removed = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
@@ -395,6 +401,11 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     });
     cx.run_until_parked();
     assert!(second_removed.iter().all(|view| view.upgrade().is_none()));
+    cx.update(|_, cx| {
+        app.read_with(cx, |this, _| {
+            assert_eq!(this.runtime_services.scope_count(), 3)
+        });
+    });
 
     let third_removed = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
@@ -415,6 +426,11 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     });
     cx.run_until_parked();
     assert!(third_removed.iter().all(|view| view.upgrade().is_none()));
+    cx.update(|_, cx| {
+        app.read_with(cx, |this, _| {
+            assert_eq!(this.runtime_services.scope_count(), 3)
+        });
+    });
 }
 
 #[gpui::test]
@@ -668,6 +684,7 @@ fn delete_chat_labels_resolve_in_every_locale() {
             "sidebar.delete_chat_cancel",
             "sidebar.more_actions",
             "menu.delete_chat",
+            "chat.error.runtime_unavailable",
             "chat.error.persistence_delete_failed",
         ] {
             assert_ne!(t!(key, locale = locale).to_string(), key);
@@ -681,6 +698,31 @@ fn delete_chat_labels_resolve_in_every_locale() {
             .contains("fixture")
         );
     }
+}
+
+#[gpui::test]
+fn unavailable_conversation_runtime_reports_a_notification_without_creating_a_draft(
+    cx: &mut TestAppContext,
+) {
+    let (app, cx) = add_app_window(cx);
+    cx.update(|_, cx| {
+        let mut root = cx
+            .global::<TestCompositionRoot>()
+            .0
+            .borrow_mut()
+            .take()
+            .expect("test composition root");
+        futures::executor::block_on(root.close()).expect("close test composition");
+    });
+
+    cx.update(|window, cx| {
+        let notification_count = window.notifications(cx).len();
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            assert!(this.conversations.is_empty());
+        });
+        assert_eq!(window.notifications(cx).len(), notification_count + 1);
+    });
 }
 
 #[gpui::test]

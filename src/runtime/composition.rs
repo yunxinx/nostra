@@ -1,6 +1,6 @@
 //! Default application composition and typed root capabilities.
 
-use std::{convert::Infallible, fmt, sync::Arc, time::Duration};
+use std::{cell::RefCell, convert::Infallible, fmt, rc::Rc, sync::Arc, time::Duration};
 
 use http_client::HttpClient;
 use reqwest_client::ReqwestClient;
@@ -87,21 +87,23 @@ pub struct RuntimeServices {
     preference_handle: PreferenceHandle,
     generation_service: Arc<dyn GenerationService>,
     exit_coordinator: Arc<ExitCoordinator>,
+    scopes: Rc<RuntimeScopeOwner>,
 }
 
 impl RuntimeServices {
-    #[must_use]
-    pub fn new(
+    fn new(
         session_services: SessionStores,
         preference_handle: PreferenceHandle,
         generation_service: Arc<dyn GenerationService>,
         exit_coordinator: Arc<ExitCoordinator>,
+        scopes: Rc<RuntimeScopeOwner>,
     ) -> Self {
         Self {
             session_services,
             preference_handle,
             generation_service,
             exit_coordinator,
+            scopes,
         }
     }
 
@@ -120,6 +122,15 @@ impl RuntimeServices {
         self.session_services.project_conversation(project)
     }
 
+    pub fn create_conversation_scope(&self) -> Result<ConversationScopeHandle, ScopeError> {
+        self.scopes.create_conversation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_count(&self) -> usize {
+        self.scopes.scope_count()
+    }
+
     #[must_use]
     pub fn preference_handle(&self) -> &PreferenceHandle {
         &self.preference_handle
@@ -136,10 +147,127 @@ impl RuntimeServices {
     }
 }
 
+struct RuntimeScopeOwner {
+    tree: RefCell<Option<ScopeTree>>,
+    application: ScopeId,
+    window: ScopeId,
+}
+
+impl RuntimeScopeOwner {
+    fn new(mut tree: ScopeTree) -> Result<Self, ScopeError> {
+        let application = tree.application();
+        let window = tree.create_window()?;
+        Ok(Self {
+            tree: RefCell::new(Some(tree)),
+            application,
+            window,
+        })
+    }
+
+    fn create_conversation(self: &Rc<Self>) -> Result<ConversationScopeHandle, ScopeError> {
+        let scope = self
+            .tree
+            .borrow_mut()
+            .as_mut()
+            .ok_or(ScopeError::NotOpen {
+                scope: self.window,
+                state: super::ScopeState::Closing,
+            })?
+            .create_conversation(self.window)?;
+        Ok(ConversationScopeHandle {
+            owner: Rc::clone(self),
+            scope,
+        })
+    }
+
+    async fn close_application(&self) -> Result<(), ScopeError> {
+        let mut tree = self.take_tree(self.application)?;
+        let result = tree.close(self.application).await;
+        *self.tree.borrow_mut() = Some(tree);
+        result
+    }
+
+    async fn close_scope(&self, scope: ScopeId) -> Result<(), ScopeError> {
+        let mut tree = self.take_tree(scope)?;
+        let result = match tree.state(scope) {
+            None => Ok(()),
+            Some(_) => match tree.close(scope).await {
+                Ok(()) => tree.remove_closed(scope),
+                Err(error) => Err(error),
+            },
+        };
+        *self.tree.borrow_mut() = Some(tree);
+        result
+    }
+
+    fn take_tree(&self, scope: ScopeId) -> Result<ScopeTree, ScopeError> {
+        self.tree.borrow_mut().take().ok_or(ScopeError::NotOpen {
+            scope,
+            state: super::ScopeState::Closing,
+        })
+    }
+
+    #[cfg(test)]
+    fn scope_count(&self) -> usize {
+        self.tree.borrow().as_ref().map_or(0, ScopeTree::len)
+    }
+}
+
+/// Identity and ownership link for one runtime conversation scope.
+#[derive(Clone)]
+pub struct ConversationScopeHandle {
+    owner: Rc<RuntimeScopeOwner>,
+    scope: ScopeId,
+}
+
+impl ConversationScopeHandle {
+    #[must_use]
+    pub const fn scope(&self) -> ScopeId {
+        self.scope
+    }
+
+    #[must_use]
+    pub fn parent_scope(&self) -> ScopeId {
+        self.owner.window
+    }
+
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.owner
+            .tree
+            .borrow()
+            .as_ref()
+            .is_some_and(|tree| tree.state(self.scope) == Some(super::ScopeState::Open))
+    }
+
+    /// Close this conversation scope and wait for all owned effects to quiesce.
+    /// Repeated calls after a successful close are no-ops.
+    pub async fn close(&self) -> Result<(), ScopeError> {
+        self.owner.close_scope(self.scope).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Rc::new(RuntimeScopeOwner::new(ScopeTree::new()).expect("test scope tree"))
+            .create_conversation()
+            .expect("test runtime accepts a conversation scope")
+    }
+}
+
+impl fmt::Debug for ConversationScopeHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConversationScopeHandle")
+            .field("scope", &self.scope)
+            .field("open", &self.is_open())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub enum CompositionBuildError {
     Snapshot(RuntimeSnapshotError),
     Startup(StartupAuditError),
+    Scope(ScopeError),
 }
 
 impl fmt::Display for CompositionBuildError {
@@ -147,6 +275,7 @@ impl fmt::Display for CompositionBuildError {
         match self {
             Self::Snapshot(error) => write!(f, "default composition snapshot is invalid: {error}"),
             Self::Startup(error) => write!(f, "default composition failed startup audit: {error}"),
+            Self::Scope(error) => write!(f, "default composition could not create scopes: {error}"),
         }
     }
 }
@@ -156,6 +285,7 @@ impl std::error::Error for CompositionBuildError {
         match self {
             Self::Snapshot(error) => Some(error),
             Self::Startup(error) => Some(error),
+            Self::Scope(error) => Some(error),
         }
     }
 }
@@ -329,7 +459,7 @@ impl CompositionRootBuilder {
             .map_err(CompositionBuildError::Startup)?;
 
         Ok(CompositionRoot {
-            scopes,
+            scopes: Rc::new(RuntimeScopeOwner::new(scopes).map_err(CompositionBuildError::Scope)?),
             snapshot,
             provider,
             session_services: Some(session_services),
@@ -344,7 +474,7 @@ impl CompositionRootBuilder {
 
 #[must_use = "composition roots own application-scoped capabilities and must be closed"]
 pub struct CompositionRoot {
-    scopes: ScopeTree,
+    scopes: Rc<RuntimeScopeOwner>,
     snapshot: RuntimeSnapshot,
     provider: ComponentId,
     session_services: Option<CapabilityLease<SessionServicesCapability>>,
@@ -378,8 +508,13 @@ impl CompositionRoot {
     }
 
     #[must_use]
-    pub const fn application_scope(&self) -> ScopeId {
-        self.scopes.application()
+    pub fn application_scope(&self) -> ScopeId {
+        self.scopes.application
+    }
+
+    #[must_use]
+    pub fn window_scope(&self) -> ScopeId {
+        self.scopes.window
     }
 
     #[must_use]
@@ -406,6 +541,7 @@ impl CompositionRoot {
             self.preferences()?.handle().clone(),
             self.generation()?.handle().clone(),
             self.exit_coordinator(),
+            Rc::clone(&self.scopes),
         ))
     }
 
@@ -420,7 +556,7 @@ impl CompositionRoot {
     }
 
     pub async fn close(&mut self) -> Result<(), ScopeError> {
-        let application = self.scopes.application();
+        let application = self.scopes.application;
         let snapshot = self
             .preferences
             .as_ref()
@@ -452,8 +588,8 @@ impl CompositionRoot {
     }
 
     async fn close_scopes(&mut self) -> Result<(), ScopeError> {
-        let application = self.scopes.application();
-        self.scopes.close(application).await?;
+        let application = self.scopes.application;
+        self.scopes.close_application().await?;
         self.session_services = None;
         self.preferences = None;
         self.generation = None;

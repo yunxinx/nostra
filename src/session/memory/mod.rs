@@ -145,6 +145,8 @@ pub struct InMemorySessionStore {
     #[cfg(test)]
     fail_append_calls: HashSet<usize>,
     #[cfg(test)]
+    fail_next_delete: bool,
+    #[cfg(test)]
     append_success_notifier: Option<SyncSender<usize>>,
     #[cfg(test)]
     create_after_commit_notifier: Option<SyncSender<()>>,
@@ -177,6 +179,11 @@ impl InMemorySessionStore {
     #[cfg(test)]
     pub(crate) fn fail_append_at_for_test(&mut self, call: usize) {
         self.fail_append_calls.insert(call.max(1));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete_for_test(&mut self) {
+        self.fail_next_delete = true;
     }
 
     #[cfg(test)]
@@ -306,6 +313,12 @@ impl SessionLifecycleStore for InMemorySessionStore {
     }
 
     fn delete_session(&mut self, session_id: &SessionId) -> Result<(), SessionError> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_delete) {
+            return Err(SessionError::io(std::io::Error::other(
+                "injected in-memory delete failure",
+            )));
+        }
         self.sessions.remove(session_id);
         Ok(())
     }

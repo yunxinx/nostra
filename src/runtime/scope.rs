@@ -257,6 +257,36 @@ impl ScopeTree {
         Ok(())
     }
 
+    pub(crate) fn remove_closed(&mut self, scope: ScopeId) -> Result<(), ScopeError> {
+        let node = self
+            .nodes
+            .get(&scope)
+            .ok_or(ScopeError::Unknown { scope })?;
+        if node.state != ScopeState::Closed {
+            return Err(ScopeError::NotOpen {
+                scope,
+                state: node.state,
+            });
+        }
+        let parent = node.parent;
+        let children = node.children.clone();
+        for child in children {
+            self.remove_closed(child)?;
+        }
+        self.nodes.remove(&scope);
+        if let Some(parent) = parent
+            && let Some(parent_node) = self.nodes.get_mut(&parent)
+        {
+            parent_node.children.retain(|child| *child != scope);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     fn create_child(
         &mut self,
         parent: ScopeId,

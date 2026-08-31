@@ -131,6 +131,9 @@ chat:
       en: Copy reasoning
       zh-CN: 复制思考过程
   error:
+    runtime_unavailable:
+      en: Unable to open a conversation right now. Please try again.
+      zh-CN: 当前无法打开对话，请稍后重试。
     persistence_start_failed:
       en: The message could not be saved. Check local storage and try again.
       zh-CN: 消息无法保存，请检查本地存储后重试。

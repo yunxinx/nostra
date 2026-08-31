@@ -1,18 +1,16 @@
 mod lifecycle;
 pub(crate) mod restore;
 
-use super::*;
+use super::conversation_runtime::{
+    ChatSessionControllerHandle, ConversationRuntime, PendingBeginRequest,
+};
 
 use futures::channel::oneshot;
+use gpui::{AppContext as _, Context};
 
-#[derive(Clone)]
-struct PendingBeginRequest {
-    text: String,
-    user_message: LlmMessage,
-    selection: ModelSelection,
-    turn_id: String,
-    composer_revision: u64,
-}
+use crate::session::{
+    ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal, SessionOperationGuard,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum BeginPersistenceError {
@@ -79,7 +77,7 @@ impl TurnPersistenceCoordinator {
         request: PendingBeginRequest,
         pending_terminal: Option<(String, ChatTurnTerminal)>,
         operation_guard: SessionOperationGuard,
-        cx: &mut Context<ChatView>,
+        cx: &mut Context<ConversationRuntime>,
     ) -> (Self, oneshot::Receiver<BeginPersistenceOutcome>) {
         let attempted_terminal_retry = pending_terminal.is_some();
         let turn_id = request.turn_id.clone();
@@ -159,7 +157,7 @@ impl TurnPersistenceCoordinator {
         controller: ChatSessionControllerHandle,
         turn_id: String,
         operation_guard: SessionOperationGuard,
-        cx: &mut Context<ChatView>,
+        cx: &mut Context<ConversationRuntime>,
     ) -> Self {
         let (command_tx, command_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();

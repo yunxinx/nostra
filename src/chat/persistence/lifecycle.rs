@@ -1,248 +1,79 @@
 use super::*;
 
-impl ChatView {
-    /// Transfer any unresolved durable turn to a detached terminal worker.
-    ///
-    /// Provider tasks are entity-owned and therefore cannot be the final owner
-    /// of a terminal fact during application exit. The detached coordinator
-    /// keeps the operation reservation until the exact terminal write settles,
-    /// which makes `SessionStores::shutdown` wait without keeping the window
-    /// alive.
-    pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
-        if self.shutdown_requested {
-            return;
-        }
-        self.shutdown_requested = true;
+use std::sync::Arc;
 
-        if let Some(coordinator) = self.terminal_persistence.take() {
-            self.persist_terminal_detached(
-                coordinator,
-                ChatTurnTerminal::cancelled(),
-                self.pending_turn_id.clone(),
-                cx,
-            );
-        } else if !self.persistence_pending
-            && let Some((turn_id, terminal)) = self.pending_terminal.take()
-        {
-            match self.new_terminal_coordinator(&turn_id, cx) {
-                Ok(coordinator) => {
-                    self.persist_terminal_detached(coordinator, terminal, Some(turn_id), cx);
-                }
-                Err(error) => {
-                    crate::logging::error(
-                        "chat.persistence",
-                        format_args!("cannot retry Chat terminal during shutdown: {error}"),
-                    );
-                }
-            }
-        } else if !self.persistence_pending
-            && let Some(turn_id) = self.pending_turn_id.clone()
-        {
-            match self.new_terminal_coordinator(&turn_id, cx) {
-                Ok(coordinator) => self.persist_terminal_detached(
-                    coordinator,
-                    ChatTurnTerminal::cancelled(),
-                    Some(turn_id),
-                    cx,
-                ),
-                Err(error) => crate::logging::error(
-                    "chat.persistence",
-                    format_args!("cannot finalize Chat turn during shutdown: {error}"),
-                ),
-            }
-        }
+use gpui::{AppContext as _, Context, Window};
+use gpui_component::{WindowExt as _, notification::NotificationType};
+use rust_i18n::t;
 
-        // Once durability has an independent owner, dropping the provider task
-        // is safe and avoids relying on a window-scoped cancellation callback.
-        if let Some(reply) = self.reply_task.take() {
-            reply.cancel();
-        }
-        self.pending = false;
-        cx.notify();
-    }
+use crate::{
+    chat::{
+        ChatDeleteRequest, ChatEvent, ChatView, Message, Role, assistant,
+        conversation_runtime::{
+            BeginTurnAdmissionError, ConversationRequestGeneration, ConversationRuntime,
+            ConversationRuntimeEvent, ConversationRuntimeFailure, ConversationRuntimeSnapshot,
+            PendingBeginRequest, StartedConversationTurn,
+        },
+        derive_title, is_replayable,
+    },
+    llm::{
+        ContentBlock, GatewayError, GenerationService, IndexedMessage, Message as LlmMessage,
+        ModelSelection, ProviderMetadata,
+    },
+    session::{ChatSessionControllerError, ChatTurnTerminal},
+};
 
-    /// Begin permanent deletion without performing storage I/O in the GPUI
-    /// update. The controller mutex serializes this operation with any begin
-    /// or terminal write already scheduled for the same conversation, so a
-    /// first turn cannot publish an orphan after the user confirms deletion.
-    pub(crate) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
-        if self.deletion_pending {
-            return ChatDeleteRequest::Pending;
-        }
-        let Some(controller) = self.session_controller.clone() else {
-            // A view without durable storage cannot have accepted a user turn.
-            return ChatDeleteRequest::RemoveNow;
-        };
-        let operation_guard = match self
-            .session_store
-            .as_ref()
-            .ok_or_else(|| "Chat session storage has not been initialized".to_string())
-            .and_then(|store| store.reserve_operation().map_err(|error| error.to_string()))
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                crate::logging::error(
-                    "chat.persistence",
-                    format_args!("cannot reserve permanent Chat deletion: {error}"),
-                );
-                self.notify_delete_failure(cx);
-                return ChatDeleteRequest::Pending;
-            }
-        };
-
-        self.deletion_requested = true;
-        if let Some(coordinator) = self.terminal_persistence.take() {
-            self.persist_terminal_detached(
-                coordinator,
-                ChatTurnTerminal::cancelled(),
-                self.pending_turn_id.clone(),
-                cx,
-            );
-        } else if !self.persistence_pending
-            && let Some((turn_id, terminal)) = self.pending_terminal.take()
-        {
-            match self.new_terminal_coordinator(&turn_id, cx) {
-                Ok(coordinator) => {
-                    self.persist_terminal_detached(coordinator, terminal, Some(turn_id), cx);
-                }
-                Err(error) => crate::logging::error(
-                    "chat.persistence",
-                    format_args!("cannot finalize Chat turn before deletion: {error}"),
-                ),
-            }
-        }
-        if let Some(reply) = self.reply_task.take() {
-            reply.cancel();
-        }
-        self.pending = false;
-        self.deletion_pending = true;
-        let background = cx.background_spawn(async move {
-            let mut controller = controller
-                .lock()
-                .map_err(|_| "Chat session controller lock is poisoned".to_string())?;
-            let authorized_store = operation_guard.authorized_store();
-            controller.with_replaced_store(authorized_store, |controller| {
-                controller
-                    .delete_session()
-                    .map_err(|error| error.to_string())
-            })
-        });
-        let task = cx.spawn(async move |this, cx| {
-            let result = background.await;
-            let _ = this.update(cx, |this, cx| {
-                this.deletion_pending = false;
-                this._deletion_task = None;
-                match result {
-                    Ok(()) => cx.emit(ChatEvent::DeleteCompleted),
-                    Err(error) => {
-                        // A failed delete leaves the durable conversation in
-                        // place. Re-enable normal interaction after the detached
-                        // cancellation terminal has closed any active turn.
-                        this.deletion_requested = false;
-                        crate::logging::error(
-                            "chat.persistence",
-                            format_args!("failed to permanently delete Chat session: {error}"),
-                        );
-                        this.notify_delete_failure(cx);
-                    }
-                }
-                cx.notify();
-            });
-        });
-        self._deletion_task = Some(task);
-        cx.notify();
-        ChatDeleteRequest::Pending
-    }
-
-    fn notify_delete_failure(&self, cx: &mut Context<Self>) {
-        let window_handle = self.window_handle;
-        let message = t!("chat.error.persistence_delete_failed").to_string();
-        cx.defer(move |cx| {
-            let _ = window_handle.update(cx, |_, window, cx| {
-                window.push_notification((NotificationType::Error, message), cx);
-            });
-        });
-    }
-
-    /// Submit a non-empty message when no reply or persistence operation is in
-    /// flight. Durable begin runs on the background executor; provider work is
-    /// started only after that commit succeeds.
-    pub(in crate::chat) fn submit(
+impl ConversationRuntime {
+    /// Admit one durable user turn and publish it only after the user fact is
+    /// committed. The runtime owns the persistence reservation and request
+    /// generation before any provider work can begin.
+    pub(super) fn begin_turn(
         &mut self,
         text: String,
-        window: &mut Window,
+        user_message: LlmMessage,
+        selection: ModelSelection,
+        composer_revision: u64,
         cx: &mut Context<Self>,
-    ) -> bool {
-        self.sync_selection_availability();
-        if self.pending
+    ) -> Result<ConversationRequestGeneration, BeginTurnAdmissionError> {
+        if self.generating
             || self.persistence_pending
             || self.deletion_requested
             || self.deletion_pending
             || self.shutdown_requested
-            || text.is_empty()
-            || !self.selection_available
-            || (self.pending_turn_id.is_some() && !self.pending)
+            || self.pending_turn_id.is_some()
         {
-            return false;
+            return Err(BeginTurnAdmissionError::NotAccepting);
         }
-
-        let Some(selection) = self.selection.clone() else {
-            return false;
-        };
-        let Some(controller) = self.session_controller.clone() else {
-            if let Some(reason) = &self.session_unavailable {
-                crate::logging::error(
-                    "chat.persistence",
-                    format_args!("cannot persist Chat turn: {reason}"),
-                );
-            }
-            window.push_notification(
-                (
-                    NotificationType::Error,
-                    t!("chat.error.persistence_start_failed").to_string(),
-                ),
-                cx,
-            );
-            return false;
-        };
-        let operation_guard = match self
+        let controller = self.session_controller.clone().ok_or_else(|| {
+            BeginTurnAdmissionError::StorageUnavailable(
+                self.session_unavailable
+                    .clone()
+                    .unwrap_or_else(|| "session storage is unavailable".into()),
+            )
+        })?;
+        let operation_guard = self
             .session_store
             .as_ref()
-            .ok_or_else(|| "Chat session storage has not been initialized".to_string())
-            .and_then(|store| store.reserve_operation().map_err(|error| error.to_string()))
-        {
-            Ok(guard) => guard,
-            Err(error) => {
-                crate::logging::error(
-                    "chat.persistence",
-                    format_args!("cannot reserve Chat turn persistence: {error}"),
-                );
-                window.push_notification(
-                    (
-                        NotificationType::Error,
-                        t!("chat.error.persistence_start_failed").to_string(),
-                    ),
-                    cx,
-                );
-                return false;
-            }
-        };
-
+            .ok_or_else(|| {
+                BeginTurnAdmissionError::StorageUnavailable(
+                    "session storage has not been initialized".into(),
+                )
+            })?
+            .reserve_operation()
+            .map_err(|error| BeginTurnAdmissionError::OperationReservation(error.to_string()))?;
+        let generation = self
+            .request_generation
+            .next()
+            .ok_or(BeginTurnAdmissionError::GenerationExhausted)?;
+        self.request_generation = generation;
         let turn_id = format!("turn-{}", self.next_turn_id);
-        let user_message = LlmMessage {
-            role: crate::llm::Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.clone(),
-                provider_metadata: ProviderMetadata::default(),
-            }],
-            provider_metadata: ProviderMetadata::default(),
-        };
         let request = PendingBeginRequest {
             text,
             user_message,
             selection,
             turn_id,
-            composer_revision: self.composer_revision,
+            composer_revision,
+            request_generation: generation,
         };
         let pending_terminal = self.pending_terminal.clone();
         let (coordinator, begin) = TurnPersistenceCoordinator::start(
@@ -265,14 +96,14 @@ impl ChatView {
         });
         self.persistence_pending = true;
         self._persistence_task = Some(task);
-        cx.notify();
-        true
+        self.publish_state(cx);
+        Ok(generation)
     }
 
     fn finish_begin_persistence(
         &mut self,
         request: PendingBeginRequest,
-        outcome: (bool, bool, Result<ChatTurnStart, BeginPersistenceError>),
+        outcome: BeginPersistenceOutcome,
         cx: &mut Context<Self>,
     ) {
         let (attempted_terminal_retry, terminal_committed, result) = outcome;
@@ -282,175 +113,84 @@ impl ChatView {
             self.pending_terminal = None;
             self.pending_turn_id = None;
         }
-        if self.shutdown_requested {
-            // `prepare_for_shutdown` already handed this turn to the detached
-            // coordinator. A late begin completion must never launch provider
-            // work while the store is crossing its final mutation barrier.
-            cx.notify();
+        if request.request_generation != self.request_generation {
+            if let Ok(start) = &result {
+                self.pending_terminal =
+                    Some((request.turn_id.clone(), ChatTurnTerminal::cancelled()));
+                self.pending_turn_id = None;
+                self.session_id = Some(start.session_id.clone());
+            }
+            self.terminal_persistence = None;
+            self.generating = false;
+            self.publish_state(cx);
             return;
         }
-        if self.deletion_requested {
-            // A committed begin may report success after deletion was already
-            // accepted. Keep the turn out of the UI and, critically, do not
-            // launch a provider request that the user has just cancelled.
-            cx.notify();
+        if self.shutdown_requested || self.deletion_requested {
+            self.publish_state(cx);
             return;
         }
         let start = match result {
             Ok(start) if self.terminal_persistence.is_some() => start,
             Ok(_) => {
-                // The view relinquished this turn (for example, deletion or
-                // shutdown) while durable begin was running. The detached
-                // worker owns cancellation persistence; provider work must not
-                // start without its command capability.
-                cx.notify();
+                self.publish_state(cx);
                 return;
             }
             Err(error) if error.is_deleted() => {
-                // Permanent deletion can overtake a previously queued begin.
-                // That is an expected cancellation; the deletion task owns
-                // the user-visible outcome and removes the conversation.
-                cx.notify();
+                self.publish_state(cx);
                 return;
             }
             Err(error) => {
                 self.terminal_persistence = None;
                 crate::logging::error(
                     "chat.persistence",
-                    format_args!("failed to persist Chat turn begin: {error}"),
+                    format_args!("failed to persist conversation turn begin: {error}"),
                 );
-                let message = if attempted_terminal_retry && !terminal_committed {
-                    t!("chat.error.persistence_retry_failed").to_string()
+                let failure = if attempted_terminal_retry && !terminal_committed {
+                    ConversationRuntimeFailure::TerminalRetry
                 } else {
-                    t!("chat.error.persistence_start_failed").to_string()
+                    ConversationRuntimeFailure::Begin
                 };
-                self.notify_begin_persistence_failure(message, cx);
-                cx.notify();
+                self.publish_state(cx);
+                self.publish_event(ConversationRuntimeEvent::Failure(failure), cx);
                 return;
             }
         };
 
-        if self.messages.is_empty() {
-            cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
-        }
-        let old_len = self.messages.len();
-        self.messages.push(Message::from_canonical_with_preferences(
-            request.user_message,
-            self.preference_state.clone(),
-            cx,
-        ));
-        self.messages.push(Message::empty(Role::Assistant));
-        self.list_state.splice(old_len..old_len, 2);
-        self.pending = true;
+        self.generating = true;
         self.pending_turn_id = Some(request.turn_id.clone());
-        self.conversation_id = start.session_id.to_string();
-        cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
-        let history = self
-            .messages
-            .iter()
-            .take(self.messages.len().saturating_sub(1))
-            .map(Message::canonical)
-            .filter(is_replayable)
-            .collect();
+        self.session_id = Some(start.session_id.clone());
         self.next_turn_id = self.next_turn_id.saturating_add(1);
-        #[cfg(test)]
-        let reply_task = if let Some(dropped) = self.next_reply_drop_flag.take() {
-            assistant::ReplyTask::pending_for_test(dropped, cx)
-        } else {
-            assistant::stream_reply(
-                history,
-                Some(request.selection),
-                self.generation_service.clone(),
-                self.conversation_id.clone(),
-                request.turn_id,
-                cx,
-            )
-        };
-        #[cfg(not(test))]
-        let reply_task = assistant::stream_reply(
-            history,
-            Some(request.selection),
-            self.generation_service.clone(),
-            self.conversation_id.clone(),
-            request.turn_id,
-            cx,
-        );
-        self.reply_task = Some(reply_task);
-        if self.composer_revision == request.composer_revision {
-            self.input_empty = true;
-            let composer = self.composer.clone();
-            let window_handle = self.window_handle;
-            cx.defer(move |cx| {
-                let _ = window_handle.update(cx, |_, window, cx| {
-                    composer.update(cx, |composer, cx| composer.clear_after_submit(window, cx));
-                });
-            });
-        }
-        self.scroll_to_bottom();
-        cx.notify();
-    }
-
-    /// Finish the turn in flight and attach its terminal error, if any. The
-    /// error card's state is built here, outside render, and all terminal state
-    /// changes are published with one notification.
-    #[cfg(test)]
-    pub fn finish_reply(
-        &mut self,
-        message: Option<IndexedMessage>,
-        error: Option<GatewayError>,
-        cx: &mut Context<Self>,
-    ) {
-        self.finish_reply_visual(message, error, cx);
-        self.pending_turn_id = None;
-        self.terminal_persistence = None;
-        cx.notify();
-    }
-
-    pub(crate) fn finish_reply_request_failed(
-        &mut self,
-        error: GatewayError,
-        cx: &mut Context<Self>,
-    ) {
-        self.finish_reply_with_terminal(
-            None,
-            ChatTurnTerminal::request_failed(&error),
-            Some(error),
+        self.publish_state(cx);
+        self.publish_event(
+            ConversationRuntimeEvent::TurnStarted(Box::new(StartedConversationTurn {
+                request,
+                session_id: start.session_id,
+            })),
             cx,
         );
     }
 
-    pub(crate) fn finish_reply_with_terminal(
+    pub(super) fn finish_terminal(
         &mut self,
-        message: Option<IndexedMessage>,
+        generation: ConversationRequestGeneration,
         terminal: ChatTurnTerminal,
-        error: Option<GatewayError>,
         cx: &mut Context<Self>,
     ) {
-        self.finish_reply_visual(message, error, cx);
-        if self.deletion_requested {
-            // The queued delete owns durability from this point. Persisting a
-            // cancellation terminal would only add write traffic and another
-            // race to a conversation that must be removed.
-            self.pending_terminal = None;
-            self.pending_turn_id = None;
-            self.terminal_persistence = None;
-            cx.notify();
+        if generation != self.request_generation {
             return;
         }
-        if self.shutdown_requested {
-            // Exit preparation already detached the cancellation terminal and
-            // dropped the provider task. Ignore a terminal callback that was
-            // queued immediately before that foreground transition.
+        self.generating = false;
+        if self.deletion_requested || self.shutdown_requested {
             self.pending_terminal = None;
             self.pending_turn_id = None;
             self.terminal_persistence = None;
-            cx.notify();
+            self.publish_state(cx);
             return;
         }
         let Some(turn_id) = self.pending_turn_id.clone() else {
             self.pending_terminal = None;
             self.terminal_persistence = None;
-            cx.notify();
+            self.publish_state(cx);
             return;
         };
         let coordinator = if let Some(coordinator) = self.terminal_persistence.take() {
@@ -461,12 +201,15 @@ impl ChatView {
                 Err(error) => {
                     crate::logging::error(
                         "chat.persistence",
-                        format_args!("cannot reserve Chat terminal persistence: {error}"),
+                        format_args!("cannot reserve conversation terminal persistence: {error}"),
                     );
                     self.pending_terminal = Some((turn_id, terminal));
                     self.pending_turn_id = None;
-                    self.notify_persistence_failure(cx);
-                    cx.notify();
+                    self.publish_state(cx);
+                    self.publish_event(
+                        ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Terminal),
+                        cx,
+                    );
                     return;
                 }
             }
@@ -480,13 +223,16 @@ impl ChatView {
                 crate::logging::error(
                     "chat.persistence",
                     format_args!(
-                        "failed to dispatch Chat terminal persistence; turn_id={retry_turn_id}: {error}"
+                        "failed to dispatch conversation terminal persistence; turn_id={retry_turn_id}: {error}"
                     ),
                 );
                 self.pending_terminal = Some((retry_turn_id, retry_terminal));
                 self.pending_turn_id = None;
-                self.notify_persistence_failure(cx);
-                cx.notify();
+                self.publish_state(cx);
+                self.publish_event(
+                    ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Terminal),
+                    cx,
+                );
                 return;
             }
         };
@@ -498,13 +244,10 @@ impl ChatView {
                 this.persistence_pending = false;
                 this._persistence_task = None;
                 match result {
-                    Ok(()) => {
-                        this.pending_turn_id = None;
-                        this.pending_terminal = None;
-                    }
-                    Err(error) if error.is_deleted() => {
-                        // Deletion owns the outcome when it overtakes a queued
-                        // terminal write; no retry or failure UI remains valid.
+                    Ok(())
+                    | Err(TerminalPersistenceError::Finish(
+                        ChatSessionControllerError::Deleted,
+                    )) => {
                         this.pending_turn_id = None;
                         this.pending_terminal = None;
                     }
@@ -512,24 +255,198 @@ impl ChatView {
                         crate::logging::error(
                             "chat.persistence",
                             format_args!(
-                                "failed to persist Chat terminal; turn_id={retry_turn_id}: {error}"
+                                "failed to persist conversation terminal; turn_id={retry_turn_id}: {error}"
                             ),
                         );
-                        // Retain the exact terminal DTO. The next submit first
-                        // retries this fact on the same serialized controller
-                        // before it attempts a new durable user turn.
                         this.pending_terminal =
                             Some((retry_turn_id.clone(), retry_terminal.clone()));
                         this.pending_turn_id = None;
-                        this.notify_persistence_failure(cx);
+                        this.publish_event(
+                            ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Terminal),
+                            cx,
+                        );
                     }
                 }
-                cx.notify();
+                this.publish_state(cx);
             });
         });
         self.persistence_pending = true;
         self._persistence_task = Some(task);
-        cx.notify();
+        self.publish_state(cx);
+    }
+
+    pub(super) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
+        if self.shutdown_requested {
+            return;
+        }
+        self.shutdown_requested = true;
+        self.advance_generation();
+
+        if let Some(coordinator) = self.terminal_persistence.take() {
+            self.persist_terminal_detached(
+                coordinator,
+                ChatTurnTerminal::cancelled(),
+                self.pending_turn_id.clone(),
+                cx,
+            );
+        } else if !self.persistence_pending
+            && let Some((turn_id, terminal)) = self.pending_terminal.take()
+        {
+            match self.new_terminal_coordinator(&turn_id, cx) {
+                Ok(coordinator) => {
+                    self.persist_terminal_detached(coordinator, terminal, Some(turn_id), cx);
+                }
+                Err(error) => crate::logging::error(
+                    "chat.persistence",
+                    format_args!("cannot retry conversation terminal during shutdown: {error}"),
+                ),
+            }
+        } else if !self.persistence_pending
+            && let Some(turn_id) = self.pending_turn_id.clone()
+        {
+            match self.new_terminal_coordinator(&turn_id, cx) {
+                Ok(coordinator) => self.persist_terminal_detached(
+                    coordinator,
+                    ChatTurnTerminal::cancelled(),
+                    Some(turn_id),
+                    cx,
+                ),
+                Err(error) => crate::logging::error(
+                    "chat.persistence",
+                    format_args!("cannot finalize conversation during shutdown: {error}"),
+                ),
+            }
+        }
+        self.generating = false;
+        self.publish_state(cx);
+    }
+
+    pub(super) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
+        if self.deletion_pending {
+            return ChatDeleteRequest::Pending;
+        }
+        let Some(controller) = self.session_controller.clone() else {
+            return ChatDeleteRequest::RemoveNow;
+        };
+        let operation_guard = match self
+            .session_store
+            .as_ref()
+            .ok_or_else(|| "conversation session storage has not been initialized".to_string())
+            .and_then(|store| store.reserve_operation().map_err(|error| error.to_string()))
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.persistence",
+                    format_args!("cannot reserve permanent conversation deletion: {error}"),
+                );
+                self.publish_event(
+                    ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Delete),
+                    cx,
+                );
+                return ChatDeleteRequest::Rejected;
+            }
+        };
+
+        self.deletion_requested = true;
+        self.advance_generation();
+        let cancelled = ChatTurnTerminal::cancelled();
+        if let Some(turn_id) = self.pending_turn_id.clone() {
+            self.pending_terminal = Some((turn_id, cancelled.clone()));
+        }
+        if let Some(coordinator) = self.terminal_persistence.take() {
+            self.persist_terminal_detached(
+                coordinator,
+                cancelled,
+                self.pending_turn_id.clone(),
+                cx,
+            );
+        } else if !self.persistence_pending
+            && let Some((turn_id, terminal)) = self.pending_terminal.clone()
+        {
+            match self.new_terminal_coordinator(&turn_id, cx) {
+                Ok(coordinator) => {
+                    self.persist_terminal_detached(coordinator, terminal, Some(turn_id), cx);
+                }
+                Err(error) => crate::logging::error(
+                    "chat.persistence",
+                    format_args!("cannot finalize conversation before deletion: {error}"),
+                ),
+            }
+        }
+        self.generating = false;
+        self.deletion_pending = true;
+        let background = cx.background_spawn(async move {
+            let mut controller = controller
+                .lock()
+                .map_err(|_| "conversation session controller lock is poisoned".to_string())?;
+            let authorized_store = operation_guard.authorized_store();
+            controller.with_replaced_store(authorized_store, |controller| {
+                controller
+                    .delete_session()
+                    .map_err(|error| error.to_string())
+            })
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = background.await;
+            let _ = this.update(cx, |this, cx| {
+                this._deletion_task = None;
+                match result {
+                    Ok(()) => this.close_scope_after_delete(cx),
+                    Err(error) => {
+                        this.deletion_pending = false;
+                        this.deletion_requested = false;
+                        this.pending_turn_id = None;
+                        this.terminal_persistence = None;
+                        this.generating = false;
+                        crate::logging::error(
+                            "chat.persistence",
+                            format_args!("failed to permanently delete conversation: {error}"),
+                        );
+                        this.publish_event(
+                            ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Delete),
+                            cx,
+                        );
+                    }
+                }
+                this.publish_state(cx);
+            });
+        });
+        self._deletion_task = Some(task);
+        self.publish_state(cx);
+        ChatDeleteRequest::Pending
+    }
+
+    fn close_scope_after_delete(&mut self, cx: &mut Context<Self>) {
+        if self._scope_close_task.is_some() {
+            return;
+        }
+        let scope = self.scope.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = scope.close().await;
+            let _ = this.update(cx, |this, cx| {
+                this._scope_close_task = None;
+                this.deletion_pending = false;
+                match result {
+                    Ok(()) => {
+                        this.publish_event(ConversationRuntimeEvent::DeleteCompleted, cx);
+                    }
+                    Err(error) => {
+                        this.deletion_requested = false;
+                        crate::logging::error(
+                            "runtime.scope",
+                            format_args!("conversation scope close failed after deletion: {error}"),
+                        );
+                        this.publish_event(
+                            ConversationRuntimeEvent::Failure(ConversationRuntimeFailure::Delete),
+                            cx,
+                        );
+                    }
+                }
+                this.publish_state(cx);
+            });
+        });
+        self._scope_close_task = Some(task);
     }
 
     fn new_terminal_coordinator(
@@ -540,11 +457,11 @@ impl ChatView {
         let controller = self
             .session_controller
             .clone()
-            .ok_or_else(|| "Chat session storage has not been initialized".to_string())?;
+            .ok_or_else(|| "conversation session storage has not been initialized".to_string())?;
         let operation_guard = self
             .session_store
             .as_ref()
-            .ok_or_else(|| "Chat session storage has not been initialized".to_string())?
+            .ok_or_else(|| "conversation session storage has not been initialized".to_string())?
             .reserve_operation()
             .map_err(|error| error.to_string())?;
         Ok(TurnPersistenceCoordinator::for_terminal(
@@ -565,13 +482,10 @@ impl ChatView {
         let result = match coordinator.persist(terminal) {
             Ok(result) => result,
             Err(error) => {
-                // A disconnected command receiver means the begin worker has
-                // already failed or has already applied its own cancellation
-                // fallback. There is no entity-owned retry left to wait on.
                 crate::logging::error(
                     "chat.persistence",
                     format_args!(
-                        "failed to dispatch detached Chat terminal; turn_id={}: {error}",
+                        "failed to dispatch detached conversation terminal; turn_id={}: {error}",
                         turn_id.as_deref().unwrap_or("pending-begin")
                     ),
                 );
@@ -580,36 +494,249 @@ impl ChatView {
         };
         cx.background_spawn(async move {
             match result.await {
-                Ok(Ok(())) | Ok(Err(TerminalPersistenceError::Finish(ChatSessionControllerError::Deleted))) => {}
+                Ok(Ok(()))
+                | Ok(Err(TerminalPersistenceError::Finish(
+                    ChatSessionControllerError::Deleted,
+                ))) => {}
                 Ok(Err(error)) => crate::logging::error(
                     "chat.persistence",
                     format_args!(
-                        "detached Chat terminal persistence failed; turn_id={}: {error}",
+                        "detached conversation terminal persistence failed; turn_id={}: {error}",
                         turn_id.as_deref().unwrap_or("pending-begin")
                     ),
                 ),
-                // A begin coordinator legitimately has no terminal result when
-                // deletion wins before the first durable user fact commits.
-                // The operation guard is still released by that worker; avoid
-                // turning this expected race into noisy diagnostics.
                 Err(_) => {}
             }
         })
         .detach();
     }
+}
 
-    fn notify_begin_persistence_failure(&self, message: String, cx: &mut Context<Self>) {
-        let window_handle = self.window_handle;
-        cx.defer(move |cx| {
-            let _ = window_handle.update(cx, |_, window, cx| {
-                window.push_notification((NotificationType::Error, message), cx);
-            });
-        });
+impl ChatView {
+    pub(crate) fn close_scope(&self, cx: &mut Context<Self>) {
+        self.runtime
+            .update(cx, |runtime, cx| runtime.close_scope_detached(cx));
     }
 
-    fn notify_persistence_failure(&self, cx: &mut Context<Self>) {
+    pub(in crate::chat) fn handle_runtime_event(
+        &mut self,
+        runtime_snapshot: ConversationRuntimeSnapshot,
+        generation_service: Arc<dyn GenerationService>,
+        event: &ConversationRuntimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            ConversationRuntimeEvent::StateChanged(snapshot) => {
+                self.runtime_snapshot = snapshot.clone();
+                cx.notify();
+            }
+            ConversationRuntimeEvent::TurnStarted(turn) => {
+                self.runtime_snapshot = runtime_snapshot.clone();
+                if turn.request.request_generation != runtime_snapshot.request_generation() {
+                    return;
+                }
+                self.start_runtime_turn(generation_service, (**turn).clone(), cx);
+            }
+            ConversationRuntimeEvent::Failure(failure) => {
+                self.notify_runtime_failure(*failure, cx);
+            }
+            ConversationRuntimeEvent::DeleteCompleted => cx.emit(ChatEvent::DeleteCompleted),
+        }
+    }
+
+    fn start_runtime_turn(
+        &mut self,
+        generation_service: Arc<dyn GenerationService>,
+        turn: StartedConversationTurn,
+        cx: &mut Context<Self>,
+    ) {
+        let request = turn.request;
+        if self.messages.is_empty() {
+            cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
+        }
+        let old_len = self.messages.len();
+        self.messages.push(Message::from_canonical_with_preferences(
+            request.user_message,
+            self.preference_state.clone(),
+            cx,
+        ));
+        self.messages.push(Message::empty(Role::Assistant));
+        self.list_state.splice(old_len..old_len, 2);
+        cx.emit(ChatEvent::SessionBound(turn.session_id.clone()));
+        let history = self
+            .messages
+            .iter()
+            .take(self.messages.len().saturating_sub(1))
+            .map(Message::canonical)
+            .filter(is_replayable)
+            .collect();
+        #[cfg(test)]
+        let reply_task = if let Some(dropped) = self.next_reply_drop_flag.take() {
+            assistant::ReplyTask::pending_for_test(dropped, cx)
+        } else {
+            assistant::stream_reply(
+                history,
+                Some(request.selection),
+                Arc::clone(&generation_service),
+                turn.session_id.to_string(),
+                request.turn_id,
+                request.request_generation,
+                cx,
+            )
+        };
+        #[cfg(not(test))]
+        let reply_task = assistant::stream_reply(
+            history,
+            Some(request.selection),
+            generation_service,
+            turn.session_id.to_string(),
+            request.turn_id,
+            request.request_generation,
+            cx,
+        );
+        self.reply_task = Some(reply_task);
+        if self.composer_revision == request.composer_revision {
+            self.input_empty = true;
+            let composer = self.composer.clone();
+            let window_handle = self.window_handle;
+            cx.defer(move |cx| {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    composer.update(cx, |composer, cx| composer.clear_after_submit(window, cx));
+                });
+            });
+        }
+        self.scroll_to_bottom();
+        cx.notify();
+    }
+
+    pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
+        self.runtime
+            .update(cx, |runtime, cx| runtime.prepare_for_shutdown(cx));
+        if let Some(reply) = self.reply_task.take() {
+            reply.cancel();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
+        let request = self
+            .runtime
+            .update(cx, |runtime, cx| runtime.request_delete(cx));
+        if request == ChatDeleteRequest::Pending
+            && let Some(reply) = self.reply_task.take()
+        {
+            reply.cancel();
+        }
+        cx.notify();
+        request
+    }
+
+    pub(in crate::chat) fn submit(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.sync_selection_availability();
+        if text.is_empty() || !self.selection_available {
+            return false;
+        }
+        let Some(selection) = self.selection.clone() else {
+            return false;
+        };
+        let user_message = LlmMessage {
+            role: crate::llm::Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.clone(),
+                provider_metadata: ProviderMetadata::default(),
+            }],
+            provider_metadata: ProviderMetadata::default(),
+        };
+        let composer_revision = self.composer_revision;
+        let result = self.runtime.update(cx, |runtime, cx| {
+            runtime.begin_turn(text, user_message, selection, composer_revision, cx)
+        });
+        match result {
+            Ok(_) => true,
+            Err(BeginTurnAdmissionError::NotAccepting) => false,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.persistence",
+                    format_args!("cannot begin conversation turn: {error}"),
+                );
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        t!("chat.error.persistence_start_failed").to_string(),
+                    ),
+                    cx,
+                );
+                false
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub fn finish_reply(
+        &mut self,
+        message: Option<IndexedMessage>,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_reply_visual(message, error, cx);
+        self.runtime.update(cx, |runtime, cx| {
+            runtime.generating = false;
+            runtime.pending_turn_id = None;
+            runtime.terminal_persistence = None;
+            runtime.publish_state(cx);
+        });
+        cx.notify();
+    }
+
+    pub(in crate::chat) fn finish_reply_request_failed(
+        &mut self,
+        generation: ConversationRequestGeneration,
+        error: GatewayError,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_reply_with_terminal(
+            generation,
+            None,
+            ChatTurnTerminal::request_failed(&error),
+            Some(error),
+            cx,
+        );
+    }
+
+    pub(in crate::chat) fn finish_reply_with_terminal(
+        &mut self,
+        generation: ConversationRequestGeneration,
+        message: Option<IndexedMessage>,
+        terminal: ChatTurnTerminal,
+        error: Option<GatewayError>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.runtime_snapshot.request_generation() {
+            return;
+        }
+        self.finish_reply_visual(message, error, cx);
+        self.runtime.update(cx, |runtime, cx| {
+            runtime.finish_terminal(generation, terminal, cx)
+        });
+        cx.notify();
+    }
+
+    fn notify_runtime_failure(&self, failure: ConversationRuntimeFailure, cx: &mut Context<Self>) {
+        let message = match failure {
+            ConversationRuntimeFailure::Begin => t!("chat.error.persistence_start_failed"),
+            ConversationRuntimeFailure::TerminalRetry => {
+                t!("chat.error.persistence_retry_failed")
+            }
+            ConversationRuntimeFailure::Terminal => t!("chat.error.persistence_finish_failed"),
+            ConversationRuntimeFailure::Delete => t!("chat.error.persistence_delete_failed"),
+        }
+        .to_string();
         let window_handle = self.window_handle;
-        let message = t!("chat.error.persistence_finish_failed").to_string();
         cx.defer(move |cx| {
             let _ = window_handle.update(cx, |_, window, cx| {
                 window.push_notification((NotificationType::Error, message), cx);
@@ -623,12 +750,9 @@ impl ChatView {
         error: Option<GatewayError>,
         cx: &mut Context<Self>,
     ) {
-        let turn_error = error.map(|error| TurnError::new(error, cx));
+        let turn_error = error.map(|error| super::super::error_card::TurnError::new(error, cx));
         if let Some(last) = self.messages.last_mut() {
             if let Some(message) = message {
-                // Match pi's message lifecycle: deltas provide a responsive live
-                // projection, then the complete message_end snapshot becomes
-                // authoritative for both rendering and replay.
                 last.replace_with_canonical_with_preferences(
                     message,
                     self.preference_state.clone(),
@@ -636,11 +760,8 @@ impl ChatView {
                 );
             }
             last.error = turn_error;
-            // Terminal fallback for a stream that never delivered its explicit
-            // `ReasoningFinished` boundary, including cancellation and failure.
             last.finish_reasoning(None);
         }
-        self.pending = false;
         self.reply_task = None;
         self.remeasure_latest_message();
     }

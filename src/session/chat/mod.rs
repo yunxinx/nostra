@@ -379,10 +379,20 @@ where
         if self.deleted {
             return Err(ChatSessionControllerError::Deleted);
         }
-        let pending = self
-            .pending_turn
-            .as_ref()
-            .ok_or(ChatSessionControllerError::NoTurnInProgress)?;
+        let Some(pending) = self.pending_turn.as_ref() else {
+            if let Some(session_id) = &self.session_id {
+                let state = self.store.load_session(session_id, None)?;
+                let expected = turn_result(turn_id, terminal);
+                if state
+                    .turn_results
+                    .iter()
+                    .any(|resolved| resolved.result == expected)
+                {
+                    return Ok(());
+                }
+            }
+            return Err(ChatSessionControllerError::NoTurnInProgress);
+        };
         if pending.turn_id != turn_id {
             return Err(ChatSessionControllerError::TurnIdMismatch {
                 expected: pending.turn_id.clone(),

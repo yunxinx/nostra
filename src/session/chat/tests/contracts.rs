@@ -256,10 +256,9 @@ fn request_failure_and_invalid_terminal_states_are_explicit() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("request failure should persist");
-    assert!(matches!(
-        controller.finish_turn("turn-1", &terminal),
-        Err(ChatSessionControllerError::NoTurnInProgress)
-    ));
+    controller
+        .finish_turn("turn-1", &terminal)
+        .expect("an exact durable terminal retry is idempotent");
     let state = controller.restore(&start.session_id).expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.turn_results[0].result.status, TurnStatus::Failed);

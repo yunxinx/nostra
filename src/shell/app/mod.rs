@@ -31,8 +31,10 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::appearance::{glass, theme};
-use crate::chat::{ChatDeleteRequest, ChatEvent, ChatView, derive_chat_title};
-use crate::llm::{GenerationService, ModelSelection};
+use crate::chat::{
+    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_chat_title,
+};
+use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
 use crate::runtime::{
     ExitCoordinator, NORMAL_EXIT_TIMEOUT, QUIT_FALLBACK_TIMEOUT, RuntimeServices,
@@ -97,7 +99,7 @@ struct AgentSessionRestore {
     request: SelectionRequest,
     project_id: String,
     session_id: SessionId,
-    view: Entity<ChatView>,
+    project: crate::session::ProjectIdentity,
     state: ResolvedSessionState,
 }
 
@@ -189,9 +191,9 @@ pub struct ChatApp {
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
     session_services: SessionStores,
+    runtime_services: RuntimeServices,
     preference_handle: PreferenceHandle,
     preference_snapshot: Preferences,
-    generation_service: Arc<dyn GenerationService>,
     exit_coordinator: Arc<ExitCoordinator>,
 }
 
@@ -257,7 +259,6 @@ impl ChatApp {
     ) -> Self {
         let session_services = services.session_services().clone();
         let preference_handle = services.preference_handle().clone();
-        let generation_service = services.generation_service();
         let exit_coordinator = services.exit_coordinator();
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
@@ -321,9 +322,9 @@ impl ChatApp {
             _quit_task: None,
             _subscriptions: Vec::new(),
             session_services,
+            runtime_services: services,
             preference_handle,
             preference_snapshot: prefs.clone(),
-            generation_service,
             exit_coordinator,
         };
         this.track_window_geometry(window, cx);
@@ -476,6 +477,30 @@ impl ChatApp {
             && self.agent.selected_session_id() == Some(session_id)
     }
 
+    fn create_conversation_scope(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::runtime::ConversationScopeHandle> {
+        match self.runtime_services.create_conversation_scope() {
+            Ok(scope) => Some(scope),
+            Err(error) => {
+                crate::logging::error(
+                    "runtime.scope",
+                    format_args!("failed to create conversation scope: {error}"),
+                );
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        t!("chat.error.runtime_unavailable").to_string(),
+                    ),
+                    cx,
+                );
+                None
+            }
+        }
+    }
+
     /// Create a fresh draft conversation with no persisted session id.  The
     /// session id is bound only after the first durable turn begin succeeds
     /// (see [`Self::handle_session_bound`]).
@@ -484,9 +509,17 @@ impl ChatApp {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         let title: SharedString = t!("chat.default_title").to_string().into();
-        let view = ChatView::view_with_generation_service_and_preferences(
+        let Some(scope) = self.create_conversation_scope(window, cx) else {
+            return;
+        };
+        let runtime = create_conversation_runtime(
+            scope,
             self.session_services.chat_conversation(),
-            self.generation_service.clone(),
+            self.runtime_services.generation_service(),
+            cx,
+        );
+        let view = ChatView::view_with_generation_service_and_preferences(
+            runtime,
             self.preference_handle.clone(),
             window,
             cx,
@@ -609,10 +642,18 @@ impl ChatApp {
         let Some(identity) = self.project_identity(&project_id, cx) else {
             return;
         };
+        let Some(scope) = self.create_conversation_scope(window, cx) else {
+            return;
+        };
         self.invalidate_agent_selection_request();
-        let view = ChatView::project_view_with_generation_service_and_preferences(
+        let runtime = create_conversation_runtime(
+            scope,
             self.session_services.project_conversation(identity),
-            self.generation_service.clone(),
+            self.runtime_services.generation_service(),
+            cx,
+        );
+        let view = ChatView::project_view_with_generation_service_and_preferences(
+            runtime,
             self.preference_handle.clone(),
             window,
             cx,
@@ -665,13 +706,6 @@ impl ChatApp {
             Err(_) => return,
         };
         let request = self.begin_agent_selection_request();
-        let view = ChatView::project_view_with_generation_service_and_preferences(
-            self.session_services.project_conversation(identity),
-            self.generation_service.clone(),
-            self.preference_handle.clone(),
-            window,
-            cx,
-        );
         let app = cx.entity();
         let window_handle = window.window_handle();
         self.agent
@@ -695,7 +729,7 @@ impl ChatApp {
                             request,
                             project_id,
                             session_id,
-                            view,
+                            project: identity,
                             state,
                         },
                         window,
@@ -733,6 +767,23 @@ impl ChatApp {
             return;
         }
 
+        let Some(scope) = self.create_conversation_scope(window, cx) else {
+            return;
+        };
+        let runtime = create_conversation_runtime(
+            scope,
+            self.session_services
+                .project_conversation(restore.project.clone()),
+            self.runtime_services.generation_service(),
+            cx,
+        );
+        let view = ChatView::project_view_with_generation_service_and_preferences(
+            runtime,
+            self.preference_handle.clone(),
+            window,
+            cx,
+        );
+
         let title = restore
             .state
             .messages
@@ -751,22 +802,22 @@ impl ChatApp {
                     })
             })
             .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
-        if restore
-            .view
+        if view
             .update(cx, |chat, cx| {
                 chat.restore_from_session(&restore.session_id, &restore.state, cx)
             })
             .is_err()
         {
+            view.update(cx, |view, cx| view.close_scope(cx));
             return;
         }
-        let subscription = self.subscribe_agent_conversation(&restore.view, window, cx);
-        let target = restore.view.entity_id();
+        let subscription = self.subscribe_agent_conversation(&view, window, cx);
+        let target = view.entity_id();
         self.agent_conversations.push(AgentConversation {
-            view: restore.view.clone(),
+            view: view.clone(),
             project_id: restore.project_id,
             title,
-            selection: restore.view.read(cx).selection(),
+            selection: view.read(cx).selection(),
             session_id: Some(restore.session_id),
             _subscription: subscription,
         });
@@ -786,7 +837,10 @@ impl ChatApp {
         let Some(index) = self.agent_conversation_index(target) else {
             return;
         };
-        self.agent_conversations.remove(index);
+        let removed = self.agent_conversations.remove(index);
+        if session_id.is_none() {
+            removed.view.update(cx, |view, cx| view.close_scope(cx));
+        }
         if let Some(session_id) = session_id {
             self.agent.remove_session(&project_id, &session_id);
         }
@@ -1165,9 +1219,17 @@ impl ChatApp {
                     })
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
-        let view = ChatView::view_with_generation_service_and_preferences(
+        let Some(scope) = self.create_conversation_scope(window, cx) else {
+            return;
+        };
+        let runtime = create_conversation_runtime(
+            scope,
             self.session_services.chat_conversation(),
-            self.generation_service.clone(),
+            self.runtime_services.generation_service(),
+            cx,
+        );
+        let view = ChatView::view_with_generation_service_and_preferences(
+            runtime,
             self.preference_handle.clone(),
             window,
             cx,
@@ -1180,6 +1242,7 @@ impl ChatApp {
                 "chat.workspace",
                 format_args!("failed to hydrate session {session_id}: {error}"),
             );
+            view.update(cx, |view, cx| view.close_scope(cx));
             return;
         }
         let sub = self.subscribe_conversation(&view, window, cx);
@@ -1494,14 +1557,13 @@ impl ChatApp {
         let request = self.conversations[index]
             .view
             .update(cx, |chat, cx| chat.request_delete(cx));
-        if request == ChatDeleteRequest::Pending {
-            if was_confirming {
-                cx.notify();
-            }
+        if request == ChatDeleteRequest::RemoveNow {
+            self.remove_conversation(target, window, cx);
             return;
         }
-
-        self.remove_conversation(target, window, cx);
+        if was_confirming {
+            cx.notify();
+        }
     }
 
     fn remove_conversation(
@@ -1522,6 +1584,9 @@ impl ChatApp {
         }
 
         let removed = self.conversations.remove(index);
+        if removed.session_id.is_none() {
+            removed.view.update(cx, |view, cx| view.close_scope(cx));
+        }
         if let Some(session_id) = &removed.session_id {
             self.opened_session_index.remove(session_id);
             // Keep the catalog snapshot in sync so the row disappears even when

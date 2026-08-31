@@ -173,10 +173,12 @@ fn add_chat_window_with_generation_service(
 ) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
     let conversation = stores.chat_conversation();
     let preference_handle = cx.update(|cx| preferences::handle(cx));
+    let scope = crate::runtime::ConversationScopeHandle::for_test();
     let (root, cx) = cx.add_window_view(move |window, cx| {
+        let runtime =
+            super::create_conversation_runtime(scope, conversation, generation_service, cx);
         let chat = ChatView::view_with_generation_service_and_preferences(
-            conversation,
-            generation_service,
+            runtime,
             preference_handle,
             window,
             cx,

@@ -7,7 +7,7 @@ impl Render for ChatView {
         self.sync_selection_availability();
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
-        let placeholder: SharedString = if self.conversation.descriptor().supports_references() {
+        let placeholder: SharedString = if self.references_enabled {
             t!("reference_picker.composer_placeholder").to_string()
         } else {
             t!("chat.placeholder").to_string()
@@ -21,16 +21,17 @@ impl Render for ChatView {
         }
 
         let has_messages = !self.messages.is_empty();
-        let send_disabled = self.pending
-            || self.persistence_pending
-            || self.deletion_pending
+        let send_disabled = self.runtime_snapshot.is_generating()
+            || self.runtime_snapshot.persistence_pending()
+            || self.runtime_snapshot.deletion_pending()
+            || self.runtime_snapshot.shutdown_requested()
             || self.input.read(cx).value().trim().is_empty()
             || !self.selection_available;
         let composer_height = self.composer_height;
         let base_composer_height = self.base_composer_height;
         self.composer_status
             .set(crate::ui::reference_picker::ComposerStatus {
-                pending: self.pending,
+                pending: self.runtime_snapshot.is_generating(),
                 send_disabled,
             });
         let view = cx.weak_entity();

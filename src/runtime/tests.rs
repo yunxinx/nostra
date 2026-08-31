@@ -2452,6 +2452,83 @@ fn default_composition_installs_the_gateway_generation_provider() {
 }
 
 #[test]
+fn runtime_services_create_distinct_conversation_scopes_under_the_window_scope() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let services = root.services().expect("active runtime services");
+    let first = services
+        .create_conversation_scope()
+        .expect("first conversation scope");
+    let second = services
+        .create_conversation_scope()
+        .expect("second conversation scope");
+
+    assert_ne!(first.scope(), second.scope());
+    assert_eq!(first.parent_scope(), root.window_scope());
+    assert!(first.is_open());
+    assert!(second.is_open());
+
+    futures::executor::block_on(root.close()).expect("close composition");
+    assert!(!first.is_open());
+    assert!(!second.is_open());
+}
+
+#[test]
+fn conversation_scope_close_is_explicit_and_idempotent() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let services = root.services().expect("active runtime services");
+    let scope = services
+        .create_conversation_scope()
+        .expect("conversation scope");
+
+    futures::executor::block_on(scope.close()).expect("close conversation scope");
+    assert!(!scope.is_open());
+    futures::executor::block_on(scope.close()).expect("repeated conversation close");
+
+    futures::executor::block_on(root.close()).expect("close composition after child close");
+}
+
+#[test]
+fn conversation_scope_close_after_parent_close_is_a_noop() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let scope = root
+        .services()
+        .expect("active runtime services")
+        .create_conversation_scope()
+        .expect("conversation scope");
+
+    futures::executor::block_on(root.close()).expect("close composition");
+    futures::executor::block_on(scope.close())
+        .expect("closed parent leaves child close idempotent");
+    assert!(!scope.is_open());
+}
+
+#[test]
+fn closed_conversation_scopes_are_removed_from_the_runtime_tree() {
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .build()
+        .expect("valid composition");
+    let services = root.services().expect("active runtime services");
+    assert_eq!(services.scope_count(), 2);
+
+    for _ in 0..20 {
+        let scope = services
+            .create_conversation_scope()
+            .expect("conversation scope");
+        assert_eq!(services.scope_count(), 3);
+        futures::executor::block_on(scope.close()).expect("close conversation scope");
+        assert_eq!(services.scope_count(), 2);
+    }
+
+    futures::executor::block_on(root.close()).expect("close composition");
+}
+
+#[test]
 fn scripted_generation_provider_uses_the_same_consumer_handle() {
     const SCRIPTED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.scripted");
     let scripted = Arc::new(ScriptedGenerationService::new(vec![

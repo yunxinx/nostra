@@ -18,7 +18,7 @@ use gpui::{Context, Task};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::{
-    chat::ChatView,
+    chat::{ChatView, conversation_runtime::ConversationRequestGeneration},
     llm::{
         GatewayError, GenerateRequest, GenerationEvent, GenerationHandle, GenerationOutcome,
         GenerationRequest, GenerationService, Message as LlmMessage, ModelSelection, OutcomeStatus,
@@ -64,6 +64,7 @@ pub fn stream_reply(
     generation_service: Arc<dyn GenerationService>,
     conversation_id: String,
     turn_id: String,
+    request_generation: ConversationRequestGeneration,
     cx: &mut Context<ChatView>,
 ) -> ReplyTask {
     let prepared = selection
@@ -90,8 +91,10 @@ pub fn stream_reply(
             Err(error) => {
                 // Same card as an upstream failure. There is no response body to
                 // show — the request never left — so it renders headline-only.
-                view.update(cx, |chat, cx| chat.finish_reply_request_failed(error, cx))
-                    .ok();
+                view.update(cx, |chat, cx| {
+                    chat.finish_reply_request_failed(request_generation, error, cx)
+                })
+                .ok();
                 return;
             }
         };
@@ -131,7 +134,13 @@ pub fn stream_reply(
         );
         view.update(cx, |chat, cx| {
             chat.follow_stream();
-            chat.finish_reply_with_terminal(outcome.message, terminal, failure, cx);
+            chat.finish_reply_with_terminal(
+                request_generation,
+                outcome.message,
+                terminal,
+                failure,
+                cx,
+            );
         })
         .ok();
     });
