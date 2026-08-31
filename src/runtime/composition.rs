@@ -126,6 +126,16 @@ impl RuntimeServices {
         self.scopes.create_conversation()
     }
 
+    #[must_use]
+    pub fn application_scope(&self) -> ScopeId {
+        self.scopes.application
+    }
+
+    #[must_use]
+    pub fn window_scope(&self) -> ScopeId {
+        self.scopes.window
+    }
+
     #[cfg(test)]
     pub(crate) fn scope_count(&self) -> usize {
         self.scopes.scope_count()

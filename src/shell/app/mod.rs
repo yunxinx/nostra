@@ -6,6 +6,7 @@ mod conversation_host;
 mod history_sidebar;
 mod project_workspace;
 mod render;
+mod workspace_host;
 
 use std::{sync::Arc, time::Duration};
 
@@ -65,12 +66,12 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
 use chat_workspace::{ChatWorkspace, ChatWorkspaceSnapshot};
 use project_workspace::{ProjectWorkspace, ProjectWorkspaceSnapshot};
+use workspace_host::WorkspaceHost;
 
 pub struct ChatApp {
     focus_handle: FocusHandle,
-    chat_workspace: Entity<ChatWorkspace>,
+    workspace_host: WorkspaceHost,
     chat_workspace_snapshot: ChatWorkspaceSnapshot,
-    project_workspace: Entity<ProjectWorkspace>,
     project_workspace_snapshot: ProjectWorkspaceSnapshot,
     collapsed: bool,
     /// True once the user has toggled the sidebar at least once.  Prevents an
@@ -149,11 +150,10 @@ impl ChatApp {
         };
 
         let parent = cx.weak_entity();
-        let chat_workspace = cx
-            .new(|cx| ChatWorkspace::new(services.clone(), preference_handle.clone(), window, cx));
+        let workspace_host = WorkspaceHost::new(services, preference_handle.clone(), window, cx);
+        let chat_workspace = workspace_host.chat_workspace();
         let chat_workspace_snapshot = chat_workspace.read(cx).snapshot().clone();
-        let project_workspace =
-            cx.new(|cx| ProjectWorkspace::new(services.clone(), preference_handle.clone(), cx));
+        let project_workspace = workspace_host.project_workspace();
         let project_workspace_snapshot = project_workspace.read(cx).snapshot().clone();
         let model_picker = cx.new(|cx| {
             ModelPicker::new(
@@ -184,9 +184,8 @@ impl ChatApp {
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
-            chat_workspace,
+            workspace_host,
             chat_workspace_snapshot,
-            project_workspace,
             project_workspace_snapshot,
             collapsed: prefs.sidebar_collapsed,
             has_toggled: false,
@@ -208,10 +207,18 @@ impl ChatApp {
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
         if matches!(this.workspace_mode, WorkspaceMode::Project) {
-            this.project_workspace
+            this.project_workspace()
                 .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx));
         }
         this
+    }
+
+    fn chat_workspace(&self) -> Entity<ChatWorkspace> {
+        self.workspace_host.chat_workspace()
+    }
+
+    fn project_workspace(&self) -> Entity<ProjectWorkspace> {
+        self.workspace_host.project_workspace()
     }
 
     /// Keep `window_geometry` current across moves and resizes.  The
@@ -241,7 +248,7 @@ impl ChatApp {
                 return;
             }
             this.preference_snapshot = snapshot;
-            this.project_workspace
+            this.project_workspace()
                 .update(cx, |workspace, cx| workspace.refresh_preferences(cx));
             cx.notify();
         });
@@ -289,9 +296,9 @@ impl ChatApp {
     }
 
     fn prepare_exit_work(&mut self, cx: &mut Context<Self>) -> ExitWork {
-        self.chat_workspace
+        self.chat_workspace()
             .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
-        self.project_workspace
+        self.project_workspace()
             .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
         let sidebar_width = self.sidebar_width.as_f32();
         let sidebar_collapsed = self.collapsed;
@@ -351,10 +358,10 @@ impl ChatApp {
     ) -> bool {
         match self.workspace_mode {
             WorkspaceMode::Chat => self
-                .chat_workspace
+                .chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
             WorkspaceMode::Project => self
-                .project_workspace
+                .project_workspace()
                 .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
         }
     }
@@ -370,11 +377,11 @@ impl ChatApp {
             WorkspaceMode::Chat => {
                 self.model_picker
                     .update(cx, |picker, cx| picker.dismiss(window, cx));
-                self.chat_workspace
+                self.chat_workspace()
                     .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
             }
             WorkspaceMode::Project => self
-                .project_workspace
+                .project_workspace()
                 .update(cx, |workspace, cx| workspace.open_project_folder(cx)),
         }
     }
@@ -383,18 +390,18 @@ impl ChatApp {
     fn spawn_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace
+        self.chat_workspace()
             .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
-        self.chat_workspace_snapshot = self.chat_workspace.read(cx).snapshot().clone();
+        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
     }
 
     #[cfg(test)]
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace
+        self.chat_workspace()
             .update(cx, |workspace, cx| workspace.select(index, cx));
-        self.chat_workspace_snapshot = self.chat_workspace.read(cx).snapshot().clone();
+        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
     }
 
     #[cfg(test)]
@@ -406,9 +413,9 @@ impl ChatApp {
     ) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace
+        self.chat_workspace()
             .update(cx, |workspace, cx| workspace.select_target(target, cx));
-        self.chat_workspace_snapshot = self.chat_workspace.read(cx).snapshot().clone();
+        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
     }
 
     #[cfg(test)]
@@ -420,10 +427,10 @@ impl ChatApp {
     ) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace.update(cx, |workspace, cx| {
+        self.chat_workspace().update(cx, |workspace, cx| {
             workspace.select_session(session_id, window, cx)
         });
-        self.chat_workspace_snapshot = self.chat_workspace.read(cx).snapshot().clone();
+        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
     }
 
     #[cfg(test)]
@@ -433,15 +440,15 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat_workspace.update(cx, |workspace, cx| {
+        self.chat_workspace().update(cx, |workspace, cx| {
             workspace.delete_conversation(target, window, cx)
         });
-        self.chat_workspace_snapshot = self.chat_workspace.read(cx).snapshot().clone();
+        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.workspace_mode, WorkspaceMode::Project) {
-            let revealed = self.project_workspace.update(cx, |workspace, cx| {
+            let revealed = self.project_workspace().update(cx, |workspace, cx| {
                 workspace.request_delete_active(window, cx)
             });
             if revealed && self.collapsed {
@@ -462,7 +469,7 @@ impl ChatApp {
             self.collapsed = false;
             self.has_toggled = true;
         }
-        self.chat_workspace.update(cx, |workspace, cx| {
+        self.chat_workspace().update(cx, |workspace, cx| {
             workspace.begin_delete_confirmation(SidebarTarget::View(target), window, cx)
         });
     }

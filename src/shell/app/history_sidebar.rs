@@ -564,7 +564,7 @@ impl ChatApp {
     }
 
     fn render_history_error_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let workspace = self.chat_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
         v_flex()
             .px_2()
             .py_2()
@@ -589,7 +589,7 @@ impl ChatApp {
 
     fn render_load_more_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let in_flight = self.chat_workspace_snapshot.history().load_more_in_flight();
-        let workspace = self.chat_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
         let row = div()
             .id("history-load-more")
             .w_full()
@@ -634,7 +634,7 @@ impl ChatApp {
             .iter()
             .position(|conv| conv.target() == target)
             .unwrap_or_default();
-        let workspace = self.chat_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
 
         self.render_history_row(
             ("conv-row", target),
@@ -711,7 +711,7 @@ impl ChatApp {
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
             is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
-        let workspace = self.chat_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
 
         self.render_history_row(
             format!("history-row-{session_id}"),
@@ -784,7 +784,7 @@ impl ChatApp {
         let focus_ring = cx.theme().ring.opacity(0.2);
         let target_for_hover = target.clone();
         let target_for_actions = target;
-        let workspace = self.chat_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
 
         let title_element = if is_generating {
             h_flex()
@@ -896,8 +896,8 @@ impl ChatApp {
         confirming: bool,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let workspace = self.chat_workspace.downgrade();
-        let project_workspace = self.project_workspace.downgrade();
+        let workspace = self.chat_workspace().downgrade();
+        let project_workspace = self.project_workspace().downgrade();
         let is_chat_target = matches!(target, SidebarTarget::View(_) | SidebarTarget::Session(_));
         let (trigger_id, confirm_id, trigger_debug_selector, delete_label, confirm_title): (
             ElementId,

@@ -646,7 +646,7 @@ impl ChatApp {
 
     fn render_agent_projects_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().sidebar_foreground.opacity(0.6);
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         h_flex()
             .id("agent-projects-header")
             .h(px(28.))
@@ -802,7 +802,7 @@ impl ChatApp {
         let name_for_key = project_id.clone();
         let target = SidebarTarget::AgentProject(project_id.clone());
         let is_confirming = self.project_workspace_snapshot.confirming() == Some(&target);
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         let workspace_for_key = workspace.clone();
 
         v_flex()
@@ -887,7 +887,8 @@ impl ChatApp {
                                             .icon(IconName::Plus)
                                             .tooltip(t!("agent.new_in_project").to_string())
                                             .on_click({
-                                                let workspace = self.project_workspace.downgrade();
+                                                let workspace =
+                                                    self.project_workspace().downgrade();
                                                 let project_id = project_id.clone();
                                                 move |_, window, cx| {
                                                     workspace
@@ -925,7 +926,7 @@ impl ChatApp {
             self.project_workspace_snapshot.catalog().open(),
             Some(AgentOpen::Draft { project_id: open_id }) if open_id == project_id
         );
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         let project_id = project_id.to_string();
         let target = self
             .project_workspace_snapshot
@@ -970,7 +971,7 @@ impl ChatApp {
             summary.updated_at,
         );
         let project_id = project_id.to_string();
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         let target = SidebarTarget::AgentSession {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -1124,7 +1125,7 @@ impl ChatApp {
     }
 
     fn render_agent_projects_error_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         v_flex()
             .px_2()
             .py_3()
@@ -1151,7 +1152,7 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let project_id = project_id.to_string();
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         v_flex()
             .ml_4()
             .px_2()
@@ -1181,7 +1182,7 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let label = t!("agent.load_more").to_string();
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         self.render_sidebar_action_row(
             "agent-load-more-projects",
             label,
@@ -1206,7 +1207,7 @@ impl ChatApp {
     ) -> impl IntoElement {
         let project_id = project_id.to_string();
         let label = t!("agent.show_more").to_string();
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         self.render_sidebar_action_row(
             format!("agent-show-more-{project_id}"),
             label,
@@ -1336,7 +1337,7 @@ impl ChatApp {
     /// Full-area guide shown in Agent mode before any folder is opened.
     fn render_agent_folder_guide(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let workspace = self.project_workspace.downgrade();
+        let workspace = self.project_workspace().downgrade();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1401,7 +1402,7 @@ impl ChatApp {
             self.project_workspace_snapshot.session_load_state(),
             AgentLoadState::Error(_)
         ) {
-            let workspace = self.project_workspace.downgrade();
+            let workspace = self.project_workspace().downgrade();
             return v_flex()
                 .size_full()
                 .items_center()
@@ -1462,7 +1463,7 @@ impl ChatApp {
             return;
         }
         if matches!(self.workspace_mode, super::WorkspaceMode::Project) {
-            self.project_workspace
+            self.project_workspace()
                 .update(cx, |workspace, cx| workspace.dismiss_active_completion(cx));
         }
         self.workspace_mode = mode;
@@ -1475,7 +1476,7 @@ impl ChatApp {
                 AgentLoadState::Unloaded | AgentLoadState::Error(_)
             )
         {
-            self.project_workspace
+            self.project_workspace()
                 .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx));
         }
         self.sync_model_picker_to_active(window, cx);

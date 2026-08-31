@@ -16,7 +16,9 @@ use reqwest_client::ReqwestClient;
 use crate::llm::{
     GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
 };
-use crate::runtime::{ComponentId, CompositionRoot, PROJECT_WORKSPACE_ID, RuntimeServices};
+use crate::runtime::{
+    CHAT_WORKSPACE_ID, ComponentId, CompositionRoot, PROJECT_WORKSPACE_ID, RuntimeServices,
+};
 use crate::session::{
     ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
     LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
@@ -251,7 +253,7 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this.chat_workspace.read(cx).conversations.conversations()[0]
+            let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
                 .clone();
             assert!(view.update(cx, |chat, cx| {
@@ -296,7 +298,7 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
     let (target, session_id) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this.chat_workspace.read(cx).conversations.conversations()[0]
+            let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
                 .clone();
             let session_id = view.update(cx, |chat, cx| chat.persist_session_for_test(cx));
@@ -382,7 +384,10 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
-                this.chat_workspace.read(cx).runtime_services.scope_count(),
+                this.chat_workspace()
+                    .read(cx)
+                    .runtime_services
+                    .scope_count(),
                 3
             )
         });
@@ -412,7 +417,10 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
-                this.chat_workspace.read(cx).runtime_services.scope_count(),
+                this.chat_workspace()
+                    .read(cx)
+                    .runtime_services
+                    .scope_count(),
                 3
             )
         });
@@ -442,7 +450,10 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
-                this.chat_workspace.read(cx).runtime_services.scope_count(),
+                this.chat_workspace()
+                    .read(cx)
+                    .runtime_services
+                    .scope_count(),
                 3
             )
         });
@@ -459,7 +470,7 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             this.spawn_draft(window, cx);
             let middle = this.chat_workspace_snapshot.conversations()[1].target();
             let next = this.chat_workspace_snapshot.conversations()[2].target();
-            this.chat_workspace
+            this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(middle, cx));
             this.delete_conversation(middle, window, cx);
             assert_eq!(this.chat_workspace_snapshot.active(), Some(next));
@@ -514,7 +525,7 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
     let (target, weak) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this.chat_workspace.read(cx).conversations.conversations()[0]
+            let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
                 .clone();
             view.update(cx, |chat, cx| {
@@ -552,7 +563,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             this.spawn_draft(window, cx);
             let target = this.chat_workspace_snapshot.conversations()[0].target();
             let selected = this.chat_workspace_snapshot.conversations()[2].target();
-            this.chat_workspace.update(cx, |workspace, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(target, cx);
                 workspace.begin_delete_confirmation(SidebarTarget::View(target), window, cx);
             });
@@ -568,7 +579,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
                 .confirming()
                 .cloned()
                 .expect("delete target");
-            this.chat_workspace.update(cx, |workspace, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.confirm_delete_target(target, window, cx)
             });
         });
@@ -597,7 +608,7 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
             this.spawn_draft(window, cx);
             let target = this.chat_workspace_snapshot.conversations()[0].target();
             let selected = this.chat_workspace_snapshot.conversations()[2].target();
-            this.chat_workspace
+            this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(target, cx));
             (target, selected)
         })
@@ -657,10 +668,10 @@ fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx)
             });
-            this.project_workspace
+            this.project_workspace()
                 .read(cx)
                 .snapshot()
                 .active()
@@ -715,13 +726,13 @@ fn deleting_the_active_agent_reveals_its_inline_confirmation_anchor(cx: &mut Tes
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx);
                 workspace.toggle_project(project.project_id.clone(), cx);
             });
             this.collapsed = true;
             this.request_delete_active(window, cx);
-            this.project_workspace
+            this.project_workspace()
                 .read(cx)
                 .snapshot()
                 .active()
@@ -824,6 +835,53 @@ fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+fn workspace_host_registers_and_owns_the_builtin_workspaces(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+
+    app.read_with(cx, |this, cx| {
+        let definitions = this.workspace_host.registry_snapshot().definitions();
+        assert_eq!(definitions.len(), 2);
+        assert_eq!(definitions[0].id(), CHAT_WORKSPACE_ID);
+        assert_eq!(definitions[0].order(), 10);
+        assert_eq!(definitions[1].id(), PROJECT_WORKSPACE_ID);
+        assert_eq!(definitions[1].order(), 20);
+        assert_eq!(
+            this.workspace_host.registry_snapshot().scope(),
+            this.chat_workspace()
+                .read(cx)
+                .runtime_services
+                .window_scope()
+        );
+
+        let chat_workspace = this.chat_workspace();
+        let project_workspace = this.project_workspace();
+        assert_eq!(
+            chat_workspace.entity_id(),
+            this.workspace_host.chat_workspace().entity_id()
+        );
+        assert_eq!(
+            project_workspace.entity_id(),
+            this.workspace_host.project_workspace().entity_id()
+        );
+        assert_ne!(chat_workspace.entity_id(), project_workspace.entity_id());
+        assert!(
+            chat_workspace
+                .read(cx)
+                .snapshot()
+                .conversations()
+                .is_empty()
+        );
+        assert!(
+            project_workspace
+                .read(cx)
+                .snapshot()
+                .conversations()
+                .is_empty()
+        );
+    });
+}
+
+#[gpui::test]
 fn startup_restores_the_last_workspace_when_enabled(cx: &mut TestAppContext) {
     let prefs = Preferences {
         restore_last_workspace_on_start: true,
@@ -895,7 +953,7 @@ fn deleting_an_agent_draft_discards_only_the_unpersisted_view(cx: &mut TestAppCo
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx);
                 let target = workspace.snapshot().active().expect("active Agent draft");
                 workspace.confirm_delete_target(SidebarTarget::AgentView(target), window, cx);
@@ -904,7 +962,7 @@ fn deleting_an_agent_draft_discards_only_the_unpersisted_view(cx: &mut TestAppCo
     });
 
     app.read_with(cx, |this, cx| {
-        let snapshot = this.project_workspace.read(cx).snapshot();
+        let snapshot = this.project_workspace().read(cx).snapshot();
         assert!(snapshot.conversations().is_empty());
         assert!(snapshot.active().is_none());
         assert!(snapshot.catalog().open().is_none());
@@ -954,21 +1012,21 @@ fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_fold
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_session(project.project_id.clone(), session_id.clone(), window, cx);
             });
         });
     });
     cx.run_until_parked();
     app.read_with(cx, |this, cx| {
-        let workspace = this.project_workspace.read(cx);
+        let workspace = this.project_workspace().read(cx);
         assert_eq!(workspace.snapshot().conversations().len(), 1);
         assert_eq!(workspace.runtime_services.scope_count(), 3);
     });
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.confirm_delete_target(
                     SidebarTarget::AgentProject(summary.project_id.clone()),
                     window,
@@ -996,7 +1054,7 @@ fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_fold
                 .project_workspace_snapshot
                 .is_deleting_project(&project.project_id)
         );
-        let workspace = this.project_workspace.read(cx);
+        let workspace = this.project_workspace().read(cx);
         assert!(workspace.snapshot().conversations().is_empty());
         assert_eq!(workspace.runtime_services.scope_count(), 2);
     });
@@ -1102,7 +1160,7 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
             first.update(cx, |chat, cx| {
                 chat.start_pending_reply_for_test(Rc::clone(&dropped), cx)
             });
-            this.chat_workspace.update(cx, |workspace, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(second.entity_id(), cx)
             });
             (first.entity_id(), second.entity_id())
@@ -1235,11 +1293,11 @@ fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestA
     let draft_target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
-            this.project_workspace.update(cx, |workspace, cx| {
+            this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_session(project.project_id.clone(), session_id.clone(), window, cx);
                 workspace.open_draft(project.project_id.clone(), window, cx);
             });
-            this.project_workspace
+            this.project_workspace()
                 .read(cx)
                 .snapshot()
                 .active()
@@ -1249,7 +1307,7 @@ fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestA
     cx.run_until_parked();
 
     app.read_with(cx, |this, cx| {
-        let snapshot = this.project_workspace.read(cx).snapshot();
+        let snapshot = this.project_workspace().read(cx).snapshot();
         assert_eq!(snapshot.active(), Some(draft_target));
         assert_eq!(snapshot.conversations().len(), 1);
         assert!(snapshot.conversations()[0].session_id().is_none());
