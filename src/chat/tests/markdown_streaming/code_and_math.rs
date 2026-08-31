@@ -488,7 +488,7 @@ fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContex
             // enabled while the current generation remains pending.
             this.select_model(next.clone(), cx);
             assert!(
-                this.runtime_snapshot_for_test(cx).is_generating(),
+                this.runtime_snapshot_for_test().is_generating(),
                 "switching models must not alter the active reply"
             );
             assert_eq!(this.selection.as_ref(), Some(&next));

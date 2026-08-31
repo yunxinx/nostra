@@ -9,7 +9,7 @@ use crate::{
         ChatDeleteRequest, ChatEvent, ChatView, Message, Role,
         conversation_runtime::{
             BeginTurnAdmissionError, ConversationRequestGeneration, ConversationRuntime,
-            ConversationRuntimeEvent, ConversationRuntimeFailure, ConversationRuntimeSnapshot,
+            ConversationRuntimeEvent, ConversationRuntimeFailure, ConversationRuntimeUpdate,
             PendingBeginRequest, StartedConversationTurn,
         },
         derive_title, is_replayable,
@@ -528,24 +528,28 @@ impl ConversationRuntime {
 }
 
 impl ChatView {
-    pub(crate) fn close_scope(&self, cx: &mut Context<Self>) {
-        self.runtime
-            .update(cx, |runtime, cx| runtime.close_scope(cx));
+    pub(crate) fn close_scope(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
+            runtime.close_scope(cx);
+            runtime.snapshot()
+        });
+        self.apply_runtime_snapshot(snapshot);
     }
 
-    pub(in crate::chat) fn handle_runtime_event(
+    pub(in crate::chat) fn handle_runtime_update(
         &mut self,
-        runtime_snapshot: ConversationRuntimeSnapshot,
-        event: &ConversationRuntimeEvent,
+        update: &ConversationRuntimeUpdate,
         cx: &mut Context<Self>,
     ) {
-        match event {
-            ConversationRuntimeEvent::StateChanged(snapshot) => {
-                self.runtime_snapshot = snapshot.clone();
+        let runtime_snapshot = update.snapshot().clone();
+        if !self.apply_runtime_snapshot(runtime_snapshot.clone()) {
+            return;
+        }
+        match update.event() {
+            ConversationRuntimeEvent::StateChanged => {
                 cx.notify();
             }
             ConversationRuntimeEvent::TurnStarted(turn) => {
-                self.runtime_snapshot = runtime_snapshot.clone();
                 if turn.request.request_generation != runtime_snapshot.request_generation() {
                     return;
                 }
@@ -686,15 +690,20 @@ impl ChatView {
     }
 
     pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
-        self.runtime
-            .update(cx, |runtime, cx| runtime.prepare_for_shutdown(cx));
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
+            runtime.prepare_for_shutdown(cx);
+            runtime.snapshot()
+        });
+        self.apply_runtime_snapshot(snapshot);
         cx.notify();
     }
 
     pub(crate) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
-        let request = self
-            .runtime
-            .update(cx, |runtime, cx| runtime.request_delete(cx));
+        let (request, snapshot) = self.runtime.update(cx, |runtime, cx| {
+            let request = runtime.request_delete(cx);
+            (request, runtime.snapshot())
+        });
+        self.apply_runtime_snapshot(snapshot);
         cx.notify();
         request
     }
@@ -721,9 +730,11 @@ impl ChatView {
             provider_metadata: ProviderMetadata::default(),
         };
         let composer_revision = self.composer_revision;
-        let result = self.runtime.update(cx, |runtime, cx| {
-            runtime.begin_turn(text, user_message, selection, composer_revision, cx)
+        let (result, snapshot) = self.runtime.update(cx, |runtime, cx| {
+            let result = runtime.begin_turn(text, user_message, selection, composer_revision, cx);
+            (result, runtime.snapshot())
         });
+        self.apply_runtime_snapshot(snapshot);
         match result {
             Ok(_) => true,
             Err(BeginTurnAdmissionError::NotAccepting) => false,
@@ -752,12 +763,14 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.finish_reply_visual(message, error, cx);
-        self.runtime.update(cx, |runtime, cx| {
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
             runtime.generating = false;
             runtime.pending_turn_id = None;
             runtime.terminal_persistence = None;
             runtime.publish_state(cx);
+            runtime.snapshot()
         });
+        self.apply_runtime_snapshot(snapshot);
         cx.notify();
     }
 
@@ -774,9 +787,11 @@ impl ChatView {
             return;
         }
         self.finish_reply_visual(message, error, cx);
-        self.runtime.update(cx, |runtime, cx| {
-            runtime.finish_terminal(generation, terminal, cx)
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
+            runtime.finish_terminal(generation, terminal, cx);
+            runtime.snapshot()
         });
+        self.apply_runtime_snapshot(snapshot);
         cx.notify();
     }
 

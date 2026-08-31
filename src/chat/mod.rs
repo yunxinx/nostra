@@ -302,9 +302,8 @@ impl ChatView {
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
         let runtime_snapshot = runtime.read(cx).snapshot();
-        let runtime_subscription = cx.subscribe(&runtime, |this, runtime, event, cx| {
-            let runtime_snapshot = runtime.read(cx).snapshot();
-            this.handle_runtime_event(runtime_snapshot, event, cx);
+        let runtime_subscription = cx.subscribe(&runtime, |this, _, update, cx| {
+            this.handle_runtime_update(update, cx);
         });
         Self {
             window_handle: window.window_handle(),
@@ -711,6 +710,14 @@ impl ChatView {
         self.runtime.update(cx, |runtime, _| runtime.request_stop());
     }
 
+    fn apply_runtime_snapshot(&mut self, snapshot: ConversationRuntimeSnapshot) -> bool {
+        if snapshot.revision() < self.runtime_snapshot.revision() {
+            return false;
+        }
+        self.runtime_snapshot = snapshot;
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn has_reply_task_for_test(&self, cx: &App) -> bool {
         self.runtime.read(cx).reply_task.is_some()
@@ -755,14 +762,16 @@ impl ChatView {
         dropped: std::rc::Rc<std::cell::Cell<bool>>,
         cx: &mut Context<Self>,
     ) {
-        self.runtime.update(cx, |runtime, cx| {
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
             runtime.request_generation = runtime
                 .current_generation()
                 .next()
                 .expect("test request generation");
             runtime.generating = true;
             runtime.publish_state(cx);
+            runtime.snapshot()
         });
+        self.apply_runtime_snapshot(snapshot);
         self.runtime.update(cx, |runtime, cx| {
             runtime.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
         });
@@ -808,23 +817,25 @@ impl ChatView {
         turn_id: impl Into<String>,
         cx: &mut Context<Self>,
     ) {
-        self.runtime.update(cx, |runtime, cx| {
-            runtime.mark_turn_pending_for_test(session_id, turn_id, cx)
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
+            runtime.mark_turn_pending_for_test(session_id, turn_id, cx);
+            runtime.snapshot()
         });
+        self.apply_runtime_snapshot(snapshot);
     }
 
     #[cfg(test)]
     pub(crate) fn mark_generating_for_test(&mut self, cx: &mut Context<Self>) {
-        self.runtime
-            .update(cx, |runtime, cx| runtime.mark_generating_for_test(cx));
+        let snapshot = self.runtime.update(cx, |runtime, cx| {
+            runtime.mark_generating_for_test(cx);
+            runtime.snapshot()
+        });
+        self.apply_runtime_snapshot(snapshot);
     }
 
     #[cfg(test)]
-    pub(in crate::chat) fn runtime_snapshot_for_test(
-        &self,
-        cx: &App,
-    ) -> ConversationRuntimeSnapshot {
-        self.runtime.read(cx).snapshot()
+    pub(in crate::chat) fn runtime_snapshot_for_test(&self) -> ConversationRuntimeSnapshot {
+        self.runtime_snapshot.clone()
     }
 
     #[cfg(test)]
@@ -896,7 +907,7 @@ impl ChatView {
             profile_id: "fixture-profile".into(),
             model_id: "fixture-model".into(),
         };
-        let start = self.runtime.update(cx, |runtime, cx| {
+        let (start, snapshot) = self.runtime.update(cx, |runtime, cx| {
             let controller = runtime
                 .session_controller
                 .as_ref()
@@ -908,10 +919,12 @@ impl ChatView {
             controller
                 .finish_turn("fixture-turn", &ChatTurnTerminal::cancelled())
                 .expect("persist test terminal");
+            drop(controller);
             runtime.session_id = Some(start.session_id.clone());
             runtime.publish_state(cx);
-            start
+            (start, runtime.snapshot())
         });
+        self.apply_runtime_snapshot(snapshot);
         cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
         start.session_id
     }

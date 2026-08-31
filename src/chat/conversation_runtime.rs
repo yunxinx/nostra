@@ -115,6 +115,7 @@ pub(super) enum BeginTurnAdmissionError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConversationRuntimeSnapshot {
+    revision: u64,
     scope: crate::runtime::ScopeId,
     session_id: Option<SessionId>,
     request_generation: ConversationRequestGeneration,
@@ -128,6 +129,11 @@ pub(super) struct ConversationRuntimeSnapshot {
 }
 
 impl ConversationRuntimeSnapshot {
+    #[must_use]
+    pub(super) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn session_id(&self) -> Option<&SessionId> {
@@ -215,7 +221,7 @@ pub(super) enum ConversationRuntimeFailure {
 
 #[derive(Clone)]
 pub(super) enum ConversationRuntimeEvent {
-    StateChanged(ConversationRuntimeSnapshot),
+    StateChanged,
     TurnStarted(Box<StartedConversationTurn>),
     StreamBatch {
         generation: ConversationRequestGeneration,
@@ -228,6 +234,27 @@ pub(super) enum ConversationRuntimeEvent {
     GenerationFinished(Box<FinishedConversationTurn>),
     Failure(ConversationRuntimeFailure),
     DeleteCompleted,
+}
+
+/// A semantic runtime event paired with the immutable state from the same
+/// publication point. Consumers can project this data into their own state
+/// without reading the runtime entity while it is emitting.
+#[derive(Clone)]
+pub(super) struct ConversationRuntimeUpdate {
+    snapshot: ConversationRuntimeSnapshot,
+    event: ConversationRuntimeEvent,
+}
+
+impl ConversationRuntimeUpdate {
+    #[must_use]
+    pub(super) fn snapshot(&self) -> &ConversationRuntimeSnapshot {
+        &self.snapshot
+    }
+
+    #[must_use]
+    pub(super) fn event(&self) -> &ConversationRuntimeEvent {
+        &self.event
+    }
 }
 
 #[derive(Clone)]
@@ -298,6 +325,7 @@ pub(crate) struct ConversationRuntime {
     pub(super) session_id: Option<SessionId>,
     pub(super) next_turn_id: u64,
     pub(super) request_generation: ConversationRequestGeneration,
+    pub(super) snapshot_revision: u64,
     pub(super) generating: bool,
     pub(super) reply_task: Option<ReplyTask>,
     pub(super) quiescence: ConversationQuiescence,
@@ -340,6 +368,7 @@ impl ConversationRuntime {
             session_id: None,
             next_turn_id: 1,
             request_generation: ConversationRequestGeneration::none(),
+            snapshot_revision: 0,
             generating: false,
             reply_task: None,
             quiescence: ConversationQuiescence::default(),
@@ -349,6 +378,7 @@ impl ConversationRuntime {
     #[must_use]
     pub(super) fn snapshot(&self) -> ConversationRuntimeSnapshot {
         ConversationRuntimeSnapshot {
+            revision: self.snapshot_revision,
             scope: self.scope.scope(),
             session_id: self.session_id.clone(),
             request_generation: self.request_generation,
@@ -412,14 +442,23 @@ impl ConversationRuntime {
         true
     }
 
-    pub(super) fn publish_state(&self, cx: &mut Context<Self>) {
-        self.publish_event(ConversationRuntimeEvent::StateChanged(self.snapshot()), cx);
+    pub(super) fn publish_state(&mut self, cx: &mut Context<Self>) {
+        self.publish_event(ConversationRuntimeEvent::StateChanged, cx);
     }
 
-    pub(super) fn publish_event(&self, event: ConversationRuntimeEvent, cx: &mut Context<Self>) {
+    pub(super) fn publish_event(
+        &mut self,
+        event: ConversationRuntimeEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.snapshot_revision = self.snapshot_revision.saturating_add(1);
         let runtime = cx.weak_entity();
+        let update = ConversationRuntimeUpdate {
+            snapshot: self.snapshot(),
+            event,
+        };
         cx.defer(move |cx| {
-            let _ = runtime.update(cx, |_, cx| cx.emit(event));
+            let _ = runtime.update(cx, |_, cx| cx.emit(update));
         });
     }
 
@@ -576,7 +615,7 @@ fn terminal_failure(
     })
 }
 
-impl EventEmitter<ConversationRuntimeEvent> for ConversationRuntime {}
+impl EventEmitter<ConversationRuntimeUpdate> for ConversationRuntime {}
 
 #[cfg(test)]
 mod tests {

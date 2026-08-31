@@ -179,7 +179,7 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
     assert!(page.sessions.is_empty(), "delete left an orphan session");
     cx.update(|window, cx| {
         chat.read_with(cx, |this, app| {
-            assert!(!this.runtime_snapshot_for_test(app).deletion_pending());
+            assert!(!this.runtime_snapshot_for_test().deletion_pending());
             assert!(!this.runtime_scope_is_open_for_test(app));
         });
         let notifications = gpui_component::Root::read(window, cx)
@@ -229,7 +229,7 @@ fn repeated_delete_requests_share_one_delete_and_scope_close(cx: &mut TestAppCon
     );
     cx.update(|_, cx| {
         chat.read_with(cx, |this, app| {
-            assert!(!this.runtime_snapshot_for_test(app).deletion_pending());
+            assert!(!this.runtime_snapshot_for_test().deletion_pending());
             assert!(!this.runtime_scope_is_open_for_test(app));
         });
     });
@@ -250,8 +250,8 @@ fn closing_a_conversation_scope_waits_for_terminal_persistence(cx: &mut TestAppC
     });
     cx.run_until_parked();
     let session_id = cx.update(|_, cx| {
-        chat.read_with(cx, |this, app| {
-            assert!(this.runtime_snapshot_for_test(app).is_generating());
+        chat.read_with(cx, |this, _app| {
+            assert!(this.runtime_snapshot_for_test().is_generating());
             this.durable_session_id_for_test()
                 .expect("durable Chat session id")
         })
@@ -330,7 +330,7 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
                 None,
                 cx,
             );
-            assert!(this.runtime_snapshot_for_test(cx).persistence_pending());
+            assert!(this.runtime_snapshot_for_test().persistence_pending());
             assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
         });
     });
@@ -542,7 +542,7 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
                 None,
                 cx,
             );
-            let runtime = this.runtime_snapshot_for_test(cx);
+            let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(runtime.persistence_pending());
         });
@@ -552,7 +552,7 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
 
     cx.update(|_, cx| {
         let state = chat.update(cx, |this, cx| {
-            let runtime = this.runtime_snapshot_for_test(cx);
+            let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
             this.session_controller_for_test(cx)
@@ -600,7 +600,7 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
                 None,
                 cx,
             );
-            assert!(this.runtime_snapshot_for_test(cx).persistence_pending());
+            assert!(this.runtime_snapshot_for_test().persistence_pending());
         });
     });
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -645,7 +645,7 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
     let session_id = cx.update(|_, cx| {
         chat.read_with(cx, |this, app| {
             assert!(
-                this.runtime_snapshot_for_test(app).is_generating(),
+                this.runtime_snapshot_for_test().is_generating(),
                 "provider generation should still be active"
             );
             assert!(this.has_reply_task_for_test(app));
@@ -725,7 +725,7 @@ fn failed_delete_reservation_does_not_cancel_active_generation(cx: &mut TestAppC
                 !dropped.get(),
                 "a rejected delete must not cancel generation"
             );
-            assert!(this.runtime_snapshot_for_test(cx).is_generating());
+            assert!(this.runtime_snapshot_for_test().is_generating());
         });
     });
 }
@@ -767,7 +767,7 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
-            let runtime = this.runtime_snapshot_for_test(cx);
+            let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
             assert!(!runtime.has_terminal_retry_pending());
@@ -777,8 +777,8 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
     cx.run_until_parked();
 
     cx.update(|_, cx| {
-        chat.read_with(cx, |this, app| {
-            assert!(this.runtime_snapshot_for_test(app).is_generating());
+        chat.read_with(cx, |this, _app| {
+            assert!(this.runtime_snapshot_for_test().is_generating());
         });
     });
     let first = catalog
@@ -833,7 +833,7 @@ fn failed_delete_preserves_an_uncommitted_cancelled_terminal_for_exact_retry(
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
-            let runtime = this.runtime_snapshot_for_test(cx);
+            let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
             assert!(runtime.has_terminal_retry_pending());
@@ -875,8 +875,8 @@ fn preparing_the_chat_view_for_shutdown_persists_a_cancelled_terminal(cx: &mut T
     });
     cx.run_until_parked();
     let session_id = cx.update(|_, cx| {
-        chat.read_with(cx, |this, app| {
-            assert!(this.runtime_snapshot_for_test(app).is_generating());
+        chat.read_with(cx, |this, _app| {
+            assert!(this.runtime_snapshot_for_test().is_generating());
             this.durable_session_id_for_test()
                 .expect("durable Chat session id")
         })
@@ -1012,7 +1012,7 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
                 None,
                 cx,
             );
-            assert!(this.runtime_snapshot_for_test(cx).persistence_pending());
+            assert!(this.runtime_snapshot_for_test().persistence_pending());
         });
     });
     cx.update(|window, cx| {
@@ -1078,8 +1078,8 @@ fn terminal_persistence_failure_unblocks_chat_and_notifies_the_user(cx: &mut Tes
     cx.run_until_parked();
 
     cx.update(|window, cx| {
-        chat.read_with(cx, |this, app| {
-            let runtime = this.runtime_snapshot_for_test(app);
+        chat.read_with(cx, |this, _app| {
+            let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
             assert!(runtime.has_terminal_retry_pending());
@@ -1115,7 +1115,7 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
                 input.set_value("original draft", window, cx)
             });
             assert!(this.submit("original draft".into(), window, cx));
-            assert!(this.runtime_snapshot_for_test(cx).persistence_pending());
+            assert!(this.runtime_snapshot_for_test().persistence_pending());
             assert!(this.messages.is_empty());
             assert!(!this.has_reply_task_for_test(cx));
             assert_eq!(this.input.read(cx).value(), "original draft");
@@ -1131,8 +1131,8 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
     cx.run_until_parked();
 
     cx.update(|_, cx| {
-        chat.read_with(cx, |this, app| {
-            assert!(!this.runtime_snapshot_for_test(app).persistence_pending());
+        chat.read_with(cx, |this, _app| {
+            assert!(!this.runtime_snapshot_for_test().persistence_pending());
             assert_eq!(this.input.read(cx).value(), "newer draft");
             assert!(!this.messages.is_empty());
         });
@@ -1176,7 +1176,7 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
 
     cx.update(|window, cx| {
         chat.read_with(cx, |this, cx| {
-            assert!(!this.runtime_snapshot_for_test(cx).persistence_pending());
+            assert!(!this.runtime_snapshot_for_test().persistence_pending());
             assert!(this.messages.is_empty());
             assert_eq!(this.input.read(cx).value(), "new draft");
         });

@@ -62,6 +62,53 @@ fn smooth_scroll_state_eases_and_accumulates_wheel_distance() {
     assert_eq!(state.remaining, px(2_400.));
 }
 
+#[gpui::test]
+fn delayed_runtime_snapshots_cannot_revert_the_chat_view_projection(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+
+    let (older, latest) = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let older = this.runtime.update(cx, |runtime, cx| {
+                runtime.generating = true;
+                runtime.publish_state(cx);
+                runtime.snapshot()
+            });
+            let latest = this.runtime.update(cx, |runtime, cx| {
+                runtime.generating = false;
+                runtime.publish_state(cx);
+                runtime.snapshot()
+            });
+
+            assert!(older.revision() < latest.revision());
+            assert!(this.apply_runtime_snapshot(latest.clone()));
+            (older, latest)
+        })
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, _| {
+            assert!(
+                !this.apply_runtime_snapshot(older),
+                "a delayed runtime snapshot must not replace a newer projection"
+            );
+            let current = this.runtime_snapshot_for_test();
+            assert_eq!(current.revision(), latest.revision());
+            assert!(!current.is_generating());
+        });
+    });
+
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        chat.read_with(cx, |this, _| {
+            let current = this.runtime_snapshot_for_test();
+            assert_eq!(current.revision(), latest.revision());
+            assert!(!current.is_generating());
+        });
+    });
+}
+
 /// A completed user turn plus the assistant placeholder a reply streams
 /// into. Pushed directly rather than through `submit`, which is gated on a
 /// configured provider that a unit test has no reason to stand up.

@@ -77,9 +77,12 @@ impl ChatView {
         state: &ResolvedSessionState,
         cx: &mut Context<Self>,
     ) -> Result<(), ChatRestoreError> {
-        let restored_model = self.runtime.update(cx, |runtime, cx| {
-            runtime.restore_session(session_id, state, cx)
-        })?;
+        let (restored_model, snapshot) = self.runtime.update(cx, |runtime, cx| {
+            let restored_model = runtime.restore_session(session_id, state, cx);
+            (restored_model, runtime.snapshot())
+        });
+        let restored_model = restored_model?;
+        self.apply_runtime_snapshot(snapshot);
 
         let messages = state
             .messages
