@@ -264,7 +264,7 @@ impl ChatApp {
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
         let workspace_mode = if prefs.restore_last_workspace_on_start {
-            prefs.last_workspace_mode
+            WorkspaceMode::from_workspace_id(prefs.last_workspace_id)
         } else {
             WorkspaceMode::Chat
         };

@@ -14,10 +14,11 @@ use std::{
 };
 
 use gpui::{App, Global, Window};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     llm::{ModelSelection, ProviderProfile},
+    runtime::{CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, WorkspaceId},
     session::SessionId,
 };
 
@@ -46,16 +47,22 @@ pub struct Preferences {
     /// Most recent explicitly active Chat session, retained even while
     /// automatic restoration is disabled.
     pub last_active_chat_session: Option<SessionId>,
-    /// Whether startup restores [`last_workspace_mode`](Self::last_workspace_mode).
+    /// Whether startup restores [`last_workspace_id`](Self::last_workspace_id).
     /// Missing values from preferences written before workspace modes existed
     /// migrate to the enabled default instead of invalidating the whole file.
     #[serde(default = "default_restore_last_workspace_on_start")]
     pub restore_last_workspace_on_start: bool,
-    /// Most recently selected top-level workspace. This is retained even while
-    /// automatic restoration is disabled so re-enabling the preference resumes
-    /// the user's last explicit choice.
-    #[serde(default)]
-    pub last_workspace_mode: WorkspaceMode,
+    /// Most recently selected top-level workspace identity. The persisted
+    /// field remains `last_workspace_mode` for the current preferences schema.
+    /// This is retained even while automatic restoration is disabled so
+    /// re-enabling the preference resumes the user's last explicit choice.
+    #[serde(
+        rename = "last_workspace_mode",
+        default = "default_last_workspace_id",
+        serialize_with = "serialize_workspace_id",
+        deserialize_with = "deserialize_workspace_id"
+    )]
+    pub last_workspace_id: WorkspaceId,
     /// Explicit theme mode override.  `None` means "follow system".
     pub theme_mode: Option<ThemeMode>,
     /// Which bundled font the composer input uses.
@@ -133,7 +140,7 @@ impl Default for Preferences {
             restore_last_chat_on_start: false,
             last_active_chat_session: None,
             restore_last_workspace_on_start: default_restore_last_workspace_on_start(),
-            last_workspace_mode: WorkspaceMode::default(),
+            last_workspace_id: default_last_workspace_id(),
             theme_mode: None,
             composer_font: ComposerFont::default(),
             user_message_markdown: false,
@@ -161,13 +168,64 @@ fn default_restore_last_workspace_on_start() -> bool {
     true
 }
 
-/// Top-level workspace selected in the main window.
+fn default_last_workspace_id() -> WorkspaceId {
+    CHAT_WORKSPACE_ID
+}
+
+fn serialize_workspace_id<S>(id: &WorkspaceId, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let persisted = if *id == CHAT_WORKSPACE_ID {
+        "chat"
+    } else if *id == PROJECT_WORKSPACE_ID {
+        "project"
+    } else {
+        id.as_str()
+    };
+    serializer.serialize_str(persisted)
+}
+
+fn deserialize_workspace_id<'de, D>(deserializer: D) -> Result<WorkspaceId, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let persisted = String::deserialize(deserializer)?;
+    // A newer build may persist a workspace this build does not provide yet;
+    // keep the rest of the preference document usable and select Chat safely.
+    Ok(match persisted.as_str() {
+        "project" => PROJECT_WORKSPACE_ID,
+        "chat" => CHAT_WORKSPACE_ID,
+        _ => CHAT_WORKSPACE_ID,
+    })
+}
+
+/// Current built-in workspace presentation modes.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceMode {
     #[default]
     Chat,
     Project,
+}
+
+impl WorkspaceMode {
+    #[must_use]
+    pub const fn workspace_id(self) -> WorkspaceId {
+        match self {
+            Self::Chat => CHAT_WORKSPACE_ID,
+            Self::Project => PROJECT_WORKSPACE_ID,
+        }
+    }
+
+    #[must_use]
+    pub fn from_workspace_id(id: WorkspaceId) -> Self {
+        if id == PROJECT_WORKSPACE_ID {
+            Self::Project
+        } else {
+            Self::Chat
+        }
+    }
 }
 
 /// UI languages the app can render in.  The serialized form doubles as the
@@ -484,11 +542,11 @@ pub fn update_with(cx: &mut App, handle: &PreferenceHandle, f: impl FnOnce(&mut 
 /// Record the user's explicit workspace selection. Entity tests keep this
 /// mutation in memory so exercising the account menu never writes to the real
 /// user configuration directory.
-pub fn set_last_workspace_mode(mode: WorkspaceMode, cx: &mut App) {
+pub fn set_last_workspace_id(id: WorkspaceId, cx: &mut App) {
     #[cfg(not(test))]
-    update(cx, |prefs| prefs.last_workspace_mode = mode);
+    update(cx, |prefs| prefs.last_workspace_id = id);
     #[cfg(test)]
-    update_in_memory(cx, |prefs| prefs.last_workspace_mode = mode);
+    update_in_memory(cx, |prefs| prefs.last_workspace_id = id);
 }
 
 pub fn remove_agent_project(project_id: &str, cx: &mut App) {
@@ -738,7 +796,7 @@ mod tests {
         assert!(!prefs.restore_last_chat_on_start);
         assert!(prefs.last_active_chat_session.is_none());
         assert!(prefs.restore_last_workspace_on_start);
-        assert_eq!(prefs.last_workspace_mode, WorkspaceMode::Chat);
+        assert_eq!(prefs.last_workspace_id, CHAT_WORKSPACE_ID);
     }
 
     #[test]
@@ -752,18 +810,71 @@ mod tests {
         let migrated: Preferences =
             serde_json::from_value(old_document).expect("migrate workspace preferences");
         assert!(migrated.restore_last_workspace_on_start);
-        assert_eq!(migrated.last_workspace_mode, WorkspaceMode::Chat);
+        assert_eq!(migrated.last_workspace_id, CHAT_WORKSPACE_ID);
 
         let prefs = Preferences {
             restore_last_workspace_on_start: false,
-            last_workspace_mode: WorkspaceMode::Project,
+            last_workspace_id: PROJECT_WORKSPACE_ID,
             ..Preferences::default()
         };
         let json = serde_json::to_string(&prefs).expect("serialize workspace preferences");
         let restored: Preferences =
             serde_json::from_str(&json).expect("deserialize workspace preferences");
         assert!(!restored.restore_last_workspace_on_start);
-        assert_eq!(restored.last_workspace_mode, WorkspaceMode::Project);
+        assert_eq!(restored.last_workspace_id, PROJECT_WORKSPACE_ID);
+    }
+
+    #[test]
+    fn workspace_identity_keeps_persisted_aliases_and_falls_back_safely() {
+        let prefs = Preferences {
+            sidebar_collapsed: true,
+            last_workspace_id: PROJECT_WORKSPACE_ID,
+            ..Preferences::default()
+        };
+        let mut value = serde_json::to_value(&prefs).expect("serialize workspace identity");
+        assert_eq!(value["last_workspace_mode"], "project");
+        let default_value = serde_json::to_value(Preferences::default())
+            .expect("serialize default workspace identity");
+        assert_eq!(default_value["last_workspace_mode"], "chat");
+
+        let restored: Preferences =
+            serde_json::from_value(value.clone()).expect("deserialize workspace identity");
+        assert_eq!(restored.last_workspace_id, PROJECT_WORKSPACE_ID);
+        assert!(restored.sidebar_collapsed);
+
+        value["last_workspace_mode"] = serde_json::Value::String("nostra.workspace.future".into());
+        let unknown: Preferences =
+            serde_json::from_value(value).expect("unknown workspace should fall back");
+        assert_eq!(unknown.last_workspace_id, CHAT_WORKSPACE_ID);
+        assert!(unknown.sidebar_collapsed);
+
+        let mut missing = serde_json::to_value(&prefs).expect("serialize workspace identity");
+        missing
+            .as_object_mut()
+            .expect("preferences object")
+            .remove("last_workspace_mode");
+        let missing: Preferences =
+            serde_json::from_value(missing).expect("missing workspace should use default");
+        assert_eq!(missing.last_workspace_id, CHAT_WORKSPACE_ID);
+        assert!(missing.sidebar_collapsed);
+
+        let mut invalid = serde_json::to_value(&prefs).expect("serialize workspace identity");
+        invalid["last_workspace_mode"] = serde_json::Value::Bool(true);
+        assert!(serde_json::from_value::<Preferences>(invalid).is_err());
+    }
+
+    #[test]
+    fn workspace_mode_adapter_uses_typed_ids_and_defaults_unknown_ids_to_chat() {
+        assert_eq!(WorkspaceMode::Chat.workspace_id(), CHAT_WORKSPACE_ID);
+        assert_eq!(WorkspaceMode::Project.workspace_id(), PROJECT_WORKSPACE_ID);
+        assert_eq!(
+            WorkspaceMode::from_workspace_id(PROJECT_WORKSPACE_ID),
+            WorkspaceMode::Project
+        );
+        assert_eq!(
+            WorkspaceMode::from_workspace_id(WorkspaceId::new("nostra.workspace.future")),
+            WorkspaceMode::Chat
+        );
     }
 
     #[test]

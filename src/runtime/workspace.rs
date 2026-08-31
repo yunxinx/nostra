@@ -8,6 +8,12 @@ use super::{ScopeId, component::has_supported_name_characters};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkspaceId(&'static str);
 
+/// Stable identity of the built-in Chat workspace.
+pub const CHAT_WORKSPACE_ID: WorkspaceId = WorkspaceId::new("nostra.workspace.chat");
+
+/// Stable identity of the built-in Project workspace.
+pub const PROJECT_WORKSPACE_ID: WorkspaceId = WorkspaceId::new("nostra.workspace.project");
+
 impl WorkspaceId {
     #[must_use]
     pub const fn new(value: &'static str) -> Self {

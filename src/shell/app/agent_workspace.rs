@@ -1659,7 +1659,7 @@ impl ChatApp {
             view.update(cx, |view, cx| view.dismiss_composer_completion(cx));
         }
         self.workspace_mode = mode;
-        crate::preferences::set_last_workspace_mode(mode, cx);
+        crate::preferences::set_last_workspace_id(mode.workspace_id(), cx);
         if matches!(mode, super::WorkspaceMode::Project)
             && matches!(
                 self.agent.projects_load_state,

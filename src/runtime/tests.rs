@@ -27,17 +27,17 @@ use crate::preferences::{PreferenceHandle, Preferences};
 use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, SessionStoresError};
 
 use super::{
-    ActivationFingerprint, AsyncStop, CapabilityId, CapabilityKey, ComponentGeneration,
-    ComponentId, ComponentLifecycle, ComponentSnapshot, ComponentSnapshotDetails,
-    ComponentSnapshotViolation, CompositionRoot, ContributionRevision, DependencyDeclaration,
-    DependencyResolution, DependencyResolver, DependencyResolverError, DependencySnapshot,
-    DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError,
-    GenerationCapability, MissingDependencySnapshot, PreparedCapability, ReconcileFailureKind,
-    ReconcileObserver, ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState,
-    RuntimeDiagnostic, RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId,
-    ScopeKind, ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId,
-    SessionServicesCapability, StartupPolicy, WorkspaceDefinition, WorkspaceId, WorkspaceRegistry,
-    WorkspaceRegistryError,
+    ActivationFingerprint, AsyncStop, CHAT_WORKSPACE_ID, CapabilityId, CapabilityKey,
+    ComponentGeneration, ComponentId, ComponentLifecycle, ComponentSnapshot,
+    ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionRoot, ContributionRevision,
+    DependencyDeclaration, DependencyResolution, DependencyResolver, DependencyResolverError,
+    DependencySnapshot, DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot,
+    ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot, PROJECT_WORKSPACE_ID,
+    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
+    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
+    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
+    ScopeTree, ScopedComponentId, SessionServicesCapability, StartupPolicy, WorkspaceDefinition,
+    WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
 };
 
 const WORKSPACE_ROOT: ScopeId = ScopeId::new(100);
@@ -45,8 +45,8 @@ const WORKSPACE_CHILD: ScopeId = ScopeId::new(101);
 const WORKSPACE_OTHER_CHILD: ScopeId = ScopeId::new(102);
 const WORKSPACE_MISSING_PARENT: ScopeId = ScopeId::new(999);
 
-const CHAT_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.chat");
-const PROJECT_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.project");
+const CHAT_WORKSPACE: WorkspaceId = CHAT_WORKSPACE_ID;
+const PROJECT_WORKSPACE: WorkspaceId = PROJECT_WORKSPACE_ID;
 const NOTES_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.notes");
 
 #[test]

@@ -16,7 +16,7 @@ use reqwest_client::ReqwestClient;
 use crate::llm::{
     GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
 };
-use crate::runtime::{ComponentId, CompositionRoot, RuntimeServices};
+use crate::runtime::{ComponentId, CompositionRoot, PROJECT_WORKSPACE_ID, RuntimeServices};
 use crate::session::{
     ChatSessionController, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore,
     LocalStoreConfig, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
@@ -739,7 +739,7 @@ fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContex
 fn startup_restores_the_last_workspace_when_enabled(cx: &mut TestAppContext) {
     let prefs = Preferences {
         restore_last_workspace_on_start: true,
-        last_workspace_mode: WorkspaceMode::Project,
+        last_workspace_id: PROJECT_WORKSPACE_ID,
         ..Preferences::default()
     };
     let (app, _) = add_app_window_with_preferences(cx, prefs);
@@ -753,7 +753,7 @@ fn startup_restores_the_last_workspace_when_enabled(cx: &mut TestAppContext) {
 fn startup_uses_chat_when_workspace_restore_is_disabled(cx: &mut TestAppContext) {
     let prefs = Preferences {
         restore_last_workspace_on_start: false,
-        last_workspace_mode: WorkspaceMode::Project,
+        last_workspace_id: PROJECT_WORKSPACE_ID,
         ..Preferences::default()
     };
     let (app, _) = add_app_window_with_preferences(cx, prefs);
@@ -783,7 +783,7 @@ fn disabled_workspace_restore_still_records_an_explicit_mode(cx: &mut TestAppCon
     cx.update(|_, cx| {
         let prefs = crate::preferences::get(cx);
         assert!(!prefs.restore_last_workspace_on_start);
-        assert_eq!(prefs.last_workspace_mode, WorkspaceMode::Project);
+        assert_eq!(prefs.last_workspace_id, PROJECT_WORKSPACE_ID);
     });
 }
 
@@ -913,7 +913,7 @@ fn chat_sidebar_uses_the_shared_content_inset(cx: &mut TestAppContext) {
 #[gpui::test]
 fn project_sidebar_uses_the_shared_content_inset(cx: &mut TestAppContext) {
     let prefs = Preferences {
-        last_workspace_mode: WorkspaceMode::Project,
+        last_workspace_id: PROJECT_WORKSPACE_ID,
         ..Preferences::default()
     };
     let (_, cx) = add_app_window_with_preferences(cx, prefs);
@@ -940,8 +940,8 @@ fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mu
     });
     cx.update(|_, cx| {
         assert_eq!(
-            crate::preferences::get(cx).last_workspace_mode,
-            WorkspaceMode::Project
+            crate::preferences::get(cx).last_workspace_id,
+            PROJECT_WORKSPACE_ID
         );
     });
 }

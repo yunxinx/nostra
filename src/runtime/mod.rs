@@ -40,8 +40,8 @@ pub use reconcile::{
 };
 pub use scope::{ScopeError, ScopeKind, ScopeState, ScopeTree};
 pub use workspace::{
-    WorkspaceDefinition, WorkspaceId, WorkspaceRegistration, WorkspaceRegistry,
-    WorkspaceRegistryError, WorkspaceRegistrySnapshot,
+    CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, WorkspaceDefinition, WorkspaceId,
+    WorkspaceRegistration, WorkspaceRegistry, WorkspaceRegistryError, WorkspaceRegistrySnapshot,
 };
 
 #[cfg(test)]
