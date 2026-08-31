@@ -1,6 +1,7 @@
 //! Markdown fenced-code rendering and its application-wide display preferences.
 
 mod code_block;
+mod extension_registry;
 
 use std::{
     ops::Range,
@@ -32,9 +33,12 @@ use crate::preferences;
 
 pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
 
-use self::code_block::extensions;
 #[cfg(test)]
 use self::code_block::*;
+use self::extension_registry::default_extensions;
+pub(crate) use self::extension_registry::{
+    MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
+};
 
 const NODE_NAME: &str = "nostra-fenced-code";
 const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
@@ -134,7 +138,7 @@ impl MarkdownBody {
     ) -> Self {
         Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
-            extensions: extensions(owner_id, 0, preference_state),
+            extensions: default_extensions(owner_id, 0, preference_state),
         }
     }
 

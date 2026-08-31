@@ -1,5 +1,7 @@
 //! Fenced-code extension, retained highlight cache, and code-block layout.
 
+use crate::runtime::ContributionId;
+
 use super::*;
 
 pub(super) fn is_fenced_code_source(source: &str) -> bool {
@@ -35,13 +37,25 @@ pub(super) struct FencedCode {
     pub(super) start: usize,
 }
 
-pub(crate) fn extensions(
-    owner_id: u64,
-    source_offset: usize,
-    preference_state: PreferenceState,
+const FENCED_CODE_EXTENSION_ID: ContributionId = ContributionId::new("nostra.markdown.fenced-code");
+const FENCED_CODE_EXTENSION_ORDER: u32 = 30;
+
+pub(crate) fn fenced_code_contribution() -> MarkdownExtensionDefinition {
+    MarkdownExtensionDefinition::new(
+        FENCED_CODE_EXTENSION_ID,
+        FENCED_CODE_EXTENSION_ORDER,
+        MarkdownExtensionInstaller::new(install_fenced_code),
+    )
+}
+
+fn install_fenced_code(
+    extensions: MarkdownExtensions,
+    context: &MarkdownExtensionContext,
 ) -> MarkdownExtensions {
-    let extensions = MarkdownExtensions::default().cjk_emphasis_compatibility();
-    crate::ui::math::extend(extensions, owner_id, source_offset)
+    let owner_id = context.owner_id();
+    let source_offset = context.source_offset();
+    let preference_state = context.preference_state().clone();
+    extensions
         .block_parser(move |node, cx| {
             let markdown_ast::Node::Code(code) = node else {
                 return None;

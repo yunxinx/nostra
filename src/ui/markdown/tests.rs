@@ -1,8 +1,12 @@
+use std::{cell::RefCell, rc::Rc};
+
 use gpui::{
     Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, point,
 };
 use gpui_base::TextSelection;
 use gpui_component::{ActiveTheme as _, Root};
+
+use crate::runtime::{ContributionDefinition, ContributionId, ContributionRegistry, ScopeId};
 
 use super::*;
 
@@ -25,6 +29,86 @@ fn init_markdown_test(cx: &mut TestAppContext) {
         preferences::init_global(prefs.clone(), cx);
         crate::appearance::theme::init(&prefs, cx);
     });
+}
+
+#[test]
+fn markdown_contribution_snapshot_preserves_stable_builtin_order() {
+    const SCOPE: ScopeId = ScopeId::new(800);
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    registry
+        .register_batch(
+            SCOPE,
+            [
+                code_block::fenced_code_contribution(),
+                crate::ui::math::markdown_contribution(),
+                extension_registry::cjk_emphasis_contribution(),
+            ],
+        )
+        .expect("register built-in Markdown contributions");
+
+    let snapshot = registry.snapshot(SCOPE).expect("Markdown snapshot");
+    assert_eq!(
+        snapshot
+            .contributions()
+            .iter()
+            .map(|entry| (entry.id().as_str(), entry.order()))
+            .collect::<Vec<_>>(),
+        [
+            ("nostra.markdown.cjk", 10),
+            ("nostra.markdown.math", 20),
+            ("nostra.markdown.fenced-code", 30),
+        ]
+    );
+}
+
+#[test]
+fn markdown_contribution_installation_uses_snapshot_order_and_body_context() {
+    const SCOPE: ScopeId = ScopeId::new(801);
+    const EARLY: ContributionId = ContributionId::new("nostra.markdown.test-early");
+    const LATE: ContributionId = ContributionId::new("nostra.markdown.test-late");
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let contribution = |id, order, label| {
+        let calls = Rc::clone(&calls);
+        ContributionDefinition::new(
+            id,
+            order,
+            MarkdownExtensionInstaller::new(move |extensions, context| {
+                calls
+                    .borrow_mut()
+                    .push((label, context.owner_id(), context.source_offset()));
+                extensions
+            }),
+        )
+    };
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    registry
+        .register_batch(
+            SCOPE,
+            [
+                contribution(LATE, 20, "late"),
+                contribution(EARLY, 10, "early"),
+            ],
+        )
+        .expect("register test Markdown contributions");
+    let snapshot = registry.snapshot(SCOPE).expect("Markdown snapshot");
+    let context = MarkdownExtensionContext::new(
+        42,
+        17,
+        Arc::new(Mutex::new(preferences::Preferences::default())),
+    );
+
+    let _ = extension_registry::install_extensions(
+        snapshot
+            .contributions()
+            .iter()
+            .map(|contribution| contribution.value()),
+        &context,
+    );
+
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [("early", 42, 17), ("late", 42, 17)]
+    );
 }
 
 fn assert_fenced_code_drag_copy(cx: &mut TestAppContext, wrap: bool) {

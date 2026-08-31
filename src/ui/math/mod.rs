@@ -23,6 +23,13 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
+use crate::{
+    runtime::ContributionId,
+    ui::markdown::{
+        MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
+    },
+};
+
 use self::{
     parse::RecognizedFormula,
     render::{FormulaRequest, FormulaStyle, RenderedFormula, cached_formula},
@@ -33,6 +40,8 @@ pub(crate) use self::render::{formula_cache_snapshot, formula_cache_snapshots};
 
 const NODE_NAME: &str = "nostra-math";
 const LITERAL_NODE_NAME: &str = "nostra-math-literal";
+const MATH_EXTENSION_ID: ContributionId = ContributionId::new("nostra.markdown.math");
+const MATH_EXTENSION_ORDER: u32 = 20;
 const DISPLAY_FALLBACK_LINE_HEIGHT: f32 = 1.2;
 const DISPLAY_FALLBACK_SCALE: f32 = 1.18;
 const MIN_DISPLAY_FALLBACK_SIZE: f32 = 12.0;
@@ -58,6 +67,16 @@ impl MathFormula {
             display: formula.display,
         }
     }
+}
+
+pub(crate) fn markdown_contribution() -> MarkdownExtensionDefinition {
+    MarkdownExtensionDefinition::new(
+        MATH_EXTENSION_ID,
+        MATH_EXTENSION_ORDER,
+        MarkdownExtensionInstaller::new(|extensions, context: &MarkdownExtensionContext| {
+            extend(extensions, context.owner_id(), context.source_offset())
+        }),
+    )
 }
 
 pub(super) fn extend(
