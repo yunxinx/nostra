@@ -7,11 +7,10 @@ impl Render for ChatView {
         self.sync_selection_availability();
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
-        let placeholder: SharedString = match &self.scope {
-            crate::session::ConversationScope::Chat => t!("chat.placeholder").to_string(),
-            crate::session::ConversationScope::Project(_) => {
-                t!("reference_picker.composer_placeholder").to_string()
-            }
+        let placeholder: SharedString = if self.conversation.descriptor().supports_references() {
+            t!("reference_picker.composer_placeholder").to_string()
+        } else {
+            t!("chat.placeholder").to_string()
         }
         .into();
         if self.placeholder != placeholder {

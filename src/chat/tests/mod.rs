@@ -22,9 +22,9 @@ use crate::llm::{
 };
 use crate::preferences;
 use crate::session::{
-    CatalogQuery, ChatTurnTerminal, ConversationSessionServices, InMemorySessionStore,
-    LocalSessionStore, LocalStoreConfig, ProjectIdentity, ResolvedSessionState,
-    SessionCatalogStore, SessionDomain, SessionId, SessionReadStore, SessionStores, TurnStatus,
+    CatalogQuery, ChatTurnTerminal, ConversationContext, InMemorySessionStore, LocalSessionStore,
+    LocalStoreConfig, ProjectIdentity, ResolvedSessionState, SessionCatalogStore, SessionDomain,
+    SessionId, SessionReadStore, SessionStores, TurnStatus,
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
@@ -145,10 +145,10 @@ fn add_chat_window_with_stores(
 
 fn add_chat_window_with_session_services(
     cx: &mut TestAppContext,
-    session_services: ConversationSessionServices,
+    conversation: ConversationContext,
 ) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
     let (root, cx) = cx.add_window_view(|window, cx| {
-        let chat = ChatView::view_with_session_services(session_services, window, cx);
+        let chat = ChatView::view_with_session_services(conversation, window, cx);
         gpui_component::Root::new(chat, window, cx)
     });
     // Test windows start inactive even though a real main window is activated
@@ -171,11 +171,11 @@ fn add_chat_window_with_generation_service(
     stores: SessionStores,
     generation_service: Arc<dyn GenerationService>,
 ) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
-    let session_services = stores.chat_conversation();
+    let conversation = stores.chat_conversation();
     let preference_handle = cx.update(|cx| preferences::handle(cx));
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let chat = ChatView::view_with_generation_service_and_preferences(
-            session_services,
+            conversation,
             generation_service,
             preference_handle,
             window,
@@ -319,17 +319,13 @@ fn chat_and_project_modes_share_the_composer_entity_with_project_references_enab
     init_app(cx);
     let stores =
         SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
-    let chat_services = stores.chat_conversation();
-    let project_services = stores.project_conversation();
     let project = ProjectIdentity::new("/tmp/nostra-shared-composer", "Shared composer");
+    let chat_conversation = stores.chat_conversation();
+    let project_conversation = stores.project_conversation(project.clone());
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let chat = ChatView::view_with_session_services(chat_services, window, cx);
-        let project = ChatView::project_view_with_session_services(
-            project.clone(),
-            project_services,
-            window,
-            cx,
-        );
+        let chat = ChatView::view_with_session_services(chat_conversation, window, cx);
+        let project =
+            ChatView::project_view_with_session_services(project_conversation, window, cx);
         let pair = cx.new(|_| ComposerPair { chat, project });
         gpui_component::Root::new(pair, window, cx)
     });

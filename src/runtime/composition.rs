@@ -11,7 +11,7 @@ use crate::{
         ProviderCatalogSnapshot,
     },
     preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
-    session::{ConversationSessionServices, SessionStores},
+    session::{ConversationContext, ProjectIdentity, SessionStores},
 };
 
 use super::{
@@ -111,13 +111,13 @@ impl RuntimeServices {
     }
 
     #[must_use]
-    pub fn chat_conversation(&self) -> ConversationSessionServices {
+    pub fn chat_conversation(&self) -> ConversationContext {
         self.session_services.chat_conversation()
     }
 
     #[must_use]
-    pub fn project_conversation(&self) -> ConversationSessionServices {
-        self.session_services.project_conversation()
+    pub fn project_conversation(&self, project: ProjectIdentity) -> ConversationContext {
+        self.session_services.project_conversation(project)
     }
 
     #[must_use]

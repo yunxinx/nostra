@@ -5,12 +5,12 @@ use std::{
 };
 
 use super::super::{
-    ChatMessageReferenceStore, LocalSessionStore, ProjectSessionStore, SessionCatalogStore,
-    SessionDomain, SessionStore,
+    ChatMessageReferenceStore, ConversationDescriptor, LocalSessionStore, ProjectIdentity,
+    ProjectSessionStore, SessionCatalogStore, SessionDomain, SessionStore,
 };
 use super::capabilities::{
-    ConversationSessionServices, SharedAgentProjectStore, SharedChatReferenceStore,
-    SharedSessionCatalog, SharedSessionStore,
+    ConversationContext, ConversationSessionServices, SharedAgentProjectStore,
+    SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
 };
 use super::core::{
     SESSION_MAINTENANCE_TIMEOUT, SESSION_OPEN_TIMEOUT, SESSION_SHUTDOWN_TIMEOUT, SharedStoreCore,
@@ -150,8 +150,8 @@ impl SessionStores {
     }
 
     /// Project the Chat-domain capabilities consumed by a Chat conversation.
-    pub fn chat_conversation(&self) -> ConversationSessionServices {
-        ConversationSessionServices::new(self.chat(), None)
+    pub fn chat_conversation(&self) -> ConversationContext {
+        self.conversation(ConversationDescriptor::chat())
     }
 
     pub fn agent(&self) -> Result<SharedSessionStore, SessionStoresError> {
@@ -176,8 +176,26 @@ impl SessionStores {
 
     /// Project the Agent lifecycle capability and Chat reference reader used
     /// by a project conversation.
-    pub fn project_conversation(&self) -> ConversationSessionServices {
-        ConversationSessionServices::new(self.agent(), self.chat_references().ok())
+    pub fn project_conversation(&self, project: ProjectIdentity) -> ConversationContext {
+        self.conversation(ConversationDescriptor::for_project(project))
+    }
+
+    /// Project the capabilities selected by a durable conversation target.
+    /// Domain routing stays at the session boundary so UI consumers do not
+    /// need a closed Chat/Project variant to construct their dependencies.
+    pub fn conversation(&self, descriptor: ConversationDescriptor) -> ConversationContext {
+        let lifecycle = match descriptor.domain() {
+            SessionDomain::Chat => self.chat(),
+            SessionDomain::Agent => self.agent(),
+        };
+        let references = descriptor
+            .supports_references()
+            .then(|| self.chat_references().ok())
+            .flatten();
+        ConversationContext::new(
+            descriptor,
+            ConversationSessionServices::new(lifecycle, references),
+        )
     }
 
     pub fn flush(&self) -> Result<(), SessionStoresError> {

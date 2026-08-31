@@ -50,8 +50,7 @@ use crate::providers;
 use crate::session::SessionStores;
 use crate::session::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
-    ConversationScope, ConversationSessionServices, ProjectIdentity, SessionId,
-    SessionOperationGuard, SharedSessionStore,
+    ConversationContext, SessionId, SessionOperationGuard, SharedSessionStore,
 };
 use crate::ui::{
     markdown::{MarkdownBody, PreferenceState},
@@ -128,7 +127,7 @@ pub struct ChatView {
     input: Entity<TextareaState>,
     composer: Entity<ChatReferenceComposer>,
     composer_status: Rc<Cell<ComposerStatus>>,
-    scope: ConversationScope,
+    conversation: ConversationContext,
     /// Placeholder text currently installed in the input state.  Compared
     /// against the live translation each frame so a language switch updates
     /// the composer without rebuilding it (and without notify loops).
@@ -207,13 +206,13 @@ impl ChatView {
 
     #[cfg(test)]
     pub(crate) fn view_with_session_services(
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let preference_handle = crate::preferences::handle(cx);
         Self::view_with_session_services_and_preferences(
-            session_services,
+            conversation,
             preference_handle,
             window,
             cx,
@@ -222,15 +221,14 @@ impl ChatView {
 
     #[cfg(test)]
     pub(crate) fn view_with_session_services_and_preferences(
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
-                ConversationScope::Chat,
-                session_services,
+                conversation,
                 Arc::new(UnavailableGenerationService),
                 preference_handle,
                 window,
@@ -240,7 +238,7 @@ impl ChatView {
     }
 
     pub(crate) fn view_with_generation_service_and_preferences(
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         generation_service: Arc<dyn GenerationService>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
@@ -248,8 +246,7 @@ impl ChatView {
     ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
-                ConversationScope::Chat,
-                session_services,
+                conversation,
                 generation_service,
                 preference_handle,
                 window,
@@ -260,15 +257,13 @@ impl ChatView {
 
     #[cfg(test)]
     pub(crate) fn project_view_with_session_services(
-        project: ProjectIdentity,
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let preference_handle = crate::preferences::handle(cx);
         Self::project_view_with_session_services_and_preferences(
-            project,
-            session_services,
+            conversation,
             preference_handle,
             window,
             cx,
@@ -277,16 +272,14 @@ impl ChatView {
 
     #[cfg(test)]
     pub(crate) fn project_view_with_session_services_and_preferences(
-        project: ProjectIdentity,
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
-                ConversationScope::Project(project),
-                session_services,
+                conversation,
                 Arc::new(UnavailableGenerationService),
                 preference_handle,
                 window,
@@ -296,8 +289,7 @@ impl ChatView {
     }
 
     pub(crate) fn project_view_with_generation_service_and_preferences(
-        project: ProjectIdentity,
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         generation_service: Arc<dyn GenerationService>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
@@ -305,8 +297,7 @@ impl ChatView {
     ) -> Entity<Self> {
         cx.new(|cx| {
             Self::new(
-                ConversationScope::Project(project),
-                session_services,
+                conversation,
                 generation_service,
                 preference_handle,
                 window,
@@ -316,8 +307,7 @@ impl ChatView {
     }
 
     fn new(
-        scope: ConversationScope,
-        session_services: ConversationSessionServices,
+        conversation: ConversationContext,
         generation_service: Arc<dyn GenerationService>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
@@ -326,27 +316,30 @@ impl ChatView {
         let preference_snapshot = preference_handle.snapshot();
         let preference_state = preference_handle.shared_preferences();
         let preferences_for_observer = preference_handle.clone();
-        let placeholder: SharedString = match &scope {
-            ConversationScope::Chat => t!("chat.placeholder").to_string(),
-            ConversationScope::Project(_) => {
-                t!("reference_picker.composer_placeholder").to_string()
-            }
+        let references_enabled = conversation.descriptor().supports_references();
+        let placeholder: SharedString = if references_enabled {
+            t!("reference_picker.composer_placeholder").to_string()
+        } else {
+            t!("chat.placeholder").to_string()
         }
         .into();
         let composer_status = Rc::new(Cell::new(ComposerStatus::default()));
-        let composer = cx.new(|cx| match &scope {
-            ConversationScope::Chat => ChatReferenceComposer::chat(
-                composer_status.clone(),
-                session_services.references(),
-                window,
-                cx,
-            ),
-            ConversationScope::Project(_) => ChatReferenceComposer::with_references(
-                composer_status.clone(),
-                session_services.references(),
-                window,
-                cx,
-            ),
+        let composer = cx.new(|cx| {
+            if references_enabled {
+                ChatReferenceComposer::with_references(
+                    composer_status.clone(),
+                    conversation.references(),
+                    window,
+                    cx,
+                )
+            } else {
+                ChatReferenceComposer::chat(
+                    composer_status.clone(),
+                    conversation.references(),
+                    window,
+                    cx,
+                )
+            }
         });
         let input = composer.read(cx).input();
 
@@ -396,14 +389,12 @@ impl ChatView {
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
         let (session_controller, session_store, session_unavailable) =
-            match session_services.lifecycle() {
+            match conversation.lifecycle() {
                 Ok(store) => {
-                    let controller = match &scope {
-                        ConversationScope::Chat => ChatSessionController::new(store.clone()),
-                        ConversationScope::Project(project) => {
-                            ChatSessionController::for_project(store.clone(), project.clone())
-                        }
-                    };
+                    let controller = ChatSessionController::with_descriptor(
+                        store.clone(),
+                        conversation.descriptor().clone(),
+                    );
                     (Some(Arc::new(Mutex::new(controller))), Some(store), None)
                 }
                 Err(error) => (None, None, Some(error.to_string())),
@@ -414,7 +405,7 @@ impl ChatView {
             input,
             composer,
             composer_status,
-            scope,
+            conversation,
             placeholder,
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,

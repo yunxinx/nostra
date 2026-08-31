@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use super::super::{
     CatalogError, CatalogPage, CatalogQuery, ChatMessageRead, ChatMessageReferenceStore,
-    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, ProjectIdentity,
-    ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore,
-    SessionDomain, SessionError, SessionFlushStore, SessionId, SessionLifecycleStore,
-    SessionReadStore, SessionStore, SessionStoresError, SessionSummary, SessionTreeSnapshot,
-    SessionTreeStore,
+    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, ConversationDescriptor,
+    ProjectIdentity, ProjectSessionStore, SessionBranchPreview, SessionBranchTreeSnapshot,
+    SessionCatalogStore, SessionDomain, SessionError, SessionFlushStore, SessionId,
+    SessionLifecycleStore, SessionReadStore, SessionStore, SessionStoresError, SessionSummary,
+    SessionTreeSnapshot, SessionTreeStore,
 };
 use super::core::{OperationPermit, SessionOperationGuard, SharedStoreCore};
 
@@ -14,7 +14,7 @@ use super::core::{OperationPermit, SessionOperationGuard, SharedStoreCore};
 /// completion surface. The lifecycle store is scoped to Chat or Agent, while
 /// references always read from the Chat domain.
 #[derive(Clone)]
-pub struct ConversationSessionServices {
+pub(super) struct ConversationSessionServices {
     lifecycle: Result<SharedSessionStore, SessionStoresError>,
     references: Option<SharedChatReferenceStore>,
 }
@@ -37,6 +37,45 @@ impl ConversationSessionServices {
     #[must_use]
     pub fn references(&self) -> Option<SharedChatReferenceStore> {
         self.references.clone()
+    }
+}
+
+/// Immutable context for one conversation's durable target and capabilities.
+///
+/// The descriptor identifies the storage domain and optional project owner;
+/// the projected services carry only the lifecycle and reference capabilities
+/// available for that target.  Consumers receive this context once at
+/// construction and do not need to rediscover the target through globals.
+#[derive(Clone)]
+pub struct ConversationContext {
+    descriptor: ConversationDescriptor,
+    services: ConversationSessionServices,
+}
+
+impl ConversationContext {
+    #[must_use]
+    pub(super) fn new(
+        descriptor: ConversationDescriptor,
+        services: ConversationSessionServices,
+    ) -> Self {
+        Self {
+            descriptor,
+            services,
+        }
+    }
+
+    #[must_use]
+    pub fn descriptor(&self) -> &ConversationDescriptor {
+        &self.descriptor
+    }
+
+    pub fn lifecycle(&self) -> Result<SharedSessionStore, SessionStoresError> {
+        self.services.lifecycle()
+    }
+
+    #[must_use]
+    pub fn references(&self) -> Option<SharedChatReferenceStore> {
+        self.services.references()
     }
 }
 

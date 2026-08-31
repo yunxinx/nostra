@@ -1,7 +1,52 @@
 use super::*;
 use crate::session::{
-    CatalogQuery, ProjectIdentity, ProjectSessionStore, SessionCatalogStore, SessionStores,
+    CatalogQuery, ConversationDescriptor, ProjectIdentity, ProjectSessionStore,
+    SessionCatalogStore, SessionDomain, SessionError, SessionStores,
 };
+
+#[test]
+fn conversation_descriptor_encodes_chat_and_project_storage_targets() {
+    let chat = ConversationDescriptor::chat();
+    assert_eq!(chat.domain(), SessionDomain::Chat);
+    assert_eq!(chat.project(), None);
+    assert!(!chat.supports_references());
+
+    let project = ProjectIdentity::new("/tmp/conversation-descriptor", "Descriptor project");
+    let project_target = ConversationDescriptor::for_project(project.clone());
+    assert_eq!(project_target.domain(), SessionDomain::Agent);
+    assert_eq!(project_target.project(), Some(&project));
+    assert!(project_target.supports_references());
+
+    let rebuilt = ConversationDescriptor::new(SessionDomain::Agent, Some(project.clone()))
+        .expect("valid project target");
+    assert_eq!(rebuilt, project_target);
+}
+
+#[test]
+fn conversation_descriptor_rejects_invalid_domain_project_pairs() {
+    let project = ProjectIdentity::new("/tmp/conversation-descriptor-invalid", "Invalid project");
+    assert!(matches!(
+        ConversationDescriptor::new(SessionDomain::Chat, Some(project.clone())),
+        Err(SessionError::ChatHasProject)
+    ));
+    assert!(matches!(
+        ConversationDescriptor::new(SessionDomain::Agent, None),
+        Err(SessionError::AgentMissingProject)
+    ));
+}
+
+#[test]
+fn session_stores_project_context_selects_the_agent_capability() {
+    let project = ProjectIdentity::new("/tmp/conversation-context", "Context project");
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let context = stores.project_conversation(project.clone());
+
+    assert_eq!(context.descriptor().domain(), SessionDomain::Agent);
+    assert_eq!(context.descriptor().project(), Some(&project));
+    assert!(context.lifecycle().is_ok());
+    assert!(context.references().is_some());
+}
 
 #[test]
 fn completed_contract_works_with_memory_store() {

@@ -611,8 +611,7 @@ impl ChatApp {
         };
         self.invalidate_agent_selection_request();
         let view = ChatView::project_view_with_generation_service_and_preferences(
-            identity,
-            self.session_services.project_conversation(),
+            self.session_services.project_conversation(identity),
             self.generation_service.clone(),
             self.preference_handle.clone(),
             window,
@@ -667,8 +666,7 @@ impl ChatApp {
         };
         let request = self.begin_agent_selection_request();
         let view = ChatView::project_view_with_generation_service_and_preferences(
-            identity,
-            self.session_services.project_conversation(),
+            self.session_services.project_conversation(identity),
             self.generation_service.clone(),
             self.preference_handle.clone(),
             window,
