@@ -36,8 +36,294 @@ use super::{
     ReconcileObserver, ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState,
     RuntimeDiagnostic, RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId,
     ScopeKind, ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId,
-    SessionServicesCapability, StartupPolicy,
+    SessionServicesCapability, StartupPolicy, WorkspaceDefinition, WorkspaceId, WorkspaceRegistry,
+    WorkspaceRegistryError,
 };
+
+const WORKSPACE_ROOT: ScopeId = ScopeId::new(100);
+const WORKSPACE_CHILD: ScopeId = ScopeId::new(101);
+const WORKSPACE_OTHER_CHILD: ScopeId = ScopeId::new(102);
+const WORKSPACE_MISSING_PARENT: ScopeId = ScopeId::new(999);
+
+const CHAT_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.chat");
+const PROJECT_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.project");
+const NOTES_WORKSPACE: WorkspaceId = WorkspaceId::new("nostra.workspace.notes");
+
+#[test]
+fn workspace_ids_are_stable_value_keys() {
+    let same = WorkspaceId::new("nostra.workspace.chat");
+    let mut ids = vec![PROJECT_WORKSPACE, CHAT_WORKSPACE];
+    ids.sort_unstable();
+
+    assert_eq!(CHAT_WORKSPACE, same);
+    assert_eq!(CHAT_WORKSPACE.as_str(), "nostra.workspace.chat");
+    assert_eq!(CHAT_WORKSPACE.to_string(), "nostra.workspace.chat");
+    assert_eq!(ids, vec![CHAT_WORKSPACE, PROJECT_WORKSPACE]);
+}
+
+#[test]
+#[should_panic(expected = "workspace ID must not be empty")]
+fn workspace_ids_reject_empty_names() {
+    let _ = WorkspaceId::new("");
+}
+
+#[test]
+#[should_panic(expected = "workspace ID contains an unsupported character")]
+fn workspace_ids_reject_unstable_names() {
+    let _ = WorkspaceId::new("Nostra Workspace");
+}
+
+#[test]
+fn workspace_snapshot_is_immutable_and_tracks_revisions() {
+    let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
+    let initial = registry.snapshot(WORKSPACE_ROOT).expect("initial snapshot");
+
+    let registration = registry
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 10))
+        .expect("register chat workspace");
+    let registered = registry
+        .snapshot(WORKSPACE_ROOT)
+        .expect("registered snapshot");
+
+    assert_eq!(initial.revision(), 0);
+    assert!(initial.definitions().is_empty());
+    assert_eq!(registered.revision(), 1);
+    assert_eq!(
+        registered.definitions(),
+        &[WorkspaceDefinition::new(CHAT_WORKSPACE, 10)]
+    );
+
+    assert!(
+        registry
+            .revoke(&registration)
+            .expect("revoke chat workspace")
+    );
+    let revoked = registry.snapshot(WORKSPACE_ROOT).expect("revoked snapshot");
+
+    assert_eq!(registered.revision(), 1);
+    assert_eq!(
+        registered.definitions(),
+        &[WorkspaceDefinition::new(CHAT_WORKSPACE, 10)]
+    );
+    assert_eq!(revoked.revision(), 2);
+    assert!(revoked.definitions().is_empty());
+}
+
+#[test]
+fn workspace_registry_rejects_missing_and_duplicate_scopes() {
+    let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
+
+    assert_eq!(
+        registry.add_scope(WORKSPACE_CHILD, WORKSPACE_MISSING_PARENT),
+        Err(WorkspaceRegistryError::InvalidParent {
+            scope: WORKSPACE_CHILD,
+            parent: WORKSPACE_MISSING_PARENT,
+        })
+    );
+    registry
+        .add_scope(WORKSPACE_CHILD, WORKSPACE_ROOT)
+        .expect("add child scope");
+    assert_eq!(
+        registry.add_scope(WORKSPACE_CHILD, WORKSPACE_ROOT),
+        Err(WorkspaceRegistryError::DuplicateScope {
+            scope: WORKSPACE_CHILD,
+        })
+    );
+    assert_eq!(
+        registry.snapshot(WORKSPACE_OTHER_CHILD),
+        Err(WorkspaceRegistryError::UnknownScope {
+            scope: WORKSPACE_OTHER_CHILD,
+        })
+    );
+    assert!(matches!(
+        registry.register(
+            WORKSPACE_OTHER_CHILD,
+            WorkspaceDefinition::new(NOTES_WORKSPACE, 20),
+        ),
+        Err(WorkspaceRegistryError::UnknownScope {
+            scope: WORKSPACE_OTHER_CHILD,
+        })
+    ));
+}
+
+#[test]
+fn duplicate_workspace_definition_does_not_change_revision_or_snapshot() {
+    let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
+    registry
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 10))
+        .expect("register initial workspace");
+    let before = registry.snapshot(WORKSPACE_ROOT).expect("before duplicate");
+
+    assert!(matches!(
+        registry.register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 30),),
+        Err(WorkspaceRegistryError::DuplicateDefinition {
+            scope: WORKSPACE_ROOT,
+            id: CHAT_WORKSPACE,
+        })
+    ));
+
+    assert_eq!(registry.revision(), before.revision());
+    assert_eq!(
+        registry.snapshot(WORKSPACE_ROOT).expect("after duplicate"),
+        before
+    );
+}
+
+#[test]
+fn workspace_snapshot_order_is_independent_of_registration_order() {
+    let mut first = WorkspaceRegistry::new(WORKSPACE_ROOT);
+    first
+        .register(
+            WORKSPACE_ROOT,
+            WorkspaceDefinition::new(PROJECT_WORKSPACE, 10),
+        )
+        .expect("register project first");
+    first
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 10))
+        .expect("register chat second");
+
+    let mut second = WorkspaceRegistry::new(WORKSPACE_OTHER_CHILD);
+    second
+        .register(
+            WORKSPACE_OTHER_CHILD,
+            WorkspaceDefinition::new(CHAT_WORKSPACE, 10),
+        )
+        .expect("register chat first");
+    second
+        .register(
+            WORKSPACE_OTHER_CHILD,
+            WorkspaceDefinition::new(PROJECT_WORKSPACE, 10),
+        )
+        .expect("register project second");
+
+    let expected = [
+        WorkspaceDefinition::new(CHAT_WORKSPACE, 10),
+        WorkspaceDefinition::new(PROJECT_WORKSPACE, 10),
+    ];
+    assert_eq!(
+        first
+            .snapshot(WORKSPACE_ROOT)
+            .expect("first snapshot")
+            .definitions(),
+        expected
+    );
+    assert_eq!(
+        second
+            .snapshot(WORKSPACE_OTHER_CHILD)
+            .expect("second snapshot")
+            .definitions(),
+        expected
+    );
+}
+
+#[test]
+fn workspace_registration_revoke_is_exact_idempotent_and_stale_safe() {
+    let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
+    let first = registry
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 10))
+        .expect("register first workspace");
+
+    assert!(registry.revoke(&first).expect("revoke first workspace"));
+    assert!(
+        !registry
+            .revoke(&first)
+            .expect("repeat revoke is idempotent")
+    );
+
+    let successor = registry
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 20))
+        .expect("register successor workspace");
+    assert!(!registry.revoke(&first).expect("stale revoke is ignored"));
+    assert_eq!(
+        registry
+            .snapshot(WORKSPACE_ROOT)
+            .expect("successor snapshot")
+            .get(CHAT_WORKSPACE),
+        Some(&WorkspaceDefinition::new(CHAT_WORKSPACE, 20))
+    );
+    assert!(
+        registry
+            .revoke(&successor)
+            .expect("revoke successor workspace")
+    );
+    assert!(
+        registry
+            .snapshot(WORKSPACE_ROOT)
+            .expect("empty successor snapshot")
+            .definitions()
+            .is_empty()
+    );
+}
+
+#[test]
+fn child_workspace_definitions_shadow_and_restore_ancestors() {
+    let mut registry = WorkspaceRegistry::new(WORKSPACE_ROOT);
+    registry
+        .register(WORKSPACE_ROOT, WorkspaceDefinition::new(CHAT_WORKSPACE, 20))
+        .expect("register parent chat workspace");
+    registry
+        .register(
+            WORKSPACE_ROOT,
+            WorkspaceDefinition::new(PROJECT_WORKSPACE, 40),
+        )
+        .expect("register parent project workspace");
+    registry
+        .add_scope(WORKSPACE_CHILD, WORKSPACE_ROOT)
+        .expect("add child scope");
+    let child_override = registry
+        .register(
+            WORKSPACE_CHILD,
+            WorkspaceDefinition::new(CHAT_WORKSPACE, 10),
+        )
+        .expect("register child chat override");
+    registry
+        .register(
+            WORKSPACE_CHILD,
+            WorkspaceDefinition::new(NOTES_WORKSPACE, 30),
+        )
+        .expect("register child notes workspace");
+
+    let shadowed = registry
+        .snapshot(WORKSPACE_CHILD)
+        .expect("shadowed snapshot");
+    assert_eq!(
+        shadowed.definitions(),
+        &[
+            WorkspaceDefinition::new(CHAT_WORKSPACE, 10),
+            WorkspaceDefinition::new(NOTES_WORKSPACE, 30),
+            WorkspaceDefinition::new(PROJECT_WORKSPACE, 40),
+        ]
+    );
+    assert_eq!(
+        shadowed.get(CHAT_WORKSPACE).map(WorkspaceDefinition::order),
+        Some(10)
+    );
+
+    assert!(
+        registry
+            .revoke(&child_override)
+            .expect("revoke child override")
+    );
+    let restored = registry
+        .snapshot(WORKSPACE_CHILD)
+        .expect("restored snapshot");
+    assert_eq!(
+        restored.get(CHAT_WORKSPACE),
+        Some(&WorkspaceDefinition::new(CHAT_WORKSPACE, 20))
+    );
+    assert_eq!(
+        restored
+            .get(PROJECT_WORKSPACE)
+            .map(WorkspaceDefinition::order),
+        Some(40)
+    );
+    assert_eq!(
+        restored
+            .get(NOTES_WORKSPACE)
+            .map(WorkspaceDefinition::order),
+        Some(30)
+    );
+}
 
 #[test]
 fn component_ids_are_stable_value_keys() {

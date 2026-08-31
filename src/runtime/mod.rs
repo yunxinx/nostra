@@ -9,6 +9,7 @@ mod effect;
 mod exit;
 mod reconcile;
 mod scope;
+mod workspace;
 
 pub use capability::{
     CapabilityId, CapabilityKey, CapabilityLease, ExclusiveCapabilitySlot, ExclusiveSlotError,
@@ -38,6 +39,10 @@ pub use reconcile::{
     ReconcileTransition, ScopeLocalReconciler,
 };
 pub use scope::{ScopeError, ScopeKind, ScopeState, ScopeTree};
+pub use workspace::{
+    WorkspaceDefinition, WorkspaceId, WorkspaceRegistration, WorkspaceRegistry,
+    WorkspaceRegistryError, WorkspaceRegistrySnapshot,
+};
 
 #[cfg(test)]
 mod tests;
