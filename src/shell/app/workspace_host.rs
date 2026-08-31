@@ -1,17 +1,40 @@
 //! Window-scoped ownership of the built-in workspace instances.
 
-use gpui::{AppContext as _, Context, Entity, Window};
+use gpui::{App, AppContext as _, Context, Entity, EntityId, Window};
 
+use crate::llm::ModelSelection;
 use crate::preferences::PreferenceHandle;
 use crate::runtime::{
     CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, RuntimeServices, WorkspaceDefinition,
     WorkspaceRegistration, WorkspaceRegistry, WorkspaceRegistrySnapshot,
 };
+use crate::session::SessionId;
 
 use super::{chat_workspace::ChatWorkspace, project_workspace::ProjectWorkspace};
 
 const CHAT_WORKSPACE_ORDER: u32 = 10;
 const PROJECT_WORKSPACE_ORDER: u32 = 20;
+
+/// Commands shared by the window-level workspace router.
+///
+/// The payload describes an operation, not a sidebar row identity. Row
+/// targets remain private to their owning workspace so a new workspace does
+/// not have to extend a central target enum.
+pub(super) enum WorkspaceCommand {
+    New,
+    OpenProjectFolder,
+    OpenProjectDraft(String),
+    SelectView(EntityId),
+    RestoreChatSession(SessionId),
+    RestoreProjectSession {
+        project_id: String,
+        session_id: SessionId,
+    },
+    SelectModel(ModelSelection),
+    #[cfg(test)]
+    DeleteView(EntityId),
+    DeleteActive,
+}
 
 /// Owns the workspace instances and their window-scoped definition registry.
 ///
@@ -79,5 +102,145 @@ impl WorkspaceHost {
 
     pub(super) fn registry_snapshot(&self) -> &WorkspaceRegistrySnapshot {
         &self._registry_snapshot
+    }
+
+    /// Dispatch a command to the workspace selected by the window.
+    ///
+    /// Each branch only adapts the command to the workspace's typed API;
+    /// persistence, selection guards, and lifecycle effects stay owned by the
+    /// workspace entity.
+    pub(super) fn dispatch(
+        &self,
+        workspace_id: crate::runtime::WorkspaceId,
+        command: WorkspaceCommand,
+        mut window: Option<&mut Window>,
+        cx: &mut App,
+    ) -> bool {
+        match command {
+            WorkspaceCommand::New => match workspace_id {
+                CHAT_WORKSPACE_ID => {
+                    let Some(window) = window.take() else {
+                        return false;
+                    };
+                    self.chat_workspace
+                        .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
+                    true
+                }
+                PROJECT_WORKSPACE_ID => {
+                    let Some(_window) = window.take() else {
+                        return false;
+                    };
+                    self.project_workspace
+                        .update(cx, |workspace, cx| workspace.open_project_folder(cx));
+                    true
+                }
+                _ => false,
+            },
+            WorkspaceCommand::OpenProjectFolder => {
+                if workspace_id != PROJECT_WORKSPACE_ID {
+                    return false;
+                }
+                self.project_workspace
+                    .update(cx, |workspace, cx| workspace.open_project_folder(cx));
+                true
+            }
+            WorkspaceCommand::OpenProjectDraft(project_id) => {
+                if workspace_id != PROJECT_WORKSPACE_ID {
+                    return false;
+                }
+                let Some(window) = window.take() else {
+                    return false;
+                };
+                self.project_workspace.update(cx, |workspace, cx| {
+                    workspace.open_draft(project_id, window, cx)
+                });
+                true
+            }
+            WorkspaceCommand::SelectView(target) => {
+                if workspace_id != CHAT_WORKSPACE_ID {
+                    return false;
+                }
+                self.chat_workspace
+                    .update(cx, |workspace, cx| workspace.select_target(target, cx));
+                true
+            }
+            WorkspaceCommand::RestoreChatSession(session_id) => {
+                if workspace_id != CHAT_WORKSPACE_ID {
+                    return false;
+                }
+                let Some(window) = window.take() else {
+                    return false;
+                };
+                self.chat_workspace.update(cx, |workspace, cx| {
+                    workspace.select_session(session_id, window, cx)
+                });
+                true
+            }
+            WorkspaceCommand::RestoreProjectSession {
+                project_id,
+                session_id,
+            } => {
+                if workspace_id != PROJECT_WORKSPACE_ID {
+                    return false;
+                }
+                let Some(window) = window.take() else {
+                    return false;
+                };
+                self.project_workspace.update(cx, |workspace, cx| {
+                    workspace.open_session(project_id, session_id, window, cx)
+                });
+                true
+            }
+            WorkspaceCommand::SelectModel(selection) => match workspace_id {
+                CHAT_WORKSPACE_ID => self
+                    .chat_workspace
+                    .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
+                PROJECT_WORKSPACE_ID => self
+                    .project_workspace
+                    .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
+                _ => false,
+            },
+            #[cfg(test)]
+            WorkspaceCommand::DeleteView(target) => {
+                if workspace_id != CHAT_WORKSPACE_ID {
+                    return false;
+                }
+                let Some(window) = window.take() else {
+                    return false;
+                };
+                self.chat_workspace.update(cx, |workspace, cx| {
+                    workspace.delete_conversation(target, window, cx)
+                });
+                true
+            }
+            WorkspaceCommand::DeleteActive => match workspace_id {
+                CHAT_WORKSPACE_ID => {
+                    let Some(window) = window.take() else {
+                        return false;
+                    };
+                    self.chat_workspace.update(cx, |workspace, cx| {
+                        workspace.request_delete_active(window, cx)
+                    })
+                }
+                PROJECT_WORKSPACE_ID => {
+                    let Some(window) = window.take() else {
+                        return false;
+                    };
+                    self.project_workspace.update(cx, |workspace, cx| {
+                        workspace.request_delete_active(window, cx)
+                    })
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// Prepare every workspace conversation for shutdown before the runtime
+    /// exit coordinator flushes session durability.
+    pub(super) fn prepare_for_shutdown(&self, cx: &mut App) {
+        self.chat_workspace
+            .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
+        self.project_workspace
+            .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
     }
 }

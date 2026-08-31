@@ -66,11 +66,11 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(80.);
 #[cfg(not(target_os = "macos"))]
 const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
-use chat_workspace::{ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot};
+use chat_workspace::{ChatWorkspace, ChatWorkspaceSnapshot};
 #[cfg(test)]
 use project_workspace::ProjectTarget;
 use project_workspace::{ProjectWorkspace, ProjectWorkspaceSnapshot};
-use workspace_host::WorkspaceHost;
+use workspace_host::{WorkspaceCommand, WorkspaceHost};
 
 #[derive(Clone)]
 enum WorkspaceSnapshot {
@@ -347,10 +347,7 @@ impl ChatApp {
     }
 
     fn prepare_exit_work(&mut self, cx: &mut Context<Self>) -> ExitWork {
-        self.chat_workspace()
-            .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
-        self.project_workspace()
-            .update(cx, |workspace, cx| workspace.prepare_for_shutdown(cx));
+        self.workspace_host.prepare_for_shutdown(cx);
         let sidebar_width = self.sidebar_width.as_f32();
         let sidebar_collapsed = self.collapsed;
         let window = self.window_geometry;
@@ -390,15 +387,28 @@ impl ChatApp {
         selection: ModelSelection,
         cx: &mut Context<Self>,
     ) -> bool {
-        match self.workspace_id {
-            CHAT_WORKSPACE_ID => self
-                .chat_workspace()
-                .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
-            PROJECT_WORKSPACE_ID => self
-                .project_workspace()
-                .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
-            _ => false,
-        }
+        let handled = self.workspace_host.dispatch(
+            self.workspace_id,
+            WorkspaceCommand::SelectModel(selection),
+            None,
+            cx,
+        );
+        self.sync_workspace_snapshot(cx);
+        handled
+    }
+
+    fn dispatch_workspace_command(
+        &mut self,
+        workspace_id: WorkspaceId,
+        command: WorkspaceCommand,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let handled = self
+            .workspace_host
+            .dispatch(workspace_id, command, window, cx);
+        self.sync_workspace_snapshot(cx);
+        handled
     }
 
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -408,26 +418,18 @@ impl ChatApp {
     }
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.workspace_id {
-            CHAT_WORKSPACE_ID => {
-                self.model_picker
-                    .update(cx, |picker, cx| picker.dismiss(window, cx));
-                self.chat_workspace()
-                    .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
-            }
-            PROJECT_WORKSPACE_ID => self
-                .project_workspace()
-                .update(cx, |workspace, cx| workspace.open_project_folder(cx)),
-            _ => {}
+        if self.workspace_id == CHAT_WORKSPACE_ID {
+            self.model_picker
+                .update(cx, |picker, cx| picker.dismiss(window, cx));
         }
+        self.dispatch_workspace_command(self.workspace_id, WorkspaceCommand::New, Some(window), cx);
     }
 
     #[cfg(test)]
     fn spawn_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace()
-            .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
+        self.dispatch_workspace_command(CHAT_WORKSPACE_ID, WorkspaceCommand::New, Some(window), cx);
         self.sync_workspace_snapshot(cx);
     }
 
@@ -435,8 +437,21 @@ impl ChatApp {
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace()
-            .update(cx, |workspace, cx| workspace.select(index, cx));
+        let target = self
+            .chat_workspace()
+            .read(cx)
+            .conversations
+            .conversations()
+            .get(index)
+            .map(|conversation| conversation.view.entity_id());
+        if let Some(target) = target {
+            self.dispatch_workspace_command(
+                CHAT_WORKSPACE_ID,
+                WorkspaceCommand::SelectView(target),
+                Some(window),
+                cx,
+            );
+        }
         self.sync_workspace_snapshot(cx);
     }
 
@@ -449,8 +464,12 @@ impl ChatApp {
     ) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace()
-            .update(cx, |workspace, cx| workspace.select_target(target, cx));
+        self.dispatch_workspace_command(
+            CHAT_WORKSPACE_ID,
+            WorkspaceCommand::SelectView(target),
+            Some(window),
+            cx,
+        );
         self.sync_workspace_snapshot(cx);
     }
 
@@ -463,9 +482,12 @@ impl ChatApp {
     ) {
         self.model_picker
             .update(cx, |picker, cx| picker.dismiss(window, cx));
-        self.chat_workspace().update(cx, |workspace, cx| {
-            workspace.select_session(session_id, window, cx)
-        });
+        self.dispatch_workspace_command(
+            CHAT_WORKSPACE_ID,
+            WorkspaceCommand::RestoreChatSession(session_id),
+            Some(window),
+            cx,
+        );
         self.sync_workspace_snapshot(cx);
     }
 
@@ -476,39 +498,27 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.chat_workspace().update(cx, |workspace, cx| {
-            workspace.delete_conversation(target, window, cx)
-        });
+        self.dispatch_workspace_command(
+            CHAT_WORKSPACE_ID,
+            WorkspaceCommand::DeleteView(target),
+            Some(window),
+            cx,
+        );
         self.sync_workspace_snapshot(cx);
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace_id == PROJECT_WORKSPACE_ID {
-            let revealed = self.project_workspace().update(cx, |workspace, cx| {
-                workspace.request_delete_active(window, cx)
-            });
-            if revealed && self.collapsed {
-                self.collapsed = false;
-                self.has_toggled = true;
-                cx.notify();
-            }
-            return;
-        }
-
-        let snapshot = self.chat_snapshot();
-        let Some(target) = snapshot.active() else {
-            return;
-        };
-        if snapshot.conversation(target).is_none() {
-            return;
-        }
-        if self.collapsed {
+        let revealed = self.workspace_host.dispatch(
+            self.workspace_id,
+            WorkspaceCommand::DeleteActive,
+            Some(window),
+            cx,
+        );
+        if revealed && self.collapsed {
             self.collapsed = false;
             self.has_toggled = true;
+            cx.notify();
         }
-        self.chat_workspace().update(cx, |workspace, cx| {
-            workspace.begin_delete_confirmation(ChatTarget::View(target), window, cx)
-        });
     }
 
     fn active_view(&self) -> Option<Entity<ChatView>> {

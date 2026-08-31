@@ -25,6 +25,7 @@ use crate::session::{
     SessionCatalogStore, SessionDomain, SessionHeader, SessionLifecycleStore, SessionReadStore,
     SessionStores, TurnStatus,
 };
+use crate::shell::app::chat_workspace::ChatTarget;
 
 use super::*;
 

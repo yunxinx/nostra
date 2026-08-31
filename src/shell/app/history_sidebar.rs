@@ -35,6 +35,8 @@ use super::ChatApp;
 use super::chat_workspace::{
     ChatConversationSnapshot, ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot,
 };
+use super::workspace_host::WorkspaceCommand;
+use crate::runtime::CHAT_WORKSPACE_ID;
 
 /// Row height for both draft and catalog rows, matching the previous
 /// conversation row so the sidebar density is unchanged.
@@ -631,12 +633,7 @@ impl ChatApp {
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
             is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
-        let index = snapshot
-            .conversations()
-            .iter()
-            .position(|conv| conv.target() == target)
-            .unwrap_or_default();
-        let workspace = self.chat_workspace().downgrade();
+        let app = cx.entity().downgrade();
 
         self.render_history_row(
             ("conv-row", target),
@@ -648,22 +645,33 @@ impl ChatApp {
             is_confirming,
             sidebar_target,
             {
-                let workspace = workspace.clone();
+                let app = app.clone();
                 move |_, _, cx| {
-                    workspace
-                        .update(cx, |workspace, cx| workspace.select(index, cx))
-                        .ok();
+                    app.update(cx, |app, cx| {
+                        app.dispatch_workspace_command(
+                            CHAT_WORKSPACE_ID,
+                            WorkspaceCommand::SelectView(target),
+                            None,
+                            cx,
+                        );
+                    })
+                    .ok();
                 }
             },
             {
-                let workspace = workspace.clone();
+                let app = app.clone();
                 move |event: &KeyDownEvent, window, cx| {
                     if crate::ui::consume_button_key(event, window, cx) {
-                        workspace
-                            .update(cx, |workspace, cx| workspace.select(index, cx))
-                            .ok();
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                CHAT_WORKSPACE_ID,
+                                WorkspaceCommand::SelectView(target),
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
                     }
-                    let _ = window;
                 }
             },
             window,
@@ -713,7 +721,7 @@ impl ChatApp {
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
             is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
-        let workspace = self.chat_workspace().downgrade();
+        let app = cx.entity().downgrade();
 
         self.render_history_row(
             format!("history-row-{session_id}"),
@@ -727,27 +735,35 @@ impl ChatApp {
             {
                 let session_id = session_id.clone();
                 {
-                    let workspace = workspace.clone();
+                    let app = app.clone();
                     move |_, window, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.select_session(session_id.clone(), window, cx)
-                            })
-                            .ok();
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                CHAT_WORKSPACE_ID,
+                                WorkspaceCommand::RestoreChatSession(session_id.clone()),
+                                Some(window),
+                                cx,
+                            );
+                        })
+                        .ok();
                     }
                 }
             },
             {
                 let session_id = session_id.clone();
                 {
-                    let workspace = workspace.clone();
+                    let app = app.clone();
                     move |event: &KeyDownEvent, window, cx| {
                         if crate::ui::consume_button_key(event, window, cx) {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.select_session(session_id.clone(), window, cx)
-                                })
-                                .ok();
+                            app.update(cx, |app, cx| {
+                                app.dispatch_workspace_command(
+                                    CHAT_WORKSPACE_ID,
+                                    WorkspaceCommand::RestoreChatSession(session_id.clone()),
+                                    Some(window),
+                                    cx,
+                                );
+                            })
+                            .ok();
                         }
                     }
                 }

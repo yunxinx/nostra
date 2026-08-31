@@ -257,13 +257,6 @@ impl ChatWorkspace {
         self.notify_changed(cx);
     }
 
-    pub(super) fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.invalidate_selection_request();
-        if self.conversations.select_index(index) {
-            self.notify_changed(cx);
-        }
-    }
-
     pub(super) fn select_target(&mut self, target: gpui::EntityId, cx: &mut Context<Self>) {
         self.invalidate_selection_request();
         if self.conversations.select_target(target) {
@@ -456,6 +449,21 @@ impl ChatWorkspace {
         conversation
             .view
             .update(cx, |chat, cx| chat.select_model(selection, cx));
+        true
+    }
+
+    pub(super) fn request_delete_active(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(target) = self.conversations.active() else {
+            return false;
+        };
+        if self.conversations.conversation(target).is_none() {
+            return false;
+        }
+        self.begin_delete_confirmation(ChatTarget::View(target), window, cx);
         true
     }
 

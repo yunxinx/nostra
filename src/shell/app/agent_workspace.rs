@@ -22,7 +22,9 @@ use super::{
     ChatApp,
     history_sidebar::{SidebarActionIds, SidebarActionSpec, render_sidebar_actions},
     project_workspace::{ProjectTarget, ProjectWorkspace},
+    workspace_host::WorkspaceCommand,
 };
+use crate::runtime::PROJECT_WORKSPACE_ID;
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
     ProjectCatalogPage, ProjectCatalogQuery, ProjectSessionStore, ProjectSummary, SessionId,
@@ -650,7 +652,7 @@ impl ChatApp {
 
     fn render_agent_projects_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().sidebar_foreground.opacity(0.6);
-        let workspace = self.project_workspace().downgrade();
+        let app = cx.entity().downgrade();
         h_flex()
             .id("agent-projects-header")
             .h(px(28.))
@@ -673,9 +675,15 @@ impl ChatApp {
                     .icon(IconName::Plus)
                     .tooltip(t!("agent.open_folder").to_string())
                     .on_click(move |_, _, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| workspace.open_project_folder(cx))
-                            .ok();
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                PROJECT_WORKSPACE_ID,
+                                WorkspaceCommand::OpenProjectFolder,
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
                     }),
             )
             .into_any_element()
@@ -808,6 +816,7 @@ impl ChatApp {
         let is_confirming = self.project_snapshot().confirming() == Some(&target);
         let workspace = self.project_workspace().downgrade();
         let workspace_for_key = workspace.clone();
+        let app = cx.entity().downgrade();
 
         v_flex()
             .w_full()
@@ -891,19 +900,20 @@ impl ChatApp {
                                             .icon(IconName::Plus)
                                             .tooltip(t!("agent.new_in_project").to_string())
                                             .on_click({
-                                                let workspace =
-                                                    self.project_workspace().downgrade();
+                                                let app = app.clone();
                                                 let project_id = project_id.clone();
                                                 move |_, window, cx| {
-                                                    workspace
-                                                        .update(cx, |workspace, cx| {
-                                                            workspace.open_draft(
+                                                    app.update(cx, |app, cx| {
+                                                        app.dispatch_workspace_command(
+                                                            PROJECT_WORKSPACE_ID,
+                                                            WorkspaceCommand::OpenProjectDraft(
                                                                 project_id.clone(),
-                                                                window,
-                                                                cx,
-                                                            )
-                                                        })
-                                                        .ok();
+                                                            ),
+                                                            Some(window),
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
                                                 }
                                             }),
                                     )
@@ -930,7 +940,7 @@ impl ChatApp {
             self.project_snapshot().catalog().open(),
             Some(AgentOpen::Draft { project_id: open_id }) if open_id == project_id
         );
-        let workspace = self.project_workspace().downgrade();
+        let app = cx.entity().downgrade();
         let project_id = project_id.to_string();
         let target = self
             .project_snapshot()
@@ -944,11 +954,15 @@ impl ChatApp {
             window,
             cx,
             move |window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.open_draft(project_id.clone(), window, cx)
-                    })
-                    .ok();
+                app.update(cx, |app, cx| {
+                    app.dispatch_workspace_command(
+                        PROJECT_WORKSPACE_ID,
+                        WorkspaceCommand::OpenProjectDraft(project_id.clone()),
+                        Some(window),
+                        cx,
+                    );
+                })
+                .ok();
             },
             target,
         )
@@ -975,7 +989,7 @@ impl ChatApp {
             summary.updated_at,
         );
         let project_id = project_id.to_string();
-        let workspace = self.project_workspace().downgrade();
+        let app = cx.entity().downgrade();
         let target = ProjectTarget::Session {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -988,11 +1002,18 @@ impl ChatApp {
             window,
             cx,
             move |window, cx| {
-                workspace
-                    .update(cx, |workspace, cx| {
-                        workspace.open_session(project_id.clone(), session_id.clone(), window, cx)
-                    })
-                    .ok();
+                app.update(cx, |app, cx| {
+                    app.dispatch_workspace_command(
+                        PROJECT_WORKSPACE_ID,
+                        WorkspaceCommand::RestoreProjectSession {
+                            project_id: project_id.clone(),
+                            session_id: session_id.clone(),
+                        },
+                        Some(window),
+                        cx,
+                    );
+                })
+                .ok();
             },
             Some(target),
         )
@@ -1419,7 +1440,7 @@ impl ChatApp {
     /// Full-area guide shown in Agent mode before any folder is opened.
     fn render_agent_folder_guide(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let workspace = self.project_workspace().downgrade();
+        let app = cx.entity().downgrade();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1449,9 +1470,15 @@ impl ChatApp {
                     .primary()
                     .label(t!("agent.open_folder").to_string())
                     .on_click(move |_, _, cx| {
-                        workspace
-                            .update(cx, |workspace, cx| workspace.open_project_folder(cx))
-                            .ok();
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                PROJECT_WORKSPACE_ID,
+                                WorkspaceCommand::OpenProjectFolder,
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
                     }),
             )
             .into_any_element()

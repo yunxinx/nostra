@@ -185,17 +185,6 @@ impl<M> ConversationHost<M> {
         true
     }
 
-    pub(super) fn select_index(&mut self, index: usize) -> bool {
-        let Some(target) = self
-            .conversations
-            .get(index)
-            .map(|conversation| conversation.view.entity_id())
-        else {
-            return false;
-        };
-        self.select_target(target)
-    }
-
     pub(super) fn select_target(&mut self, target: EntityId) -> bool {
         if self.active == Some(target) || self.conversation(target).is_none() {
             return false;
