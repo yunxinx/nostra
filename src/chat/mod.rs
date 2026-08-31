@@ -106,6 +106,9 @@ impl GenerationService for UnavailableGenerationService {
 pub enum ChatEvent {
     TitleChanged(SharedString),
     SelectionChanged(ModelSelection),
+    /// Emitted when the view's runtime snapshot changes in a way that affects
+    /// workspace annotations such as generation state.
+    StateChanged,
     /// Emitted once a durable turn begin has bound a persisted session id to
     /// this view.  Carries the session id now authoritative for the view.
     SessionBound(SessionId),

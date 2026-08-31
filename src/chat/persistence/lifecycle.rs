@@ -547,6 +547,7 @@ impl ChatView {
         }
         match update.event() {
             ConversationRuntimeEvent::StateChanged => {
+                cx.emit(ChatEvent::StateChanged);
                 cx.notify();
             }
             ConversationRuntimeEvent::TurnStarted(turn) => {
