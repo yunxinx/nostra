@@ -238,12 +238,8 @@ impl ChatWorkspace {
             self.runtime_services.generation_service(),
             cx,
         );
-        let view = ChatView::view_with_generation_service_and_preferences(
-            runtime,
-            self.preference_handle.clone(),
-            window,
-            cx,
-        );
+        let view =
+            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
         let subscription = self.subscribe_conversation(&view, window, cx);
         let selection = view.read(cx).selection();
         self.conversations.push_and_activate(Conversation {
@@ -357,12 +353,8 @@ impl ChatWorkspace {
             self.runtime_services.generation_service(),
             cx,
         );
-        let view = ChatView::view_with_generation_service_and_preferences(
-            runtime,
-            self.preference_handle.clone(),
-            window,
-            cx,
-        );
+        let view =
+            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
         if view
             .update(cx, |chat, cx| {
                 chat.restore_from_session(&restore.session_id, &restore.state, cx)

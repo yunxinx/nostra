@@ -406,12 +406,8 @@ impl ProjectWorkspace {
             self.runtime_services.generation_service(),
             cx,
         );
-        let view = ChatView::project_view_with_generation_service_and_preferences(
-            runtime,
-            self.preference_handle.clone(),
-            window,
-            cx,
-        );
+        let view =
+            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
         let selection = view.read(cx).selection();
         let subscription = self.subscribe_conversation(&view, window, cx);
         self.conversations.push_and_activate(Conversation {
@@ -522,12 +518,8 @@ impl ProjectWorkspace {
             self.runtime_services.generation_service(),
             cx,
         );
-        let view = ChatView::project_view_with_generation_service_and_preferences(
-            runtime,
-            self.preference_handle.clone(),
-            window,
-            cx,
-        );
+        let view =
+            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
 
         let title = restore
             .state

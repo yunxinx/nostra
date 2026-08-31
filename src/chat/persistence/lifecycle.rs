@@ -585,11 +585,12 @@ impl ChatView {
             cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
         }
         let old_len = self.messages.len();
-        self.messages.push(Message::from_canonical_with_preferences(
-            request.user_message,
-            self.preference_state.clone(),
-            cx,
-        ));
+        self.messages
+            .push(Message::from_canonical_with_presentation(
+                request.user_message,
+                &self.markdown_presentation,
+                cx,
+            ));
         self.messages.push(Message::empty(Role::Assistant));
         self.list_state.splice(old_len..old_len, 2);
         cx.emit(ChatEvent::SessionBound(turn.session_id.clone()));
@@ -819,9 +820,9 @@ impl ChatView {
         let turn_error = error.map(|error| super::super::error_card::TurnError::new(error, cx));
         if let Some(last) = self.messages.last_mut() {
             if let Some(message) = message {
-                last.replace_with_canonical_with_preferences(
+                last.replace_with_canonical_with_presentation(
                     message,
-                    self.preference_state.clone(),
+                    &self.markdown_presentation,
                     cx,
                 );
             }

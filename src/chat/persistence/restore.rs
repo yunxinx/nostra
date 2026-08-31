@@ -88,9 +88,9 @@ impl ChatView {
             .messages
             .iter()
             .map(|resolved| {
-                Message::from_canonical_with_preferences(
+                Message::from_canonical_with_presentation(
                     resolved.message.clone(),
-                    self.preference_state.clone(),
+                    &self.markdown_presentation,
                     cx,
                 )
             })

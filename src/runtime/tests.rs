@@ -25,20 +25,27 @@ use crate::llm::{
 };
 use crate::preferences::{PreferenceHandle, Preferences};
 use crate::session::{InMemorySessionStore, SessionDomain, SessionStores, SessionStoresError};
+use crate::ui::{
+    markdown::{
+        CJK_EMPHASIS_ID as MARKDOWN_CJK, FENCED_CODE_EXTENSION_ID as MARKDOWN_CODE,
+        MarkdownExtensionKey,
+    },
+    math::MATH_EXTENSION_ID as MARKDOWN_MATH,
+};
 
 use super::{
     ActivationFingerprint, AsyncStop, CHAT_WORKSPACE_ID, CapabilityId, CapabilityKey,
     ComponentGeneration, ComponentId, ComponentLifecycle, ComponentSnapshot,
     ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionRoot, ContributionDefinition,
-    ContributionId, ContributionKey, ContributionRegistry, ContributionRegistryError,
-    ContributionRevision, DependencyDeclaration, DependencyResolution, DependencyResolver,
-    DependencyResolverError, DependencySnapshot, DesiredRevision, DisposeError, EffectScope,
-    ExclusiveCapabilitySlot, ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot,
-    PROJECT_WORKSPACE_ID, PreparedCapability, ReconcileFailureKind, ReconcileObserver,
-    ReconcileStage, ReconcileStatus, ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic,
-    RuntimeResourceCounts, RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind,
-    ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId, SessionServicesCapability,
-    StartupPolicy, WorkspaceDefinition, WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
+    ContributionKey, ContributionRegistry, ContributionRegistryError, ContributionRevision,
+    DependencyDeclaration, DependencyResolution, DependencyResolver, DependencyResolverError,
+    DependencySnapshot, DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot,
+    ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot, PROJECT_WORKSPACE_ID,
+    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
+    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
+    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
+    ScopeTree, ScopedComponentId, SessionServicesCapability, StartupPolicy, WorkspaceDefinition,
+    WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
 };
 
 const WORKSPACE_ROOT: ScopeId = ScopeId::new(100);
@@ -58,9 +65,6 @@ impl ContributionKey for MarkdownContributionKey {
     const NAME: &'static str = "nostra.markdown.test";
 }
 
-const MARKDOWN_CJK: ContributionId = ContributionId::new("nostra.markdown.cjk");
-const MARKDOWN_MATH: ContributionId = ContributionId::new("nostra.markdown.math");
-const MARKDOWN_CODE: ContributionId = ContributionId::new("nostra.markdown.fenced-code");
 const MARKDOWN_SCOPE: ScopeId = ScopeId::new(299);
 
 struct EmptyContributionKey;
@@ -388,6 +392,118 @@ fn default_composition_workspace_contributions_unload_without_registry_residue()
     );
 
     futures::executor::block_on(root.close()).expect("close default composition");
+}
+
+#[test]
+fn default_composition_owns_and_projects_the_markdown_extension_snapshot() {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let preferences = crate::preferences::PreferenceHandle::in_memory(Preferences::default());
+    let mut root = CompositionRoot::builder(stores)
+        .with_preferences(preferences)
+        .build()
+        .expect("default composition with Markdown extensions");
+
+    let root_snapshot = root
+        .markdown_extensions()
+        .expect("active composition exposes Markdown extensions");
+    assert_eq!(root_snapshot.revision(), 1);
+    assert_eq!(
+        root_snapshot
+            .definitions()
+            .iter()
+            .map(|definition| (definition.id(), definition.order()))
+            .collect::<Vec<_>>(),
+        vec![(MARKDOWN_CJK, 10), (MARKDOWN_MATH, 20), (MARKDOWN_CODE, 30)]
+    );
+
+    let services = root.services().expect("active runtime services");
+    let service_snapshot = services.markdown_extensions();
+    assert_eq!(service_snapshot.revision(), root_snapshot.revision());
+    assert_eq!(
+        service_snapshot
+            .definitions()
+            .iter()
+            .map(|definition| definition.id())
+            .collect::<Vec<_>>(),
+        vec![MARKDOWN_CJK, MARKDOWN_MATH, MARKDOWN_CODE]
+    );
+    assert_eq!(
+        root.snapshot().contribution_revisions(),
+        [ContributionRevision::new(
+            CapabilityId::of::<MarkdownExtensionKey>(),
+            root_snapshot.revision(),
+        )]
+    );
+    for component in [
+        ComponentId::new(MARKDOWN_CJK.as_str()),
+        ComponentId::new(MARKDOWN_MATH.as_str()),
+        ComponentId::new(MARKDOWN_CODE.as_str()),
+    ] {
+        let component = composition_component(root.snapshot(), component);
+        assert_eq!(component.scope(), root.application_scope());
+        assert_eq!(component.startup_policy(), StartupPolicy::MustActivate);
+        assert_eq!(component.state(), RuntimeComponentState::Active);
+        assert_eq!(component.resource_counts().effects(), 1);
+    }
+
+    assert!(
+        futures::executor::block_on(root.deactivate_markdown_contribution_for_test(MARKDOWN_MATH))
+            .expect("deactivate the math contribution component")
+    );
+    let without_math = root
+        .markdown_extensions()
+        .expect("remaining Markdown extensions stay projected");
+    assert_eq!(without_math.revision(), 2);
+    assert_eq!(
+        without_math
+            .definitions()
+            .iter()
+            .map(|definition| definition.id())
+            .collect::<Vec<_>>(),
+        vec![MARKDOWN_CJK, MARKDOWN_CODE]
+    );
+    assert_eq!(
+        composition_component(root.snapshot(), ComponentId::new(MARKDOWN_MATH.as_str())).state(),
+        RuntimeComponentState::Disposed
+    );
+    assert_eq!(
+        composition_component(root.snapshot(), ComponentId::new(MARKDOWN_MATH.as_str()))
+            .resource_counts(),
+        RuntimeResourceCounts::default()
+    );
+    for contribution in [MARKDOWN_CJK, MARKDOWN_CODE] {
+        let component =
+            composition_component(root.snapshot(), ComponentId::new(contribution.as_str()));
+        assert_eq!(component.state(), RuntimeComponentState::Active);
+        assert_eq!(component.resource_counts().effects(), 1);
+    }
+    assert_eq!(
+        root.services()
+            .expect("active capabilities project the current Markdown snapshot")
+            .markdown_extensions()
+            .revision(),
+        without_math.revision()
+    );
+
+    futures::executor::block_on(root.close()).expect("close Markdown composition");
+    assert!(root.markdown_extensions().is_none());
+    let closed_snapshot = root
+        .markdown_registry_snapshot()
+        .expect("closed Markdown registry snapshot");
+    assert_eq!(closed_snapshot.revision(), 4);
+    assert!(closed_snapshot.definitions().is_empty());
+    for component in [
+        ComponentId::new(MARKDOWN_CJK.as_str()),
+        ComponentId::new(MARKDOWN_MATH.as_str()),
+        ComponentId::new(MARKDOWN_CODE.as_str()),
+    ] {
+        assert_eq!(
+            composition_component(root.snapshot(), component).state(),
+            RuntimeComponentState::Disposed
+        );
+    }
+    assert!(root.services().is_none());
 }
 
 #[test]
@@ -3189,7 +3305,7 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     snapshot
         .audit_startup()
         .expect("default required components are active");
-    assert_eq!(snapshot.components().len(), 3);
+    assert_eq!(snapshot.components().len(), 6);
     let preferences_component =
         composition_component(snapshot, ComponentId::new("nostra.preferences.json"));
     let generation_component =

@@ -44,7 +44,7 @@ use gpui_component::{
 use rust_i18n::t;
 
 use super::hover_reveal::hover_reveal_copy;
-use crate::ui::markdown::{MarkdownBody, PreferenceState};
+use crate::ui::markdown::{MarkdownBody, MarkdownPresentation};
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
 /// card without accidentally matching another card in the same turn.
@@ -143,12 +143,12 @@ pub(crate) struct ReasoningTrace {
 impl ReasoningTrace {
     /// Open a trace for a block that just started reasoning. Auto-expanded: the
     /// point of streaming reasoning is that it is visible as it arrives.
-    pub(crate) fn new_with_preferences(
+    pub(crate) fn new_with_presentation(
         owner_id: u64,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
-        let body = MarkdownBody::new_with_preferences("", owner_id, preference_state, cx);
+        let body = MarkdownBody::new_with_presentation("", owner_id, presentation, cx);
         Self {
             body,
             expanded: true,
@@ -163,13 +163,13 @@ impl ReasoningTrace {
     }
 
     /// Build a closed trace from an authoritative terminal message.
-    pub(crate) fn completed_with_preferences(
+    pub(crate) fn completed_with_presentation(
         source: String,
         owner_id: u64,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
-        let body = MarkdownBody::new_with_preferences(&source, owner_id, preference_state, cx);
+        let body = MarkdownBody::new_with_presentation(&source, owner_id, presentation, cx);
         let scroll = if source.len() >= VIRTUALIZED_SOURCE_BYTES {
             ReasoningScroll::Virtualized(body.scroll_state(cx))
         } else {
@@ -191,14 +191,12 @@ impl ReasoningTrace {
 
     #[cfg(test)]
     pub(crate) fn new(owner_id: u64, cx: &mut App) -> Self {
-        let preference_state = crate::preferences::test_handle(cx).shared_preferences();
-        Self::new_with_preferences(owner_id, preference_state, cx)
+        Self::new_with_presentation(owner_id, &MarkdownPresentation::for_test(cx), cx)
     }
 
     #[cfg(test)]
     pub(crate) fn completed(source: String, owner_id: u64, cx: &mut App) -> Self {
-        let preference_state = crate::preferences::test_handle(cx).shared_preferences();
-        Self::completed_with_preferences(source, owner_id, preference_state, cx)
+        Self::completed_with_presentation(source, owner_id, &MarkdownPresentation::for_test(cx), cx)
     }
 
     /// Append a reasoning delta, and keep the newest text in view.

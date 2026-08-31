@@ -5,14 +5,15 @@ use std::rc::Rc;
 use gpui_component::text::MarkdownExtensions;
 
 use crate::runtime::{
-    ContributionDefinition, ContributionId, ContributionKey, ContributionSnapshot,
+    CapabilityKey, ContributionDefinition, ContributionId, ContributionKey, ContributionSnapshot,
 };
 
 use super::PreferenceState;
 
-const CJK_EMPHASIS_ID: ContributionId = ContributionId::new("nostra.markdown.cjk");
+pub(crate) const CJK_EMPHASIS_ID: ContributionId = ContributionId::new("nostra.markdown.cjk");
 const CJK_EMPHASIS_ORDER: u32 = 10;
-const DEFAULT_EXTENSION_REVISION: u64 = 1;
+#[cfg(test)]
+const TEST_EXTENSION_REVISION: u64 = 1;
 
 pub(crate) struct MarkdownExtensionKey;
 
@@ -20,6 +21,12 @@ impl ContributionKey for MarkdownExtensionKey {
     type Value = MarkdownExtensionInstaller;
 
     const NAME: &'static str = "nostra.markdown.extensions";
+}
+
+impl CapabilityKey for MarkdownExtensionKey {
+    type Handle = MarkdownExtensionSnapshot;
+
+    const NAME: &'static str = <Self as ContributionKey>::NAME;
 }
 
 pub(crate) type MarkdownExtensionDefinition = ContributionDefinition<MarkdownExtensionKey>;
@@ -41,6 +48,11 @@ impl MarkdownExtensionSnapshot {
 
     pub(crate) const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn definitions(&self) -> &[MarkdownExtensionDefinition] {
+        &self.definitions
     }
 
     pub(super) fn install(&self, context: &MarkdownExtensionContext) -> MarkdownExtensions {
@@ -141,6 +153,14 @@ pub(crate) fn cjk_emphasis_contribution() -> MarkdownExtensionDefinition {
     )
 }
 
+pub(crate) fn builtin_extension_contributions() -> [MarkdownExtensionDefinition; 3] {
+    [
+        cjk_emphasis_contribution(),
+        crate::ui::math::markdown_contribution(),
+        super::code_block::fenced_code_contribution(),
+    ]
+}
+
 pub(super) fn install_extensions<'a>(
     installers: impl IntoIterator<Item = &'a MarkdownExtensionInstaller>,
     context: &MarkdownExtensionContext,
@@ -152,15 +172,12 @@ pub(super) fn install_extensions<'a>(
         })
 }
 
-pub(super) fn default_extension_snapshot() -> MarkdownExtensionSnapshot {
-    let mut contributions = [
-        cjk_emphasis_contribution(),
-        crate::ui::math::markdown_contribution(),
-        super::code_block::fenced_code_contribution(),
-    ];
+#[cfg(test)]
+pub(crate) fn test_extension_snapshot() -> MarkdownExtensionSnapshot {
+    let mut contributions = builtin_extension_contributions();
     contributions.sort_unstable_by_key(|contribution| (contribution.order(), contribution.id()));
     MarkdownExtensionSnapshot {
-        revision: DEFAULT_EXTENSION_REVISION,
+        revision: TEST_EXTENSION_REVISION,
         definitions: Rc::from(contributions),
     }
 }

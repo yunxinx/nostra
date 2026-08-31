@@ -62,9 +62,9 @@ impl Message {
         }
     }
 
-    pub(super) fn from_canonical_with_preferences(
+    pub(super) fn from_canonical_with_presentation(
         message: LlmMessage,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
         let role = match message.role {
@@ -76,12 +76,7 @@ impl Message {
             .into_iter()
             .enumerate()
             .map(|(index, block)| {
-                MessagePart::from_canonical_with_preferences(
-                    index,
-                    block,
-                    preference_state.clone(),
-                    cx,
-                )
+                MessagePart::from_canonical_with_presentation(index, block, presentation, cx)
             })
             .collect();
         Self {
@@ -95,8 +90,7 @@ impl Message {
 
     #[cfg(test)]
     pub(super) fn from_canonical(message: LlmMessage, cx: &mut App) -> Self {
-        let preference_state = crate::preferences::test_handle(cx).shared_preferences();
-        Self::from_canonical_with_preferences(message, preference_state, cx)
+        Self::from_canonical_with_presentation(message, &MarkdownPresentation::for_test(cx), cx)
     }
 
     pub(super) fn canonical(&self) -> LlmMessage {
@@ -114,10 +108,10 @@ impl Message {
         }
     }
 
-    pub(super) fn replace_with_canonical_with_preferences(
+    pub(super) fn replace_with_canonical_with_presentation(
         &mut self,
         message: IndexedMessage,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) {
         let mut previous = std::mem::take(&mut self.parts)
@@ -129,13 +123,7 @@ impl Message {
             .into_iter()
             .map(|part| {
                 let old = previous.remove(&part.content_index);
-                MessagePart::reconcile(
-                    part.content_index,
-                    old,
-                    part.block,
-                    preference_state.clone(),
-                    cx,
-                )
+                MessagePart::reconcile(part.content_index, old, part.block, presentation, cx)
             })
             .collect();
         self.provider_metadata = message.provider_metadata;
@@ -163,10 +151,10 @@ impl Message {
 }
 
 impl MessagePart {
-    pub(super) fn from_canonical_with_preferences(
+    pub(super) fn from_canonical_with_presentation(
         index: usize,
         block: ContentBlock,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
         let ui_id = NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed);
@@ -178,12 +166,7 @@ impl MessagePart {
                 content_index: index,
                 ui_id,
                 id: format!("terminal-text-{index}"),
-                body: MarkdownBody::new_with_preferences(
-                    &text,
-                    ui_id,
-                    preference_state.clone(),
-                    cx,
-                ),
+                body: MarkdownBody::new_with_presentation(&text, ui_id, presentation, cx),
                 text,
                 replay: provider_metadata,
                 finished: true,
@@ -194,10 +177,10 @@ impl MessagePart {
                 id: format!("terminal-reasoning-{index}"),
                 finished: true,
                 trace: (!reasoning.display.is_empty()).then(|| {
-                    ReasoningTrace::completed_with_preferences(
+                    ReasoningTrace::completed_with_presentation(
                         reasoning.display.clone(),
                         ui_id,
-                        preference_state.clone(),
+                        presentation,
                         cx,
                     )
                 }),
@@ -213,10 +196,10 @@ impl MessagePart {
             },
             ContentBlock::ToolResult { tool_result } => Self::ToolResult {
                 content_index: index,
-                body: MarkdownBody::new_with_preferences(
+                body: MarkdownBody::new_with_presentation(
                     &tool_result.content,
                     ui_id,
-                    preference_state,
+                    presentation,
                     cx,
                 ),
                 tool_result,
@@ -263,7 +246,7 @@ impl MessagePart {
         index: usize,
         old: Option<Self>,
         block: ContentBlock,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
         match (old, block) {
@@ -329,7 +312,7 @@ impl MessagePart {
                 },
                 tool_call: Some(tool_call),
             },
-            (_, block) => Self::from_canonical_with_preferences(index, block, preference_state, cx),
+            (_, block) => Self::from_canonical_with_presentation(index, block, presentation, cx),
         }
     }
 }

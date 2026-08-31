@@ -50,7 +50,7 @@ use crate::providers;
 use crate::session::SessionStores;
 use crate::session::{ConversationContext, SessionId};
 use crate::ui::{
-    markdown::{MarkdownBody, PreferenceState},
+    markdown::{MarkdownBody, MarkdownExtensionSnapshot, MarkdownPresentation},
     reference_picker::{ChatReferenceComposer, ComposerEvent, ComposerStatus},
 };
 #[cfg(test)]
@@ -161,8 +161,8 @@ pub struct ChatView {
     list_state: ListState,
     smooth_scroll: SmoothScrollState,
     preference_snapshot: crate::preferences::Preferences,
-    preference_state: PreferenceState,
     preference_handle: crate::preferences::PreferenceHandle,
+    markdown_presentation: MarkdownPresentation,
     selection: Option<ModelSelection>,
     selection_available: bool,
     provider_catalog_revision: u64,
@@ -217,32 +217,39 @@ impl ChatView {
         Self::view_with_generation_service_and_preferences(runtime, preference_handle, window, cx)
     }
 
+    #[cfg(test)]
     pub(crate) fn view_with_generation_service_and_preferences(
         runtime: Entity<ConversationRuntime>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        cx.new(|cx| Self::new(runtime, preference_handle, window, cx))
+        let markdown_extensions = crate::ui::markdown::test_extension_snapshot();
+        cx.new(|cx| Self::new(runtime, preference_handle, markdown_extensions, window, cx))
     }
 
-    pub(crate) fn project_view_with_generation_service_and_preferences(
+    pub(crate) fn view_with_runtime_services(
         runtime: Entity<ConversationRuntime>,
-        preference_handle: crate::preferences::PreferenceHandle,
+        services: &crate::runtime::RuntimeServices,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        Self::view_with_generation_service_and_preferences(runtime, preference_handle, window, cx)
+        let preference_handle = services.preference_handle().clone();
+        let markdown_extensions = services.markdown_extensions().clone();
+        cx.new(|cx| Self::new(runtime, preference_handle, markdown_extensions, window, cx))
     }
 
     fn new(
         runtime: Entity<ConversationRuntime>,
         preference_handle: crate::preferences::PreferenceHandle,
+        markdown_extensions: MarkdownExtensionSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let preference_snapshot = preference_handle.snapshot();
         let preference_state = preference_handle.shared_preferences();
+        let markdown_presentation =
+            MarkdownPresentation::new(preference_state, markdown_extensions);
         let preferences_for_observer = preference_handle.clone();
         let references_enabled = runtime.read(cx).supports_references();
         let references = runtime.read(cx).references();
@@ -328,8 +335,8 @@ impl ChatView {
             list_state,
             smooth_scroll: SmoothScrollState::default(),
             preference_snapshot,
-            preference_state: preference_state.clone(),
             preference_handle,
+            markdown_presentation,
             selection,
             selection_available,
             provider_catalog_revision: providers::catalog_revision(),
@@ -389,6 +396,11 @@ impl ChatView {
             .update(cx, |composer, cx| composer.focus_input(window, cx));
     }
 
+    #[cfg(test)]
+    pub(crate) const fn markdown_extension_revision(&self) -> u64 {
+        self.markdown_presentation.extension_revision()
+    }
+
     pub(crate) fn dismiss_composer_completion(&self, cx: &mut Context<Self>) {
         self.composer
             .update(cx, |composer, cx| composer.dismiss_completion(cx));
@@ -435,7 +447,7 @@ impl ChatView {
             text: String::new(),
             replay: ProviderMetadata::default(),
             finished: false,
-            body: MarkdownBody::new_with_preferences("", ui_id, self.preference_state.clone(), cx),
+            body: MarkdownBody::new_with_presentation("", ui_id, &self.markdown_presentation, cx),
         });
         last.parts.sort_by_key(MessagePart::content_index);
     }
@@ -570,7 +582,7 @@ impl ChatView {
             reasoning.display.push_str(delta);
             trace
                 .get_or_insert_with(|| {
-                    ReasoningTrace::new_with_preferences(*ui_id, self.preference_state.clone(), cx)
+                    ReasoningTrace::new_with_presentation(*ui_id, &self.markdown_presentation, cx)
                 })
                 .push(delta, cx);
         }
@@ -635,10 +647,10 @@ impl ChatView {
         } else if let Some(trace) = trace.as_mut() {
             trace.set_source(&snapshot.display, cx);
         } else {
-            *trace = Some(ReasoningTrace::completed_with_preferences(
+            *trace = Some(ReasoningTrace::completed_with_presentation(
                 snapshot.display.clone(),
                 *ui_id,
-                self.preference_state.clone(),
+                &self.markdown_presentation,
                 cx,
             ));
         }
@@ -797,11 +809,12 @@ impl ChatView {
             .begin_turn(user_message.clone(), selection, turn_id.clone())
             .expect("persist test turn begin");
         self.mark_turn_pending_for_test(start.session_id.clone(), turn_id, cx);
-        self.messages.push(Message::from_canonical_with_preferences(
-            user_message,
-            self.preference_state.clone(),
-            cx,
-        ));
+        self.messages
+            .push(Message::from_canonical_with_presentation(
+                user_message,
+                &self.markdown_presentation,
+                cx,
+            ));
         self.messages.push(Message::empty(Role::Assistant));
         start
     }

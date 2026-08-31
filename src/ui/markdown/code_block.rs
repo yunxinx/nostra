@@ -37,7 +37,8 @@ pub(super) struct FencedCode {
     pub(super) start: usize,
 }
 
-const FENCED_CODE_EXTENSION_ID: ContributionId = ContributionId::new("nostra.markdown.fenced-code");
+pub(crate) const FENCED_CODE_EXTENSION_ID: ContributionId =
+    ContributionId::new("nostra.markdown.fenced-code");
 const FENCED_CODE_EXTENSION_ORDER: u32 = 30;
 
 pub(crate) fn fenced_code_contribution() -> MarkdownExtensionDefinition {

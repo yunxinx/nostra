@@ -137,15 +137,9 @@ fn markdown_body_materializes_snapshots_once_and_rejects_stale_revision_completi
         MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old Markdown snapshot"));
     cx.update(gpui_component::init);
     let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
-    let mut body = cx.update(|cx| {
-        MarkdownBody::new_with_extension_snapshot(
-            "body",
-            42,
-            Arc::clone(&preferences),
-            &old_snapshot,
-            cx,
-        )
-    });
+    let presentation = MarkdownPresentation::new(Arc::clone(&preferences), old_snapshot.clone());
+    let mut body =
+        cx.update(|cx| MarkdownBody::new_with_presentation("body", 42, &presentation, cx));
 
     assert_eq!(calls.borrow().as_slice(), [("old", 42)]);
     assert_eq!(body.extension_revision(), old_snapshot.revision());
@@ -213,15 +207,10 @@ fn newer_markdown_snapshot_reparses_existing_state_without_render_time_registry_
         MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old renderer snapshot"));
     init_markdown_test(cx);
     let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(preferences, old_snapshot.clone());
     let content = cx.update(|cx| {
         cx.new(|cx| CodeSelectionTestRoot {
-            body: MarkdownBody::new_with_extension_snapshot(
-                "existing body",
-                43,
-                preferences,
-                &old_snapshot,
-                cx,
-            ),
+            body: MarkdownBody::new_with_presentation("existing body", 43, &presentation, cx),
         })
     });
     let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));

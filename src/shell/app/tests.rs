@@ -905,6 +905,26 @@ fn workspace_host_registers_and_owns_the_builtin_workspaces(cx: &mut TestAppCont
                 .is_empty()
         );
     });
+
+    let expected_markdown_revision = app.read_with(cx, |this, cx| {
+        this.chat_workspace()
+            .read(cx)
+            .runtime_services
+            .markdown_extensions()
+            .revision()
+    });
+    let active_view = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.chat_snapshot()
+                .active_view()
+                .expect("default composition creates an active Chat view")
+        })
+    });
+    assert_eq!(
+        active_view.read_with(cx, |view, _| view.markdown_extension_revision()),
+        expected_markdown_revision
+    );
 }
 
 #[gpui::test]

@@ -35,11 +35,47 @@ pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
 
 #[cfg(test)]
 use self::code_block::*;
-use self::extension_registry::default_extension_snapshot;
 pub(crate) use self::extension_registry::{
     MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
-    MarkdownExtensionSnapshot,
+    MarkdownExtensionKey, MarkdownExtensionSnapshot, builtin_extension_contributions,
 };
+
+#[cfg(test)]
+pub(crate) use self::{code_block::FENCED_CODE_EXTENSION_ID, extension_registry::CJK_EMPHASIS_ID};
+
+#[cfg(test)]
+pub(crate) use self::extension_registry::test_extension_snapshot;
+
+#[derive(Clone)]
+pub(crate) struct MarkdownPresentation {
+    preference_state: PreferenceState,
+    extension_snapshot: MarkdownExtensionSnapshot,
+}
+
+impl MarkdownPresentation {
+    pub(crate) fn new(
+        preference_state: PreferenceState,
+        extension_snapshot: MarkdownExtensionSnapshot,
+    ) -> Self {
+        Self {
+            preference_state,
+            extension_snapshot,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(cx: &App) -> Self {
+        Self::new(
+            preferences::test_handle(cx).shared_preferences(),
+            test_extension_snapshot(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn extension_revision(&self) -> u64 {
+        self.extension_snapshot.revision()
+    }
+}
 
 const NODE_NAME: &str = "nostra-fenced-code";
 const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
@@ -133,44 +169,27 @@ pub(crate) struct MarkdownBody {
 }
 
 impl MarkdownBody {
-    pub(crate) fn new_with_preferences(
+    pub(crate) fn new_with_presentation(
         source: &str,
         owner_id: u64,
-        preference_state: PreferenceState,
+        presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
-        let extension_snapshot = default_extension_snapshot();
-        Self::new_with_extension_snapshot(
-            source,
-            owner_id,
-            preference_state,
-            &extension_snapshot,
-            cx,
-        )
-    }
-
-    pub(crate) fn new_with_extension_snapshot(
-        source: &str,
-        owner_id: u64,
-        preference_state: PreferenceState,
-        snapshot: &MarkdownExtensionSnapshot,
-        cx: &mut App,
-    ) -> Self {
-        let extension_context = MarkdownExtensionContext::new(owner_id, 0, preference_state);
+        let extension_context =
+            MarkdownExtensionContext::new(owner_id, 0, presentation.preference_state.clone());
         let mut body = Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
             extension_context,
             extension_snapshot: MarkdownExtensionSnapshot::empty(),
             extensions: MarkdownExtensions::default(),
         };
-        _ = body.update_extension_snapshot(snapshot);
+        _ = body.update_extension_snapshot(&presentation.extension_snapshot);
         body
     }
 
     #[cfg(test)]
     pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
-        let preference_state = preferences::test_handle(cx).shared_preferences();
-        Self::new_with_preferences(source, owner_id, preference_state, cx)
+        Self::new_with_presentation(source, owner_id, &MarkdownPresentation::for_test(cx), cx)
     }
 
     pub(crate) fn push_str(&mut self, delta: &str, cx: &mut App) {
