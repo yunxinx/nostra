@@ -130,7 +130,7 @@ fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContex
     });
     let cx = cx.add_empty_window();
     let chat = cx.update(ChatView::view);
-    let input = cx.update(|_, cx| chat.read(cx).input.clone());
+    let input = cx.update(|_, cx| chat.read(cx).composer.read(cx).input());
 
     // First measurement of an empty composer sets both heights.
     cx.update(|_, cx| {
@@ -152,9 +152,25 @@ fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContex
     cx.update(|_, cx| {
         chat.update(cx, |this, _| {
             assert!(!this.input_empty);
+            assert!(!this.input_blank);
             assert!(this.record_composer_height(px(168.)));
             assert_eq!(this.composer_height, px(168.));
             assert_eq!(this.base_composer_height, px(96.));
+        });
+    });
+
+    // Whitespace is not an empty layout state, but it is still not a
+    // submittable draft. Both decisions are retained in the view snapshot.
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.set_value("   ", window, cx);
+            cx.emit(InputEvent::Change);
+        });
+    });
+    cx.update(|_, cx| {
+        chat.update(cx, |this, _| {
+            assert!(!this.input_empty);
+            assert!(this.input_blank);
         });
     });
 
@@ -169,6 +185,7 @@ fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContex
     cx.update(|_, cx| {
         chat.update(cx, |this, _| {
             assert!(this.input_empty);
+            assert!(this.input_blank);
             assert!(this.record_composer_height(px(104.)));
             assert_eq!(this.base_composer_height, px(104.));
             // Idempotent: the same measurement asks for no re-render.

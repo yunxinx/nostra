@@ -100,8 +100,6 @@ impl ChatView {
         let new_len = self.messages.len();
         if previous_len != new_len {
             self.list_state.splice(previous_len..previous_len, new_len);
-        } else {
-            cx.notify();
         }
 
         if let Some(model) = restored_model {
@@ -120,7 +118,6 @@ impl ChatView {
         if let Some(model) = self.selection.clone() {
             cx.emit(ChatEvent::SelectionChanged(model));
         }
-        cx.notify();
         Ok(())
     }
 }

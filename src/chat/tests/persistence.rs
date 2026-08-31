@@ -154,8 +154,11 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let (chat, cx) = add_chat_window_with_stores(cx, stores);
-    let controller =
-        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            this.runtime.read(app).session_controller_for_test()
+        })
+    });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|window, cx| {
@@ -180,7 +183,7 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
     cx.update(|window, cx| {
         chat.read_with(cx, |this, app| {
             assert!(!this.runtime_snapshot_for_test().deletion_pending());
-            assert!(!this.runtime_scope_is_open_for_test(app));
+            assert!(!this.runtime.read(app).scope.is_open());
         });
         let notifications = gpui_component::Root::read(window, cx)
             .notification
@@ -199,8 +202,11 @@ fn repeated_delete_requests_share_one_delete_and_scope_close(cx: &mut TestAppCon
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let (chat, cx) = add_chat_window_with_stores(cx, stores);
-    let controller =
-        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            this.runtime.read(app).session_controller_for_test()
+        })
+    });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|window, cx| {
@@ -230,7 +236,7 @@ fn repeated_delete_requests_share_one_delete_and_scope_close(cx: &mut TestAppCon
     cx.update(|_, cx| {
         chat.read_with(cx, |this, app| {
             assert!(!this.runtime_snapshot_for_test().deletion_pending());
-            assert!(!this.runtime_scope_is_open_for_test(app));
+            assert!(!this.runtime.read(app).scope.is_open());
         });
     });
 }
@@ -272,7 +278,7 @@ fn closing_a_conversation_scope_waits_for_terminal_persistence(cx: &mut TestAppC
     cx.update(|_, cx| {
         chat.read_with(cx, |this, app| {
             assert!(
-                !this.runtime_scope_is_open_for_test(app),
+                !this.runtime.read(app).scope.is_open(),
                 "scope remained open after terminal persistence settled"
             );
         });
@@ -307,7 +313,9 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
     let controller = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             let start = this
-                .session_controller_for_test(cx)
+                .runtime
+                .read(cx)
+                .session_controller_for_test()
                 .lock()
                 .expect("controller lock")
                 .begin_turn(user.clone(), selection, "turn-1")
@@ -315,14 +323,14 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
             this.mark_turn_pending_for_test(start.session_id, "turn-1", cx);
             this.messages.push(Message::from_canonical(user, cx));
             this.messages.push(Message::empty(Role::Assistant));
-            this.session_controller_for_test(cx)
+            this.runtime.read(cx).session_controller_for_test()
         })
     });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let generation = this.request_generation_for_test(cx);
+            let generation = this.runtime_snapshot_for_test().request_generation();
             this.finish_reply_with_terminal(
                 generation,
                 None,
@@ -401,7 +409,7 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
                 "a deleted durable begin must not publish a visible turn"
             );
             assert!(
-                !this.has_reply_task_for_test(app),
+                !this.runtime.read(app).reply_task.is_some(),
                 "a deleted durable begin must not start the provider"
             );
         });
@@ -425,7 +433,7 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
 
     let session_id = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let controller = this.session_controller_for_test(cx);
+            let controller = this.runtime.read(cx).session_controller_for_test();
             let mut guard = controller.lock().expect("lock");
             let user_message = LlmMessage {
                 role: crate::llm::Role::User,
@@ -467,7 +475,7 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
             assert_eq!(this.messages.len(), 1);
             assert_eq!(this.durable_session_id_for_test(), Some(session_id.clone()));
             assert!(
-                this.next_turn_id_for_test(app) >= 2,
+                this.runtime.read(app).next_turn_id >= 2,
                 "turn id must advance past the persisted turn-1"
             );
         });
@@ -530,8 +538,11 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
         })
     });
 
-    let controller =
-        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            this.runtime.read(app).session_controller_for_test()
+        })
+    });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|_, cx| {
@@ -555,7 +566,9 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
             let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
-            this.session_controller_for_test(cx)
+            this.runtime
+                .read(cx)
+                .session_controller_for_test()
                 .lock()
                 .expect("controller lock")
                 .restore(&start.session_id)
@@ -587,7 +600,7 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
     let controller = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.seed_pending_turn_for_test(user.clone(), selection, "turn-1", cx);
-            this.session_controller_for_test(cx)
+            this.runtime.read(cx).session_controller_for_test()
         })
     });
     let controller_guard = controller.lock().expect("hold controller");
@@ -648,7 +661,7 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
                 this.runtime_snapshot_for_test().is_generating(),
                 "provider generation should still be active"
             );
-            assert!(this.has_reply_task_for_test(app));
+            assert!(this.runtime.read(app).reply_task.is_some());
             this.durable_session_id_for_test()
                 .expect("durable Chat session id")
         })
@@ -685,7 +698,9 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
     // the final shutdown barrier independently.
     cx.update(|_, cx| {
         let state = chat.update(cx, |this, cx| {
-            this.session_controller_for_test(cx)
+            this.runtime
+                .read(cx)
+                .session_controller_for_test()
                 .lock()
                 .expect("controller lock")
                 .restore(&session_id)
@@ -715,7 +730,9 @@ fn failed_delete_reservation_does_not_cancel_active_generation(cx: &mut TestAppC
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.start_pending_reply_for_test(Rc::clone(&dropped), cx);
-            this.session_controller_for_test(cx)
+            this.runtime
+                .read(cx)
+                .session_controller_for_test()
                 .lock()
                 .expect("controller lock")
                 .shutdown()
@@ -1000,8 +1017,11 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
             start.session_id
         })
     });
-    let controller =
-        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            this.runtime.read(app).session_controller_for_test()
+        })
+    });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|_, cx| {
@@ -1101,8 +1121,11 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
         profile_id: "profile".into(),
         model_id: "model-a".into(),
     };
-    let controller =
-        cx.update(|_, cx| chat.read_with(cx, |this, app| this.session_controller_for_test(app)));
+    let controller = cx.update(|_, cx| {
+        chat.read_with(cx, |this, app| {
+            this.runtime.read(app).session_controller_for_test()
+        })
+    });
     let controller_guard = controller.lock().expect("hold controller");
 
     cx.update(|window, cx| {
@@ -1111,19 +1134,24 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
             this.selection_available = true;
             this.provider_catalog_revision = crate::providers::catalog_revision();
             this.composer_revision = 1;
-            this.input.update(cx, |input, cx| {
+            this.composer.read(cx).input().update(cx, |input, cx| {
                 input.set_value("original draft", window, cx)
             });
             assert!(this.submit("original draft".into(), window, cx));
             assert!(this.runtime_snapshot_for_test().persistence_pending());
             assert!(this.messages.is_empty());
-            assert!(!this.has_reply_task_for_test(cx));
-            assert_eq!(this.input.read(cx).value(), "original draft");
+            assert!(!this.runtime.read(cx).reply_task.is_some());
+            assert_eq!(
+                this.composer.read(cx).input().read(cx).value(),
+                "original draft"
+            );
 
             // A foreground edit made while the durable begin is queued must
             // survive its later success callback.
             this.composer_revision = 2;
-            this.input
+            this.composer
+                .read(cx)
+                .input()
                 .update(cx, |input, cx| input.set_value("newer draft", window, cx));
         });
     });
@@ -1133,7 +1161,10 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
     cx.update(|_, cx| {
         chat.read_with(cx, |this, _app| {
             assert!(!this.runtime_snapshot_for_test().persistence_pending());
-            assert_eq!(this.input.read(cx).value(), "newer draft");
+            assert_eq!(
+                this.composer.read(cx).input().read(cx).value(),
+                "newer draft"
+            );
             assert!(!this.messages.is_empty());
         });
     });
@@ -1158,7 +1189,9 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
                 }],
                 provider_metadata: ProviderMetadata::default(),
             };
-            this.session_controller_for_test(cx)
+            this.runtime
+                .read(cx)
+                .session_controller_for_test()
                 .lock()
                 .expect("controller lock")
                 .begin_turn(existing, selection.clone(), "turn-1")
@@ -1167,7 +1200,9 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
             this.selection_available = true;
             this.provider_catalog_revision = crate::providers::catalog_revision();
             this.composer_revision = 1;
-            this.input
+            this.composer
+                .read(cx)
+                .input()
                 .update(cx, |input, cx| input.set_value("new draft", window, cx));
             assert!(this.submit("new draft".into(), window, cx));
         });
@@ -1178,7 +1213,7 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
         chat.read_with(cx, |this, cx| {
             assert!(!this.runtime_snapshot_for_test().persistence_pending());
             assert!(this.messages.is_empty());
-            assert_eq!(this.input.read(cx).value(), "new draft");
+            assert_eq!(this.composer.read(cx).input().read(cx).value(), "new draft");
         });
         let notifications = gpui_component::Root::read(window, cx)
             .notification

@@ -569,7 +569,6 @@ impl ChatView {
                 if turn.generation == runtime_snapshot.request_generation() {
                     self.follow_stream();
                     self.finish_reply_visual(turn.message.clone(), turn.error.clone(), cx);
-                    cx.notify();
                 }
             }
             ConversationRuntimeEvent::Failure(failure) => {
@@ -621,6 +620,7 @@ impl ChatView {
         });
         if self.composer_revision == request.composer_revision {
             self.input_empty = true;
+            self.input_blank = true;
             let composer = self.composer.clone();
             let window_handle = self.window_handle;
             cx.defer(move |cx| {
@@ -695,7 +695,6 @@ impl ChatView {
             runtime.snapshot()
         });
         self.apply_runtime_snapshot(snapshot);
-        cx.notify();
     }
 
     pub(crate) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
@@ -704,7 +703,6 @@ impl ChatView {
             (request, runtime.snapshot())
         });
         self.apply_runtime_snapshot(snapshot);
-        cx.notify();
         request
     }
 
@@ -771,7 +769,6 @@ impl ChatView {
             runtime.snapshot()
         });
         self.apply_runtime_snapshot(snapshot);
-        cx.notify();
     }
 
     #[cfg(test)]
@@ -792,7 +789,6 @@ impl ChatView {
             runtime.snapshot()
         });
         self.apply_runtime_snapshot(snapshot);
-        cx.notify();
     }
 
     fn notify_runtime_failure(&self, failure: ConversationRuntimeFailure, cx: &mut Context<Self>) {

@@ -34,7 +34,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme, ElementExt as _, StyledExt as _, h_flex,
-    input::{InputEvent, RopeExt as _, TextareaState},
+    input::{InputEvent, RopeExt as _},
     scroll::ScrollableElement as _,
     text::{TextView, TextViewStyle},
     v_flex,
@@ -131,7 +131,6 @@ pub(crate) fn create_conversation_runtime(
 pub struct ChatView {
     window_handle: AnyWindowHandle,
     messages: Vec<Message>,
-    input: Entity<TextareaState>,
     composer: Entity<ChatReferenceComposer>,
     composer_status: Rc<Cell<ComposerStatus>>,
     references_enabled: bool,
@@ -152,8 +151,10 @@ pub struct ChatView {
     /// recalibrates it on its own.
     base_composer_height: Pixels,
     /// Snapshot maintained by the input subscription. Rendering hooks must not
-    /// read the external `InputState` entity while recording layout bounds.
+    /// read the external input entity while recording layout bounds or deciding
+    /// whether the current draft can be submitted.
     input_empty: bool,
+    input_blank: bool,
     list_state: ListState,
     smooth_scroll: SmoothScrollState,
     preference_snapshot: crate::preferences::Preferences,
@@ -277,16 +278,19 @@ impl ChatView {
         let subscription = cx.subscribe_in(&input, window, |this, input, event, _, cx| {
             if let InputEvent::Change = event {
                 this.composer_revision = this.composer_revision.saturating_add(1);
-                let (input_empty, cursor_line, lines_len, x) = {
+                let (input_empty, input_blank, cursor_line, lines_len, x) = {
                     let state = input.read(cx);
+                    let value = state.value();
                     (
-                        state.value().is_empty(),
+                        value.is_empty(),
+                        value.trim().is_empty(),
                         state.cursor_position().line as usize,
                         state.text().lines_len(),
                         state.scroll_offset().x,
                     )
                 };
                 this.input_empty = input_empty;
+                this.input_blank = input_blank;
                 if lines_len > 1 && cursor_line + 1 == lines_len {
                     input.update(cx, |state, cx| {
                         state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
@@ -308,7 +312,6 @@ impl ChatView {
         Self {
             window_handle: window.window_handle(),
             messages: Vec::new(),
-            input,
             composer,
             composer_status,
             references_enabled,
@@ -318,6 +321,7 @@ impl ChatView {
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
             input_empty: true,
+            input_blank: true,
             list_state,
             smooth_scroll: SmoothScrollState::default(),
             preference_snapshot,
@@ -718,11 +722,6 @@ impl ChatView {
         true
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_reply_task_for_test(&self, cx: &App) -> bool {
-        self.runtime.read(cx).reply_task.is_some()
-    }
-
     /// The transcript turn with `ui_id`, or `None` once the view is dropped or
     /// the turn is replaced by a replay.
     fn message_by_ui_id(&self, ui_id: u64) -> Option<&Message> {
@@ -778,14 +777,6 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub(in crate::chat) fn session_controller_for_test(
-        &self,
-        cx: &App,
-    ) -> conversation_runtime::ChatSessionControllerHandle {
-        self.runtime.read(cx).session_controller_for_test()
-    }
-
-    #[cfg(test)]
     pub(crate) fn seed_pending_turn_for_test(
         &mut self,
         user_message: LlmMessage,
@@ -795,7 +786,9 @@ impl ChatView {
     ) -> crate::session::ChatTurnStart {
         let turn_id = turn_id.into();
         let start = self
-            .session_controller_for_test(cx)
+            .runtime
+            .read(cx)
+            .session_controller_for_test()
             .lock()
             .expect("test controller lock")
             .begin_turn(user_message.clone(), selection, turn_id.clone())
@@ -839,19 +832,6 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub(in crate::chat) fn runtime_scope_is_open_for_test(&self, cx: &App) -> bool {
-        self.runtime.read(cx).scope.is_open()
-    }
-
-    #[cfg(test)]
-    pub(in crate::chat) fn request_generation_for_test(
-        &self,
-        cx: &App,
-    ) -> conversation_runtime::ConversationRequestGeneration {
-        self.runtime.read(cx).current_generation()
-    }
-
-    #[cfg(test)]
     pub(in crate::chat) fn finish_current_reply_with_terminal_for_test(
         &mut self,
         message: Option<IndexedMessage>,
@@ -859,13 +839,8 @@ impl ChatView {
         error: Option<GatewayError>,
         cx: &mut Context<Self>,
     ) {
-        let generation = self.request_generation_for_test(cx);
+        let generation = self.runtime_snapshot.request_generation();
         self.finish_reply_with_terminal(generation, message, terminal, error, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_turn_id_for_test(&self, cx: &App) -> u64 {
-        self.runtime.read(cx).next_turn_id
     }
 
     #[cfg(test)]

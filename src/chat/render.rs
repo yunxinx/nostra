@@ -25,7 +25,7 @@ impl Render for ChatView {
             || self.runtime_snapshot.persistence_pending()
             || self.runtime_snapshot.deletion_pending()
             || self.runtime_snapshot.shutdown_requested()
-            || self.input.read(cx).value().trim().is_empty()
+            || self.input_blank
             || !self.selection_available;
         let composer_height = self.composer_height;
         let base_composer_height = self.base_composer_height;
