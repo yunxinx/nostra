@@ -80,15 +80,16 @@ impl ChatApp {
             .min_h_0()
             .px(SIDEBAR_CONTENT_INSET)
             .pt(SIDEBAR_CONTENT_INSET)
-            .child(match self.workspace_mode {
-                WorkspaceMode::Chat => self.render_history_content(window, cx),
-                WorkspaceMode::Project => self.render_agent_content(window, cx),
+            .child(match self.workspace_id {
+                CHAT_WORKSPACE_ID => self.render_history_content(window, cx),
+                PROJECT_WORKSPACE_ID => self.render_agent_content(window, cx),
+                _ => self.render_history_content(window, cx),
             })
     }
 
     fn render_sidebar_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_dark = cx.theme().mode.is_dark();
-        let workspace_mode = self.workspace_mode;
+        let workspace_id = self.workspace_id;
         let app = cx.weak_entity();
 
         let account = Button::new("account")
@@ -146,13 +147,13 @@ impl ChatApp {
                                     gpui_component::menu::PopupMenuItem::new(
                                         t!("sidebar.chats").to_string(),
                                     )
-                                    .checked(matches!(workspace_mode, WorkspaceMode::Chat))
+                                    .checked(workspace_id == CHAT_WORKSPACE_ID)
                                     .on_click(
                                         move |_, window, cx| {
                                             chat_app
                                                 .update(cx, |this, cx| {
-                                                    this.switch_workspace_mode(
-                                                        WorkspaceMode::Chat,
+                                                    this.switch_workspace(
+                                                        CHAT_WORKSPACE_ID,
                                                         window,
                                                         cx,
                                                     );
@@ -165,13 +166,13 @@ impl ChatApp {
                                     gpui_component::menu::PopupMenuItem::new(
                                         t!("agent.mode").to_string(),
                                     )
-                                    .checked(matches!(workspace_mode, WorkspaceMode::Project))
+                                    .checked(workspace_id == PROJECT_WORKSPACE_ID)
                                     .on_click(
                                         move |_, window, cx| {
                                             project_app
                                                 .update(cx, |this, cx| {
-                                                    this.switch_workspace_mode(
-                                                        WorkspaceMode::Project,
+                                                    this.switch_workspace(
+                                                        PROJECT_WORKSPACE_ID,
                                                         window,
                                                         cx,
                                                     );
@@ -225,10 +226,7 @@ impl Focusable for ChatApp {
 impl Render for ChatApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_view = self.active_view();
-        let has_active = match self.workspace_mode {
-            WorkspaceMode::Chat => active_view.is_some(),
-            WorkspaceMode::Project => self.active_agent_view().is_some(),
-        };
+        let has_active = active_view.is_some();
 
         // Root overlays (sheets, dialogs, notifications) must be rendered
         // inside the top-level view of the window.
@@ -280,14 +278,20 @@ impl Render for ChatApp {
         // Keep the title row in normal layout flow with an opaque background.
         // The model pill is positioned over this reserved row, while message
         // content and its scrollbar remain entirely below it.
-        let main_content: AnyElement = match self.workspace_mode {
-            WorkspaceMode::Chat => div()
+        let main_content: AnyElement = match self.workspace_id {
+            CHAT_WORKSPACE_ID => div()
                 .flex_1()
                 .min_h_0()
                 .when_some(active_view, |this, view| this.child(view))
                 .when(!has_active, |this| this.child(render_empty_workspace(cx)))
                 .into_any_element(),
-            WorkspaceMode::Project => self.render_agent_main(window, cx),
+            PROJECT_WORKSPACE_ID => self.render_agent_main(window, cx),
+            _ => div()
+                .flex_1()
+                .min_h_0()
+                .when_some(active_view, |this, view| this.child(view))
+                .when(!has_active, |this| this.child(render_empty_workspace(cx)))
+                .into_any_element(),
         };
 
         let main_column = v_flex()
@@ -327,7 +331,7 @@ impl Render for ChatApp {
                     .ghost()
                     .small()
                     .icon(Icon::default().path("icons/square-pen.svg"))
-                    .tooltip(if matches!(self.workspace_mode, WorkspaceMode::Chat) {
+                    .tooltip(if self.workspace_id == CHAT_WORKSPACE_ID {
                         t!("sidebar.new_chat").to_string()
                     } else {
                         t!("agent.open_folder").to_string()

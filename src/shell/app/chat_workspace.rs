@@ -16,10 +16,16 @@ use crate::session::{
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
 use super::{
-    SidebarTarget,
     conversation_host::{Conversation, ConversationHost, ConversationHostSnapshot},
     history_sidebar::ChatHistorySidebar,
 };
+
+/// Identity of a Chat sidebar row.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ChatTarget {
+    View(gpui::EntityId),
+    Session(SessionId),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SelectionRequest(u64);
@@ -50,8 +56,8 @@ pub(super) type ChatConversationSnapshot = super::conversation_host::Conversatio
 pub(super) struct ChatWorkspaceSnapshot {
     conversations: ConversationHostSnapshot<()>,
     history: ChatHistorySidebar,
-    hovered: Option<SidebarTarget>,
-    confirming: Option<SidebarTarget>,
+    hovered: Option<ChatTarget>,
+    confirming: Option<ChatTarget>,
     delete_confirmation: InlineDeleteConfirmationHandle,
 }
 
@@ -101,11 +107,11 @@ impl ChatWorkspaceSnapshot {
         &self.history
     }
 
-    pub(super) fn hovered(&self) -> Option<&SidebarTarget> {
+    pub(super) fn hovered(&self) -> Option<&ChatTarget> {
         self.hovered.as_ref()
     }
 
-    pub(super) fn confirming(&self) -> Option<&SidebarTarget> {
+    pub(super) fn confirming(&self) -> Option<&ChatTarget> {
         self.confirming.as_ref()
     }
 
@@ -130,8 +136,8 @@ pub(super) struct ChatWorkspace {
     pub(super) _summary_refresh_task: Option<Task<()>>,
     pub(super) _history_delete_task: Option<Task<()>>,
     pub(super) startup_restore_attempted: bool,
-    pub(super) hovered: Option<SidebarTarget>,
-    pub(super) confirming: Option<SidebarTarget>,
+    pub(super) hovered: Option<ChatTarget>,
+    pub(super) confirming: Option<ChatTarget>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
     pub(super) session_services: SessionStores,
     pub(super) runtime_services: RuntimeServices,
@@ -459,7 +465,7 @@ impl ChatWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let was_confirming = self.confirming == Some(SidebarTarget::View(target));
+        let was_confirming = self.confirming == Some(ChatTarget::View(target));
         if was_confirming {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
@@ -512,7 +518,7 @@ impl ChatWorkspace {
 
     pub(super) fn begin_delete_confirmation(
         &mut self,
-        target: SidebarTarget,
+        target: ChatTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -523,7 +529,7 @@ impl ChatWorkspace {
 
     pub(super) fn clear_delete_confirmation(
         &mut self,
-        target: &SidebarTarget,
+        target: &ChatTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -534,7 +540,7 @@ impl ChatWorkspace {
         }
     }
 
-    pub(super) fn set_hovered(&mut self, target: Option<SidebarTarget>, cx: &mut Context<Self>) {
+    pub(super) fn set_hovered(&mut self, target: Option<ChatTarget>, cx: &mut Context<Self>) {
         if self.hovered != target {
             self.hovered = target;
             self.notify_changed(cx);
@@ -543,20 +549,19 @@ impl ChatWorkspace {
 
     pub(super) fn confirm_delete_target(
         &mut self,
-        target: SidebarTarget,
+        target: ChatTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match target {
-            SidebarTarget::View(entity) => self.delete_conversation(entity, window, cx),
-            SidebarTarget::Session(session_id) => {
+            ChatTarget::View(entity) => self.delete_conversation(entity, window, cx),
+            ChatTarget::Session(session_id) => {
                 if let Some(entity) = self.conversations.opened_target(&session_id) {
                     self.delete_conversation(entity, window, cx);
                 } else {
                     self.delete_unopened_session(session_id, window, cx);
                 }
             }
-            _ => {}
         }
     }
 }

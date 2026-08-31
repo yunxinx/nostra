@@ -18,7 +18,11 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use super::{ChatApp, SidebarTarget, project_workspace::ProjectWorkspace};
+use super::{
+    ChatApp,
+    history_sidebar::{SidebarActionIds, SidebarActionSpec, render_sidebar_actions},
+    project_workspace::{ProjectTarget, ProjectWorkspace},
+};
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
     ProjectCatalogPage, ProjectCatalogQuery, ProjectSessionStore, ProjectSummary, SessionId,
@@ -683,8 +687,8 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut children: Vec<AnyElement> = Vec::new();
-        let catalog = self.project_workspace_snapshot.catalog();
-        let projects = self.project_workspace_snapshot.projects();
+        let catalog = self.project_snapshot().catalog();
+        let projects = self.project_snapshot().projects();
 
         let loading_and_empty =
             matches!(catalog.projects_load_state, AgentLoadState::Loading) && projects.is_empty();
@@ -728,11 +732,11 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project_id = project.project_id.clone();
-        let catalog = self.project_workspace_snapshot.catalog();
+        let catalog = self.project_snapshot().catalog();
         let expanded = catalog.is_project_expanded(&project_id);
         let list = catalog.session_list(&project_id);
         let draft_here = self
-            .project_workspace_snapshot
+            .project_snapshot()
             .draft_for_project(&project_id)
             .is_some();
 
@@ -790,7 +794,7 @@ impl ChatApp {
         } else {
             IconName::ChevronRight
         };
-        let is_open_project = self.project_workspace_snapshot.catalog().open_project_id()
+        let is_open_project = self.project_snapshot().catalog().open_project_id()
             == Some(project.project_id.as_str());
         let toggle_id = format!("agent-project-{project_id}");
         let hover_group: SharedString = format!("agent-project-hover-{project_id}").into();
@@ -800,8 +804,8 @@ impl ChatApp {
             .clone();
         let focus_ring = cx.theme().ring.opacity(0.2);
         let name_for_key = project_id.clone();
-        let target = SidebarTarget::AgentProject(project_id.clone());
-        let is_confirming = self.project_workspace_snapshot.confirming() == Some(&target);
+        let target = ProjectTarget::Project(project_id.clone());
+        let is_confirming = self.project_snapshot().confirming() == Some(&target);
         let workspace = self.project_workspace().downgrade();
         let workspace_for_key = workspace.clone();
 
@@ -903,7 +907,7 @@ impl ChatApp {
                                                 }
                                             }),
                                     )
-                                    .child(self.render_sidebar_actions(
+                                    .child(self.render_project_sidebar_actions(
                                         target,
                                         true,
                                         is_confirming,
@@ -923,15 +927,15 @@ impl ChatApp {
     ) -> AnyElement {
         let title: SharedString = t!("agent.new_draft").to_string().into();
         let is_selected = matches!(
-            self.project_workspace_snapshot.catalog().open(),
+            self.project_snapshot().catalog().open(),
             Some(AgentOpen::Draft { project_id: open_id }) if open_id == project_id
         );
         let workspace = self.project_workspace().downgrade();
         let project_id = project_id.to_string();
         let target = self
-            .project_workspace_snapshot
+            .project_snapshot()
             .draft_for_project(&project_id)
-            .map(|conversation| SidebarTarget::AgentView(conversation.target()));
+            .map(|conversation| ProjectTarget::View(conversation.target()));
         self.render_indented_session_row(
             format!("agent-draft-{project_id}"),
             title,
@@ -972,7 +976,7 @@ impl ChatApp {
         );
         let project_id = project_id.to_string();
         let workspace = self.project_workspace().downgrade();
-        let target = SidebarTarget::AgentSession {
+        let target = ProjectTarget::Session {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
         };
@@ -994,6 +998,79 @@ impl ChatApp {
         )
     }
 
+    fn render_project_sidebar_actions(
+        &self,
+        target: ProjectTarget,
+        visible: bool,
+        confirming: bool,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ids = match &target {
+            ProjectTarget::View(entity) => SidebarActionIds {
+                trigger_id: ("agent-conversation-actions", *entity).into(),
+                confirm_id: ("agent-conversation-delete-confirm", *entity).into(),
+                trigger_debug_selector: format!("agent-conversation-actions-{}", entity.as_u64()),
+                delete_label: t!("agent.delete_session").to_string(),
+                confirm_title: t!("agent.delete_session_title").to_string(),
+            },
+            ProjectTarget::Session {
+                project_id,
+                session_id,
+            } => SidebarActionIds {
+                trigger_id: format!("agent-session-actions-{project_id}-{session_id}").into(),
+                confirm_id: format!("agent-session-delete-confirm-{project_id}-{session_id}")
+                    .into(),
+                trigger_debug_selector: format!("agent-session-actions-{project_id}-{session_id}"),
+                delete_label: t!("agent.delete_session").to_string(),
+                confirm_title: t!("agent.delete_session_title").to_string(),
+            },
+            ProjectTarget::Project(project_id) => SidebarActionIds {
+                trigger_id: format!("agent-project-actions-{project_id}").into(),
+                confirm_id: format!("agent-project-delete-confirm-{project_id}").into(),
+                trigger_debug_selector: format!("agent-project-actions-{project_id}"),
+                delete_label: t!("agent.delete_project").to_string(),
+                confirm_title: t!("agent.delete_project_title").to_string(),
+            },
+        };
+        let workspace = self.project_workspace().downgrade();
+        render_sidebar_actions(
+            SidebarActionSpec {
+                target,
+                visible,
+                confirming,
+                ids,
+                handle: self.project_snapshot().delete_confirmation(),
+            },
+            {
+                let workspace = workspace.clone();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.clear_delete_confirmation(&target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+            {
+                let workspace = workspace.clone();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.confirm_delete_target(target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+            move |target, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.begin_delete_confirmation(target, window, cx)
+                    })
+                    .ok();
+            },
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_indented_session_row(
         &self,
@@ -1004,7 +1081,7 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
         on_activate: impl Fn(&mut Window, &mut App) + 'static,
-        target: Option<SidebarTarget>,
+        target: Option<ProjectTarget>,
     ) -> AnyElement {
         let focus_handle = window
             .use_keyed_state(row_id.clone(), cx, |_, cx| cx.focus_handle())
@@ -1015,7 +1092,7 @@ impl ChatApp {
         let hover_group: SharedString = format!("{row_id}-hover").into();
         let is_confirming = target
             .as_ref()
-            .is_some_and(|target| self.project_workspace_snapshot.confirming() == Some(target));
+            .is_some_and(|target| self.project_snapshot().confirming() == Some(target));
 
         div()
             .id(row_id)
@@ -1075,7 +1152,12 @@ impl ChatApp {
                     .group_hover(hover_group, |this| this.visible())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .when_some(target, |this, target| {
-                        this.child(self.render_sidebar_actions(target, true, is_confirming, cx))
+                        this.child(self.render_project_sidebar_actions(
+                            target,
+                            true,
+                            is_confirming,
+                            cx,
+                        ))
                     }),
             )
             .into_any_element()
@@ -1277,18 +1359,18 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let catalog = self.project_workspace_snapshot.catalog();
-        let has_projects = !self.project_workspace_snapshot.projects().is_empty();
+        let catalog = self.project_snapshot().catalog();
+        let has_projects = !self.project_snapshot().projects().is_empty();
         if !has_projects {
             return self.render_agent_folder_guide(cx).into_any_element();
         }
         if catalog.open().is_none() {
             return self.render_agent_idle_workspace(cx).into_any_element();
         }
-        if catalog.open_project_id().is_some_and(|project_id| {
-            self.project_workspace_snapshot
-                .is_deleting_project(project_id)
-        }) {
+        if catalog
+            .open_project_id()
+            .is_some_and(|project_id| self.project_snapshot().is_deleting_project(project_id))
+        {
             return v_flex()
                 .flex_1()
                 .items_center()
@@ -1304,7 +1386,7 @@ impl ChatApp {
                 .into_any_element();
         }
 
-        self.project_workspace_snapshot
+        self.project_snapshot()
             .active_view()
             .map(IntoElement::into_any_element)
             .unwrap_or_else(|| self.render_agent_main_empty(cx).into_any_element())
@@ -1378,7 +1460,7 @@ impl ChatApp {
     fn render_agent_main_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let loading = matches!(
-            self.project_workspace_snapshot.session_load_state(),
+            self.project_snapshot().session_load_state(),
             AgentLoadState::Loading
         );
 
@@ -1399,7 +1481,7 @@ impl ChatApp {
         }
 
         if matches!(
-            self.project_workspace_snapshot.session_load_state(),
+            self.project_snapshot().session_load_state(),
             AgentLoadState::Error(_)
         ) {
             let workspace = self.project_workspace().downgrade();
@@ -1453,26 +1535,25 @@ impl ChatApp {
             .into_any_element()
     }
 
-    pub(super) fn switch_workspace_mode(
+    pub(super) fn switch_workspace(
         &mut self,
-        mode: super::WorkspaceMode,
+        workspace_id: crate::runtime::WorkspaceId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_mode == mode {
+        if self.workspace_id == workspace_id {
             return;
         }
-        if matches!(self.workspace_mode, super::WorkspaceMode::Project) {
+        if self.workspace_id == crate::runtime::PROJECT_WORKSPACE_ID {
             self.project_workspace()
                 .update(cx, |workspace, cx| workspace.dismiss_active_completion(cx));
         }
-        self.workspace_mode = mode;
-        crate::preferences::set_last_workspace_id(mode.workspace_id(), cx);
-        if matches!(mode, super::WorkspaceMode::Project)
+        self.workspace_id = workspace_id;
+        crate::preferences::set_last_workspace_id(workspace_id, cx);
+        self.sync_workspace_snapshot(cx);
+        if workspace_id == crate::runtime::PROJECT_WORKSPACE_ID
             && matches!(
-                self.project_workspace_snapshot
-                    .catalog()
-                    .projects_load_state,
+                self.project_snapshot().catalog().projects_load_state,
                 AgentLoadState::Unloaded | AgentLoadState::Error(_)
             )
         {

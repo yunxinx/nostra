@@ -77,7 +77,6 @@ impl WorkspaceHost {
         self.project_workspace.clone()
     }
 
-    #[cfg(test)]
     pub(super) fn registry_snapshot(&self) -> &WorkspaceRegistrySnapshot {
         &self._registry_snapshot
     }

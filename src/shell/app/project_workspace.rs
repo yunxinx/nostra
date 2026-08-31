@@ -19,13 +19,23 @@ use crate::session::{
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
 use super::{
-    SidebarTarget,
     agent_workspace::{AgentLoadState, AgentWorkspace, merge_persisted_projects},
     chat_workspace::{SelectionEpoch, SelectionRequest},
     conversation_host::{
         Conversation, ConversationHost, ConversationHostSnapshot, ConversationSnapshot,
     },
 };
+
+/// Identity of a Project sidebar row.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum ProjectTarget {
+    View(gpui::EntityId),
+    Session {
+        project_id: String,
+        session_id: SessionId,
+    },
+    Project(String),
+}
 
 #[derive(Clone)]
 pub(super) struct ProjectConversationMetadata {
@@ -46,7 +56,7 @@ pub(super) struct ProjectWorkspaceSnapshot {
     projects: Vec<crate::session::ProjectSummary>,
     conversations: ConversationHostSnapshot<ProjectConversationMetadata>,
     deleting_projects: std::collections::HashSet<String>,
-    confirming: Option<SidebarTarget>,
+    confirming: Option<ProjectTarget>,
     delete_confirmation: InlineDeleteConfirmationHandle,
     session_load_state: AgentLoadState,
 }
@@ -113,7 +123,7 @@ impl ProjectWorkspaceSnapshot {
         self.deleting_projects.contains(project_id)
     }
 
-    pub(super) fn confirming(&self) -> Option<&SidebarTarget> {
+    pub(super) fn confirming(&self) -> Option<&ProjectTarget> {
         self.confirming.as_ref()
     }
 
@@ -144,7 +154,7 @@ pub(super) struct ProjectWorkspace {
     pub(super) _delete_task: Option<Task<()>>,
     pub(super) deleting_projects: std::collections::HashSet<String>,
     pub(super) _folder_task: Option<Task<()>>,
-    pub(super) confirming: Option<SidebarTarget>,
+    pub(super) confirming: Option<ProjectTarget>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
     pub(super) session_load_state: AgentLoadState,
     pub(super) session_services: SessionStores,
@@ -777,7 +787,7 @@ impl ProjectWorkspace {
 
     pub(super) fn begin_delete_confirmation(
         &mut self,
-        target: SidebarTarget,
+        target: ProjectTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -788,7 +798,7 @@ impl ProjectWorkspace {
 
     pub(super) fn clear_delete_confirmation(
         &mut self,
-        target: &SidebarTarget,
+        target: &ProjectTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -812,8 +822,8 @@ impl ProjectWorkspace {
         };
         let project_id = conversation.metadata.project_id.clone();
         let sidebar_target = conversation.session_id.clone().map_or_else(
-            || SidebarTarget::AgentView(target),
-            |session_id| SidebarTarget::AgentSession {
+            || ProjectTarget::View(target),
+            |session_id| ProjectTarget::Session {
                 project_id: project_id.clone(),
                 session_id,
             },
@@ -825,13 +835,13 @@ impl ProjectWorkspace {
 
     pub(super) fn confirm_delete_target(
         &mut self,
-        target: SidebarTarget,
+        target: ProjectTarget,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match target {
-            SidebarTarget::AgentView(entity) => self.delete_conversation(entity, window, cx),
-            SidebarTarget::AgentSession {
+            ProjectTarget::View(entity) => self.delete_conversation(entity, window, cx),
+            ProjectTarget::Session {
                 project_id,
                 session_id,
             } => {
@@ -841,7 +851,7 @@ impl ProjectWorkspace {
                     self.delete_unopened_session(project_id, session_id, window, cx);
                 }
             }
-            SidebarTarget::AgentProject(project_id) => {
+            ProjectTarget::Project(project_id) => {
                 if let Some(project) = self
                     .snapshot
                     .projects()
@@ -852,7 +862,6 @@ impl ProjectWorkspace {
                     self.delete_project(project, window, cx);
                 }
             }
-            _ => {}
         }
     }
 

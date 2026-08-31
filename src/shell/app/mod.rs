@@ -32,10 +32,12 @@ use rust_i18n::t;
 use crate::appearance::{glass, theme};
 use crate::chat::ChatView;
 use crate::llm::ModelSelection;
-use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry, WorkspaceMode};
+use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry};
 use crate::runtime::{
-    ExitCoordinator, NORMAL_EXIT_TIMEOUT, QUIT_FALLBACK_TIMEOUT, RuntimeServices,
+    CHAT_WORKSPACE_ID, ExitCoordinator, NORMAL_EXIT_TIMEOUT, PROJECT_WORKSPACE_ID,
+    QUIT_FALLBACK_TIMEOUT, RuntimeServices, WorkspaceId,
 };
+#[cfg(test)]
 use crate::session::SessionId;
 use crate::shell::actions::{OpenSettings, ToggleTheme};
 use crate::ui::model_select::ModelPicker;
@@ -64,15 +66,44 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(80.);
 #[cfg(not(target_os = "macos"))]
 const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
-use chat_workspace::{ChatWorkspace, ChatWorkspaceSnapshot};
+use chat_workspace::{ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot};
+#[cfg(test)]
+use project_workspace::ProjectTarget;
 use project_workspace::{ProjectWorkspace, ProjectWorkspaceSnapshot};
 use workspace_host::WorkspaceHost;
+
+#[derive(Clone)]
+enum WorkspaceSnapshot {
+    Chat(Box<ChatWorkspaceSnapshot>),
+    Project(Box<ProjectWorkspaceSnapshot>),
+}
+
+impl WorkspaceSnapshot {
+    fn active_view(&self) -> Option<Entity<ChatView>> {
+        match self {
+            Self::Chat(snapshot) => snapshot.active_view(),
+            Self::Project(snapshot) => snapshot.active_view(),
+        }
+    }
+
+    fn active_selection(&self) -> Option<ModelSelection> {
+        match self {
+            Self::Chat(snapshot) => snapshot
+                .active()
+                .and_then(|target| snapshot.conversation(target))
+                .and_then(|conversation| conversation.selection()),
+            Self::Project(snapshot) => snapshot
+                .active()
+                .and_then(|target| snapshot.conversation(target))
+                .and_then(|conversation| conversation.selection()),
+        }
+    }
+}
 
 pub struct ChatApp {
     focus_handle: FocusHandle,
     workspace_host: WorkspaceHost,
-    chat_workspace_snapshot: ChatWorkspaceSnapshot,
-    project_workspace_snapshot: ProjectWorkspaceSnapshot,
+    workspace_snapshot: WorkspaceSnapshot,
     collapsed: bool,
     /// True once the user has toggled the sidebar at least once.  Prevents an
     /// unwanted slide-in on the very first render.
@@ -91,28 +122,13 @@ pub struct ChatApp {
     /// observer and persisted on quit.
     window_geometry: Option<WindowGeometry>,
     model_picker: Entity<ModelPicker>,
-    /// Current workspace mode (Chat or Agent).
-    workspace_mode: WorkspaceMode,
+    /// Current workspace identity selected in the window.
+    workspace_id: WorkspaceId,
     _quit_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
     preference_handle: PreferenceHandle,
     preference_snapshot: Preferences,
     exit_coordinator: Arc<ExitCoordinator>,
-}
-
-/// Identity of a sidebar row.  Drafts (unbound views) are addressed by their
-/// view entity; persisted catalog rows are addressed by their session id so the
-/// row stays stable whether or not the session is currently opened.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum SidebarTarget {
-    View(gpui::EntityId),
-    Session(SessionId),
-    AgentView(gpui::EntityId),
-    AgentSession {
-        project_id: String,
-        session_id: SessionId,
-    },
-    AgentProject(String),
 }
 
 struct ExitWork {
@@ -143,18 +159,24 @@ impl ChatApp {
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
-        let workspace_mode = if prefs.restore_last_workspace_on_start {
-            WorkspaceMode::from_workspace_id(prefs.last_workspace_id)
-        } else {
-            WorkspaceMode::Chat
-        };
-
         let parent = cx.weak_entity();
         let workspace_host = WorkspaceHost::new(services, preference_handle.clone(), window, cx);
         let chat_workspace = workspace_host.chat_workspace();
-        let chat_workspace_snapshot = chat_workspace.read(cx).snapshot().clone();
         let project_workspace = workspace_host.project_workspace();
-        let project_workspace_snapshot = project_workspace.read(cx).snapshot().clone();
+        let requested_workspace_id = if prefs.restore_last_workspace_on_start {
+            prefs.last_workspace_id
+        } else {
+            CHAT_WORKSPACE_ID
+        };
+        let workspace_id = workspace_host
+            .registry_snapshot()
+            .get(requested_workspace_id)
+            .map_or(CHAT_WORKSPACE_ID, |_| requested_workspace_id);
+        let workspace_snapshot = if workspace_id == PROJECT_WORKSPACE_ID {
+            WorkspaceSnapshot::Project(Box::new(project_workspace.read(cx).snapshot().clone()))
+        } else {
+            WorkspaceSnapshot::Chat(Box::new(chat_workspace.read(cx).snapshot().clone()))
+        };
         let model_picker = cx.new(|cx| {
             ModelPicker::new(
                 prefs.last_model_selection.clone(),
@@ -171,22 +193,27 @@ impl ChatApp {
 
         let workspace_subscription =
             cx.observe_in(&chat_workspace, window, |this, workspace, window, cx| {
-                this.chat_workspace_snapshot = workspace.read(cx).snapshot().clone();
-                this.sync_model_picker_to_active(window, cx);
-                cx.notify();
+                if this.workspace_id == CHAT_WORKSPACE_ID {
+                    this.workspace_snapshot =
+                        WorkspaceSnapshot::Chat(Box::new(workspace.read(cx).snapshot().clone()));
+                    this.sync_model_picker_to_active(window, cx);
+                    cx.notify();
+                }
             });
         let project_workspace_subscription =
             cx.observe_in(&project_workspace, window, |this, workspace, window, cx| {
-                this.project_workspace_snapshot = workspace.read(cx).snapshot().clone();
-                this.sync_model_picker_to_active(window, cx);
-                cx.notify();
+                if this.workspace_id == PROJECT_WORKSPACE_ID {
+                    this.workspace_snapshot =
+                        WorkspaceSnapshot::Project(Box::new(workspace.read(cx).snapshot().clone()));
+                    this.sync_model_picker_to_active(window, cx);
+                    cx.notify();
+                }
             });
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             workspace_host,
-            chat_workspace_snapshot,
-            project_workspace_snapshot,
+            workspace_snapshot,
             collapsed: prefs.sidebar_collapsed,
             has_toggled: false,
             sidebar_width,
@@ -194,7 +221,7 @@ impl ChatApp {
             titlebar_move_pending: false,
             window_geometry: Some(WindowGeometry::from_window(window)),
             model_picker,
-            workspace_mode,
+            workspace_id,
             _quit_task: None,
             _subscriptions: vec![workspace_subscription, project_workspace_subscription],
             preference_handle,
@@ -206,7 +233,7 @@ impl ChatApp {
         this.track_system_appearance(window, cx);
         this.register_save_on_quit(cx);
         this.register_window_close(window, cx);
-        if matches!(this.workspace_mode, WorkspaceMode::Project) {
+        if this.workspace_id == PROJECT_WORKSPACE_ID {
             this.project_workspace()
                 .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx));
         }
@@ -219,6 +246,30 @@ impl ChatApp {
 
     fn project_workspace(&self) -> Entity<ProjectWorkspace> {
         self.workspace_host.project_workspace()
+    }
+
+    fn chat_snapshot(&self) -> &ChatWorkspaceSnapshot {
+        match &self.workspace_snapshot {
+            WorkspaceSnapshot::Chat(snapshot) => snapshot,
+            WorkspaceSnapshot::Project(_) => unreachable!("active workspace snapshot is Chat"),
+        }
+    }
+
+    fn project_snapshot(&self) -> &ProjectWorkspaceSnapshot {
+        match &self.workspace_snapshot {
+            WorkspaceSnapshot::Project(snapshot) => snapshot,
+            WorkspaceSnapshot::Chat(_) => unreachable!("active workspace snapshot is Project"),
+        }
+    }
+
+    fn sync_workspace_snapshot(&mut self, cx: &App) {
+        self.workspace_snapshot = if self.workspace_id == PROJECT_WORKSPACE_ID {
+            WorkspaceSnapshot::Project(Box::new(
+                self.project_workspace().read(cx).snapshot().clone(),
+            ))
+        } else {
+            WorkspaceSnapshot::Chat(Box::new(self.chat_workspace().read(cx).snapshot().clone()))
+        };
     }
 
     /// Keep `window_geometry` current across moves and resizes.  The
@@ -328,24 +379,7 @@ impl ChatApp {
     }
 
     fn sync_model_picker_to_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selection = match self.workspace_mode {
-            WorkspaceMode::Chat => {
-                let Some(target) = self.chat_workspace_snapshot.active() else {
-                    return;
-                };
-                self.chat_workspace_snapshot
-                    .conversation(target)
-                    .and_then(|conversation| conversation.selection())
-            }
-            WorkspaceMode::Project => {
-                let Some(target) = self.project_workspace_snapshot.active() else {
-                    return;
-                };
-                self.project_workspace_snapshot
-                    .conversation(target)
-                    .and_then(|conversation| conversation.selection())
-            }
-        };
+        let selection = self.workspace_snapshot.active_selection();
         self.model_picker.update(cx, |picker, cx| {
             picker.set_conversation(selection, window, cx)
         });
@@ -356,13 +390,14 @@ impl ChatApp {
         selection: ModelSelection,
         cx: &mut Context<Self>,
     ) -> bool {
-        match self.workspace_mode {
-            WorkspaceMode::Chat => self
+        match self.workspace_id {
+            CHAT_WORKSPACE_ID => self
                 .chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
-            WorkspaceMode::Project => self
+            PROJECT_WORKSPACE_ID => self
                 .project_workspace()
                 .update(cx, |workspace, cx| workspace.select_model(selection, cx)),
+            _ => false,
         }
     }
 
@@ -373,16 +408,17 @@ impl ChatApp {
     }
 
     pub(crate) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match self.workspace_mode {
-            WorkspaceMode::Chat => {
+        match self.workspace_id {
+            CHAT_WORKSPACE_ID => {
                 self.model_picker
                     .update(cx, |picker, cx| picker.dismiss(window, cx));
                 self.chat_workspace()
                     .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
             }
-            WorkspaceMode::Project => self
+            PROJECT_WORKSPACE_ID => self
                 .project_workspace()
                 .update(cx, |workspace, cx| workspace.open_project_folder(cx)),
+            _ => {}
         }
     }
 
@@ -392,7 +428,7 @@ impl ChatApp {
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         self.chat_workspace()
             .update(cx, |workspace, cx| workspace.spawn_draft(window, cx));
-        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
+        self.sync_workspace_snapshot(cx);
     }
 
     #[cfg(test)]
@@ -401,7 +437,7 @@ impl ChatApp {
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         self.chat_workspace()
             .update(cx, |workspace, cx| workspace.select(index, cx));
-        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
+        self.sync_workspace_snapshot(cx);
     }
 
     #[cfg(test)]
@@ -415,7 +451,7 @@ impl ChatApp {
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         self.chat_workspace()
             .update(cx, |workspace, cx| workspace.select_target(target, cx));
-        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
+        self.sync_workspace_snapshot(cx);
     }
 
     #[cfg(test)]
@@ -430,7 +466,7 @@ impl ChatApp {
         self.chat_workspace().update(cx, |workspace, cx| {
             workspace.select_session(session_id, window, cx)
         });
-        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
+        self.sync_workspace_snapshot(cx);
     }
 
     #[cfg(test)]
@@ -443,11 +479,11 @@ impl ChatApp {
         self.chat_workspace().update(cx, |workspace, cx| {
             workspace.delete_conversation(target, window, cx)
         });
-        self.chat_workspace_snapshot = self.chat_workspace().read(cx).snapshot().clone();
+        self.sync_workspace_snapshot(cx);
     }
 
     pub(crate) fn request_delete_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.workspace_mode, WorkspaceMode::Project) {
+        if self.workspace_id == PROJECT_WORKSPACE_ID {
             let revealed = self.project_workspace().update(cx, |workspace, cx| {
                 workspace.request_delete_active(window, cx)
             });
@@ -459,10 +495,11 @@ impl ChatApp {
             return;
         }
 
-        let Some(target) = self.chat_workspace_snapshot.active() else {
+        let snapshot = self.chat_snapshot();
+        let Some(target) = snapshot.active() else {
             return;
         };
-        if self.chat_workspace_snapshot.conversation(target).is_none() {
+        if snapshot.conversation(target).is_none() {
             return;
         }
         if self.collapsed {
@@ -470,16 +507,12 @@ impl ChatApp {
             self.has_toggled = true;
         }
         self.chat_workspace().update(cx, |workspace, cx| {
-            workspace.begin_delete_confirmation(SidebarTarget::View(target), window, cx)
+            workspace.begin_delete_confirmation(ChatTarget::View(target), window, cx)
         });
     }
 
     fn active_view(&self) -> Option<Entity<ChatView>> {
-        self.chat_workspace_snapshot.active_view()
-    }
-
-    fn active_agent_view(&self) -> Option<Entity<ChatView>> {
-        self.project_workspace_snapshot.active_view()
+        self.workspace_snapshot.active_view()
     }
 }
 

@@ -263,7 +263,7 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
     });
     cx.run_until_parked();
     let session_id = app.read_with(cx, |this, cx| {
-        this.chat_workspace_snapshot.conversations()[0]
+        this.chat_snapshot().conversations()[0]
             .view()
             .read_with(cx, |chat, _| chat.durable_session_id_for_test())
             .expect("durable Chat session id")
@@ -326,7 +326,7 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
     );
     app.read_with(cx, |this, _| {
         assert!(
-            this.chat_workspace_snapshot
+            this.chat_snapshot()
                 .conversations()
                 .iter()
                 .all(|conversation| conversation.view().entity_id() != target)
@@ -356,20 +356,20 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
             for _ in 1..20 {
                 this.spawn_draft(window, cx);
             }
-            assert_eq!(this.chat_workspace_snapshot.conversations().len(), 20);
+            assert_eq!(this.chat_snapshot().conversations().len(), 20);
 
             let mut removed = Vec::new();
-            while this.chat_workspace_snapshot.conversations().len() > 1 {
-                let view = this.chat_workspace_snapshot.conversations()[0].view();
+            while this.chat_snapshot().conversations().len() > 1 {
+                let view = this.chat_snapshot().conversations()[0].view();
                 let view = view.downgrade();
-                let target = this.chat_workspace_snapshot.conversations()[0].target();
+                let target = this.chat_snapshot().conversations()[0].target();
                 removed.push(view);
                 this.delete_conversation(target, window, cx);
             }
-            assert_eq!(this.chat_workspace_snapshot.conversations().len(), 1);
-            assert!(this.chat_workspace_snapshot.active().is_some());
+            assert_eq!(this.chat_snapshot().conversations().len(), 1);
+            assert!(this.chat_snapshot().active().is_some());
             assert_eq!(
-                this.chat_workspace_snapshot
+                this.chat_snapshot()
                     .conversations()
                     .iter()
                     .filter(|_| true)
@@ -399,16 +399,14 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
                 this.spawn_draft(window, cx);
             }
             let mut removed = Vec::new();
-            while this.chat_workspace_snapshot.conversations().len() > 1 {
-                let view = this.chat_workspace_snapshot.conversations()[0]
-                    .view()
-                    .downgrade();
-                let target = this.chat_workspace_snapshot.conversations()[0].target();
+            while this.chat_snapshot().conversations().len() > 1 {
+                let view = this.chat_snapshot().conversations()[0].view().downgrade();
+                let target = this.chat_snapshot().conversations()[0].target();
                 removed.push(view);
                 this.delete_conversation(target, window, cx);
             }
-            assert_eq!(this.chat_workspace_snapshot.conversations().len(), 1);
-            assert!(this.chat_workspace_snapshot.active().is_some());
+            assert_eq!(this.chat_snapshot().conversations().len(), 1);
+            assert!(this.chat_snapshot().active().is_some());
             removed
         })
     });
@@ -432,16 +430,14 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
                 this.spawn_draft(window, cx);
             }
             let mut removed = Vec::new();
-            while this.chat_workspace_snapshot.conversations().len() > 1 {
-                let view = this.chat_workspace_snapshot.conversations()[0]
-                    .view()
-                    .downgrade();
-                let target = this.chat_workspace_snapshot.conversations()[0].target();
+            while this.chat_snapshot().conversations().len() > 1 {
+                let view = this.chat_snapshot().conversations()[0].view().downgrade();
+                let target = this.chat_snapshot().conversations()[0].target();
                 removed.push(view);
                 this.delete_conversation(target, window, cx);
             }
-            assert_eq!(this.chat_workspace_snapshot.conversations().len(), 1);
-            assert!(this.chat_workspace_snapshot.active().is_some());
+            assert_eq!(this.chat_snapshot().conversations().len(), 1);
+            assert!(this.chat_snapshot().active().is_some());
             removed
         })
     });
@@ -468,14 +464,14 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let middle = this.chat_workspace_snapshot.conversations()[1].target();
-            let next = this.chat_workspace_snapshot.conversations()[2].target();
+            let middle = this.chat_snapshot().conversations()[1].target();
+            let next = this.chat_snapshot().conversations()[2].target();
             this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(middle, cx));
             this.delete_conversation(middle, window, cx);
-            assert_eq!(this.chat_workspace_snapshot.active(), Some(next));
+            assert_eq!(this.chat_snapshot().active(), Some(next));
             assert_eq!(
-                this.chat_workspace_snapshot
+                this.chat_snapshot()
                     .active_view()
                     .expect("active view")
                     .entity_id(),
@@ -483,15 +479,15 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             );
 
             let before = this
-                .chat_workspace_snapshot
+                .chat_snapshot()
                 .active_view()
                 .expect("active view")
                 .entity_id();
-            let non_active = this.chat_workspace_snapshot.conversations()[0].target();
+            let non_active = this.chat_snapshot().conversations()[0].target();
             this.delete_conversation(non_active, window, cx);
-            assert_eq!(this.chat_workspace_snapshot.active(), Some(before));
+            assert_eq!(this.chat_snapshot().active(), Some(before));
             assert_eq!(
-                this.chat_workspace_snapshot
+                this.chat_snapshot()
                     .active_view()
                     .expect("active view")
                     .entity_id(),
@@ -499,18 +495,18 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             );
 
             let only = this
-                .chat_workspace_snapshot
+                .chat_snapshot()
                 .active_view()
                 .expect("active view")
                 .downgrade();
             let only_id = this
-                .chat_workspace_snapshot
+                .chat_snapshot()
                 .active_view()
                 .expect("active view")
                 .entity_id();
             this.delete_conversation(only_id, window, cx);
-            assert!(this.chat_workspace_snapshot.conversations().is_empty());
-            assert!(this.chat_workspace_snapshot.active().is_none());
+            assert!(this.chat_snapshot().conversations().is_empty());
+            assert!(this.chat_snapshot().active().is_none());
             drop(only);
         });
     });
@@ -545,10 +541,7 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
     assert!(dropped.get());
     assert!(weak.upgrade().is_none());
     assert_eq!(
-        app.read_with(cx, |this, _| this
-            .chat_workspace_snapshot
-            .conversations()
-            .len()),
+        app.read_with(cx, |this, _| this.chat_snapshot().conversations().len()),
         0
     );
 }
@@ -561,11 +554,11 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let target = this.chat_workspace_snapshot.conversations()[0].target();
-            let selected = this.chat_workspace_snapshot.conversations()[2].target();
+            let target = this.chat_snapshot().conversations()[0].target();
+            let selected = this.chat_snapshot().conversations()[2].target();
             this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(target, cx);
-                workspace.begin_delete_confirmation(SidebarTarget::View(target), window, cx);
+                workspace.begin_delete_confirmation(ChatTarget::View(target), window, cx);
             });
             this.select(2, window, cx);
             (target, selected)
@@ -575,7 +568,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             let target = this
-                .chat_workspace_snapshot
+                .chat_snapshot()
                 .confirming()
                 .cloned()
                 .expect("delete target");
@@ -587,14 +580,14 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
     cx.run_until_parked();
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 2);
+        assert_eq!(this.chat_snapshot().conversations().len(), 2);
         assert!(
-            this.chat_workspace_snapshot
+            this.chat_snapshot()
                 .conversations()
                 .iter()
                 .all(|conversation| conversation.view().entity_id() != target)
         );
-        assert_eq!(this.chat_workspace_snapshot.active(), Some(selected));
+        assert_eq!(this.chat_snapshot().active(), Some(selected));
     });
 }
 
@@ -606,8 +599,8 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let target = this.chat_workspace_snapshot.conversations()[0].target();
-            let selected = this.chat_workspace_snapshot.conversations()[2].target();
+            let target = this.chat_snapshot().conversations()[0].target();
+            let selected = this.chat_snapshot().conversations()[2].target();
             this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(target, cx));
             (target, selected)
@@ -619,10 +612,8 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("down enter");
     redraw(cx);
     assert_eq!(
-        app.read_with(cx, |this, _| {
-            this.chat_workspace_snapshot.confirming().cloned()
-        }),
-        Some(SidebarTarget::View(target))
+        app.read_with(cx, |this, _| { this.chat_snapshot().confirming().cloned() }),
+        Some(ChatTarget::View(target))
     );
 
     cx.update(|window, cx| {
@@ -638,15 +629,15 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     click(cx, confirm);
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 2);
+        assert_eq!(this.chat_snapshot().conversations().len(), 2);
         assert!(
-            this.chat_workspace_snapshot
+            this.chat_snapshot()
                 .conversations()
                 .iter()
                 .all(|conversation| conversation.view().entity_id() != target)
         );
-        assert_eq!(this.chat_workspace_snapshot.active(), Some(selected));
-        assert_eq!(this.chat_workspace_snapshot.confirming(), None);
+        assert_eq!(this.chat_snapshot().active(), Some(selected));
+        assert_eq!(this.chat_snapshot().confirming(), None);
     });
 }
 
@@ -667,7 +658,7 @@ fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext
     let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx)
             });
@@ -687,9 +678,9 @@ fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext
     redraw(cx);
     assert_eq!(
         app.read_with(cx, |this, _| {
-            this.project_workspace_snapshot.confirming().cloned()
+            this.project_snapshot().confirming().cloned()
         }),
-        Some(SidebarTarget::AgentView(target))
+        Some(ProjectTarget::View(target))
     );
 
     let confirm = Box::leak(
@@ -702,9 +693,9 @@ fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext
     click(cx, confirm);
 
     app.read_with(cx, |this, _| {
-        assert!(this.project_workspace_snapshot.conversations().is_empty());
-        assert!(this.project_workspace_snapshot.active().is_none());
-        assert_eq!(this.project_workspace_snapshot.confirming(), None);
+        assert!(this.project_snapshot().conversations().is_empty());
+        assert!(this.project_snapshot().active().is_none());
+        assert_eq!(this.project_snapshot().confirming(), None);
     });
 }
 
@@ -725,7 +716,7 @@ fn deleting_the_active_agent_reveals_its_inline_confirmation_anchor(cx: &mut Tes
     let (app, cx) = add_app_window_with_preferences_and_stores(cx, prefs, Some(stores));
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx);
                 workspace.toggle_project(project.project_id.clone(), cx);
@@ -744,13 +735,13 @@ fn deleting_the_active_agent_reveals_its_inline_confirmation_anchor(cx: &mut Tes
     app.read_with(cx, |this, _| {
         assert!(!this.collapsed);
         assert!(
-            this.project_workspace_snapshot
+            this.project_snapshot()
                 .catalog()
                 .is_project_expanded(&project.project_id)
         );
         assert_eq!(
-            this.project_workspace_snapshot.confirming(),
-            Some(&SidebarTarget::AgentView(target))
+            this.project_snapshot().confirming(),
+            Some(&ProjectTarget::View(target))
         );
     });
     let confirm = Box::leak(
@@ -808,7 +799,7 @@ fn unavailable_conversation_runtime_reports_a_notification_without_creating_a_dr
         let notification_count = window.notifications(cx).len();
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            assert!(this.chat_workspace_snapshot.conversations().is_empty());
+            assert!(this.chat_snapshot().conversations().is_empty());
         });
         assert_eq!(window.notifications(cx).len(), notification_count + 1);
     });
@@ -819,18 +810,14 @@ fn startup_shows_empty_workspace_without_creating_a_draft(cx: &mut TestAppContex
     let (app, cx) = add_app_window(cx);
     app.read_with(cx, |this, _| {
         assert!(
-            this.chat_workspace_snapshot.conversations().is_empty(),
+            this.chat_snapshot().conversations().is_empty(),
             "no draft on startup"
         );
         assert!(
-            this.chat_workspace_snapshot.active().is_none(),
+            this.chat_snapshot().active().is_none(),
             "no active target on startup"
         );
-        assert!(
-            this.chat_workspace_snapshot
-                .opened_session_index()
-                .is_empty()
-        );
+        assert!(this.chat_snapshot().opened_session_index().is_empty());
     });
 }
 
@@ -891,7 +878,7 @@ fn startup_restores_the_last_workspace_when_enabled(cx: &mut TestAppContext) {
     let (app, _) = add_app_window_with_preferences(cx, prefs);
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+        assert_eq!(this.workspace_id, PROJECT_WORKSPACE_ID);
     });
 }
 
@@ -905,7 +892,7 @@ fn startup_uses_chat_when_workspace_restore_is_disabled(cx: &mut TestAppContext)
     let (app, _) = add_app_window_with_preferences(cx, prefs);
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.workspace_mode, WorkspaceMode::Chat);
+        assert_eq!(this.workspace_id, CHAT_WORKSPACE_ID);
     });
 }
 
@@ -919,12 +906,12 @@ fn disabled_workspace_restore_still_records_an_explicit_mode(cx: &mut TestAppCon
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
         });
     });
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+        assert_eq!(this.workspace_id, PROJECT_WORKSPACE_ID);
     });
     cx.update(|_, cx| {
         let prefs = crate::preferences::get(cx);
@@ -952,11 +939,11 @@ fn deleting_an_agent_draft_discards_only_the_unpersisted_view(cx: &mut TestAppCo
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx);
                 let target = workspace.snapshot().active().expect("active Agent draft");
-                workspace.confirm_delete_target(SidebarTarget::AgentView(target), window, cx);
+                workspace.confirm_delete_target(ProjectTarget::View(target), window, cx);
             });
         });
     });
@@ -1011,7 +998,7 @@ fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_fold
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_session(project.project_id.clone(), session_id.clone(), window, cx);
             });
@@ -1028,7 +1015,7 @@ fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_fold
         app.update(cx, |this, cx| {
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.confirm_delete_target(
-                    SidebarTarget::AgentProject(summary.project_id.clone()),
+                    ProjectTarget::Project(summary.project_id.clone()),
                     window,
                     cx,
                 )
@@ -1051,7 +1038,7 @@ fn deleting_an_agent_project_removes_sessions_and_preferences_but_keeps_the_fold
     app.read_with(cx, |this, cx| {
         assert!(
             !this
-                .project_workspace_snapshot
+                .project_snapshot()
                 .is_deleting_project(&project.project_id)
         );
         let workspace = this.project_workspace().read(cx);
@@ -1112,7 +1099,7 @@ fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mu
     redraw(cx);
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.workspace_mode, WorkspaceMode::Project);
+        assert_eq!(this.workspace_id, PROJECT_WORKSPACE_ID);
     });
     cx.update(|_, cx| {
         assert_eq!(
@@ -1131,19 +1118,15 @@ fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {
         });
     });
     app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 1);
+        assert_eq!(this.chat_snapshot().conversations().len(), 1);
         assert!(
-            this.chat_workspace_snapshot.conversations()[0]
+            this.chat_snapshot().conversations()[0]
                 .session_id()
                 .is_none(),
             "draft has no session id"
         );
-        assert!(this.chat_workspace_snapshot.active().is_some());
-        assert!(
-            this.chat_workspace_snapshot
-                .opened_session_index()
-                .is_empty()
-        );
+        assert!(this.chat_snapshot().active().is_some());
+        assert!(this.chat_snapshot().opened_session_index().is_empty());
     });
 }
 
@@ -1155,8 +1138,8 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let first = this.chat_workspace_snapshot.conversations()[0].view();
-            let second = this.chat_workspace_snapshot.conversations()[1].view();
+            let first = this.chat_snapshot().conversations()[0].view();
+            let second = this.chat_snapshot().conversations()[1].view();
             first.update(cx, |chat, cx| {
                 chat.start_pending_reply_for_test(Rc::clone(&dropped), cx)
             });
@@ -1181,8 +1164,8 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
     );
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.active(), Some(first));
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 2);
+        assert_eq!(this.chat_snapshot().active(), Some(first));
+        assert_eq!(this.chat_snapshot().conversations().len(), 2);
     });
 }
 
@@ -1192,14 +1175,14 @@ fn deleting_the_last_conversation_returnss_to_empty_workspace(cx: &mut TestAppCo
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let target = this.chat_workspace_snapshot.conversations()[0].target();
+            let target = this.chat_snapshot().conversations()[0].target();
             this.delete_conversation(target, window, cx);
         });
     });
     cx.run_until_parked();
     app.read_with(cx, |this, _| {
-        assert!(this.chat_workspace_snapshot.conversations().is_empty());
-        assert!(this.chat_workspace_snapshot.active().is_none());
+        assert!(this.chat_snapshot().conversations().is_empty());
+        assert!(this.chat_snapshot().active().is_none());
     });
 }
 
@@ -1211,16 +1194,16 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             {
-                let view = this.chat_workspace_snapshot.conversations()[0].view();
+                let view = this.chat_snapshot().conversations()[0].view();
                 view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
             }
         })
     });
     cx.run_until_parked();
     let opened_target = app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.opened_session_index().len(), 1);
+        assert_eq!(this.chat_snapshot().opened_session_index().len(), 1);
         *this
-            .chat_workspace_snapshot
+            .chat_snapshot()
             .opened_session_index()
             .get(&session_id)
             .expect("session bound")
@@ -1235,11 +1218,11 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
     cx.run_until_parked();
     app.read_with(cx, |this, _| {
         assert_eq!(
-            this.chat_workspace_snapshot.active(),
+            this.chat_snapshot().active(),
             Some(opened_target),
             "reuse without spawning a new view"
         );
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 2);
+        assert_eq!(this.chat_snapshot().conversations().len(), 2);
     });
 }
 
@@ -1254,19 +1237,17 @@ fn selecting_a_chat_draft_invalidates_an_older_session_restore(cx: &mut TestAppC
         app.update(cx, |this, cx| {
             this.select_session(session_id.clone(), window, cx);
             this.spawn_draft(window, cx);
-            this.chat_workspace_snapshot
-                .active()
-                .expect("new draft is active")
+            this.chat_snapshot().active().expect("new draft is active")
         })
     });
     cx.run_until_parked();
 
     app.read_with(cx, |this, _| {
-        assert_eq!(this.chat_workspace_snapshot.active(), Some(draft_target));
-        assert_eq!(this.chat_workspace_snapshot.conversations().len(), 1);
+        assert_eq!(this.chat_snapshot().active(), Some(draft_target));
+        assert_eq!(this.chat_snapshot().conversations().len(), 1);
         assert!(
             !this
-                .chat_workspace_snapshot
+                .chat_snapshot()
                 .opened_session_index()
                 .contains_key(&session_id)
         );
@@ -1292,7 +1273,7 @@ fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestA
 
     let draft_target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.switch_workspace_mode(WorkspaceMode::Project, window, cx);
+            this.switch_workspace(PROJECT_WORKSPACE_ID, window, cx);
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_session(project.project_id.clone(), session_id.clone(), window, cx);
                 workspace.open_draft(project.project_id.clone(), window, cx);

@@ -6,7 +6,7 @@
 //! workspace state, never row identity. Every catalog read runs on the
 //! background executor; render only reads the snapshot.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, rc::Rc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -31,8 +31,10 @@ use crate::session::{
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmation;
 
-use super::chat_workspace::{ChatConversationSnapshot, ChatWorkspace, ChatWorkspaceSnapshot};
-use super::{ChatApp, SidebarTarget};
+use super::ChatApp;
+use super::chat_workspace::{
+    ChatConversationSnapshot, ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot,
+};
 
 /// Row height for both draft and catalog rows, matching the previous
 /// conversation row so the sidebar density is unchanged.
@@ -398,7 +400,7 @@ impl ChatWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.confirming == Some(SidebarTarget::Session(session_id.clone())) {
+        if self.confirming == Some(ChatTarget::Session(session_id.clone())) {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
         }
@@ -479,7 +481,7 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let snapshot = &self.chat_workspace_snapshot;
+        let snapshot = self.chat_snapshot();
         let mut children: Vec<AnyElement> = Vec::new();
 
         let drafts: Vec<&ChatConversationSnapshot> = snapshot
@@ -588,7 +590,7 @@ impl ChatApp {
     }
 
     fn render_load_more_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let in_flight = self.chat_workspace_snapshot.history().load_more_in_flight();
+        let in_flight = self.chat_snapshot().history().load_more_in_flight();
         let workspace = self.chat_workspace().downgrade();
         let row = div()
             .id("history-load-more")
@@ -625,7 +627,7 @@ impl ChatApp {
         let title = conversation.title();
         let is_active = snapshot.active() == Some(target);
         let is_generating = conversation.is_generating();
-        let sidebar_target = SidebarTarget::View(target);
+        let sidebar_target = ChatTarget::View(target);
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
             is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
@@ -678,7 +680,7 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let session_id = summary.session_id.clone();
-        let sidebar_target = SidebarTarget::Session(session_id.clone());
+        let sidebar_target = ChatTarget::Session(session_id.clone());
         let opened_target = snapshot.opened_target(&session_id);
         let is_active = active_session_id == Some(&session_id);
         let is_generating = opened_target
@@ -769,7 +771,7 @@ impl ChatApp {
         is_generating: bool,
         actions_visible: bool,
         is_confirming: bool,
-        target: SidebarTarget,
+        target: ChatTarget,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_key_down: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
         window: &mut Window,
@@ -876,7 +878,7 @@ impl ChatApp {
                     .top(px(6.))
                     .size_5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_sidebar_actions(
+                    .child(self.render_chat_sidebar_actions(
                         target_for_actions,
                         actions_visible,
                         is_confirming,
@@ -886,174 +888,147 @@ impl ChatApp {
             .into_any_element()
     }
 
-    /// Render the trailing actions button for any sidebar row.  When
-    /// confirming, the button becomes a Popover trigger with an inline delete
-    /// card; otherwise it opens a dropdown menu with a delete entry.
-    pub(super) fn render_sidebar_actions(
+    fn render_chat_sidebar_actions(
         &self,
-        target: SidebarTarget,
+        target: ChatTarget,
         visible: bool,
         confirming: bool,
         _cx: &mut Context<Self>,
     ) -> AnyElement {
         let workspace = self.chat_workspace().downgrade();
-        let project_workspace = self.project_workspace().downgrade();
-        let is_chat_target = matches!(target, SidebarTarget::View(_) | SidebarTarget::Session(_));
-        let (trigger_id, confirm_id, trigger_debug_selector, delete_label, confirm_title): (
-            ElementId,
-            ElementId,
-            String,
-            String,
-            String,
-        ) = match &target {
-            SidebarTarget::View(entity) => (
-                ("conversation-actions", *entity).into(),
-                ("conversation-delete-confirm", *entity).into(),
-                format!("conversation-actions-{}", entity.as_u64()),
-                t!("sidebar.delete_chat").to_string(),
-                t!("sidebar.delete_chat_title").to_string(),
-            ),
-            SidebarTarget::Session(session) => (
-                format!("history-actions-{session}").into(),
-                format!("history-delete-confirm-{session}").into(),
-                format!("history-actions-{session}"),
-                t!("sidebar.delete_chat").to_string(),
-                t!("sidebar.delete_chat_title").to_string(),
-            ),
-            SidebarTarget::AgentView(entity) => (
-                ("agent-conversation-actions", *entity).into(),
-                ("agent-conversation-delete-confirm", *entity).into(),
-                format!("agent-conversation-actions-{}", entity.as_u64()),
-                t!("agent.delete_session").to_string(),
-                t!("agent.delete_session_title").to_string(),
-            ),
-            SidebarTarget::AgentSession {
-                project_id,
-                session_id,
-            } => (
-                format!("agent-session-actions-{project_id}-{session_id}").into(),
-                format!("agent-session-delete-confirm-{project_id}-{session_id}").into(),
-                format!("agent-session-actions-{project_id}-{session_id}"),
-                t!("agent.delete_session").to_string(),
-                t!("agent.delete_session_title").to_string(),
-            ),
-            SidebarTarget::AgentProject(project_id) => (
-                format!("agent-project-actions-{project_id}").into(),
-                format!("agent-project-delete-confirm-{project_id}").into(),
-                format!("agent-project-actions-{project_id}"),
-                t!("agent.delete_project").to_string(),
-                t!("agent.delete_project_title").to_string(),
-            ),
+        let ids = match &target {
+            ChatTarget::View(entity) => SidebarActionIds {
+                trigger_id: ("conversation-actions", *entity).into(),
+                confirm_id: ("conversation-delete-confirm", *entity).into(),
+                trigger_debug_selector: format!("conversation-actions-{}", entity.as_u64()),
+                delete_label: t!("sidebar.delete_chat").to_string(),
+                confirm_title: t!("sidebar.delete_chat_title").to_string(),
+            },
+            ChatTarget::Session(session) => SidebarActionIds {
+                trigger_id: format!("history-actions-{session}").into(),
+                confirm_id: format!("history-delete-confirm-{session}").into(),
+                trigger_debug_selector: format!("history-actions-{session}"),
+                delete_label: t!("sidebar.delete_chat").to_string(),
+                confirm_title: t!("sidebar.delete_chat_title").to_string(),
+            },
         };
-        let trigger = Button::new(trigger_id)
-            .ghost()
-            .xsmall()
-            .icon(IconName::Ellipsis)
-            .tooltip(t!("sidebar.more_actions").to_string())
-            .debug_selector(move || trigger_debug_selector.clone());
+        render_sidebar_actions(
+            SidebarActionSpec {
+                target,
+                visible,
+                confirming,
+                ids,
+                handle: self.chat_snapshot().delete_confirmation(),
+            },
+            move |target, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.clear_delete_confirmation(&target, window, cx)
+                    })
+                    .ok();
+            },
+            {
+                let workspace = self.chat_workspace().downgrade();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.confirm_delete_target(target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+            {
+                let workspace = self.chat_workspace().downgrade();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.begin_delete_confirmation(target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+        )
+    }
+}
 
-        if confirming {
-            let target_for_open = target.clone();
-            let target_for_confirm = target;
-            InlineDeleteConfirmation::new(
-                confirm_id,
-                trigger,
-                confirm_title,
-                t!("sidebar.delete_chat_cancel").to_string(),
-                t!("sidebar.delete_chat_confirm").to_string(),
-                if is_chat_target {
-                    self.chat_workspace_snapshot.delete_confirmation()
-                } else {
-                    self.project_workspace_snapshot.delete_confirmation()
-                },
-            )
-            .on_open_change({
-                let workspace = workspace.clone();
-                let project_workspace = project_workspace.clone();
-                move |open: &bool, window, cx| {
-                    if *open {
-                        return;
-                    }
-                    if is_chat_target {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.clear_delete_confirmation(&target_for_open, window, cx)
-                            })
-                            .ok();
-                    } else {
-                        project_workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.clear_delete_confirmation(&target_for_open, window, cx)
-                            })
-                            .ok();
-                    }
-                }
-            })
-            .on_confirm({
-                let workspace = workspace.clone();
-                let project_workspace = project_workspace.clone();
-                move |window, cx| {
-                    if is_chat_target {
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.confirm_delete_target(
-                                    target_for_confirm.clone(),
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .ok();
-                    } else {
-                        project_workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.confirm_delete_target(
-                                    target_for_confirm.clone(),
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .ok();
-                    }
-                }
+/// Stable UI identifiers and labels for one workspace-local sidebar target.
+pub(super) struct SidebarActionIds {
+    pub(super) trigger_id: ElementId,
+    pub(super) confirm_id: ElementId,
+    pub(super) trigger_debug_selector: String,
+    pub(super) delete_label: String,
+    pub(super) confirm_title: String,
+}
+
+pub(super) struct SidebarActionSpec<T> {
+    pub(super) target: T,
+    pub(super) visible: bool,
+    pub(super) confirming: bool,
+    pub(super) ids: SidebarActionIds,
+    pub(super) handle: crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle,
+}
+
+/// Render the common trailing action control without understanding the target
+/// type or which workspace owns it.
+pub(super) fn render_sidebar_actions<T>(
+    spec: SidebarActionSpec<T>,
+    on_clear: impl Fn(T, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(T, &mut Window, &mut App) + 'static,
+    on_begin: impl Fn(T, &mut Window, &mut App) + 'static,
+) -> AnyElement
+where
+    T: Clone + 'static,
+{
+    let SidebarActionSpec {
+        target,
+        visible,
+        confirming,
+        ids,
+        handle,
+    } = spec;
+    let on_begin = Rc::new(on_begin);
+    let trigger = Button::new(ids.trigger_id)
+        .ghost()
+        .xsmall()
+        .icon(IconName::Ellipsis)
+        .tooltip(t!("sidebar.more_actions").to_string())
+        .debug_selector(move || ids.trigger_debug_selector.clone());
+
+    if confirming {
+        let target_for_open = target.clone();
+        let target_for_confirm = target;
+        InlineDeleteConfirmation::new(
+            ids.confirm_id,
+            trigger,
+            ids.confirm_title,
+            t!("sidebar.delete_chat_cancel").to_string(),
+            t!("sidebar.delete_chat_confirm").to_string(),
+            handle,
+        )
+        .on_open_change(move |open: &bool, window, cx| {
+            if !*open {
+                on_clear(target_for_open.clone(), window, cx);
+            }
+        })
+        .on_confirm(move |window, cx| {
+            on_confirm(target_for_confirm.clone(), window, cx);
+        })
+        .into_any_element()
+    } else {
+        let target_for_begin = target;
+        trigger
+            .when(!visible, |this| this.invisible())
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+                let target = target_for_begin.clone();
+                let on_begin = Rc::clone(&on_begin);
+                menu.item(
+                    gpui_component::menu::PopupMenuItem::new(ids.delete_label.clone()).on_click(
+                        move |_, window, cx| {
+                            on_begin(target.clone(), window, cx);
+                        },
+                    ),
+                )
             })
             .into_any_element()
-        } else {
-            trigger
-                .when(!visible, |this| this.invisible())
-                .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-                    let workspace = workspace.clone();
-                    let project_workspace = project_workspace.clone();
-                    let target = target.clone();
-                    let delete_label = delete_label.clone();
-                    menu.item(
-                        gpui_component::menu::PopupMenuItem::new(delete_label).on_click(
-                            move |_, window, cx| {
-                                if is_chat_target {
-                                    workspace
-                                        .update(cx, |workspace, cx| {
-                                            workspace.begin_delete_confirmation(
-                                                target.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                        .ok();
-                                } else {
-                                    project_workspace
-                                        .update(cx, |workspace, cx| {
-                                            workspace.begin_delete_confirmation(
-                                                target.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                        .ok();
-                                }
-                            },
-                        ),
-                    )
-                })
-                .into_any_element()
-        }
     }
 }
