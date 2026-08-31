@@ -35,9 +35,10 @@ pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
 
 #[cfg(test)]
 use self::code_block::*;
-use self::extension_registry::default_extensions;
+use self::extension_registry::default_extension_snapshot;
 pub(crate) use self::extension_registry::{
     MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
+    MarkdownExtensionSnapshot,
 };
 
 const NODE_NAME: &str = "nostra-fenced-code";
@@ -126,6 +127,8 @@ define_probe!(
 /// revision from forcing a full Markdown reparse on every frame.
 pub(crate) struct MarkdownBody {
     state: Entity<TextViewState>,
+    extension_context: MarkdownExtensionContext,
+    extension_snapshot: MarkdownExtensionSnapshot,
     extensions: MarkdownExtensions,
 }
 
@@ -136,10 +139,32 @@ impl MarkdownBody {
         preference_state: PreferenceState,
         cx: &mut App,
     ) -> Self {
-        Self {
+        let extension_snapshot = default_extension_snapshot();
+        Self::new_with_extension_snapshot(
+            source,
+            owner_id,
+            preference_state,
+            &extension_snapshot,
+            cx,
+        )
+    }
+
+    pub(crate) fn new_with_extension_snapshot(
+        source: &str,
+        owner_id: u64,
+        preference_state: PreferenceState,
+        snapshot: &MarkdownExtensionSnapshot,
+        cx: &mut App,
+    ) -> Self {
+        let extension_context = MarkdownExtensionContext::new(owner_id, 0, preference_state);
+        let mut body = Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
-            extensions: default_extensions(owner_id, 0, preference_state),
-        }
+            extension_context,
+            extension_snapshot: MarkdownExtensionSnapshot::empty(),
+            extensions: MarkdownExtensions::default(),
+        };
+        _ = body.update_extension_snapshot(snapshot);
+        body
     }
 
     #[cfg(test)]
@@ -158,6 +183,19 @@ impl MarkdownBody {
     pub(crate) fn set_text(&mut self, source: &str, cx: &mut App) {
         self.state
             .update(cx, |state, cx| state.set_text(source, cx));
+    }
+
+    pub(crate) fn update_extension_snapshot(
+        &mut self,
+        snapshot: &MarkdownExtensionSnapshot,
+    ) -> bool {
+        if snapshot.revision() <= self.extension_snapshot.revision() {
+            return false;
+        }
+
+        self.extensions = snapshot.install(&self.extension_context);
+        self.extension_snapshot = snapshot.clone();
+        true
     }
 
     pub(crate) fn text_view(&self, style: TextViewStyle) -> TextView {
@@ -181,6 +219,11 @@ impl MarkdownBody {
     #[cfg(test)]
     pub(crate) fn entity_id(&self) -> gpui::EntityId {
         self.state.entity_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn extension_revision(&self) -> u64 {
+        self.extension_snapshot.revision()
     }
 
     #[cfg(test)]

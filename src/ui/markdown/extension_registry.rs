@@ -4,12 +4,15 @@ use std::rc::Rc;
 
 use gpui_component::text::MarkdownExtensions;
 
-use crate::runtime::{ContributionDefinition, ContributionId, ContributionKey};
+use crate::runtime::{
+    ContributionDefinition, ContributionId, ContributionKey, ContributionSnapshot,
+};
 
 use super::PreferenceState;
 
 const CJK_EMPHASIS_ID: ContributionId = ContributionId::new("nostra.markdown.cjk");
 const CJK_EMPHASIS_ORDER: u32 = 10;
+const DEFAULT_EXTENSION_REVISION: u64 = 1;
 
 pub(crate) struct MarkdownExtensionKey;
 
@@ -20,6 +23,55 @@ impl ContributionKey for MarkdownExtensionKey {
 }
 
 pub(crate) type MarkdownExtensionDefinition = ContributionDefinition<MarkdownExtensionKey>;
+
+/// Immutable foreground projection of one contribution registry revision.
+#[derive(Clone)]
+pub(crate) struct MarkdownExtensionSnapshot {
+    revision: u64,
+    definitions: Rc<[MarkdownExtensionDefinition]>,
+}
+
+impl MarkdownExtensionSnapshot {
+    pub(super) fn empty() -> Self {
+        Self {
+            revision: 0,
+            definitions: Vec::new().into(),
+        }
+    }
+
+    pub(crate) const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub(super) fn install(&self, context: &MarkdownExtensionContext) -> MarkdownExtensions {
+        install_extensions(
+            self.definitions
+                .iter()
+                .map(MarkdownExtensionDefinition::value),
+            context,
+        )
+    }
+}
+
+impl From<&ContributionSnapshot<MarkdownExtensionKey>> for MarkdownExtensionSnapshot {
+    fn from(snapshot: &ContributionSnapshot<MarkdownExtensionKey>) -> Self {
+        Self {
+            revision: snapshot.revision(),
+            definitions: snapshot
+                .contributions()
+                .iter()
+                .map(|contribution| {
+                    MarkdownExtensionDefinition::new(
+                        contribution.id(),
+                        contribution.order(),
+                        contribution.value().clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
 
 type InstallExtension =
     dyn Fn(MarkdownExtensions, &MarkdownExtensionContext) -> MarkdownExtensions + 'static;
@@ -100,20 +152,15 @@ pub(super) fn install_extensions<'a>(
         })
 }
 
-pub(super) fn default_extensions(
-    owner_id: u64,
-    source_offset: usize,
-    preference_state: PreferenceState,
-) -> MarkdownExtensions {
+pub(super) fn default_extension_snapshot() -> MarkdownExtensionSnapshot {
     let mut contributions = [
         cjk_emphasis_contribution(),
         crate::ui::math::markdown_contribution(),
         super::code_block::fenced_code_contribution(),
     ];
     contributions.sort_unstable_by_key(|contribution| (contribution.order(), contribution.id()));
-    let context = MarkdownExtensionContext::new(owner_id, source_offset, preference_state);
-    install_extensions(
-        contributions.iter().map(MarkdownExtensionDefinition::value),
-        &context,
-    )
+    MarkdownExtensionSnapshot {
+        revision: DEFAULT_EXTENSION_REVISION,
+        definitions: Rc::from(contributions),
+    }
 }
