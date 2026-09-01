@@ -1,4 +1,8 @@
 //! Serialized component reconciliation within one runtime scope.
+//!
+//! Production assembly still lives in [`super::composition`]. This loop is
+//! crate-private and exercised by fake-component tests; it is not the live
+//! composition driver. `RuntimeHost` is not landed.
 
 use std::{cell::RefCell, fmt, future::Future, pin::Pin, rc::Rc, time::Instant};
 

@@ -168,7 +168,6 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             assert!(this.submit("delete while saving".into(), window, cx));
             assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
         });
@@ -216,7 +215,6 @@ fn repeated_delete_requests_share_one_delete_and_scope_close(cx: &mut TestAppCon
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             assert!(this.submit("delete once".into(), window, cx));
             assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
             assert_eq!(this.request_delete(cx), ChatDeleteRequest::Pending);
@@ -380,7 +378,6 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             assert!(this.submit("delete after commit".into(), window, cx));
         });
     });
@@ -649,7 +646,6 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             this.next_reply_drop_flag = Some(Rc::clone(&dropped));
             assert!(this.submit("hold generation open".into(), window, cx));
         });
@@ -885,7 +881,6 @@ fn preparing_the_chat_view_for_shutdown_persists_a_cancelled_terminal(cx: &mut T
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             this.next_reply_drop_flag = Some(Rc::clone(&dropped));
             assert!(this.submit("close during generation".into(), window, cx));
         });
@@ -949,7 +944,6 @@ fn released_chat_retries_its_exact_cancelled_terminal_once(cx: &mut TestAppConte
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             this.next_reply_drop_flag = Some(Rc::clone(&dropped));
             assert!(this.submit("close through one transient failure".into(), window, cx));
         });
@@ -1132,7 +1126,6 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
         chat.update(cx, |this, cx| {
             this.selection = Some(selection);
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             this.composer_revision = 1;
             this.composer.read(cx).input().update(cx, |input, cx| {
                 input.set_value("original draft", window, cx)
@@ -1198,7 +1191,6 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
                 .expect("seed pending controller turn");
             this.selection = Some(selection);
             this.selection_available = true;
-            this.provider_catalog_revision = crate::providers::catalog_revision();
             this.composer_revision = 1;
             this.composer
                 .read(cx)

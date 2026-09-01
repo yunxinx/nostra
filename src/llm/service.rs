@@ -1,13 +1,15 @@
 //! Stable generation service boundary used by runtime Consumers.
 //!
-//! Provider catalog resolution stays in the default adapter. Consumers receive
-//! a prepared handle and only observe canonical events and terminal outcomes.
+//! Provider catalog resolution stays in the default adapter, which reads a live
+//! [`ProviderCatalogSource`] once per request so configuration edits apply to
+//! the next generation without replacing the Provider. Consumers receive a
+//! prepared handle and only observe canonical events and terminal outcomes.
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use super::{
     Gateway, GatewayError, GenerateRequest, Generation, GenerationEvent, HttpTransport,
-    ModelSelection, OutcomeObserver, ProviderCatalogSnapshot,
+    ModelSelection, OutcomeObserver, ProviderCatalogSnapshot, ProviderCatalogSource,
 };
 
 /// Request context accepted by a generation Provider.
@@ -67,14 +69,14 @@ pub trait GenerationRunner {
 
 /// First-party generation Provider backed by the existing Gateway.
 pub struct GatewayGenerationService {
-    catalog: ProviderCatalogSnapshot,
+    catalog: Arc<dyn ProviderCatalogSource>,
     gateway: Gateway,
 }
 
 impl GatewayGenerationService {
     #[must_use]
     pub fn new(
-        catalog: ProviderCatalogSnapshot,
+        catalog: Arc<dyn ProviderCatalogSource>,
         transport: HttpTransport,
         observer: Option<Arc<dyn OutcomeObserver>>,
     ) -> Self {
@@ -82,21 +84,23 @@ impl GatewayGenerationService {
     }
 
     #[must_use]
-    pub fn from_gateway(catalog: ProviderCatalogSnapshot, gateway: Gateway) -> Self {
+    pub fn from_gateway(catalog: Arc<dyn ProviderCatalogSource>, gateway: Gateway) -> Self {
         Self { catalog, gateway }
     }
 
+    /// Resolve the routing catalog currently published by the source.
     #[must_use]
-    pub fn catalog_snapshot(&self) -> &ProviderCatalogSnapshot {
-        &self.catalog
+    pub fn catalog(&self) -> ProviderCatalogSnapshot {
+        self.catalog.catalog()
     }
 }
 
 impl GenerationService for GatewayGenerationService {
     fn start(&self, request: GenerationRequest) -> Result<GenerationHandle, GatewayError> {
-        let generation =
-            self.gateway
-                .prepare(&self.catalog, &request.selection, request.request)?;
+        let catalog = self.catalog.catalog();
+        let generation = self
+            .gateway
+            .prepare(&catalog, &request.selection, request.request)?;
         Ok(GenerationHandle::from_runner(GatewayGenerationRunner {
             generation,
         }))
@@ -122,7 +126,7 @@ impl GenerationRunner for GatewayGenerationRunner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use reqwest_client::ReqwestClient;
 
@@ -152,11 +156,11 @@ mod tests {
     fn gateway_service_resolves_the_catalog_before_creating_a_handle() {
         let metrics = Arc::new(InMemoryMetrics::new(8));
         let service = GatewayGenerationService::new(
-            ProviderCatalogSnapshot::new(vec![profile()]),
+            Arc::new(ProviderCatalogSnapshot::new(vec![profile()])),
             HttpTransport::new(Arc::new(ReqwestClient::new())),
             Some(metrics.clone()),
         );
-        assert_eq!(service.catalog_snapshot().profiles().len(), 1);
+        assert_eq!(service.catalog().profiles().len(), 1);
 
         let request = GenerationRequest::new(
             ModelSelection {
@@ -181,7 +185,7 @@ mod tests {
     #[test]
     fn gateway_service_rejects_selection_before_transport_is_used() {
         let service = GatewayGenerationService::new(
-            ProviderCatalogSnapshot::new(vec![profile()]),
+            Arc::new(ProviderCatalogSnapshot::new(vec![profile()])),
             HttpTransport::new(Arc::new(ReqwestClient::new())),
             None,
         );
@@ -193,5 +197,63 @@ mod tests {
             GenerateRequest::default(),
         );
         assert!(service.start(request).is_err());
+    }
+
+    #[derive(Default)]
+    struct MutableCatalog {
+        profiles: Mutex<Vec<ProviderProfile>>,
+    }
+
+    impl MutableCatalog {
+        fn publish(&self, profiles: Vec<ProviderProfile>) {
+            *self
+                .profiles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = profiles;
+        }
+    }
+
+    impl ProviderCatalogSource for MutableCatalog {
+        fn catalog(&self) -> ProviderCatalogSnapshot {
+            ProviderCatalogSnapshot::new(
+                self.profiles
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone(),
+            )
+        }
+    }
+
+    /// A Provider configured after the service was built must become routable
+    /// without replacing the generation Provider.
+    #[test]
+    fn a_selection_configured_after_construction_resolves_on_the_next_request() {
+        let catalog = Arc::new(MutableCatalog::default());
+        let service = GatewayGenerationService::new(
+            Arc::clone(&catalog) as Arc<dyn ProviderCatalogSource>,
+            HttpTransport::new(Arc::new(ReqwestClient::new())),
+            None,
+        );
+        let request = || {
+            GenerationRequest::new(
+                ModelSelection {
+                    profile_id: "provider".into(),
+                    model_id: "model".into(),
+                },
+                GenerateRequest::default(),
+            )
+        };
+
+        assert!(
+            service.start(request()).is_err(),
+            "an empty catalog cannot route a selection"
+        );
+
+        catalog.publish(vec![profile()]);
+
+        let mut handle = service
+            .start(request())
+            .expect("a newly configured Provider routes without a Provider replacement");
+        handle.cancel();
     }
 }

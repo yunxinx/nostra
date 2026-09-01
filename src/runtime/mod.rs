@@ -4,12 +4,16 @@ mod capability;
 mod component;
 mod composition;
 mod contribution;
+/// Crate-private until RuntimeHost lands. See `.trellis/tasks/09-01-runtime-host`.
+#[allow(dead_code)]
 mod dependency;
 mod diagnostics;
 mod effect;
 mod exit;
 mod generation_mount;
 mod provider;
+/// Crate-private until RuntimeHost lands. See `.trellis/tasks/09-01-runtime-host`.
+#[allow(dead_code)]
 mod reconcile;
 mod scope;
 mod workspace;
@@ -30,9 +34,11 @@ pub use contribution::{
     ContributionRegistry, ContributionRegistryError, ContributionSnapshot,
     ContributionSnapshotEntry,
 };
-pub use dependency::{
+pub(crate) use dependency::ResolvedDependency;
+#[cfg(test)]
+pub(crate) use dependency::{
     ActivationFingerprint, DependencyDeclaration, DependencyResolution, DependencyResolver,
-    DependencyResolverError, DependencySnapshot, PendingDependencies, ResolvedDependency,
+    DependencyResolverError, DependencySnapshot,
 };
 pub(crate) use diagnostics::RuntimeSnapshotSource;
 pub use diagnostics::{
@@ -47,11 +53,11 @@ pub use exit::{ExitCoordinator, ExitReport, NORMAL_EXIT_TIMEOUT, QUIT_FALLBACK_T
 pub use provider::{
     PreparedProvider, ProviderPrepareError, ProviderPrepareFailureKind, ProviderSelectionError,
 };
-pub use reconcile::{
-    ComponentLifecycle, DesiredRevision, DesiredRevisionExhausted, ReconcileFailure,
-    ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus, ReconcileTarget,
-    ReconcileTransition, ScopeLocalReconciler,
+#[cfg(test)]
+pub(crate) use reconcile::{
+    ComponentLifecycle, ReconcileFailureKind, ReconcileStatus, ScopeLocalReconciler,
 };
+pub(crate) use reconcile::{DesiredRevision, ReconcileFailure, ReconcileObserver, ReconcileStage};
 pub use scope::{ScopeError, ScopeKind, ScopeState, ScopeTree};
 pub use workspace::{
     CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, WorkspaceDefinition, WorkspaceId,

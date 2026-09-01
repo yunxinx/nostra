@@ -4,7 +4,6 @@ use super::*;
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_selection_availability();
         // Re-resolve the placeholder so a language switch reaches the
         // already-built input; guarded to avoid a notify cycle.
         let placeholder: SharedString = if self.references_enabled {

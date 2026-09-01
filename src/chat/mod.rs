@@ -165,7 +165,6 @@ pub struct ChatView {
     markdown_presentation: MarkdownPresentation,
     selection: Option<ModelSelection>,
     selection_available: bool,
-    provider_catalog_revision: u64,
     #[cfg(test)]
     next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     composer_revision: u64,
@@ -339,7 +338,6 @@ impl ChatView {
             markdown_presentation,
             selection,
             selection_available,
-            provider_catalog_revision: providers::catalog_revision(),
             #[cfg(test)]
             next_reply_drop_flag: None,
             composer_revision: 0,
@@ -352,7 +350,12 @@ impl ChatView {
                     if this.preference_snapshot == snapshot {
                         return;
                     }
+                    let profiles_changed =
+                        this.preference_snapshot.provider_profiles != snapshot.provider_profiles;
                     this.preference_snapshot = snapshot;
+                    if profiles_changed {
+                        this.sync_selection_availability();
+                    }
                     cx.notify();
                 }),
             ],
@@ -871,7 +874,6 @@ impl ChatView {
             model_id: "fixture-model".into(),
         });
         self.selection_available = true;
-        self.provider_catalog_revision = crate::providers::catalog_revision();
         self.next_reply_drop_flag = Some(dropped);
         self.submit("close during generation".to_string(), window, cx)
     }
@@ -935,7 +937,6 @@ impl ChatView {
         }
         self.selection = Some(selection);
         self.selection_available = true;
-        self.provider_catalog_revision = providers::catalog_revision();
         true
     }
 
@@ -951,15 +952,10 @@ impl ChatView {
     }
 
     fn sync_selection_availability(&mut self) {
-        let revision = providers::catalog_revision();
-        if self.provider_catalog_revision == revision {
-            return;
-        }
         self.selection_available = providers::selection_is_available_from(
             self.selection.as_ref(),
             &self.preference_snapshot,
         );
-        self.provider_catalog_revision = revision;
     }
 }
 

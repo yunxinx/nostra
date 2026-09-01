@@ -79,7 +79,7 @@ fn default_composed_services(
 
 fn generation_service() -> Arc<dyn GenerationService> {
     Arc::new(GatewayGenerationService::new(
-        ProviderCatalogSnapshot::new(Vec::new()),
+        Arc::new(ProviderCatalogSnapshot::new(Vec::new())),
         HttpTransport::new(Arc::new(ReqwestClient::new())),
         None,
     ))

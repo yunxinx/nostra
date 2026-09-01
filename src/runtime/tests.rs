@@ -1044,6 +1044,19 @@ fn required_test_dependencies() -> [DependencyDeclaration; 2] {
     ]
 }
 
+#[test]
+fn required_declarations_name_their_capability() {
+    let [service, catalog] = required_test_dependencies();
+    assert_eq!(
+        service.capability(),
+        CapabilityId::of::<TestServiceCapability>()
+    );
+    assert_eq!(
+        catalog.capability(),
+        CapabilityId::of::<TestCatalogCapability>()
+    );
+}
+
 fn resolve_test_dependencies(
     service_slot: &ExclusiveCapabilitySlot<TestServiceCapability>,
     catalog_slot: &ExclusiveCapabilitySlot<TestCatalogCapability>,
@@ -1928,6 +1941,8 @@ const RECONCILE_COMPONENT: ComponentId = ComponentId::new("nostra.test.reconcile
 #[test]
 fn activation_transition_is_observable_until_publication_finishes() {
     let mut reconciler = ScopeLocalReconciler::new(TEST_SCOPE, RECONCILE_COMPONENT, Some(1));
+    assert_eq!(reconciler.scope(), TEST_SCOPE);
+    assert_eq!(reconciler.component(), RECONCILE_COMPONENT);
     let observer = reconciler.observer();
     let observed_stage = Rc::new(Cell::new(None));
     let mut lifecycle = ObservedActivationLifecycle {

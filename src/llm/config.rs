@@ -130,6 +130,22 @@ impl ProviderCatalogSnapshot {
     }
 }
 
+/// Live source of provider routing configuration.
+///
+/// Generation resolves a fresh catalog for each request so configuration edits
+/// take effect without replacing the generation Provider. Implementations own
+/// the authoritative configuration state; the catalog itself stays immutable
+/// for the duration of one request.
+pub trait ProviderCatalogSource: Send + Sync {
+    fn catalog(&self) -> ProviderCatalogSnapshot;
+}
+
+impl ProviderCatalogSource for ProviderCatalogSnapshot {
+    fn catalog(&self) -> ProviderCatalogSnapshot {
+        self.clone()
+    }
+}
+
 pub fn resolve_selection<'a>(
     profiles: &'a [ProviderProfile],
     selection: &ModelSelection,

@@ -1,4 +1,8 @@
 //! Required dependency resolution and activation identity snapshots.
+//!
+//! Production assembly still lives in [`super::composition`]. This resolver is
+//! crate-private and exercised by fake-component tests; it is not the live
+//! composition driver. `RuntimeHost` is not landed.
 
 use std::{
     any::Any,

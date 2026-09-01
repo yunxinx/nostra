@@ -18,7 +18,7 @@ use reqwest_client::ReqwestClient;
 use crate::{
     llm::{
         GatewayGenerationService, GenerationService, HttpTransport, InMemoryMetrics,
-        ProviderCatalogSnapshot,
+        ProviderCatalogSource,
     },
     preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
     session::{ConversationContext, ProjectIdentity, SessionStores},
@@ -125,11 +125,13 @@ fn default_preference_handle() -> PreferenceHandle {
     }
 }
 
-/// Build the first-party generation Provider from an explicit catalog
-/// snapshot. The catalog is captured before the service is installed so every
-/// Consumer observes one validated routing view for its lifetime.
+/// Build the first-party generation Provider over a live routing source.
+///
+/// The source is read once per request, so a provider profile edit reaches
+/// generation without replacing the Provider. Each request still resolves
+/// against one immutable catalog.
 fn default_generation_service(
-    catalog: ProviderCatalogSnapshot,
+    catalog: Arc<dyn ProviderCatalogSource>,
     http_client: Arc<dyn HttpClient>,
 ) -> Arc<dyn GenerationService> {
     let metrics = Arc::new(InMemoryMetrics::new(256));
@@ -1438,7 +1440,7 @@ pub struct CompositionRootBuilder {
     preference_provider: ComponentId,
     generation_providers: Vec<(ComponentId, ProviderFactory<GenerationCapability>)>,
     selected_generation_provider: ComponentId,
-    provider_catalog: Option<ProviderCatalogSnapshot>,
+    provider_catalog: Option<Arc<dyn ProviderCatalogSource>>,
     http_client: Arc<dyn HttpClient>,
 }
 
@@ -1528,8 +1530,11 @@ impl CompositionRootBuilder {
         self
     }
 
+    /// Route generation through an explicit catalog source instead of the
+    /// preference capability. A fixed [`ProviderCatalogSnapshot`] is itself a
+    /// source, so tests can pin one validated routing view.
     #[must_use = "composition builders must be built to install their capabilities"]
-    pub fn with_provider_catalog(mut self, catalog: ProviderCatalogSnapshot) -> Self {
+    pub fn with_provider_catalog(mut self, catalog: Arc<dyn ProviderCatalogSource>) -> Self {
         self.provider_catalog = Some(catalog);
         self
     }
@@ -1556,12 +1561,12 @@ impl CompositionRootBuilder {
             selected_session_provider,
         )
         .map_err(CompositionBuildError::Providers)?;
-        let catalog = provider_catalog.unwrap_or_else(|| {
-            ProviderCatalogSnapshot::new(preference_handle.snapshot().provider_profiles)
+        let catalog: Arc<dyn ProviderCatalogSource> = provider_catalog.unwrap_or_else(|| {
+            Arc::new(preference_handle.clone()) as Arc<dyn ProviderCatalogSource>
         });
         let default_generation_factory = provider_factory::<GenerationCapability>(move || {
             Ok(default_generation_service(
-                catalog.clone(),
+                Arc::clone(&catalog),
                 Arc::clone(&http_client),
             ))
         });

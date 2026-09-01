@@ -17,7 +17,7 @@ use gpui::{App, Global, Window};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    llm::{ModelSelection, ProviderProfile},
+    llm::{ModelSelection, ProviderCatalogSnapshot, ProviderCatalogSource, ProviderProfile},
     runtime::{CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, WorkspaceId},
     session::SessionId,
 };
@@ -468,6 +468,16 @@ impl PreferenceHandle {
     }
 }
 
+/// Provider routing is derived from the live preference state, so a profile
+/// edit reaches generation on the next request without replacing the
+/// generation Provider. Preferences remain the single writer; there is no
+/// second catalog to keep in step.
+impl ProviderCatalogSource for PreferenceHandle {
+    fn catalog(&self) -> ProviderCatalogSnapshot {
+        ProviderCatalogSnapshot::new(self.snapshot().provider_profiles)
+    }
+}
+
 /// App-global foreground adapter for the explicit preference capability.
 /// Render code can continue to borrow a stable snapshot while composition
 /// consumers receive the cloneable [`PreferenceHandle`].
@@ -764,6 +774,31 @@ mod tests {
         handle.update_in_memory(|prefs| prefs.sidebar_collapsed = false);
         assert!(!handle.snapshot().sidebar_collapsed);
         assert_eq!(saves.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn preference_handle_catalog_reflects_live_profile_edits() {
+        let handle = PreferenceHandle::in_memory(Preferences::default());
+        assert!(handle.catalog().profiles().is_empty());
+
+        handle.update_in_memory(|prefs| {
+            prefs.provider_profiles.push(ProviderProfile {
+                id: "provider".into(),
+                name: "Provider".into(),
+                base_url: "https://example.com/v1".into(),
+                api_key: crate::llm::SecretString::default(),
+                protocol: crate::llm::Protocol::Responses,
+                compatibility: crate::llm::CompatibilityProfile::default(),
+                models: vec![crate::llm::ModelConfig {
+                    id: "model".into(),
+                    model_id: "vendor/model".into(),
+                    display_name: None,
+                }],
+            });
+        });
+
+        assert_eq!(handle.catalog().profiles().len(), 1);
+        assert_eq!(handle.catalog().profiles()[0].id, "provider");
     }
 
     #[test]

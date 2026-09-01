@@ -714,7 +714,6 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.sync_selection_availability();
         if text.is_empty() || !self.selection_available {
             return false;
         }

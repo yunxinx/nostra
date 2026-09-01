@@ -4,7 +4,6 @@ use crate::{
     chat::conversation_runtime::ConversationRuntime,
     chat::{ChatEvent, ChatView, Message, derive_title},
     llm::{ContentBlock, ModelSelection},
-    providers,
     session::{ChatSessionControllerError, ResolvedSessionState, SessionId},
 };
 
@@ -104,11 +103,7 @@ impl ChatView {
 
         if let Some(model) = restored_model {
             self.selection = Some(model);
-            self.selection_available = providers::selection_is_available_from(
-                self.selection.as_ref(),
-                &self.preference_snapshot,
-            );
-            self.provider_catalog_revision = providers::catalog_revision();
+            self.sync_selection_availability();
         }
 
         if let Some(title) = derive_title_from_state(state) {

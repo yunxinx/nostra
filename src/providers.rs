@@ -1,13 +1,11 @@
 //! Provider profile persistence boundary shared by settings and generation UI.
 //!
-//! Mutations persist through preferences and advance a process-local catalog
-//! revision. Menus use the same validated model projection as gateway routing,
-//! preventing UI selection rules from drifting from generation rules.
+//! Preferences are the single owner of provider configuration. Mutations write
+//! there, and every reader — menus, composer availability, and gateway routing
+//! — derives from that one live state, so UI selection rules cannot drift from
+//! generation rules.
 
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
 
 use gpui::App;
 
@@ -21,12 +19,6 @@ pub struct SelectableModel {
     pub selection: ModelSelection,
     pub profile_name: String,
     pub model_name: String,
-}
-
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
-
-pub fn catalog_revision() -> u64 {
-    CATALOG_REVISION.load(Ordering::Relaxed)
 }
 
 fn update_preferences(
@@ -48,7 +40,6 @@ fn update_catalog(
     update_preferences(preference_handle, cx, |prefs| {
         change(&mut prefs.provider_profiles)
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
@@ -156,7 +147,6 @@ pub fn remove(id: &str, preference_handle: &preferences::PreferenceHandle, cx: &
     update_preferences(preference_handle, cx, |prefs| {
         remove_profile_from_preferences(id, prefs);
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
@@ -216,7 +206,6 @@ pub(crate) fn update_model_in_memory(
         };
         change(model);
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
@@ -244,7 +233,6 @@ pub fn remove_model(
             prefs.last_model_selection = None;
         }
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 

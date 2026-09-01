@@ -15,8 +15,8 @@ mod service;
 mod transport;
 
 pub use config::{
-    ModelConfig, ModelId, ModelSelection, ProfileId, ProviderCatalogSnapshot, ProviderProfile,
-    SecretString, resolve_selection,
+    ModelConfig, ModelId, ModelSelection, ProfileId, ProviderCatalogSnapshot,
+    ProviderCatalogSource, ProviderProfile, SecretString, resolve_selection,
 };
 pub use error::{ErrorKind, GatewayError};
 pub use event::{
