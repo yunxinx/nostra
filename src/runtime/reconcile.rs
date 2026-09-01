@@ -15,8 +15,13 @@ impl DesiredRevision {
         self.0
     }
 
-    fn next(self) -> Option<Self> {
+    pub(crate) fn next(self) -> Option<Self> {
         self.0.checked_add(1).map(Self)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -155,6 +160,23 @@ pub struct ReconcileFailure {
 }
 
 impl ReconcileFailure {
+    pub(crate) fn error(
+        scope: ScopeId,
+        component: ComponentId,
+        revision: DesiredRevision,
+        stage: ReconcileStage,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope,
+            component,
+            revision,
+            stage,
+            kind: ReconcileFailureKind::Error,
+            message: message.into(),
+        }
+    }
+
     #[must_use]
     pub const fn scope(&self) -> ScopeId {
         self.scope
@@ -690,7 +712,7 @@ impl<D: Clone + Eq, P: 'static> ScopeLocalReconciler<D, P> {
         stage: ReconcileStage,
         message: String,
     ) -> ReconcileFailure {
-        self.failure(revision, stage, ReconcileFailureKind::Error, message)
+        ReconcileFailure::error(self.scope, self.component, revision, stage, message)
     }
 
     fn failure(

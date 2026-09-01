@@ -1,6 +1,17 @@
-//! Immutable runtime diagnostics and required-component startup audit.
+//! Immutable runtime diagnostics, revisioned publication, and startup audit.
 
-use std::{fmt, time::Duration, time::Instant};
+use std::{
+    cell::{Cell, RefCell},
+    fmt,
+    future::Future,
+    pin::Pin,
+    rc::{Rc, Weak},
+    task::{Context, Poll},
+    time::Duration,
+    time::Instant,
+};
+
+use futures::task::AtomicWaker;
 
 use super::{
     CapabilityId, ComponentId, DesiredRevision, ReconcileFailure, ReconcileObserver,
@@ -226,6 +237,38 @@ pub struct ComponentSnapshot {
     last_failure: Option<ReconcileFailure>,
 }
 
+pub(crate) struct ComponentTransitionState {
+    component: ComponentId,
+    scope: ScopeId,
+    startup_policy: StartupPolicy,
+    desired_revision: DesiredRevision,
+    stage: ReconcileStage,
+    started_at: Instant,
+    last_failure: Option<ReconcileFailure>,
+}
+
+impl ComponentTransitionState {
+    pub(crate) fn new(
+        component: ComponentId,
+        scope: ScopeId,
+        startup_policy: StartupPolicy,
+        desired_revision: DesiredRevision,
+        stage: ReconcileStage,
+        started_at: Instant,
+        last_failure: Option<ReconcileFailure>,
+    ) -> Self {
+        Self {
+            component,
+            scope,
+            startup_policy,
+            desired_revision,
+            stage,
+            started_at,
+            last_failure,
+        }
+    }
+}
+
 impl ComponentSnapshot {
     #[must_use]
     pub fn pending(
@@ -318,6 +361,38 @@ impl ComponentSnapshot {
             }),
             last_failure: observer.last_failure(),
         })
+    }
+
+    pub(crate) fn transitioning_explicit(
+        transition: ComponentTransitionState,
+        observed_at: Instant,
+        details: ComponentSnapshotDetails,
+    ) -> Self {
+        let state = match transition.stage {
+            ReconcileStage::Preparing | ReconcileStage::Activating => {
+                RuntimeComponentState::Preparing
+            }
+            ReconcileStage::Stopping | ReconcileStage::RollingBack => {
+                RuntimeComponentState::Quiescing
+            }
+        };
+        Self {
+            component: transition.component,
+            scope: transition.scope,
+            startup_policy: transition.startup_policy,
+            desired_revision: transition.desired_revision,
+            state,
+            details,
+            transition: Some(TransitionSnapshot {
+                revision: transition.desired_revision,
+                stage: transition.stage,
+                started_at: transition.started_at,
+                elapsed: observed_at
+                    .checked_duration_since(transition.started_at)
+                    .unwrap_or_default(),
+            }),
+            last_failure: transition.last_failure,
+        }
     }
 
     #[must_use]
@@ -450,6 +525,78 @@ impl ComponentSnapshot {
     }
 }
 
+pub struct RuntimeComponentDiagnostic<'a> {
+    component: &'a ComponentSnapshot,
+}
+
+impl<'a> RuntimeComponentDiagnostic<'a> {
+    #[must_use]
+    pub const fn new(component: &'a ComponentSnapshot) -> Self {
+        Self { component }
+    }
+}
+
+impl fmt::Display for RuntimeComponentDiagnostic<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let component = self.component;
+        write!(
+            f,
+            "event=component_state component={} scope={} state={} desired_revision={} startup_policy={} effects={} tasks={} subscriptions={} quiescence_barriers={}",
+            component.component(),
+            component.scope().raw(),
+            component.state(),
+            component.desired_revision().get(),
+            match component.startup_policy() {
+                StartupPolicy::MustActivate => "must_activate",
+                StartupPolicy::AllowedPending => "allowed_pending",
+            },
+            component.resource_counts().effects(),
+            component.resource_counts().tasks(),
+            component.resource_counts().subscriptions(),
+            component.resource_counts().quiescence_barriers(),
+        )?;
+        for dependency in component.dependencies() {
+            write!(
+                f,
+                " dependency={}:{}:{}:{}",
+                dependency.capability().name(),
+                dependency.scope().raw(),
+                dependency.provider(),
+                dependency.generation().get(),
+            )?;
+        }
+        for missing in component.missing_dependencies() {
+            write!(f, " missing_dependency={}", missing.capability().name())?;
+            for blocker in missing.blocking_chain() {
+                write!(
+                    f,
+                    " blocking_component={}:{}",
+                    blocker.component(),
+                    blocker.scope().raw(),
+                )?;
+            }
+        }
+        if let Some(transition) = component.transition() {
+            write!(
+                f,
+                " transition_stage={:?} transition_revision={} transition_duration_ms={}",
+                transition.stage(),
+                transition.revision().get(),
+                transition.elapsed().as_millis(),
+            )?;
+        }
+        if let Some(failure) = component.last_failure() {
+            write!(
+                f,
+                " last_error_stage={:?} last_error_kind={:?}",
+                failure.stage(),
+                failure.kind(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContributionRevision {
     registry: CapabilityId,
@@ -484,7 +631,7 @@ pub enum RuntimeDiagnostic {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StartupAuditError {
     blockers: Box<[ComponentSnapshot]>,
 }
@@ -493,6 +640,14 @@ impl StartupAuditError {
     #[must_use]
     pub fn blockers(&self) -> &[ComponentSnapshot] {
         &self.blockers
+    }
+}
+
+impl fmt::Debug for StartupAuditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StartupAuditError")
+            .field("blocker_count", &self.blockers.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -527,7 +682,12 @@ impl fmt::Display for StartupAuditError {
                 f.write_str(")")?;
             }
             if let Some(failure) = &blocker.last_failure {
-                write!(f, ": {failure}")?;
+                write!(
+                    f,
+                    " (last_error_stage={:?}, last_error_kind={:?})",
+                    failure.stage(),
+                    failure.kind(),
+                )?;
             }
         }
         Ok(())
@@ -641,6 +801,178 @@ pub struct RuntimeSnapshot {
     components: Box<[ComponentSnapshot]>,
     contribution_revisions: Box<[ContributionRevision]>,
     diagnostics: Box<[RuntimeDiagnostic]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSnapshotUpdate {
+    revision: u64,
+    snapshot: RuntimeSnapshot,
+}
+
+impl RuntimeSnapshotUpdate {
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn snapshot(&self) -> &RuntimeSnapshot {
+        &self.snapshot
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeSnapshotGuard {
+    revision: u64,
+}
+
+struct RuntimeSnapshotSubscriberState {
+    seen_revision: Cell<u64>,
+    waker: AtomicWaker,
+}
+
+struct RuntimeSnapshotSourceState {
+    current: RuntimeSnapshotUpdate,
+    subscribers: Vec<Weak<RuntimeSnapshotSubscriberState>>,
+}
+
+#[derive(Clone)]
+pub struct RuntimeSnapshotReader {
+    state: Rc<RefCell<RuntimeSnapshotSourceState>>,
+}
+
+impl RuntimeSnapshotReader {
+    #[must_use]
+    pub fn current(&self) -> RuntimeSnapshotUpdate {
+        self.state.borrow().current.clone()
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> RuntimeSnapshotSubscription {
+        let seen_revision = self.state.borrow().current.revision;
+        let subscriber = Rc::new(RuntimeSnapshotSubscriberState {
+            seen_revision: Cell::new(seen_revision),
+            waker: AtomicWaker::new(),
+        });
+        self.state
+            .borrow_mut()
+            .subscribers
+            .push(Rc::downgrade(&subscriber));
+        RuntimeSnapshotSubscription {
+            source: Rc::downgrade(&self.state),
+            subscriber,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeSnapshotSource {
+    reader: RuntimeSnapshotReader,
+}
+
+impl RuntimeSnapshotSource {
+    #[must_use]
+    pub(crate) fn new(snapshot: RuntimeSnapshot) -> Self {
+        Self {
+            reader: RuntimeSnapshotReader {
+                state: Rc::new(RefCell::new(RuntimeSnapshotSourceState {
+                    current: RuntimeSnapshotUpdate {
+                        revision: 1,
+                        snapshot,
+                    },
+                    subscribers: Vec::new(),
+                })),
+            },
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn reader(&self) -> RuntimeSnapshotReader {
+        self.reader.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn guard(&self) -> RuntimeSnapshotGuard {
+        RuntimeSnapshotGuard {
+            revision: self.reader.state.borrow().current.revision,
+        }
+    }
+
+    pub(crate) fn publish(&self, snapshot: RuntimeSnapshot) -> bool {
+        let guard = self.guard();
+        self.publish_if_current(&guard, snapshot)
+    }
+
+    pub(crate) fn publish_if_current(
+        &self,
+        guard: &RuntimeSnapshotGuard,
+        snapshot: RuntimeSnapshot,
+    ) -> bool {
+        let subscribers = {
+            let mut state = self.reader.state.borrow_mut();
+            if state.current.revision != guard.revision {
+                return false;
+            }
+            let Some(revision) = state.current.revision.checked_add(1) else {
+                return false;
+            };
+            state.current = RuntimeSnapshotUpdate { revision, snapshot };
+            let mut subscribers = Vec::with_capacity(state.subscribers.len());
+            state.subscribers.retain(|subscriber| {
+                let Some(subscriber) = subscriber.upgrade() else {
+                    return false;
+                };
+                subscribers.push(subscriber);
+                true
+            });
+            subscribers
+        };
+        for subscriber in subscribers {
+            subscriber.waker.wake();
+        }
+        true
+    }
+}
+
+pub struct RuntimeSnapshotSubscription {
+    source: Weak<RefCell<RuntimeSnapshotSourceState>>,
+    subscriber: Rc<RuntimeSnapshotSubscriberState>,
+}
+
+impl RuntimeSnapshotSubscription {
+    pub async fn next(&mut self) -> Option<RuntimeSnapshotUpdate> {
+        RuntimeSnapshotNext { subscription: self }.await
+    }
+}
+
+struct RuntimeSnapshotNext<'a> {
+    subscription: &'a mut RuntimeSnapshotSubscription,
+}
+
+impl Future for RuntimeSnapshotNext<'_> {
+    type Output = Option<RuntimeSnapshotUpdate>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let subscription = &mut *self.get_mut().subscription;
+        let Some(source) = subscription.source.upgrade() else {
+            return Poll::Ready(None);
+        };
+        let current = source.borrow().current.clone();
+        let seen_revision = subscription.subscriber.seen_revision.get();
+        if current.revision > seen_revision {
+            subscription.subscriber.seen_revision.set(current.revision);
+            return Poll::Ready(Some(current));
+        }
+        subscription.subscriber.waker.register(cx.waker());
+        let current = source.borrow().current.clone();
+        let seen_revision = subscription.subscriber.seen_revision.get();
+        if current.revision > seen_revision {
+            subscription.subscriber.seen_revision.set(current.revision);
+            Poll::Ready(Some(current))
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl RuntimeSnapshot {

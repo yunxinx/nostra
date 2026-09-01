@@ -36,16 +36,19 @@ use crate::ui::{
 use super::{
     ActivationFingerprint, AsyncStop, CHAT_WORKSPACE_ID, CapabilityId, CapabilityKey,
     ComponentGeneration, ComponentId, ComponentLifecycle, ComponentSnapshot,
-    ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionRoot, ContributionDefinition,
-    ContributionKey, ContributionRegistry, ContributionRegistryError, ContributionRevision,
-    DependencyDeclaration, DependencyResolution, DependencyResolver, DependencyResolverError,
-    DependencySnapshot, DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot,
-    ExclusiveSlotError, GenerationCapability, MissingDependencySnapshot, PROJECT_WORKSPACE_ID,
-    PreparedCapability, ReconcileFailureKind, ReconcileObserver, ReconcileStage, ReconcileStatus,
-    ResolvedDependency, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
-    RuntimeSnapshot, RuntimeSnapshotError, ScopeId, ScopeKind, ScopeLocalReconciler, ScopeState,
-    ScopeTree, ScopedComponentId, SessionServicesCapability, StartupPolicy, WorkspaceDefinition,
-    WorkspaceId, WorkspaceRegistry, WorkspaceRegistryError,
+    ComponentSnapshotDetails, ComponentSnapshotViolation, CompositionBuildError,
+    CompositionReplaceError, CompositionRoot, ContributionDefinition, ContributionKey,
+    ContributionRegistry, ContributionRegistryError, ContributionRevision, DependencyDeclaration,
+    DependencyResolution, DependencyResolver, DependencyResolverError, DependencySnapshot,
+    DesiredRevision, DisposeError, EffectScope, ExclusiveCapabilitySlot, ExclusiveSlotError,
+    GenerationCapability, MissingDependencySnapshot, PROJECT_WORKSPACE_ID, PreparedCapability,
+    PreparedProvider, ProviderSelectionError, ReconcileFailure, ReconcileFailureKind,
+    ReconcileObserver, ReconcileStage, ReconcileStatus, ResolvedDependency,
+    RuntimeComponentDiagnostic, RuntimeComponentState, RuntimeDiagnostic, RuntimeResourceCounts,
+    RuntimeSnapshot, RuntimeSnapshotError, RuntimeSnapshotSource, ScopeId, ScopeKind,
+    ScopeLocalReconciler, ScopeState, ScopeTree, ScopedComponentId, SessionServicesCapability,
+    StartupCleanupStage, StartupPolicy, WorkspaceDefinition, WorkspaceId, WorkspaceRegistry,
+    WorkspaceRegistryError,
 };
 
 const WORKSPACE_ROOT: ScopeId = ScopeId::new(100);
@@ -315,7 +318,7 @@ fn default_composition_workspace_contributions_unload_without_registry_residue()
     let preferences = crate::preferences::PreferenceHandle::in_memory(Preferences::default());
     let mut root = CompositionRoot::builder(stores)
         .with_preferences(preferences)
-        .build()
+        .build_blocking()
         .expect("default composition with in-memory stores");
 
     let application = root.application_scope();
@@ -401,7 +404,7 @@ fn default_composition_owns_and_projects_the_markdown_extension_snapshot() {
     let preferences = crate::preferences::PreferenceHandle::in_memory(Preferences::default());
     let mut root = CompositionRoot::builder(stores)
         .with_preferences(preferences)
-        .build()
+        .build_blocking()
         .expect("default composition with Markdown extensions");
 
     let root_snapshot = root
@@ -485,6 +488,13 @@ fn default_composition_owns_and_projects_the_markdown_extension_snapshot() {
             .revision(),
         without_math.revision()
     );
+    let runtime_snapshots = services.runtime_snapshots();
+    let after_first_unload = runtime_snapshots.current();
+    assert!(
+        !futures::executor::block_on(root.deactivate_markdown_contribution_for_test(MARKDOWN_MATH))
+            .expect("repeated Markdown component unload is a no-op")
+    );
+    assert_eq!(runtime_snapshots.current(), after_first_unload);
 
     futures::executor::block_on(root.close()).expect("close Markdown composition");
     assert!(root.markdown_extensions().is_none());
@@ -2705,7 +2715,9 @@ fn startup_audit_aggregates_required_pending_and_failed_components() {
     assert!(message.contains(PENDING_COMPONENT.as_str()));
     assert!(message.contains(BLOCKING_COMPONENT.as_str()));
     assert!(message.contains(ForegroundCapability::NAME));
-    assert!(message.contains("candidate preparation failed"));
+    assert!(message.contains("last_error_stage=Preparing"));
+    assert!(message.contains("last_error_kind=Error"));
+    assert!(!message.contains("candidate preparation failed"));
 }
 
 #[test]
@@ -3021,6 +3033,50 @@ fn long_transition_is_diagnostic_without_changing_lifecycle_state() {
     assert_eq!(reconciler.active_desired(), Some(&1));
 }
 
+#[test]
+fn runtime_component_diagnostics_include_bindings_missing_dependencies_and_recent_errors() {
+    const PRIVATE_DETAIL: &str = "authorization=runtime-diagnostic-private-token";
+    let pending = ComponentSnapshot::pending(
+        RECONCILE_COMPONENT,
+        TEST_SCOPE,
+        StartupPolicy::MustActivate,
+        DesiredRevision::INITIAL,
+        ComponentSnapshotDetails::new(
+            [],
+            [MissingDependencySnapshot::blocked_by(
+                CapabilityId::of::<TestServiceCapability>(),
+                [ScopedComponentId::new(DEFAULT_TEST_PROVIDER, TEST_SCOPE)],
+            )],
+            RuntimeResourceCounts::default(),
+        ),
+    );
+    let pending_record = RuntimeComponentDiagnostic::new(&pending).to_string();
+    assert!(pending_record.contains("event=component_state"));
+    assert!(pending_record.contains("component=nostra.test.reconcile"));
+    assert!(pending_record.contains("state=pending"));
+    assert!(pending_record.contains("missing_dependency=nostra.test.service"));
+    assert!(pending_record.contains("blocking_component=nostra.test.service-default:7"));
+
+    let failure = ReconcileFailure::error(
+        TEST_SCOPE,
+        RECONCILE_COMPONENT,
+        DesiredRevision::INITIAL,
+        ReconcileStage::Preparing,
+        PRIVATE_DETAIL,
+    );
+    assert_eq!(failure.message(), PRIVATE_DETAIL);
+    let failed = ComponentSnapshot::failed(
+        StartupPolicy::MustActivate,
+        failure,
+        ComponentSnapshotDetails::default(),
+    );
+    let failed_record = RuntimeComponentDiagnostic::new(&failed).to_string();
+    assert!(failed_record.contains("state=failed"));
+    assert!(failed_record.contains("last_error_stage=Preparing"));
+    assert!(failed_record.contains("last_error_kind=Error"));
+    assert!(!failed_record.contains(PRIVATE_DETAIL));
+}
+
 fn composition_component(snapshot: &RuntimeSnapshot, component: ComponentId) -> &ComponentSnapshot {
     snapshot
         .components()
@@ -3144,9 +3200,1014 @@ fn scripted_completed_outcome() -> GenerationOutcome {
 }
 
 #[test]
+fn composition_explicitly_selects_registered_session_and_generation_providers() {
+    const MEMORY_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.memory");
+    const SCRIPTED_GENERATION_PROVIDER: ComponentId =
+        ComponentId::new("nostra.generation.scripted");
+    let default_stores = SessionStores::default();
+    let memory_stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let memory_provider = memory_stores.clone();
+    let scripted = Arc::new(ScriptedGenerationService::new(vec![
+        GenerationEvent::Started(StreamMetadata {
+            response_id: Some("response".into()),
+            upstream_model: Some("model".into()),
+        }),
+        GenerationEvent::Finished(Box::new(scripted_completed_outcome())),
+    ]));
+
+    let mut root = CompositionRoot::builder(default_stores)
+        .register_session_provider(MEMORY_SESSION_PROVIDER, move || Ok(memory_provider.clone()))
+        .select_session_provider(MEMORY_SESSION_PROVIDER)
+        .register_generation_provider(SCRIPTED_GENERATION_PROVIDER, scripted)
+        .select_generation_provider(SCRIPTED_GENERATION_PROVIDER)
+        .build_blocking()
+        .expect("explicit provider selection builds the composition");
+
+    assert_eq!(
+        root.registered_session_providers(),
+        vec![
+            ComponentId::new("nostra.session.local"),
+            MEMORY_SESSION_PROVIDER,
+        ]
+    );
+    assert_eq!(
+        root.registered_generation_providers(),
+        vec![
+            ComponentId::new("nostra.generation.gateway"),
+            SCRIPTED_GENERATION_PROVIDER,
+        ]
+    );
+
+    let session = root
+        .session_services()
+        .expect("selected session capability");
+    assert_eq!(session.provider(), MEMORY_SESSION_PROVIDER);
+    assert!(session.handle().chat().is_ok());
+    assert!(session.handle().agent().is_ok());
+
+    let generation = root.generation().expect("selected generation capability");
+    assert_eq!(generation.provider(), SCRIPTED_GENERATION_PROVIDER);
+    let events = consume_generation(generation.handle().as_ref());
+    assert!(matches!(events.first(), Some(GenerationEvent::Started(_))));
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Finished(outcome))
+            if outcome.status == OutcomeStatus::Completed
+    ));
+
+    futures::executor::block_on(root.close()).expect("close selected composition");
+}
+
+#[test]
+fn composition_provider_validation_is_atomic_before_mount() {
+    const DEFAULT_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.local");
+    const UNKNOWN_GENERATION_PROVIDER: ComponentId = ComponentId::new("nostra.generation.unknown");
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+
+    let duplicate = match CompositionRoot::builder(stores.clone())
+        .register_session_provider(DEFAULT_SESSION_PROVIDER, {
+            let stores = stores.clone();
+            move || Ok(stores.clone())
+        })
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("duplicate Provider identity must reject the mount transaction");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        duplicate,
+        CompositionBuildError::Providers(ProviderSelectionError::Duplicate {
+            provider: DEFAULT_SESSION_PROVIDER,
+            ..
+        })
+    ));
+    assert!(stores.chat().is_ok());
+    assert!(stores.agent().is_ok());
+
+    let collision = match CompositionRoot::builder(stores.clone())
+        .register_generation_provider(
+            DEFAULT_SESSION_PROVIDER,
+            Arc::new(ScriptedGenerationService::new(Vec::new())),
+        )
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("one component identity cannot own unrelated Provider definitions");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        collision,
+        CompositionBuildError::Providers(ProviderSelectionError::ComponentCollision {
+            provider: DEFAULT_SESSION_PROVIDER,
+            ..
+        })
+    ));
+    assert!(stores.chat().is_ok());
+    assert!(stores.agent().is_ok());
+
+    let unknown = match CompositionRoot::builder(stores.clone())
+        .select_generation_provider(UNKNOWN_GENERATION_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("unregistered selection must reject the mount transaction");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(
+        unknown,
+        CompositionBuildError::Providers(ProviderSelectionError::Unknown {
+            provider: UNKNOWN_GENERATION_PROVIDER,
+            ..
+        })
+    ));
+    assert!(stores.chat().is_ok());
+    assert!(stores.agent().is_ok());
+}
+
+#[test]
+fn session_provider_factories_prepare_only_the_explicit_selection() {
+    const LAZY_PROVIDER: ComponentId = ComponentId::new("nostra.session.lazy");
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.session.failed");
+    let lazy_prepares = Arc::new(AtomicUsize::new(0));
+    let observed_lazy_prepares = Arc::clone(&lazy_prepares);
+    let lazy_stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_session_provider(LAZY_PROVIDER, move || {
+            observed_lazy_prepares.fetch_add(1, Ordering::SeqCst);
+            Ok(lazy_stores.clone())
+        })
+        .build_blocking()
+        .expect("unselected session factory remains private");
+
+    assert_eq!(lazy_prepares.load(Ordering::SeqCst), 0);
+    futures::executor::block_on(root.close()).expect("close default session selection");
+
+    let failed_prepares = Arc::new(AtomicUsize::new(0));
+    let observed_failed_prepares = Arc::clone(&failed_prepares);
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_session_provider(FAILED_PROVIDER, move || {
+            observed_failed_prepares.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("session Provider preparation failed"))
+        })
+        .select_session_provider(FAILED_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("selected session preparation must abort composition")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(error, CompositionBuildError::Prepare(_)));
+    assert_eq!(failed_prepares.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn generation_provider_replacement_closes_old_admission_before_publishing_the_successor() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.old");
+    const NEW_PROVIDER: ComponentId = ComponentId::new("nostra.generation.new");
+    const UNKNOWN_PROVIDER: ComponentId = ComponentId::new("nostra.generation.unknown");
+    let old = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let new = Arc::new(ScriptedGenerationService::new(vec![
+        GenerationEvent::Started(StreamMetadata {
+            response_id: Some("replacement-response".into()),
+            upstream_model: Some("replacement-model".into()),
+        }),
+        GenerationEvent::Finished(Box::new(scripted_completed_outcome())),
+    ]));
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(OLD_PROVIDER, old)
+        .register_generation_provider(NEW_PROVIDER, new)
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with two generation Providers");
+    let old_services = root.services().expect("old Consumer projection");
+    let runtime_snapshots = old_services.runtime_snapshots();
+    let mut snapshot_subscription = runtime_snapshots.subscribe();
+
+    let unknown = futures::executor::block_on(root.replace_generation_provider(UNKNOWN_PROVIDER))
+        .expect_err("an unregistered candidate cannot start replacement");
+    assert!(matches!(unknown, CompositionReplaceError::Providers(_)));
+    let unused = old_services
+        .generation_service()
+        .start(scripted_request())
+        .expect("failed candidate preparation leaves old admission open");
+    drop(unused);
+
+    let held = old_services
+        .generation_service()
+        .start(scripted_request())
+        .expect("old Consumer starts one in-flight generation");
+    let mut replacement = Box::pin(root.replace_generation_provider(NEW_PROVIDER));
+    assert!(matches!(poll_once(replacement.as_mut()), Poll::Pending));
+    let quiescing = futures::executor::block_on(snapshot_subscription.next())
+        .expect("replacement publishes its quiescing state");
+    let old_component = composition_component(quiescing.snapshot(), OLD_PROVIDER);
+    assert_eq!(old_component.state(), RuntimeComponentState::Quiescing);
+    assert_eq!(
+        old_component.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 1)
+    );
+    assert!(
+        old_component
+            .transition()
+            .is_some_and(|transition| { transition.stage() == ReconcileStage::Stopping })
+    );
+    assert!(
+        old_services
+            .generation_service()
+            .start(scripted_request())
+            .is_err(),
+        "replacement closes old admission before waiting for quiescence"
+    );
+
+    drop(held);
+    let Poll::Ready(result) = poll_once(replacement.as_mut()) else {
+        panic!("releasing the final old handle must settle replacement");
+    };
+    assert!(result.expect("replace registered generation Provider"));
+    drop(replacement);
+
+    let generation = root.generation().expect("successor generation capability");
+    assert_eq!(generation.provider(), NEW_PROVIDER);
+    assert_eq!(generation.generation().get(), 2);
+    let remounted_events = consume_generation(old_services.generation_service().as_ref());
+    assert!(matches!(
+        remounted_events.last(),
+        Some(GenerationEvent::Finished(outcome))
+            if outcome.status == OutcomeStatus::Completed
+    ));
+    let successor_services = root.services().expect("successor Consumer projection");
+    let events = consume_generation(successor_services.generation_service().as_ref());
+    assert!(matches!(
+        events.last(),
+        Some(GenerationEvent::Finished(outcome))
+            if outcome.status == OutcomeStatus::Completed
+    ));
+
+    futures::executor::block_on(root.close()).expect("close replaced composition");
+}
+
+#[test]
+fn generation_provider_prepare_failure_preserves_the_active_provider() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.prepare-old");
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.prepare-failed");
+    let old: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let observed_prepares = Arc::clone(&prepares);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(OLD_PROVIDER, old)
+        .register_generation_provider_factory(FAILED_PROVIDER, move || {
+            observed_prepares.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("scripted Provider preparation failed"))
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with a fallible replacement Provider");
+    let services = root.services().expect("active Consumer projection");
+    let source = services.runtime_snapshots();
+    let initial_update = source.current();
+
+    let error = futures::executor::block_on(root.replace_generation_provider(FAILED_PROVIDER))
+        .expect_err("failed preparation cannot start replacement");
+
+    assert!(matches!(error, CompositionReplaceError::Prepare(_)));
+    assert_eq!(prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(source.current(), initial_update);
+    let generation = root.generation().expect("old Provider remains active");
+    assert_eq!(generation.provider(), OLD_PROVIDER);
+    assert_eq!(generation.generation(), ComponentGeneration::INITIAL);
+    let handle = services
+        .generation_service()
+        .start(scripted_request())
+        .expect("failed candidate leaves old admission open");
+    drop(handle);
+
+    futures::executor::block_on(root.close()).expect("close composition after prepare failure");
+}
+
+#[test]
+fn selected_generation_provider_prepare_failure_aborts_composition_before_mount() {
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.startup-failed");
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let observed_prepares = Arc::clone(&prepares);
+
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider_factory(FAILED_PROVIDER, move || {
+            observed_prepares.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("startup preparation failed"))
+        })
+        .select_generation_provider(FAILED_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("selected Provider preparation must abort composition")
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, CompositionBuildError::Prepare(_)));
+    assert_eq!(prepares.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancelled_generation_replacement_remains_diagnostic_and_can_be_retried() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.cancel-old");
+    const NEW_PROVIDER: ComponentId = ComponentId::new("nostra.generation.cancel-new");
+    let old: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let new: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(vec![
+        GenerationEvent::Finished(Box::new(scripted_completed_outcome())),
+    ]));
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let observed_prepares = Arc::clone(&prepares);
+    let prepared_service = Arc::clone(&new);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(OLD_PROVIDER, old)
+        .register_generation_provider_factory(NEW_PROVIDER, move || {
+            observed_prepares.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::clone(&prepared_service))
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with retryable replacement Provider");
+    let services = root.services().expect("stable Consumer projection");
+    let source = services.runtime_snapshots();
+    let held = services
+        .generation_service()
+        .start(scripted_request())
+        .expect("old Provider starts one active handle");
+
+    let mut replacement = Box::pin(root.replace_generation_provider(NEW_PROVIDER));
+    assert!(matches!(poll_once(replacement.as_mut()), Poll::Pending));
+    drop(replacement);
+
+    let interrupted = source.current();
+    let old_component = composition_component(interrupted.snapshot(), OLD_PROVIDER);
+    let new_component = composition_component(interrupted.snapshot(), NEW_PROVIDER);
+    assert_eq!(old_component.state(), RuntimeComponentState::Quiescing);
+    assert_eq!(new_component.state(), RuntimeComponentState::Preparing);
+    assert_eq!(
+        new_component
+            .transition()
+            .map(|transition| transition.stage()),
+        Some(ReconcileStage::Preparing)
+    );
+    assert!(
+        services
+            .generation_service()
+            .start(scripted_request())
+            .is_err()
+    );
+    drop(held);
+
+    assert!(
+        futures::executor::block_on(root.replace_generation_provider(NEW_PROVIDER))
+            .expect("retry settles the interrupted replacement")
+    );
+    assert_eq!(prepares.load(Ordering::SeqCst), 1);
+    let generation = root.generation().expect("retry publishes successor");
+    assert_eq!(generation.provider(), NEW_PROVIDER);
+    assert_eq!(generation.generation().get(), 2);
+    let events = consume_generation(services.generation_service().as_ref());
+    assert!(matches!(events.last(), Some(GenerationEvent::Finished(_))));
+
+    futures::executor::block_on(root.close()).expect("close recovered composition");
+}
+
+#[test]
+fn changing_replacement_target_rolls_back_the_retained_candidate_before_preparing_next() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.target-old");
+    const FIRST_PROVIDER: ComponentId = ComponentId::new("nostra.generation.target-first");
+    const SECOND_PROVIDER: ComponentId = ComponentId::new("nostra.generation.target-second");
+    let first_rollbacks = Rc::new(Cell::new(0));
+    let first_released = Rc::new(Cell::new(false));
+    let first_events = Rc::new(RefCell::new(Vec::new()));
+    let second_prepares = Rc::new(Cell::new(0));
+    let first: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_first = Arc::clone(&first);
+    let observed_rollbacks = Rc::clone(&first_rollbacks);
+    let observed_release = Rc::clone(&first_released);
+    let observed_events = Rc::clone(&first_events);
+    let second: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_second = Arc::clone(&second);
+    let observed_second_prepares = Rc::clone(&second_prepares);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(
+            OLD_PROVIDER,
+            Arc::new(ScriptedGenerationService::new(Vec::new())),
+        )
+        .register_prepared_generation_provider(FIRST_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(Arc::clone(&prepared_first));
+            prepared.own_async(TestQuiescenceBarrier {
+                attempts: Rc::clone(&observed_rollbacks),
+                released: Rc::clone(&observed_release),
+                events: Rc::clone(&observed_events),
+                started_event: "first-rollback-started",
+                finished_event: "first-rollback-finished",
+            });
+            Ok(prepared)
+        })
+        .register_generation_provider_factory(SECOND_PROVIDER, move || {
+            observed_second_prepares.set(observed_second_prepares.get() + 1);
+            Ok(Arc::clone(&prepared_second))
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with two replacement targets");
+    let services = root.services().expect("stable Consumer projection");
+    let snapshots = services.runtime_snapshots();
+    let held = services
+        .generation_service()
+        .start(scripted_request())
+        .expect("old Provider starts one active handle");
+
+    let mut first_replacement = Box::pin(root.replace_generation_provider(FIRST_PROVIDER));
+    assert!(matches!(
+        poll_once(first_replacement.as_mut()),
+        Poll::Pending
+    ));
+    drop(first_replacement);
+
+    let mut second_replacement = Box::pin(root.replace_generation_provider(SECOND_PROVIDER));
+    assert!(matches!(
+        poll_once(second_replacement.as_mut()),
+        Poll::Pending
+    ));
+    assert_eq!(first_rollbacks.get(), 1);
+    assert_eq!(second_prepares.get(), 0);
+    let rolling_back = snapshots.current();
+    let old = composition_component(rolling_back.snapshot(), OLD_PROVIDER);
+    let first = composition_component(rolling_back.snapshot(), FIRST_PROVIDER);
+    assert_eq!(old.state(), RuntimeComponentState::Quiescing);
+    assert_eq!(
+        old.transition().map(|transition| transition.stage()),
+        Some(ReconcileStage::Stopping)
+    );
+    assert_eq!(first.state(), RuntimeComponentState::Quiescing);
+    assert_eq!(
+        first.transition().map(|transition| transition.stage()),
+        Some(ReconcileStage::RollingBack)
+    );
+
+    first_released.set(true);
+    assert!(matches!(
+        poll_once(second_replacement.as_mut()),
+        Poll::Pending
+    ));
+    assert_eq!(second_prepares.get(), 1);
+    assert!(
+        snapshots
+            .current()
+            .snapshot()
+            .components()
+            .iter()
+            .all(|component| component.component() != FIRST_PROVIDER)
+    );
+
+    drop(held);
+    let Poll::Ready(result) = poll_once(second_replacement.as_mut()) else {
+        panic!("replacement completes after the old generation handle is released")
+    };
+    assert!(result.expect("second replacement succeeds"));
+    drop(second_replacement);
+    assert_eq!(
+        root.generation()
+            .expect("second Provider is active")
+            .provider(),
+        SECOND_PROVIDER
+    );
+    assert_eq!(
+        first_events.borrow().as_slice(),
+        ["first-rollback-started", "first-rollback-finished"]
+    );
+
+    futures::executor::block_on(root.close()).expect("close retargeted composition");
+}
+
+#[test]
+fn startup_prepare_failure_awaits_prepared_provider_rollback() {
+    const FAILED_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.startup-failed");
+    const PREPARED_GENERATION_PROVIDER: ComponentId =
+        ComponentId::new("nostra.generation.startup-prepared");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let attempts = Rc::new(Cell::new(0));
+    let released = Rc::new(Cell::new(true));
+    let service: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_service = Arc::clone(&service);
+    let prepared_events = Rc::clone(&events);
+    let prepared_attempts = Rc::clone(&attempts);
+    let prepared_released = Rc::clone(&released);
+
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_prepared_generation_provider(PREPARED_GENERATION_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(Arc::clone(&prepared_service));
+            prepared.own_async(TestQuiescenceBarrier {
+                attempts: Rc::clone(&prepared_attempts),
+                released: Rc::clone(&prepared_released),
+                events: Rc::clone(&prepared_events),
+                started_event: "startup-rollback-started",
+                finished_event: "startup-rollback-finished",
+            });
+            Ok(prepared)
+        })
+        .select_generation_provider(PREPARED_GENERATION_PROVIDER)
+        .register_session_provider(FAILED_SESSION_PROVIDER, || {
+            Err(anyhow::anyhow!("session prepare contains private details"))
+        })
+        .select_session_provider(FAILED_SESSION_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("later startup preparation failure must abort composition");
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, CompositionBuildError::Prepare(_)));
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(
+        events.borrow().as_slice(),
+        ["startup-rollback-started", "startup-rollback-finished"]
+    );
+}
+
+#[test]
+fn startup_cleanup_failure_retains_ownership_until_explicit_retry() {
+    const FAILED_SESSION_PROVIDER: ComponentId =
+        ComponentId::new("nostra.session.startup-cleanup-failed");
+    const PREPARED_GENERATION_PROVIDER: ComponentId =
+        ComponentId::new("nostra.generation.startup-cleanup-prepared");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let service: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_service = Arc::clone(&service);
+    let prepared_events = Rc::clone(&events);
+
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_prepared_generation_provider(PREPARED_GENERATION_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(Arc::clone(&prepared_service));
+            prepared.own_async(FailingOnceStop {
+                failed: false,
+                events: Rc::clone(&prepared_events),
+            });
+            Ok(prepared)
+        })
+        .select_generation_provider(PREPARED_GENERATION_PROVIDER)
+        .register_session_provider(FAILED_SESSION_PROVIDER, || {
+            Err(anyhow::anyhow!("session preparation failed"))
+        })
+        .select_session_provider(FAILED_SESSION_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("later startup preparation failure must abort composition");
+        }
+        Err(error) => error,
+    };
+
+    let cleanup = error
+        .startup_cleanup()
+        .expect("failed startup rollback retains an explicit owner");
+    assert_eq!(cleanup.stage(), StartupCleanupStage::GenerationPreparation);
+    assert_eq!(cleanup.component(), Some(PREPARED_GENERATION_PROVIDER));
+    assert_eq!(cleanup.retained_effect_count(), 1);
+    assert!(matches!(
+        futures::executor::block_on(error.retry_startup_cleanup()),
+        Ok(CompositionBuildError::Prepare(_))
+    ));
+    assert_eq!(events.borrow().as_slice(), ["async-stop-finished"]);
+}
+
+#[test]
+fn startup_activation_failure_reverts_effects_in_global_acquisition_order() {
+    const SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.startup-order");
+    const GENERATION_PROVIDER: ComponentId = ComponentId::new("nostra.generation.startup-order");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let session_events = Rc::clone(&events);
+    let generation_events = Rc::clone(&events);
+    let session_stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let generation_service: Arc<dyn GenerationService> =
+        Arc::new(ScriptedGenerationService::new(Vec::new()));
+
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_prepared_generation_provider(GENERATION_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(Arc::clone(&generation_service));
+            let preparation_events = Rc::clone(&generation_events);
+            prepared.own_sync(move || {
+                preparation_events
+                    .borrow_mut()
+                    .push("generation-preparation")
+            });
+            let activation_events = Rc::clone(&generation_events);
+            Ok(prepared.on_activate(move |effects| {
+                effects
+                    .own_sync(move || activation_events.borrow_mut().push("generation-activation"));
+                anyhow::bail!("generation activation failed")
+            }))
+        })
+        .select_generation_provider(GENERATION_PROVIDER)
+        .register_prepared_session_provider(SESSION_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(session_stores.clone());
+            let preparation_events = Rc::clone(&session_events);
+            prepared.own_sync(move || preparation_events.borrow_mut().push("session-preparation"));
+            let activation_events = Rc::clone(&session_events);
+            Ok(prepared.on_activate(move |effects| {
+                effects.own_sync(move || activation_events.borrow_mut().push("session-activation"));
+                Ok(())
+            }))
+        })
+        .select_session_provider(SESSION_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("generation activation failure must abort composition");
+        }
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, CompositionBuildError::Activate(_)));
+    assert_eq!(
+        events.borrow().as_slice(),
+        [
+            "generation-activation",
+            "session-activation",
+            "session-preparation",
+            "generation-preparation",
+        ]
+    );
+}
+
+#[test]
+fn provider_prepare_errors_redact_their_source_from_display_and_debug() {
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.redacted");
+    const PRIVATE_DETAIL: &str = "authorization=private-provider-token";
+
+    let error = match CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider_factory(FAILED_PROVIDER, || {
+            Err(anyhow::anyhow!(PRIVATE_DETAIL))
+        })
+        .select_generation_provider(FAILED_PROVIDER)
+        .build_blocking()
+    {
+        Ok(mut root) => {
+            let _ = futures::executor::block_on(root.close());
+            panic!("selected Provider preparation must fail");
+        }
+        Err(error) => error,
+    };
+
+    assert!(!format!("{error}").contains(PRIVATE_DETAIL));
+    assert!(!format!("{error:?}").contains(PRIVATE_DETAIL));
+    let prepare_error = std::error::Error::source(&error).expect("prepare error source");
+    let private_source = prepare_error
+        .source()
+        .expect("returned error retains its private source chain");
+    assert!(private_source.to_string().contains(PRIVATE_DETAIL));
+}
+
+#[test]
+fn generation_activation_failure_rolls_back_after_old_provider_revocation() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.activate-old");
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.activate-failed");
+    let rollback_count = Rc::new(Cell::new(0));
+    let observed_rollbacks = Rc::clone(&rollback_count);
+    let replacement: Arc<dyn GenerationService> =
+        Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_replacement = Arc::clone(&replacement);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(
+            OLD_PROVIDER,
+            Arc::new(ScriptedGenerationService::new(Vec::new())),
+        )
+        .register_prepared_generation_provider(FAILED_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(Arc::clone(&prepared_replacement));
+            let rollback_count = Rc::clone(&observed_rollbacks);
+            prepared.own_sync(move || rollback_count.set(rollback_count.get() + 1));
+            Ok(prepared.on_activate(|_| anyhow::bail!("private activation failure")))
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with fallible activation");
+    let services = root.services().expect("stable Consumer projection");
+
+    let error = futures::executor::block_on(root.replace_generation_provider(FAILED_PROVIDER))
+        .expect_err("activation fails after old capability revocation");
+
+    assert!(matches!(error, CompositionReplaceError::Activate(_)));
+    assert_eq!(rollback_count.get(), 1);
+    assert!(root.generation().is_none());
+    assert!(
+        services
+            .generation_service()
+            .start(scripted_request())
+            .is_err()
+    );
+    let failed = composition_component(root.snapshot(), FAILED_PROVIDER);
+    assert_eq!(failed.state(), RuntimeComponentState::Failed);
+    assert_eq!(failed.resource_counts(), RuntimeResourceCounts::default());
+    assert!(failed.last_failure().is_some_and(|failure| {
+        failure.stage() == ReconcileStage::Activating
+            && !failure.message().contains("private activation failure")
+    }));
+
+    futures::executor::block_on(root.close()).expect("close after activation rollback");
+}
+
+#[test]
+fn failed_generation_activation_rollback_retains_ownership_until_retry() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.rollback-old");
+    const FAILED_PROVIDER: ComponentId = ComponentId::new("nostra.generation.rollback-failed");
+    let prepares = Rc::new(Cell::new(0));
+    let observed_prepares = Rc::clone(&prepares);
+    let rollback_events = Rc::new(RefCell::new(Vec::new()));
+    let observed_events = Rc::clone(&rollback_events);
+    let replacement: Arc<dyn GenerationService> =
+        Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let prepared_replacement = Arc::clone(&replacement);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(
+            OLD_PROVIDER,
+            Arc::new(ScriptedGenerationService::new(Vec::new())),
+        )
+        .register_prepared_generation_provider(FAILED_PROVIDER, move || {
+            let attempt = observed_prepares.get() + 1;
+            observed_prepares.set(attempt);
+            let mut prepared = PreparedProvider::new(Arc::clone(&prepared_replacement));
+            if attempt == 1 {
+                prepared.own_async(FailingOnceStop {
+                    failed: false,
+                    events: Rc::clone(&observed_events),
+                });
+                return Ok(prepared.on_activate(|_| anyhow::bail!("private activation failure")));
+            }
+            Ok(prepared)
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with retryable candidate rollback");
+    let services = root.services().expect("stable Consumer projection");
+
+    let error = futures::executor::block_on(root.replace_generation_provider(FAILED_PROVIDER))
+        .expect_err("candidate rollback fails once");
+    assert!(matches!(error, CompositionReplaceError::Rollback(_)));
+    assert_eq!(prepares.get(), 1);
+    let failed = composition_component(root.snapshot(), FAILED_PROVIDER);
+    assert_eq!(failed.state(), RuntimeComponentState::Failed);
+    assert_eq!(
+        failed.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 1)
+    );
+    assert!(
+        failed
+            .last_failure()
+            .is_some_and(|failure| { failure.stage() == ReconcileStage::RollingBack })
+    );
+    assert!(root.generation().is_none());
+    assert!(
+        services
+            .generation_service()
+            .start(scripted_request())
+            .is_err()
+    );
+
+    assert!(
+        futures::executor::block_on(root.replace_generation_provider(FAILED_PROVIDER))
+            .expect("retry finishes rollback and prepares a fresh candidate")
+    );
+    assert_eq!(prepares.get(), 2);
+    assert_eq!(rollback_events.borrow().as_slice(), ["async-stop-finished"]);
+    assert_eq!(
+        root.generation()
+            .expect("retry publishes candidate")
+            .provider(),
+        FAILED_PROVIDER
+    );
+
+    futures::executor::block_on(root.close()).expect("close recovered composition");
+}
+
+#[test]
+fn generation_revision_exhaustion_rejects_before_candidate_preparation() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.revision-old");
+    const NEW_PROVIDER: ComponentId = ComponentId::new("nostra.generation.revision-new");
+    let prepares = Rc::new(Cell::new(0));
+    let observed_prepares = Rc::clone(&prepares);
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(
+            OLD_PROVIDER,
+            Arc::new(ScriptedGenerationService::new(Vec::new())),
+        )
+        .register_generation_provider_factory(NEW_PROVIDER, move || {
+            observed_prepares.set(observed_prepares.get() + 1);
+            Ok(Arc::new(ScriptedGenerationService::new(Vec::new())))
+        })
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with unprepared replacement");
+    let services = root.services().expect("active Consumer projection");
+    let snapshots = services.runtime_snapshots();
+    let before = snapshots.current();
+    root.exhaust_generation_revision_for_test();
+
+    let error = futures::executor::block_on(root.replace_generation_provider(NEW_PROVIDER))
+        .expect_err("exhausted desired revision rejects replacement");
+
+    assert!(matches!(
+        error,
+        CompositionReplaceError::RevisionExhausted { .. }
+    ));
+    assert_eq!(prepares.get(), 0);
+    assert_eq!(snapshots.current(), before);
+    assert_eq!(
+        root.generation().expect("old Provider remains").provider(),
+        OLD_PROVIDER
+    );
+
+    futures::executor::block_on(root.close()).expect("close after revision exhaustion");
+}
+
+#[test]
+fn repeated_generation_replacement_remounts_one_stable_consumer_handle() {
+    const FIRST_PROVIDER: ComponentId = ComponentId::new("nostra.generation.repeat-first");
+    const SECOND_PROVIDER: ComponentId = ComponentId::new("nostra.generation.repeat-second");
+    let first: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let second: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(FIRST_PROVIDER, first)
+        .register_generation_provider(SECOND_PROVIDER, second)
+        .select_generation_provider(FIRST_PROVIDER)
+        .build_blocking()
+        .expect("composition with repeatable Providers");
+    let services = root.services().expect("stable Consumer projection");
+
+    assert!(
+        futures::executor::block_on(root.replace_generation_provider(SECOND_PROVIDER))
+            .expect("replace with second Provider")
+    );
+    assert!(
+        futures::executor::block_on(root.replace_generation_provider(FIRST_PROVIDER))
+            .expect("replace back with first Provider")
+    );
+
+    let generation = root.generation().expect("first Provider is active again");
+    assert_eq!(generation.provider(), FIRST_PROVIDER);
+    assert_eq!(generation.generation().get(), 3);
+    let handle = services
+        .generation_service()
+        .start(scripted_request())
+        .expect("original Consumer handle follows the latest remount");
+    drop(handle);
+
+    futures::executor::block_on(root.close()).expect("close repeatedly replaced composition");
+}
+
+#[test]
+fn application_scope_release_waits_for_generation_quiescence() {
+    const PROVIDER: ComponentId = ComponentId::new("nostra.generation.parent-release");
+    let service: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(PROVIDER, service)
+        .select_generation_provider(PROVIDER)
+        .build_blocking()
+        .expect("composition with an active generation Provider");
+    let services = root.services().expect("active Consumer projection");
+    let source = services.runtime_snapshots();
+    let held = services
+        .generation_service()
+        .start(scripted_request())
+        .expect("generation remains owned by the application scope");
+
+    let mut close = Box::pin(root.close());
+    assert!(matches!(poll_once(close.as_mut()), Poll::Pending));
+    let update = source.current();
+    assert_eq!(
+        composition_component(update.snapshot(), PROVIDER).state(),
+        RuntimeComponentState::Quiescing
+    );
+    assert!(
+        services
+            .generation_service()
+            .start(scripted_request())
+            .is_err()
+    );
+
+    drop(held);
+    let Poll::Ready(result) = poll_once(close.as_mut()) else {
+        panic!("application scope closes after the active handle is released")
+    };
+    result.expect("application scope release settles");
+    drop(close);
+    assert!(root.services().is_none());
+    assert_eq!(
+        composition_component(root.snapshot(), PROVIDER).state(),
+        RuntimeComponentState::Disposed
+    );
+}
+
+#[test]
+fn composition_snapshot_reader_observes_only_the_successor() {
+    const OLD_PROVIDER: ComponentId = ComponentId::new("nostra.generation.stale-old");
+    const NEW_PROVIDER: ComponentId = ComponentId::new("nostra.generation.stale-new");
+    let old: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let new: Arc<dyn GenerationService> = Arc::new(ScriptedGenerationService::new(Vec::new()));
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_generation_provider(OLD_PROVIDER, old)
+        .register_generation_provider(NEW_PROVIDER, new)
+        .select_generation_provider(OLD_PROVIDER)
+        .build_blocking()
+        .expect("composition with replaceable Providers");
+    let source = root
+        .services()
+        .expect("active Consumer projection")
+        .runtime_snapshots();
+    assert!(
+        futures::executor::block_on(root.replace_generation_provider(NEW_PROVIDER))
+            .expect("publish successor")
+    );
+    let current = source.current();
+    assert_eq!(
+        composition_component(current.snapshot(), NEW_PROVIDER).state(),
+        RuntimeComponentState::Active
+    );
+    assert!(
+        current
+            .snapshot()
+            .components()
+            .iter()
+            .all(|component| component.component() != OLD_PROVIDER)
+    );
+
+    futures::executor::block_on(root.close()).expect("close successor composition");
+}
+
+#[test]
+fn runtime_snapshot_source_coalesces_updates_and_rejects_stale_publication() {
+    let initial = RuntimeSnapshot::new([], [], Duration::from_secs(30))
+        .expect("empty initial runtime snapshot");
+    let source = RuntimeSnapshotSource::new(initial.clone());
+    let reader = source.reader();
+    let stale_guard = source.guard();
+    let mut subscription = reader.subscribe();
+    let second = RuntimeSnapshot::new(
+        [],
+        [ContributionRevision::new(
+            CapabilityId::of::<MarkdownExtensionKey>(),
+            2,
+        )],
+        Duration::from_secs(30),
+    )
+    .expect("second runtime snapshot");
+    let third = RuntimeSnapshot::new(
+        [],
+        [ContributionRevision::new(
+            CapabilityId::of::<MarkdownExtensionKey>(),
+            3,
+        )],
+        Duration::from_secs(30),
+    )
+    .expect("third runtime snapshot");
+
+    let (release, wait_for_release) = futures::channel::oneshot::channel();
+    let stale_source = source.clone();
+    let mut stale_completion = Box::pin(async move {
+        let _ = wait_for_release.await;
+        stale_source.publish_if_current(&stale_guard, initial)
+    });
+    assert!(matches!(
+        poll_once(stale_completion.as_mut()),
+        Poll::Pending
+    ));
+
+    assert!(source.publish(second));
+    assert!(source.publish(third.clone()));
+    let _ = release.send(());
+    assert!(!futures::executor::block_on(stale_completion));
+
+    let update = futures::executor::block_on(subscription.next())
+        .expect("one coalesced runtime snapshot notification");
+    assert_eq!(update.revision(), 3);
+    assert_eq!(update.snapshot(), &third);
+    assert_eq!(reader.current(), update);
+}
+
+#[test]
 fn default_composition_installs_the_gateway_generation_provider() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let generation = root.generation().expect("active generation capability");
 
@@ -3168,7 +4229,7 @@ fn default_composition_installs_the_gateway_generation_provider() {
 #[test]
 fn runtime_services_create_distinct_conversation_scopes_under_the_window_scope() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let services = root.services().expect("active runtime services");
     let first = services
@@ -3191,7 +4252,7 @@ fn runtime_services_create_distinct_conversation_scopes_under_the_window_scope()
 #[test]
 fn conversation_scope_close_is_explicit_and_idempotent() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let services = root.services().expect("active runtime services");
     let scope = services
@@ -3208,7 +4269,7 @@ fn conversation_scope_close_is_explicit_and_idempotent() {
 #[test]
 fn conversation_scope_close_after_parent_close_is_a_noop() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let scope = root
         .services()
@@ -3225,7 +4286,7 @@ fn conversation_scope_close_after_parent_close_is_a_noop() {
 #[test]
 fn closed_conversation_scopes_are_removed_from_the_runtime_tree() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let services = root.services().expect("active runtime services");
     assert_eq!(services.scope_count(), 2);
@@ -3253,8 +4314,9 @@ fn scripted_generation_provider_uses_the_same_consumer_handle() {
         GenerationEvent::Finished(Box::new(scripted_completed_outcome())),
     ]));
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .with_generation_service(SCRIPTED_PROVIDER, scripted)
-        .build()
+        .register_generation_provider(SCRIPTED_PROVIDER, scripted)
+        .select_generation_provider(SCRIPTED_PROVIDER)
+        .build_blocking()
         .expect("valid scripted composition");
     let generation = root.generation().expect("active scripted capability");
 
@@ -3280,7 +4342,7 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     let stores =
         SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
     let mut root = CompositionRoot::builder(stores)
-        .build()
+        .build_blocking()
         .expect("valid default composition");
     let application = root.application_scope();
     let session_services = root
@@ -3320,6 +4382,18 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     assert_eq!(preferences_component.state(), RuntimeComponentState::Active);
     assert_eq!(generation_component.state(), RuntimeComponentState::Active);
     assert_eq!(session_component.state(), RuntimeComponentState::Active);
+    assert_eq!(
+        preferences_component.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 0)
+    );
+    assert_eq!(
+        generation_component.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 0)
+    );
+    assert_eq!(
+        session_component.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 0)
+    );
     assert!(preferences_component.dependencies().is_empty());
     assert!(preferences_component.missing_dependencies().is_empty());
     assert!(generation_component.dependencies().is_empty());
@@ -3327,7 +4401,12 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     assert!(session_component.dependencies().is_empty());
     assert!(session_component.missing_dependencies().is_empty());
 
+    let runtime_snapshots = root
+        .services()
+        .expect("active services expose runtime snapshots")
+        .runtime_snapshots();
     futures::executor::block_on(root.close()).expect("close default composition");
+    let after_first_close = runtime_snapshots.current();
     assert!(root.session_services().is_none());
     assert_eq!(
         composition_component(root.snapshot(), ComponentId::new("nostra.preferences.json"),)
@@ -3348,13 +4427,14 @@ fn default_composition_installs_stable_session_provider_and_passes_startup_audit
     );
     futures::executor::block_on(root.close())
         .expect("closing an already closed composition is idempotent");
+    assert_eq!(runtime_snapshots.current(), after_first_close);
 }
 
 #[test]
 fn default_composition_preserves_independent_session_domain_availability() {
     let mut chat_root =
         CompositionRoot::builder(SessionStores::with_chat_store(InMemorySessionStore::new()))
-            .build()
+            .build_blocking()
             .expect("Chat-only default composition");
     let chat_services = chat_root
         .session_services()
@@ -3376,7 +4456,7 @@ fn default_composition_preserves_independent_session_domain_availability() {
 
     let mut agent_root =
         CompositionRoot::builder(SessionStores::with_agent_store(InMemorySessionStore::new()))
-            .build()
+            .build_blocking()
             .expect("Agent-only default composition");
     let agent_services = agent_root
         .session_services()
@@ -3404,7 +4484,7 @@ fn default_composition_close_waits_for_session_shutdown_owner() {
     let mut chat = InMemorySessionStore::new();
     chat.observe_shutdown_for_test(started_tx, Some(release_rx));
     let mut root = CompositionRoot::builder(SessionStores::with_chat_store(chat))
-        .build()
+        .build_blocking()
         .expect("valid default composition");
 
     let release_worker = thread::spawn(move || {
@@ -3426,7 +4506,7 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     let mut chat = InMemorySessionStore::new();
     chat.observe_shutdown_for_test(started_tx, Some(release_rx));
     let mut root = CompositionRoot::builder(SessionStores::with_chat_store(chat))
-        .build()
+        .build_blocking()
         .expect("valid default composition");
 
     let first_close = futures::executor::block_on(root.close());
@@ -3435,10 +4515,16 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
         .expect("shutdown owner must start before reporting timeout");
     assert!(first_close.is_err());
     assert!(root.session_services().is_some());
+    let failed = composition_component(root.snapshot(), ComponentId::new("nostra.session.local"));
+    assert_eq!(failed.state(), RuntimeComponentState::Failed);
     assert_eq!(
-        composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
-        RuntimeComponentState::Active
+        failed.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 1)
     );
+    assert!(failed.last_failure().is_some_and(|failure| {
+        failure.stage() == ReconcileStage::Stopping
+            && failure.message().contains("session shutdown")
+    }));
 
     release_tx
         .send(())
@@ -3448,7 +4534,48 @@ fn default_composition_close_failure_retains_shutdown_effect_for_retry() {
     assert!(root.session_services().is_some());
     assert_eq!(
         composition_component(root.snapshot(), ComponentId::new("nostra.session.local"),).state(),
-        RuntimeComponentState::Active
+        RuntimeComponentState::Failed
+    );
+}
+
+#[test]
+fn session_provider_stop_failure_is_diagnosed_until_retry() {
+    const SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.stop-failed");
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let prepared_events = Rc::clone(&events);
+
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_prepared_session_provider(SESSION_PROVIDER, move || {
+            let mut prepared = PreparedProvider::new(SessionStores::default());
+            prepared.own_async(FailingOnceStop {
+                failed: false,
+                events: Rc::clone(&prepared_events),
+            });
+            Ok(prepared)
+        })
+        .select_session_provider(SESSION_PROVIDER)
+        .build_blocking()
+        .expect("composition with a fallible session teardown");
+
+    let first_close = futures::executor::block_on(root.close());
+    assert!(first_close.is_err());
+    let failed = composition_component(root.snapshot(), SESSION_PROVIDER);
+    assert_eq!(failed.state(), RuntimeComponentState::Failed);
+    assert_eq!(
+        failed.resource_counts(),
+        RuntimeResourceCounts::new(1, 0, 0, 1)
+    );
+    assert!(failed.last_failure().is_some_and(|failure| {
+        failure.stage() == ReconcileStage::Stopping
+            && failure.message().contains("failed to roll back")
+    }));
+    assert!(root.session_services().is_none());
+
+    futures::executor::block_on(root.close()).expect("retry session provider teardown");
+    assert_eq!(events.borrow().as_slice(), ["async-stop-finished"]);
+    assert_eq!(
+        composition_component(root.snapshot(), SESSION_PROVIDER).state(),
+        RuntimeComponentState::Disposed
     );
 }
 
@@ -3518,7 +4645,7 @@ fn composition_close_releases_scopes_when_preference_save_fails() {
     );
     let mut root = CompositionRoot::builder(SessionStores::default())
         .with_preferences(preferences)
-        .build()
+        .build_blocking()
         .expect("valid composition");
 
     futures::executor::block_on(root.close())
@@ -3534,13 +4661,14 @@ fn composition_close_releases_scopes_when_preference_save_fails() {
 fn memory_session_provider_uses_the_same_typed_capability_consumer() {
     const MEMORY_SESSION_PROVIDER: ComponentId = ComponentId::new("nostra.session.memory");
 
-    let mut root = CompositionRoot::builder(SessionStores::with_stores(
-        InMemorySessionStore::new(),
-        InMemorySessionStore::new(),
-    ))
-    .with_provider(MEMORY_SESSION_PROVIDER)
-    .build()
-    .expect("valid memory session composition");
+    let memory_stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let memory_provider = memory_stores.clone();
+    let mut root = CompositionRoot::builder(SessionStores::default())
+        .register_session_provider(MEMORY_SESSION_PROVIDER, move || Ok(memory_provider.clone()))
+        .select_session_provider(MEMORY_SESSION_PROVIDER)
+        .build_blocking()
+        .expect("valid memory session composition");
     let session_services = root
         .session_services()
         .expect("active memory session capability");
@@ -3571,7 +4699,7 @@ fn memory_session_provider_uses_the_same_typed_capability_consumer() {
 #[test]
 fn default_composition_exposes_the_json_preference_provider() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition with unavailable session domains");
     let preferences = root
         .preferences()
@@ -3598,7 +4726,7 @@ fn default_composition_exposes_the_json_preference_provider() {
 #[test]
 fn composition_services_project_the_active_handles_as_one_bundle() {
     let mut root = CompositionRoot::builder(SessionStores::default())
-        .build()
+        .build_blocking()
         .expect("valid composition");
     let services = root.services().expect("active runtime services");
 
@@ -3625,7 +4753,7 @@ fn in_memory_preference_provider_uses_the_same_capability_consumer() {
     let mut root = CompositionRoot::builder(SessionStores::default())
         .with_preferences(preferences.clone())
         .with_preferences_provider(MEMORY_PREFERENCE_PROVIDER)
-        .build()
+        .build_blocking()
         .expect("valid in-memory preference composition");
 
     let lease = root

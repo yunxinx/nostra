@@ -83,6 +83,11 @@ impl EffectScope {
         }
     }
 
+    #[must_use]
+    pub fn effect_count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Releases effects until an asynchronous owner requires quiescence.
     ///
     /// Returns `false` after dropping that owner to request cancellation while

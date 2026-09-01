@@ -11,12 +11,11 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme, Root, TitleBar};
 use rust_i18n::t;
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, rc::Rc};
 
 use crate::appearance::glass;
-use crate::llm::GenerationService;
 use crate::preferences::{Preferences, WindowGeometry};
-use crate::runtime::{ComponentId, CompositionRoot, QUIT_FALLBACK_TIMEOUT};
+use crate::runtime::{CompositionRoot, QUIT_FALLBACK_TIMEOUT};
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
@@ -87,7 +86,6 @@ const MIN_SIZE: Size<Pixels> = Size {
 /// Open the main chat window and wire up per-window platform hooks.
 pub fn open_main_window(
     prefs: Preferences,
-    generation_service: Arc<dyn GenerationService>,
     preference_handle: crate::preferences::PreferenceHandle,
     cx: &mut App,
 ) {
@@ -96,16 +94,15 @@ pub fn open_main_window(
     // source file. Keep that work off the application thread before the first
     // window and its ChatView are constructed.
     let stores = cx.background_spawn(async { SessionStores::open_default() });
+    let http_client = cx.http_client();
 
     cx.spawn(async move |cx| {
         let stores = stores.await;
         let composition = match CompositionRoot::builder(stores)
             .with_preferences(preference_handle)
-            .with_generation_service(
-                ComponentId::new("nostra.generation.gateway"),
-                generation_service,
-            )
+            .with_http_client(http_client)
             .build()
+            .await
         {
             Ok(composition) => composition,
             Err(error) => {

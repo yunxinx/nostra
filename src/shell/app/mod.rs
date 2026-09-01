@@ -35,7 +35,7 @@ use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry};
 use crate::runtime::{
     CHAT_WORKSPACE_ID, ExitCoordinator, NORMAL_EXIT_TIMEOUT, PROJECT_WORKSPACE_ID,
-    QUIT_FALLBACK_TIMEOUT, RuntimeServices, WorkspaceId,
+    QUIT_FALLBACK_TIMEOUT, RuntimeServices, RuntimeSnapshotUpdate, WorkspaceId,
 };
 #[cfg(test)]
 use crate::session::SessionId;
@@ -125,7 +125,9 @@ pub struct ChatApp {
     /// Current workspace identity selected in the window.
     workspace_id: WorkspaceId,
     _quit_task: Option<gpui::Task<()>>,
+    _runtime_snapshot_task: Option<gpui::Task<()>>,
     _subscriptions: Vec<Subscription>,
+    runtime_snapshot: RuntimeSnapshotUpdate,
     preference_handle: PreferenceHandle,
     preference_snapshot: Preferences,
     exit_coordinator: Arc<ExitCoordinator>,
@@ -156,6 +158,9 @@ impl ChatApp {
     ) -> Self {
         let preference_handle = services.preference_handle().clone();
         let exit_coordinator = services.exit_coordinator();
+        let runtime_snapshots = services.runtime_snapshots();
+        let runtime_snapshot = runtime_snapshots.current();
+        let mut runtime_snapshot_subscription = runtime_snapshots.subscribe();
         let sidebar_width = px(prefs.sidebar_width)
             .max(SIDEBAR_MIN_WIDTH)
             .min(SIDEBAR_MAX_WIDTH);
@@ -223,12 +228,30 @@ impl ChatApp {
             model_picker,
             workspace_id,
             _quit_task: None,
+            _runtime_snapshot_task: None,
             _subscriptions: vec![workspace_subscription, project_workspace_subscription],
+            runtime_snapshot,
             preference_handle,
             preference_snapshot: prefs.clone(),
             exit_coordinator,
         };
         this.track_window_geometry(window, cx);
+        this._runtime_snapshot_task = Some(cx.spawn(async move |this, cx| {
+            while let Some(update) = runtime_snapshot_subscription.next().await {
+                if this
+                    .update(cx, |this, cx| {
+                        if update.revision() <= this.runtime_snapshot.revision() {
+                            return;
+                        }
+                        this.runtime_snapshot = update;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
         this.track_preferences(window, cx);
         this.track_system_appearance(window, cx);
         this.register_save_on_quit(cx);
@@ -238,6 +261,11 @@ impl ChatApp {
                 .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx));
         }
         this
+    }
+
+    #[cfg(test)]
+    fn runtime_snapshot_for_test(&self) -> &RuntimeSnapshotUpdate {
+        &self.runtime_snapshot
     }
 
     fn chat_workspace(&self) -> Entity<ChatWorkspace> {

@@ -51,11 +51,12 @@ fn composed_services(
     let generation_service = generation_service();
     let root = CompositionRoot::builder(session_services.clone())
         .with_preferences(preference_handle)
-        .with_generation_service(
+        .register_generation_provider(
             ComponentId::new("nostra.generation.test"),
             generation_service,
         )
-        .build()
+        .select_generation_provider(ComponentId::new("nostra.generation.test"))
+        .build_blocking()
         .expect("valid test composition");
     let services = root.services().expect("active test services");
     cx.update(|cx| cx.set_global(TestCompositionRoot(RefCell::new(Some(root)))));
@@ -69,7 +70,7 @@ fn default_composed_services(
 ) -> RuntimeServices {
     let root = CompositionRoot::builder(session_services)
         .with_preferences(preference_handle)
-        .build()
+        .build_blocking()
         .expect("valid default composition");
     let services = root.services().expect("active default services");
     cx.update(|cx| cx.set_global(TestCompositionRoot(RefCell::new(Some(root)))));
@@ -173,6 +174,37 @@ fn add_app_window_with_default_composition(
     });
     let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
     let services = default_composed_services(cx, SessionStores::default(), preference_handle);
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
+        Root::new(app, window, cx)
+    });
+    let app = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ChatApp>()
+            .expect("Root must contain the ChatApp")
+    });
+    (app, cx)
+}
+
+fn add_app_window_with_replaceable_generation(
+    cx: &mut TestAppContext,
+) -> (Entity<ChatApp>, &mut gpui::VisualTestContext) {
+    const REPLACEMENT_PROVIDER: ComponentId = ComponentId::new("nostra.generation.replacement");
+    let prefs = Preferences::default();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::appearance::fonts::init(prefs.composer_font, cx);
+        crate::preferences::init_global(prefs.clone(), cx);
+    });
+    let preference_handle = cx.update(|cx| crate::preferences::handle(cx));
+    let root = CompositionRoot::builder(SessionStores::default())
+        .with_preferences(preference_handle)
+        .register_generation_provider(REPLACEMENT_PROVIDER, generation_service())
+        .build_blocking()
+        .expect("replaceable default composition");
+    let services = root.services().expect("active replaceable services");
+    cx.update(|cx| cx.set_global(TestCompositionRoot(RefCell::new(Some(root)))));
     let (root, cx) = cx.add_window_view(move |window, cx| {
         let app = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
         Root::new(app, window, cx)
@@ -841,6 +873,53 @@ fn unavailable_conversation_runtime_reports_a_notification_without_creating_a_dr
             assert!(this.chat_snapshot().conversations().is_empty());
         });
         assert_eq!(window.notifications(cx).len(), notification_count + 1);
+    });
+}
+
+#[gpui::test]
+fn runtime_snapshot_updates_are_applied_to_app_owned_state(cx: &mut TestAppContext) {
+    const DEFAULT_PROVIDER: ComponentId = ComponentId::new("nostra.generation.gateway");
+    const REPLACEMENT_PROVIDER: ComponentId = ComponentId::new("nostra.generation.replacement");
+    let (app, cx) = add_app_window_with_replaceable_generation(cx);
+    let initial_revision = app.read_with(cx, |this, _| {
+        assert!(
+            this.runtime_snapshot_for_test()
+                .snapshot()
+                .components()
+                .iter()
+                .any(|component| component.component() == DEFAULT_PROVIDER)
+        );
+        this.runtime_snapshot_for_test().revision()
+    });
+
+    cx.update(|_, cx| {
+        let root = cx.global::<TestCompositionRoot>();
+        let mut root = root.0.borrow_mut();
+        let root = root.as_mut().expect("test composition root");
+        assert!(
+            futures::executor::block_on(root.replace_generation_provider(REPLACEMENT_PROVIDER))
+                .expect("replace generation Provider")
+        );
+    });
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, _| {
+        let update = this.runtime_snapshot_for_test();
+        assert!(update.revision() > initial_revision);
+        assert!(
+            update
+                .snapshot()
+                .components()
+                .iter()
+                .any(|component| component.component() == REPLACEMENT_PROVIDER)
+        );
+        assert!(
+            update
+                .snapshot()
+                .components()
+                .iter()
+                .all(|component| component.component() != DEFAULT_PROVIDER)
+        );
     });
 }
 
