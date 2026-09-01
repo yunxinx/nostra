@@ -14,6 +14,8 @@ use ratex_parser::parse;
 use ratex_svg::{SvgColorSyntax, SvgOptions, render_to_svg_with_color_syntax};
 use ratex_types::{Color, MathStyle};
 
+use crate::ui::markdown::MarkdownContributionOwner;
+
 // RaTeX's SVG coordinate system is expressed in em units multiplied by this
 // font size. These small pads prevent antialiasing at the outer glyph/stroke
 // edge from being clipped; display formulas receive more breathing room.
@@ -71,6 +73,7 @@ pub(super) struct FormulaRequest<'a> {
     pub(super) style: FormulaStyle,
     pub(super) start: usize,
     pub(super) owner_id: u64,
+    pub(super) contribution_owner: MarkdownContributionOwner,
     pub(super) font_size: f32,
     pub(super) color: Hsla,
 }
@@ -104,13 +107,18 @@ pub(crate) struct FormulaCacheSnapshot {
 }
 
 #[cfg(test)]
-fn formula_cache_probes() -> &'static Mutex<HashMap<(u64, usize), FormulaCacheSnapshot>> {
-    static PROBES: OnceLock<Mutex<HashMap<(u64, usize), FormulaCacheSnapshot>>> = OnceLock::new();
+type FormulaProbeKey = (MarkdownContributionOwner, u64, usize);
+
+#[cfg(test)]
+fn formula_cache_probes() -> &'static Mutex<HashMap<FormulaProbeKey, FormulaCacheSnapshot>> {
+    static PROBES: OnceLock<Mutex<HashMap<FormulaProbeKey, FormulaCacheSnapshot>>> =
+        OnceLock::new();
     PROBES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[cfg(test)]
 fn record_formula_cache(
+    contribution_owner: MarkdownContributionOwner,
     owner_id: u64,
     start: usize,
     fingerprint: &FormulaFingerprint,
@@ -120,11 +128,11 @@ fn record_formula_cache(
     let mut probes = formula_cache_probes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = probes.get(&(owner_id, start));
+    let previous = probes.get(&(contribution_owner, owner_id, start));
     let release_count = previous.map_or(0, |snapshot| snapshot.release_count);
     let image_drop_count = previous.map_or(0, |snapshot| snapshot.image_drop_count);
     probes.insert(
-        (owner_id, start),
+        (contribution_owner, owner_id, start),
         FormulaCacheSnapshot {
             source: fingerprint.source.clone(),
             inline: fingerprint.inline,
@@ -139,11 +147,16 @@ fn record_formula_cache(
 }
 
 #[cfg(test)]
-fn record_formula_release(owner_id: u64, start: usize, dropped_image: bool) {
+fn record_formula_release(
+    contribution_owner: MarkdownContributionOwner,
+    owner_id: u64,
+    start: usize,
+    dropped_image: bool,
+) {
     if let Some(snapshot) = formula_cache_probes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get_mut(&(owner_id, start))
+        .get_mut(&(contribution_owner, owner_id, start))
     {
         snapshot.active = false;
         snapshot.release_count += 1;
@@ -152,11 +165,15 @@ fn record_formula_release(owner_id: u64, start: usize, dropped_image: bool) {
 }
 
 #[cfg(test)]
-fn record_formula_image_drop(owner_id: u64, start: usize) {
+fn record_formula_image_drop(
+    contribution_owner: MarkdownContributionOwner,
+    owner_id: u64,
+    start: usize,
+) {
     if let Some(snapshot) = formula_cache_probes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get_mut(&(owner_id, start))
+        .get_mut(&(contribution_owner, owner_id, start))
     {
         snapshot.image_drop_count += 1;
     }
@@ -167,7 +184,24 @@ pub(crate) fn formula_cache_snapshot(owner_id: u64, start: usize) -> Option<Form
     formula_cache_probes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&(owner_id, start))
+        .iter()
+        .filter(|((_, candidate_owner, candidate_start), _)| {
+            *candidate_owner == owner_id && *candidate_start == start
+        })
+        .max_by_key(|((contribution_owner, _, _), _)| contribution_owner.generation())
+        .map(|(_, snapshot)| snapshot.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn formula_cache_snapshot_for_owner(
+    contribution_owner: MarkdownContributionOwner,
+    owner_id: u64,
+    start: usize,
+) -> Option<FormulaCacheSnapshot> {
+    formula_cache_probes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&(contribution_owner, owner_id, start))
         .cloned()
 }
 
@@ -177,16 +211,29 @@ pub(crate) fn formula_cache_snapshots(owner_id: u64) -> Vec<(usize, FormulaCache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
-        .filter_map(|(&(candidate_owner, start), snapshot)| {
-            if candidate_owner == owner_id {
-                Some((start, snapshot.clone()))
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(&(contribution_owner, candidate_owner, start), snapshot)| {
+                if candidate_owner == owner_id {
+                    Some((contribution_owner.generation(), start, snapshot.clone()))
+                } else {
+                    None
+                }
+            },
+        )
         .collect::<Vec<_>>();
-    snapshots.sort_by_key(|(start, _)| *start);
+    snapshots.sort_by_key(|(generation, start, _)| (*start, *generation));
     snapshots
+        .into_iter()
+        .fold(Vec::new(), |mut latest, (_, start, snapshot)| {
+            if latest
+                .last()
+                .is_some_and(|(latest_start, _)| *latest_start == start)
+            {
+                latest.pop();
+            }
+            latest.push((start, snapshot));
+            latest
+        })
 }
 
 impl FormulaCache {
@@ -215,7 +262,7 @@ pub(super) fn cached_formula(
     cx: &mut App,
 ) -> Option<RenderedFormula> {
     #[cfg(test)]
-    let probe_key = (request.owner_id, request.start);
+    let probe_key = (request.contribution_owner, request.owner_id, request.start);
     let fingerprint = FormulaFingerprint {
         source: request.source.to_string(),
         inline: request.inline,
@@ -227,7 +274,10 @@ pub(super) fn cached_formula(
         // logical width and height at 1x, 2x, and 3x displays.
         raster_scale: (window.scale_factor() / gpui::SMOOTH_SVG_SCALE_FACTOR).max(0.5),
     };
-    let key = format!("markdown-math-{}-{}", request.owner_id, request.start);
+    let key =
+        request
+            .contribution_owner
+            .keyed_state_id("markdown-math", request.owner_id, request.start);
     let cache = window.use_keyed_state(key, cx, |window, cache_cx| {
         let cache = FormulaCache::new(fingerprint.clone());
         // `RenderImage` has no Drop implementation and ImageSource::Render is
@@ -241,7 +291,7 @@ pub(super) fn cached_formula(
                 move |cache: &mut FormulaCache, window, cx| {
                     let image = cache.take_image();
                     #[cfg(test)]
-                    record_formula_release(probe_key.0, probe_key.1, image.is_some());
+                    record_formula_release(probe_key.0, probe_key.1, probe_key.2, image.is_some());
                     if let Some(image) = image {
                         cx.drop_image(image, Some(window));
                     }
@@ -271,6 +321,7 @@ pub(super) fn cached_formula(
             record_formula_cache(
                 probe_key.0,
                 probe_key.1,
+                probe_key.2,
                 &cached.fingerprint,
                 cached.generation,
                 &cached.status,
@@ -321,6 +372,7 @@ pub(super) fn cached_formula(
                     record_formula_cache(
                         probe_key.0,
                         probe_key.1,
+                        probe_key.2,
                         &cache.fingerprint,
                         cache.generation,
                         &cache.status,
@@ -329,12 +381,12 @@ pub(super) fn cached_formula(
                 });
                 if let Some(image) = discarded_image.take() {
                     #[cfg(test)]
-                    record_formula_image_drop(probe_key.0, probe_key.1);
+                    record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
                     cx.drop_image(image, Some(window));
                 }
                 if let Some(image) = replaced_image.take() {
                     #[cfg(test)]
-                    record_formula_image_drop(probe_key.0, probe_key.1);
+                    record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
                     cx.drop_image(image, Some(window));
                 }
             });

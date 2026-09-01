@@ -4,6 +4,34 @@ use crate::runtime::ContributionId;
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    static BACKGROUND_HIGHLIGHT_GATES: std::cell::RefCell<
+        std::collections::VecDeque<futures::channel::oneshot::Receiver<()>>,
+    > = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn block_background_highlights(
+    count: usize,
+) -> Vec<futures::channel::oneshot::Sender<()>> {
+    let mut senders = Vec::with_capacity(count);
+    BACKGROUND_HIGHLIGHT_GATES.with(|gates| {
+        let mut gates = gates.borrow_mut();
+        for _ in 0..count {
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            senders.push(sender);
+            gates.push_back(receiver);
+        }
+    });
+    senders
+}
+
+#[cfg(test)]
+fn take_background_highlight_gate() -> Option<futures::channel::oneshot::Receiver<()>> {
+    BACKGROUND_HIGHLIGHT_GATES.with(|gates| gates.borrow_mut().pop_front())
+}
+
 pub(super) fn is_fenced_code_source(source: &str) -> bool {
     let first_line = source.lines().next().unwrap_or_default().as_bytes();
     let indentation = first_line.iter().take_while(|byte| **byte == b' ').count();
@@ -56,6 +84,7 @@ fn install_fenced_code(
     let owner_id = context.owner_id();
     let source_offset = context.source_offset();
     let preference_state = context.preference_state().clone();
+    let contribution_owner = context.contribution_owner();
     extensions
         .block_parser(move |node, cx| {
             let markdown_ast::Node::Code(code) = node else {
@@ -97,6 +126,7 @@ fn install_fenced_code(
                 code,
                 node.attached_selectable_text_state(),
                 owner_id,
+                contribution_owner,
                 preference_state.clone(),
                 window,
                 cx,
@@ -108,6 +138,7 @@ fn install_fenced_code(
 pub(super) type CodeStyles = Arc<[(Range<usize>, HighlightStyle)]>;
 
 pub(super) struct HighlightCache {
+    owner: MarkdownContributionOwner,
     code: SharedString,
     /// Normalized syntax language ID used for cache matching and highlighting.
     language: String,
@@ -132,8 +163,28 @@ pub(super) struct HighlightCache {
     pub(super) highlight_task_generation: Option<u64>,
 }
 
+#[cfg(test)]
+fn record_background_task_owner_release() {
+    update_background_probe(|probe| {
+        debug_assert!(probe.active_task_owners > 0);
+        probe.active_task_owners -= 1;
+        probe.task_owner_releases += 1;
+    });
+}
+
 impl HighlightCache {
-    pub(super) fn new(code: &FencedCode, cx: &App) -> Self {
+    pub(super) fn own_highlight_task(&mut self, task: Task<()>) {
+        #[cfg(test)]
+        update_background_probe(|probe| probe.active_task_owners += 1);
+        self.highlight_task = Some(task);
+    }
+
+    pub(super) fn new(code: &FencedCode, owner: MarkdownContributionOwner, cx: &App) -> Self {
+        #[cfg(test)]
+        update_background_probe(|probe| {
+            probe.active_caches += 1;
+            probe.last_created_owner = Some(owner);
+        });
         let theme = cx.theme().highlight_theme.clone();
         let language = normalized_language_id(code.language.as_deref());
         // Short blocks are highlighted synchronously so the first paint is
@@ -157,6 +208,7 @@ impl HighlightCache {
             .into();
 
         Self {
+            owner,
             code: code.code.clone(),
             language,
             theme,
@@ -171,13 +223,14 @@ impl HighlightCache {
 
     pub(super) fn replace(&mut self, code: &FencedCode, cx: &App) {
         let generation = self.generation.wrapping_add(1);
+        let owner = self.owner;
         // Dropping the previous task cancels a worker that has not started yet
         // and discards the result of one already running (a synchronous
         // tree-sitter parse cannot be preempted mid-poll). Either way the
         // current generation starts a fresh worker on the next render instead
         // of waiting on (and discarding) a stale result; `generation` still
         // guards against a stale result that arrives late.
-        *self = Self::new(code, cx);
+        *self = Self::new(code, owner, cx);
         self.generation = generation;
     }
 
@@ -200,6 +253,21 @@ impl HighlightCache {
                 .language
                 .eq_ignore_ascii_case(code.language.as_deref().unwrap_or("text"))
             && self.theme == cx.theme().highlight_theme
+    }
+}
+
+#[cfg(test)]
+impl Drop for HighlightCache {
+    fn drop(&mut self) {
+        if self.highlight_task.is_some() {
+            record_background_task_owner_release();
+        }
+        update_background_probe(|probe| {
+            debug_assert!(probe.active_caches > 0);
+            probe.active_caches -= 1;
+            probe.cache_releases += 1;
+            probe.last_released_owner = Some(self.owner);
+        });
     }
 }
 
@@ -327,6 +395,7 @@ pub(super) fn render(
     code: &FencedCode,
     attached_text_state: Option<&SelectableTextState>,
     owner_id: u64,
+    contribution_owner: MarkdownContributionOwner,
     preference_state: PreferenceState,
     window: &mut Window,
     cx: &mut App,
@@ -334,9 +403,12 @@ pub(super) fn render(
     #[cfg(test)]
     update_perf_probe(|probe| probe.code_block_renders += 1);
 
-    let cache_id: SharedString =
-        format!("markdown-code-highlight-{owner_id}-{}", code.start).into();
-    let cache = window.use_keyed_state(cache_id, cx, |_, cx| HighlightCache::new(code, cx));
+    let cache_id: SharedString = contribution_owner
+        .keyed_state_id("markdown-code-highlight", owner_id, code.start)
+        .into();
+    let cache = window.use_keyed_state(cache_id, cx, |_, cx| {
+        HighlightCache::new(code, contribution_owner, cx)
+    });
     if !cache.read(cx).matches(code, cx) {
         cache.update(cx, |cache, cx| cache.replace(code, cx));
     }
@@ -360,8 +432,9 @@ pub(super) fn render(
             preferences.code_block_line_numbers,
         )
     };
-    let wrap_state_id: SharedString =
-        format!("markdown-code-wrap-state-{owner_id}-{}", code.start).into();
+    let wrap_state_id: SharedString = contribution_owner
+        .keyed_state_id("markdown-code-wrap-state", owner_id, code.start)
+        .into();
     let wrap_state = window.use_keyed_state(wrap_state_id, cx, |_, _| {
         WrapState::new(global_wrap, global_wrap_revision)
     });
@@ -428,14 +501,16 @@ pub(super) fn render(
             ))
             .into_any_element()
     } else {
-        let scroll_state_id: SharedString =
-            format!("markdown-code-scroll-state-{owner_id}-{}", code.start).into();
+        let scroll_state_id: SharedString = contribution_owner
+            .keyed_state_id("markdown-code-scroll-state", owner_id, code.start)
+            .into();
         let scroll_handle = window
             .use_keyed_state(scroll_state_id, cx, |_, _| gpui::ScrollHandle::new())
             .read(cx)
             .clone();
-        let overflow_state_id: SharedString =
-            format!("markdown-code-overflow-state-{owner_id}-{}", code.start).into();
+        let overflow_state_id: SharedString = contribution_owner
+            .keyed_state_id("markdown-code-overflow-state", owner_id, code.start)
+            .into();
         let overflow_state = window.use_keyed_state(overflow_state_id, cx, |_, _| false);
         has_horizontal_overflow = *overflow_state.read(cx);
         let scrollbar_id: SharedString =
@@ -662,6 +737,8 @@ pub(super) fn spawn_background_highlight(
     let background = cx.background_spawn(async move {
         compute_code_styles(code_text.as_ref(), &language, theme.as_ref())
     });
+    #[cfg(test)]
+    let background_gate = take_background_highlight_gate();
     // Publish the generation before scheduling the foreground continuation so
     // an executor that polls a newly spawned task immediately still passes the
     // stale-result guard below. The task handle is installed after spawn.
@@ -669,12 +746,20 @@ pub(super) fn spawn_background_highlight(
         cache.highlight_task_generation = Some(generation);
     });
     let task = window.spawn(cx, async move |async_cx| {
+        #[cfg(test)]
+        if let Some(background_gate) = background_gate {
+            let _ = background_gate.await;
+        }
         let styles = background.await;
         // The window (and its keyed-state cache) may already be gone; a
         // dropped result is expected there, so an empty update is fine.
         let _ = async_cx.update(|_, cx| {
             let _ = weak_cache.update(cx, |cache, cache_cx| {
                 if cache.highlight_task_generation == Some(generation) {
+                    #[cfg(test)]
+                    if cache.highlight_task.is_some() {
+                        record_background_task_owner_release();
+                    }
                     cache.highlight_task = None;
                     cache.highlight_task_generation = None;
                     #[cfg(test)]
@@ -698,7 +783,7 @@ pub(super) fn spawn_background_highlight(
     // The generation was registered before spawn; keep the task handle alive so
     // subsequent frames do not start duplicate workers.
     cache.update(cx, |cache, _| {
-        cache.highlight_task = Some(task);
+        cache.own_highlight_task(task);
     });
 }
 

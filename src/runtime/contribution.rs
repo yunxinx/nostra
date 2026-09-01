@@ -129,6 +129,7 @@ impl<K: ContributionKey> fmt::Debug for ContributionRegistration<K> {
 #[derive(Clone)]
 pub struct ContributionSnapshotEntry<K: ContributionKey> {
     definition: ContributionDefinition<K>,
+    generation: u64,
 }
 
 impl<K: ContributionKey> ContributionSnapshotEntry<K> {
@@ -140,6 +141,11 @@ impl<K: ContributionKey> ContributionSnapshotEntry<K> {
     #[must_use]
     pub const fn order(&self) -> u32 {
         self.definition.order
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[must_use]
@@ -382,6 +388,7 @@ impl<K: ContributionKey> ContributionRegistry<K> {
                             value: entry.definition.value.clone(),
                             marker: PhantomData,
                         },
+                        generation: entry.generation,
                     });
             }
             current = layer.parent.and_then(|parent| self.layers.get(&parent));

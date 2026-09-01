@@ -31,18 +31,53 @@ impl CapabilityKey for MarkdownExtensionKey {
 
 pub(crate) type MarkdownExtensionDefinition = ContributionDefinition<MarkdownExtensionKey>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct MarkdownContributionOwner {
+    id: ContributionId,
+    generation: u64,
+}
+
+impl MarkdownContributionOwner {
+    pub(crate) const fn new(id: ContributionId, generation: u64) -> Self {
+        Self { id, generation }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn keyed_state_id(
+        self,
+        namespace: &str,
+        body_owner_id: u64,
+        source_start: usize,
+    ) -> String {
+        format!(
+            "{namespace}-{}-{}-{body_owner_id}-{source_start}",
+            self.id, self.generation
+        )
+    }
+}
+
+#[derive(Clone)]
+struct MarkdownExtensionContribution {
+    definition: MarkdownExtensionDefinition,
+    owner: MarkdownContributionOwner,
+}
+
 /// Immutable foreground projection of one contribution registry revision.
 #[derive(Clone)]
 pub(crate) struct MarkdownExtensionSnapshot {
     revision: u64,
-    definitions: Rc<[MarkdownExtensionDefinition]>,
+    contributions: Rc<[MarkdownExtensionContribution]>,
 }
 
 impl MarkdownExtensionSnapshot {
     pub(super) fn empty() -> Self {
         Self {
             revision: 0,
-            definitions: Vec::new().into(),
+            contributions: Vec::new().into(),
         }
     }
 
@@ -51,17 +86,23 @@ impl MarkdownExtensionSnapshot {
     }
 
     #[cfg(test)]
-    pub(crate) fn definitions(&self) -> &[MarkdownExtensionDefinition] {
-        &self.definitions
+    pub(crate) fn definitions(&self) -> Vec<&MarkdownExtensionDefinition> {
+        self.contributions
+            .iter()
+            .map(|contribution| &contribution.definition)
+            .collect()
     }
 
-    pub(super) fn install(&self, context: &MarkdownExtensionContext) -> MarkdownExtensions {
-        install_extensions(
-            self.definitions
-                .iter()
-                .map(MarkdownExtensionDefinition::value),
-            context,
-        )
+    pub(super) fn install(&self, context: &MarkdownExtensionInstallContext) -> MarkdownExtensions {
+        self.contributions
+            .iter()
+            .fold(MarkdownExtensions::default(), |extensions, contribution| {
+                let contribution_context = context.for_contribution(contribution.owner);
+                contribution
+                    .definition
+                    .value()
+                    .install(extensions, &contribution_context)
+            })
     }
 }
 
@@ -69,15 +110,19 @@ impl From<&ContributionSnapshot<MarkdownExtensionKey>> for MarkdownExtensionSnap
     fn from(snapshot: &ContributionSnapshot<MarkdownExtensionKey>) -> Self {
         Self {
             revision: snapshot.revision(),
-            definitions: snapshot
+            contributions: snapshot
                 .contributions()
                 .iter()
-                .map(|contribution| {
-                    MarkdownExtensionDefinition::new(
+                .map(|contribution| MarkdownExtensionContribution {
+                    definition: MarkdownExtensionDefinition::new(
                         contribution.id(),
                         contribution.order(),
                         contribution.value().clone(),
-                    )
+                    ),
+                    owner: MarkdownContributionOwner::new(
+                        contribution.id(),
+                        contribution.generation(),
+                    ),
                 })
                 .collect::<Vec<_>>()
                 .into(),
@@ -112,14 +157,13 @@ impl MarkdownExtensionInstaller {
     }
 }
 
-/// Per-body values required by parser and renderer contributions.
-pub(crate) struct MarkdownExtensionContext {
+pub(crate) struct MarkdownExtensionInstallContext {
     owner_id: u64,
     source_offset: usize,
     preference_state: PreferenceState,
 }
 
-impl MarkdownExtensionContext {
+impl MarkdownExtensionInstallContext {
     pub(crate) fn new(
         owner_id: u64,
         source_offset: usize,
@@ -132,6 +176,28 @@ impl MarkdownExtensionContext {
         }
     }
 
+    fn for_contribution(
+        &self,
+        contribution_owner: MarkdownContributionOwner,
+    ) -> MarkdownExtensionContext {
+        MarkdownExtensionContext {
+            owner_id: self.owner_id,
+            source_offset: self.source_offset,
+            preference_state: self.preference_state.clone(),
+            contribution_owner,
+        }
+    }
+}
+
+/// Per-body values required by one parser and renderer contribution.
+pub(crate) struct MarkdownExtensionContext {
+    owner_id: u64,
+    source_offset: usize,
+    preference_state: PreferenceState,
+    contribution_owner: MarkdownContributionOwner,
+}
+
+impl MarkdownExtensionContext {
     pub(crate) const fn owner_id(&self) -> u64 {
         self.owner_id
     }
@@ -142,6 +208,10 @@ impl MarkdownExtensionContext {
 
     pub(crate) const fn preference_state(&self) -> &PreferenceState {
         &self.preference_state
+    }
+
+    pub(crate) const fn contribution_owner(&self) -> MarkdownContributionOwner {
+        self.contribution_owner
     }
 }
 
@@ -161,23 +231,23 @@ pub(crate) fn builtin_extension_contributions() -> [MarkdownExtensionDefinition;
     ]
 }
 
-pub(super) fn install_extensions<'a>(
-    installers: impl IntoIterator<Item = &'a MarkdownExtensionInstaller>,
-    context: &MarkdownExtensionContext,
-) -> MarkdownExtensions {
-    installers
-        .into_iter()
-        .fold(MarkdownExtensions::default(), |extensions, installer| {
-            installer.install(extensions, context)
-        })
-}
-
 #[cfg(test)]
 pub(crate) fn test_extension_snapshot() -> MarkdownExtensionSnapshot {
     let mut contributions = builtin_extension_contributions();
     contributions.sort_unstable_by_key(|contribution| (contribution.order(), contribution.id()));
     MarkdownExtensionSnapshot {
         revision: TEST_EXTENSION_REVISION,
-        definitions: Rc::from(contributions),
+        contributions: contributions
+            .into_iter()
+            .enumerate()
+            .map(|(index, definition)| MarkdownExtensionContribution {
+                owner: MarkdownContributionOwner::new(
+                    definition.id(),
+                    u64::try_from(index + 1).unwrap_or(u64::MAX),
+                ),
+                definition,
+            })
+            .collect::<Vec<_>>()
+            .into(),
     }
 }

@@ -26,7 +26,8 @@ use rust_i18n::t;
 use crate::{
     runtime::ContributionId,
     ui::markdown::{
-        MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
+        MarkdownContributionOwner, MarkdownExtensionContext, MarkdownExtensionDefinition,
+        MarkdownExtensionInstaller,
     },
 };
 
@@ -36,7 +37,9 @@ use self::{
 };
 
 #[cfg(test)]
-pub(crate) use self::render::{formula_cache_snapshot, formula_cache_snapshots};
+pub(crate) use self::render::{
+    formula_cache_snapshot, formula_cache_snapshot_for_owner, formula_cache_snapshots,
+};
 
 const NODE_NAME: &str = "nostra-math";
 const LITERAL_NODE_NAME: &str = "nostra-math-literal";
@@ -74,7 +77,12 @@ pub(crate) fn markdown_contribution() -> MarkdownExtensionDefinition {
         MATH_EXTENSION_ID,
         MATH_EXTENSION_ORDER,
         MarkdownExtensionInstaller::new(|extensions, context: &MarkdownExtensionContext| {
-            extend(extensions, context.owner_id(), context.source_offset())
+            extend(
+                extensions,
+                context.owner_id(),
+                context.source_offset(),
+                context.contribution_owner(),
+            )
         }),
     )
 }
@@ -83,6 +91,7 @@ pub(super) fn extend(
     extensions: MarkdownExtensions,
     owner_id: u64,
     source_offset: usize,
+    contribution_owner: MarkdownContributionOwner,
 ) -> MarkdownExtensions {
     extensions
         .parse_options(|options| {
@@ -99,11 +108,11 @@ pub(super) fn extend(
         .parse_error_formatter(|_| t!("chat.error.markdown").to_string())
         .inline_parser(move |node, cx| parse_inline(node, cx, source_offset))
         .inline_renderer(NODE_NAME, move |node, context, window, cx| {
-            render_inline(node, context, owner_id, window, cx)
+            render_inline(node, context, owner_id, contribution_owner, window, cx)
         })
         .block_parser(move |node, cx| parse_display(node, cx, source_offset))
         .block_renderer(NODE_NAME, move |node, window, cx| {
-            render_display(node, owner_id, window, cx)
+            render_display(node, owner_id, contribution_owner, window, cx)
         })
         .block_renderer(LITERAL_NODE_NAME, |node, _, _| {
             // An unfinished flow-math opener is kept as a literal custom
@@ -209,6 +218,7 @@ fn render_inline(
     node: &MarkdownNode,
     context: &MarkdownInlineRenderContext,
     owner_id: u64,
+    contribution_owner: MarkdownContributionOwner,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<MarkdownInline> {
@@ -222,6 +232,7 @@ fn render_inline(
             style: inherited_formula_style(text_style),
             start: formula.start,
             owner_id,
+            contribution_owner,
             font_size,
             color: text_style.color,
         },
@@ -238,6 +249,7 @@ fn render_inline(
 fn render_display(
     node: &MarkdownNode,
     owner_id: u64,
+    contribution_owner: MarkdownContributionOwner,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -250,6 +262,7 @@ fn render_display(
         DisplayFormulaRow {
             formula,
             owner_id,
+            contribution_owner,
             font_size,
             inherited_style: inherited_formula_style(&text_style),
             flow_state: node
@@ -265,6 +278,7 @@ fn render_display(
 struct DisplayFormulaRow<'a> {
     formula: &'a MathFormula,
     owner_id: u64,
+    contribution_owner: MarkdownContributionOwner,
     font_size: f32,
     inherited_style: FormulaStyle,
     flow_state: InlineFlowState,
@@ -278,11 +292,14 @@ fn render_display_formula_row(
     let DisplayFormulaRow {
         formula,
         owner_id,
+        contribution_owner,
         font_size,
         inherited_style,
         flow_state,
     } = row;
-    let key: SharedString = format!("markdown-math-scroll-{owner_id}-{}", formula.start).into();
+    let key: SharedString = contribution_owner
+        .keyed_state_id("markdown-math-scroll", owner_id, formula.start)
+        .into();
     let scroll_handle = window
         .use_keyed_state(key, cx, |_, _| ScrollHandle::default())
         .read(cx)
@@ -296,6 +313,7 @@ fn render_display_formula_row(
             style: inherited_style,
             start: formula.start,
             owner_id,
+            contribution_owner,
             font_size,
             color,
         },

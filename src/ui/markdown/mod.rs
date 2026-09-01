@@ -36,8 +36,9 @@ pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
 #[cfg(test)]
 use self::code_block::*;
 pub(crate) use self::extension_registry::{
-    MarkdownExtensionContext, MarkdownExtensionDefinition, MarkdownExtensionInstaller,
-    MarkdownExtensionKey, MarkdownExtensionSnapshot, builtin_extension_contributions,
+    MarkdownContributionOwner, MarkdownExtensionContext, MarkdownExtensionDefinition,
+    MarkdownExtensionInstallContext, MarkdownExtensionInstaller, MarkdownExtensionKey,
+    MarkdownExtensionSnapshot, builtin_extension_contributions,
 };
 
 #[cfg(test)]
@@ -147,6 +148,12 @@ pub(crate) struct BackgroundHighlightProbe {
     pub(crate) last_style_count: usize,
     /// Generation carried by the most recent successful worker.
     pub(crate) last_generation: Option<u64>,
+    pub(crate) active_caches: usize,
+    pub(crate) cache_releases: usize,
+    pub(crate) active_task_owners: usize,
+    pub(crate) task_owner_releases: usize,
+    pub(crate) last_created_owner: Option<MarkdownContributionOwner>,
+    pub(crate) last_released_owner: Option<MarkdownContributionOwner>,
 }
 
 #[cfg(test)]
@@ -163,7 +170,7 @@ define_probe!(
 /// revision from forcing a full Markdown reparse on every frame.
 pub(crate) struct MarkdownBody {
     state: Entity<TextViewState>,
-    extension_context: MarkdownExtensionContext,
+    extension_context: MarkdownExtensionInstallContext,
     extension_snapshot: MarkdownExtensionSnapshot,
     extensions: MarkdownExtensions,
 }
@@ -175,8 +182,11 @@ impl MarkdownBody {
         presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
-        let extension_context =
-            MarkdownExtensionContext::new(owner_id, 0, presentation.preference_state.clone());
+        let extension_context = MarkdownExtensionInstallContext::new(
+            owner_id,
+            0,
+            presentation.preference_state.clone(),
+        );
         let mut body = Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
             extension_context,
