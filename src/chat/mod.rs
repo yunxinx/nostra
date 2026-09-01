@@ -60,6 +60,7 @@ use self::conversation_runtime::{ConversationRuntime, ConversationRuntimeSnapsho
 use self::error_card::TurnError;
 use self::hover_reveal::hover_reveal_copy;
 pub use self::message::{Message, MessagePart, Role};
+pub(crate) use self::persistence::restore::derive_title_from_state;
 use self::reasoning_card::ReasoningTrace;
 use self::render::copyable_text;
 pub(crate) use self::scrolling::set_smooth_scrolling;

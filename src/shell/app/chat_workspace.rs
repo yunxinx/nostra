@@ -1,18 +1,16 @@
 //! Chat workspace instance state and lifecycle.
 
-use gpui::{App, Context, Entity, Subscription, Task, Window};
+use gpui::{Context, Entity, Subscription, Task, Window};
 use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
 
 use crate::chat::{
-    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_chat_title,
+    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_title_from_state,
 };
 use crate::llm::ModelSelection;
 use crate::preferences::PreferenceHandle;
 use crate::runtime::RuntimeServices;
-use crate::session::{
-    ChatSessionCatalogController, ResolvedSessionState, SessionId, SessionStores,
-};
+use crate::session::{ChatSessionCatalogController, ResolvedSessionState, SessionId};
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
 use super::{
@@ -139,7 +137,6 @@ pub(super) struct ChatWorkspace {
     pub(super) hovered: Option<ChatTarget>,
     pub(super) confirming: Option<ChatTarget>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
-    pub(super) session_services: SessionStores,
     pub(super) runtime_services: RuntimeServices,
     pub(super) preference_handle: PreferenceHandle,
     pub(super) snapshot: ChatWorkspaceSnapshot,
@@ -165,13 +162,12 @@ impl ChatWorkspace {
             hovered: None,
             confirming: None,
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
-            session_services: services.session_services().clone(),
             runtime_services: services,
             preference_handle,
             snapshot: ChatWorkspaceSnapshot::empty(),
         };
         workspace.start_catalog_initial_load(window, cx);
-        workspace.publish_snapshot_with(cx);
+        workspace.publish_snapshot();
         workspace
     }
 
@@ -179,9 +175,9 @@ impl ChatWorkspace {
         &self.snapshot
     }
 
-    fn publish_snapshot_with(&mut self, cx: &App) {
+    fn publish_snapshot(&mut self) {
         self.snapshot = ChatWorkspaceSnapshot {
-            conversations: self.conversations.snapshot(cx),
+            conversations: self.conversations.snapshot(),
             history: self.history.clone(),
             hovered: self.hovered.clone(),
             confirming: self.confirming.clone(),
@@ -190,7 +186,7 @@ impl ChatWorkspace {
     }
 
     pub(super) fn notify_changed(&mut self, cx: &mut Context<Self>) {
-        self.publish_snapshot_with(cx);
+        self.publish_snapshot();
         cx.notify();
     }
 
@@ -234,7 +230,7 @@ impl ChatWorkspace {
         };
         let runtime = create_conversation_runtime(
             scope,
-            self.session_services.chat_conversation(),
+            self.runtime_services.session_services().chat_conversation(),
             self.runtime_services.generation_service(),
             cx,
         );
@@ -242,12 +238,14 @@ impl ChatWorkspace {
             ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
         let subscription = self.subscribe_conversation(&view, window, cx);
         let selection = view.read(cx).selection();
+        let is_generating = view.read(cx).is_generating();
         self.conversations.push_and_activate(Conversation {
             view,
             metadata: (),
             title,
             selection,
             session_id: None,
+            is_generating,
             _subscription: subscription,
         });
         self.notify_changed(cx);
@@ -270,9 +268,22 @@ impl ChatWorkspace {
             self.select_target(target, cx);
             return;
         }
-        let stores = self.session_services.clone();
-        let Ok(catalog_store) = stores.chat_catalog() else {
-            return;
+        let catalog_store = match self.runtime_services.session_services().chat_catalog() {
+            Ok(store) => store,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.restore",
+                    format_args!("failed to open the chat session catalog: {error}"),
+                );
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        t!("chat.error.runtime_unavailable").to_string(),
+                    ),
+                    cx,
+                );
+                return;
+            }
         };
         let request = self.begin_selection_request();
         let workspace = cx.entity();
@@ -290,8 +301,24 @@ impl ChatWorkspace {
                     })
                 })
                 .await;
-            let Ok(state) = result else {
-                return;
+            let state = match result {
+                Ok(state) => state,
+                Err(error) => {
+                    crate::logging::error(
+                        "chat.restore",
+                        format_args!("failed to load chat session {session_id}: {error}"),
+                    );
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        window.push_notification(
+                            (
+                                NotificationType::Error,
+                                t!("chat.error.runtime_unavailable").to_string(),
+                            ),
+                            cx,
+                        );
+                    });
+                    return;
+                }
             };
             let _ = window_handle.update(cx, |_, window, cx| {
                 workspace.update(cx, |workspace, cx| {
@@ -326,47 +353,43 @@ impl ChatWorkspace {
             self.notify_changed(cx);
             return;
         }
-        let title = restore
-            .state
-            .messages
-            .iter()
-            .find(|message| message.message.role == crate::llm::Role::User)
-            .and_then(|message| {
-                message
-                    .message
-                    .content
-                    .iter()
-                    .find_map(|block| match block {
-                        crate::llm::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                            Some(derive_chat_title(text))
-                        }
-                        _ => None,
-                    })
-            })
+        let title = derive_title_from_state(&restore.state)
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
         let Some(scope) = self.create_scope(window, cx) else {
             return;
         };
         let runtime = create_conversation_runtime(
             scope,
-            self.session_services.chat_conversation(),
+            self.runtime_services.session_services().chat_conversation(),
             self.runtime_services.generation_service(),
             cx,
         );
         let view =
             ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
-        if view
-            .update(cx, |chat, cx| {
-                chat.restore_from_session(&restore.session_id, &restore.state, cx)
-            })
-            .is_err()
-        {
+        if let Err(error) = view.update(cx, |chat, cx| {
+            chat.restore_from_session(&restore.session_id, &restore.state, cx)
+        }) {
+            crate::logging::error(
+                "chat.restore",
+                format_args!(
+                    "failed to restore chat session {}: {error}",
+                    restore.session_id
+                ),
+            );
             view.update(cx, |chat, cx| chat.close_scope(cx));
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    t!("chat.error.runtime_unavailable").to_string(),
+                ),
+                cx,
+            );
             return;
         }
         let subscription = self.subscribe_conversation(&view, window, cx);
         self.conversations.push_and_activate(Conversation {
             selection: view.read(cx).selection(),
+            is_generating: view.read(cx).is_generating(),
             view,
             metadata: (),
             title,
@@ -415,7 +438,10 @@ impl ChatWorkspace {
                         workspace.record_active_session(session_id, cx);
                     }
                 }
-                ChatEvent::StateChanged => {}
+                ChatEvent::StateChanged => {
+                    workspace.conversations.conversations_mut()[index].is_generating =
+                        view.read(cx).is_generating();
+                }
                 ChatEvent::DeleteCompleted => {
                     cx.defer_in(window, move |workspace, window, cx| {
                         workspace.remove_conversation(target, window, cx);

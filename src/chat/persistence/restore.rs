@@ -139,8 +139,9 @@ fn turn_id_index(turn_id: &str) -> Option<u64> {
         .and_then(|rest| rest.parse::<u64>().ok())
 }
 
-#[allow(dead_code)]
-fn derive_title_from_state(state: &ResolvedSessionState) -> Option<SharedString> {
+/// Derive a conversation title from the first non-empty user message in a
+/// resolved session state.
+pub(crate) fn derive_title_from_state(state: &ResolvedSessionState) -> Option<SharedString> {
     state
         .messages
         .iter()

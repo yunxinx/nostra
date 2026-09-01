@@ -1,4 +1,11 @@
 _version: 2
+startup:
+  failed_title:
+    en: Nostra failed to start
+    zh-CN: Nostra 启动失败
+  quit:
+    en: Quit
+    zh-CN: 退出
 sidebar:
   chats:
     en: Chats

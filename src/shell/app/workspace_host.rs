@@ -81,7 +81,7 @@ impl WorkspaceHost {
 
         let chat_workspace = cx
             .new(|cx| ChatWorkspace::new(services.clone(), preference_handle.clone(), window, cx));
-        let project_workspace = cx.new(|cx| ProjectWorkspace::new(services, preference_handle, cx));
+        let project_workspace = cx.new(|_| ProjectWorkspace::new(services, preference_handle));
 
         Self {
             _registry: registry,

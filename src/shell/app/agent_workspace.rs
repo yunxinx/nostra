@@ -397,7 +397,7 @@ impl ProjectWorkspace {
         ) {
             return;
         }
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
@@ -451,7 +451,7 @@ impl ProjectWorkspace {
         let Some(cursor) = self.catalog.projects_next_cursor.clone() else {
             return;
         };
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
@@ -504,7 +504,7 @@ impl ProjectWorkspace {
         if !self.catalog.sessions_need_load(&project_id) {
             return;
         }
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
@@ -576,7 +576,7 @@ impl ProjectWorkspace {
             return;
         };
         let generation = list.generation;
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,

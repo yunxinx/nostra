@@ -1906,15 +1906,6 @@ impl CompositionRoot {
         }
     }
 
-    /// Open the first-party local session stores and install them as the
-    /// default session Provider.
-    pub async fn open_default() -> Result<Self, CompositionBuildError> {
-        Self::builder(SessionStores::open_default())
-            .with_preferences(PreferenceHandle::json(crate::preferences::load()))
-            .build()
-            .await
-    }
-
     #[must_use]
     pub fn application_scope(&self) -> ScopeId {
         self.scopes.application

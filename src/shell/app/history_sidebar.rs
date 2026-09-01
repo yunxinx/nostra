@@ -196,7 +196,7 @@ impl ChatWorkspace {
         ) {
             return;
         }
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(error) => {
@@ -265,7 +265,7 @@ impl ChatWorkspace {
         let Some(cursor) = self.history.next_cursor.clone() else {
             return;
         };
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -321,7 +321,7 @@ impl ChatWorkspace {
         session_id: SessionId,
         cx: &mut Context<Self>,
     ) {
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -407,7 +407,7 @@ impl ChatWorkspace {
             self.confirming = None;
         }
 
-        let stores = self.session_services.clone();
+        let stores = self.runtime_services.session_services().clone();
         let store = match stores.chat() {
             Ok(store) => store,
             Err(error) => {

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, Entity, EntityId, SharedString, Subscription};
+use gpui::{Entity, EntityId, SharedString, Subscription};
 
 use crate::chat::ChatView;
 use crate::llm::ModelSelection;
@@ -14,6 +14,7 @@ pub(super) struct Conversation<M> {
     pub(super) title: SharedString,
     pub(super) selection: Option<ModelSelection>,
     pub(super) session_id: Option<SessionId>,
+    pub(super) is_generating: bool,
     pub(super) _subscription: Subscription,
 }
 
@@ -262,7 +263,7 @@ impl<M> ConversationHost<M> {
 }
 
 impl<M: Clone> ConversationHost<M> {
-    pub(super) fn snapshot(&self, cx: &App) -> ConversationHostSnapshot<M> {
+    pub(super) fn snapshot(&self) -> ConversationHostSnapshot<M> {
         ConversationHostSnapshot {
             conversations: self
                 .conversations
@@ -273,7 +274,7 @@ impl<M: Clone> ConversationHost<M> {
                     title: conversation.title.clone(),
                     selection: conversation.selection.clone(),
                     session_id: conversation.session_id.clone(),
-                    is_generating: conversation.view.read(cx).is_generating(),
+                    is_generating: conversation.is_generating,
                 })
                 .collect(),
             opened_session_index: self.opened_session_index.clone(),

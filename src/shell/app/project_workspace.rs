@@ -2,19 +2,18 @@
 
 use std::{collections::HashMap, path::PathBuf};
 
-use gpui::{App, Context, Entity, Subscription, Task, Window};
+use gpui::{Context, Entity, Subscription, Task, Window};
 use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
 
 use crate::chat::{
-    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_chat_title,
+    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_title_from_state,
 };
 use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle};
 use crate::runtime::RuntimeServices;
 use crate::session::{
     ProjectSessionStore as _, ResolvedSessionState, SessionId, SessionLifecycleStore as _,
-    SessionStores,
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
@@ -157,18 +156,13 @@ pub(super) struct ProjectWorkspace {
     pub(super) confirming: Option<ProjectTarget>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
     pub(super) session_load_state: AgentLoadState,
-    pub(super) session_services: SessionStores,
     pub(super) runtime_services: RuntimeServices,
     pub(super) preference_handle: PreferenceHandle,
     snapshot: ProjectWorkspaceSnapshot,
 }
 
 impl ProjectWorkspace {
-    pub(super) fn new(
-        services: RuntimeServices,
-        preference_handle: PreferenceHandle,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub(super) fn new(services: RuntimeServices, preference_handle: PreferenceHandle) -> Self {
         let mut workspace = Self {
             catalog: AgentWorkspace::new(),
             conversations: ConversationHost::new(),
@@ -182,12 +176,11 @@ impl ProjectWorkspace {
             confirming: None,
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
             session_load_state: AgentLoadState::Unloaded,
-            session_services: services.session_services().clone(),
             runtime_services: services,
             preference_handle,
             snapshot: ProjectWorkspaceSnapshot::empty(),
         };
-        workspace.publish_snapshot_with(cx);
+        workspace.publish_snapshot();
         workspace
     }
 
@@ -195,12 +188,12 @@ impl ProjectWorkspace {
         &self.snapshot
     }
 
-    fn publish_snapshot_with(&mut self, cx: &App) {
+    fn publish_snapshot(&mut self) {
         let persisted = self.preference_handle.snapshot().agent_projects;
         self.snapshot = ProjectWorkspaceSnapshot {
             catalog: self.catalog.clone(),
             projects: merge_persisted_projects(self.catalog.projects(), &persisted),
-            conversations: self.conversations.snapshot(cx),
+            conversations: self.conversations.snapshot(),
             deleting_projects: self.deleting_projects.clone(),
             confirming: self.confirming.clone(),
             delete_confirmation: self.delete_confirmation.clone(),
@@ -209,7 +202,7 @@ impl ProjectWorkspace {
     }
 
     pub(super) fn notify_changed(&mut self, cx: &mut Context<Self>) {
-        self.publish_snapshot_with(cx);
+        self.publish_snapshot();
         cx.notify();
     }
 
@@ -340,7 +333,10 @@ impl ProjectWorkspace {
                     workspace.conversations.conversations_mut()[index].selection =
                         Some(selection.clone());
                 }
-                ChatEvent::StateChanged => {}
+                ChatEvent::StateChanged => {
+                    workspace.conversations.conversations_mut()[index].is_generating =
+                        view.read(cx).is_generating();
+                }
                 ChatEvent::SessionBound(session_id) => {
                     let project_id = workspace.conversations.conversations()[index]
                         .metadata
@@ -402,7 +398,7 @@ impl ProjectWorkspace {
         self.invalidate_selection_request();
         let runtime = create_conversation_runtime(
             scope,
-            self.session_services.project_conversation(identity),
+            self.runtime_services.project_conversation(identity),
             self.runtime_services.generation_service(),
             cx,
         );
@@ -418,6 +414,7 @@ impl ProjectWorkspace {
             title: t!("agent.new_draft").to_string().into(),
             selection,
             session_id: None,
+            is_generating: view.read(cx).is_generating(),
             _subscription: subscription,
         });
         self.catalog.new_project_draft(project_id.clone());
@@ -443,7 +440,14 @@ impl ProjectWorkspace {
         let Some(identity) = self.project_identity(&project_id) else {
             return;
         };
-        let Ok(project_store) = self.session_services.agent_projects() else {
+        let Ok(project_store) = self.runtime_services.session_services().agent_projects() else {
+            self.session_load_state =
+                AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
+            crate::logging::error(
+                "agent.restore",
+                format_args!("agent project store unavailable while opening session"),
+            );
+            self.notify_changed(cx);
             return;
         };
         let request = self.begin_selection_request();
@@ -513,7 +517,7 @@ impl ProjectWorkspace {
         };
         let runtime = create_conversation_runtime(
             scope,
-            self.session_services
+            self.runtime_services
                 .project_conversation(restore.project.clone()),
             self.runtime_services.generation_service(),
             cx,
@@ -521,36 +525,28 @@ impl ProjectWorkspace {
         let view =
             ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
 
-        let title = restore
-            .state
-            .messages
-            .iter()
-            .find(|message| message.message.role == crate::llm::Role::User)
-            .and_then(|message| {
-                message
-                    .message
-                    .content
-                    .iter()
-                    .find_map(|block| match block {
-                        crate::llm::ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                            Some(derive_chat_title(text))
-                        }
-                        _ => None,
-                    })
-            })
+        let title = derive_title_from_state(&restore.state)
             .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
-        if view
-            .update(cx, |chat, cx| {
-                chat.restore_from_session(&restore.session_id, &restore.state, cx)
-            })
-            .is_err()
-        {
+        if let Err(error) = view.update(cx, |chat, cx| {
+            chat.restore_from_session(&restore.session_id, &restore.state, cx)
+        }) {
+            crate::logging::error(
+                "agent.restore",
+                format_args!(
+                    "failed to restore Agent session {}: {error}",
+                    restore.session_id
+                ),
+            );
             view.update(cx, |view, cx| view.close_scope(cx));
+            self.session_load_state =
+                AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
+            self.notify_changed(cx);
             return;
         }
         let subscription = self.subscribe_conversation(&view, window, cx);
         self.conversations.push_and_activate(Conversation {
             selection: view.read(cx).selection(),
+            is_generating: view.read(cx).is_generating(),
             view,
             metadata: ProjectConversationMetadata {
                 project_id: restore.project_id,
@@ -643,7 +639,18 @@ impl ProjectWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(mut store) = self.session_services.agent() else {
+        let Ok(mut store) = self.runtime_services.session_services().agent() else {
+            crate::logging::error(
+                "agent.delete",
+                format_args!("agent session store unavailable while deleting session"),
+            );
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    t!("agent.delete_failed").to_string(),
+                ),
+                cx,
+            );
             return;
         };
         let workspace = cx.entity();
@@ -698,11 +705,25 @@ impl ProjectWorkspace {
             );
             return;
         }
-        let Ok(project_store) = self.session_services.agent_projects() else {
-            return;
-        };
-        let Ok(mut lifecycle) = self.session_services.agent() else {
-            return;
+        let (project_store, mut lifecycle) = match (
+            self.runtime_services.session_services().agent_projects(),
+            self.runtime_services.session_services().agent(),
+        ) {
+            (Ok(project_store), Ok(lifecycle)) => (project_store, lifecycle),
+            _ => {
+                crate::logging::error(
+                    "agent.delete",
+                    format_args!("agent stores unavailable while deleting project"),
+                );
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        t!("agent.delete_failed").to_string(),
+                    ),
+                    cx,
+                );
+                return;
+            }
         };
         let project_id = project.project_id.clone();
         let apply_project_id = project_id.clone();
