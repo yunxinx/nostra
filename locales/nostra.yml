@@ -3,6 +3,9 @@ startup:
   failed_title:
     en: Nostra failed to start
     zh-CN: Nostra 启动失败
+  failed_hint:
+    en: The application could not start. Details are in the diagnostic log.
+    zh-CN: 应用无法启动，详细信息已写入诊断日志。
   quit:
     en: Quit
     zh-CN: 退出

@@ -1419,6 +1419,21 @@ impl CompositionBuildError {
         }
     }
 
+    /// Stable diagnostic category for logs. Never formats the underlying source.
+    #[must_use]
+    pub const fn diagnostic_kind(&self) -> &'static str {
+        match self {
+            Self::Providers(_) => "provider_selection",
+            Self::Prepare(_) => "prepare",
+            Self::Activate(_) => "activate",
+            Self::Contributions(_) => "contributions",
+            Self::Snapshot(_) => "snapshot",
+            Self::Startup(_) => "startup_audit",
+            Self::StartupCleanup { .. } => "startup_cleanup",
+            Self::Scope(_) => "scope",
+        }
+    }
+
     /// Retry an incomplete startup rollback. On success, returns the original
     /// build failure after every retained effect and scope has been released.
     pub async fn retry_startup_cleanup(self) -> Result<Self, Self> {
@@ -1429,6 +1444,17 @@ impl CompositionBuildError {
             Ok(()) => Ok(*cause),
             Err(cleanup) => Err(Self::StartupCleanup { cause, cleanup }),
         }
+    }
+
+    /// Finish any retained startup rollback, then return the error to report.
+    ///
+    /// Production callers must settle a build failure before dropping it so
+    /// incomplete cleanup is not left to `Drop`. Failures without retained
+    /// ownership are returned unchanged.
+    pub async fn settle(self) -> Self {
+        self.retry_startup_cleanup()
+            .await
+            .unwrap_or_else(|error| error)
     }
 }
 

@@ -837,6 +837,9 @@ fn delete_chat_labels_resolve_in_every_locale() {
             "menu.delete_chat",
             "chat.error.runtime_unavailable",
             "chat.error.persistence_delete_failed",
+            "startup.failed_title",
+            "startup.failed_hint",
+            "startup.quit",
         ] {
             assert_ne!(t!(key, locale = locale).to_string(), key);
         }
@@ -873,6 +876,38 @@ fn unavailable_conversation_runtime_reports_a_notification_without_creating_a_dr
             assert!(this.chat_snapshot().conversations().is_empty());
         });
         assert_eq!(window.notifications(cx).len(), notification_count + 1);
+    });
+}
+
+#[gpui::test]
+fn restoring_a_session_after_runtime_shutdown_reports_a_notification(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_id = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    cx.update(|_, cx| {
+        let mut root = cx
+            .global::<TestCompositionRoot>()
+            .0
+            .borrow_mut()
+            .take()
+            .expect("test composition root");
+        futures::executor::block_on(root.close()).expect("close test composition");
+    });
+
+    let notification_count = cx.update(|window, cx| window.notifications(cx).len());
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.notifications(cx).len(), notification_count + 1);
+        app.update(cx, |this, _| {
+            assert!(this.chat_snapshot().conversations().is_empty());
+            assert!(this.chat_snapshot().opened_session_index().is_empty());
+        });
     });
 }
 

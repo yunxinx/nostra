@@ -7,8 +7,8 @@
 
 use gpui::{
     App, AppContext as _, AsyncApp, Bounds, Context, Focusable as _, FontWeight, Global,
-    IntoElement, Menu, MenuItem, ParentElement as _, Pixels, Render, SharedString, Size,
-    Styled as _, WeakEntity, Window, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
+    IntoElement, Menu, MenuItem, ParentElement as _, Pixels, Render, Size, Styled as _, WeakEntity,
+    Window, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
 };
 use gpui_component::{
     ActiveTheme, Root, TitleBar,
@@ -20,7 +20,7 @@ use std::{cell::RefCell, rc::Rc};
 
 use crate::appearance::glass;
 use crate::preferences::{Preferences, WindowGeometry};
-use crate::runtime::{CompositionRoot, QUIT_FALLBACK_TIMEOUT};
+use crate::runtime::{CompositionBuildError, CompositionRoot, QUIT_FALLBACK_TIMEOUT};
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
@@ -111,26 +111,19 @@ pub fn open_main_window(
         {
             Ok(composition) => composition,
             Err(error) => {
-                crate::logging::error(
-                    "runtime.composition",
-                    format_args!("failed to build application composition: {error}"),
-                );
-                fail_startup(error.to_string().into(), cx);
+                report_startup_failure(error.settle().await, cx);
                 return;
             }
         };
         let Some(services) = composition.services() else {
             crate::logging::error(
                 "runtime.composition",
-                "application composition did not expose active services",
+                "composition build did not publish active services",
             );
-            fail_startup(
-                "application composition did not expose active services".into(),
-                cx,
-            );
+            close_abandoned_composition(composition).await;
+            fail_startup(cx);
             return;
         };
-        let composition = Rc::new(RefCell::new(Some(composition)));
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
@@ -172,10 +165,12 @@ pub fn open_main_window(
                     "shell.window",
                     format_args!("failed to open main window: {error:?}"),
                 );
-                fail_startup(error.to_string().into(), cx);
+                close_abandoned_composition(composition).await;
+                fail_startup(cx);
                 return;
             }
         };
+        let composition = Rc::new(RefCell::new(Some(composition)));
 
         if let Err(error) = window.update(cx, |_, window, cx| {
             window.activate_window();
@@ -232,11 +227,36 @@ pub fn open_main_window(
     .detach();
 }
 
-/// Terminal startup-failure view: the composition could not be built, so no
-/// main window exists. Shows the error and offers the only remaining action.
-struct StartupFailure {
-    message: SharedString,
+fn report_startup_failure(error: CompositionBuildError, cx: &mut AsyncApp) {
+    match error.startup_cleanup() {
+        Some(cleanup) => crate::logging::error(
+            "runtime.composition",
+            format_args!(
+                "composition build failed ({}) at {} with {} retained effects",
+                error.diagnostic_kind(),
+                cleanup.stage(),
+                cleanup.retained_effect_count()
+            ),
+        ),
+        None => crate::logging::error(
+            "runtime.composition",
+            format_args!("composition build failed ({})", error.diagnostic_kind()),
+        ),
+    }
+    fail_startup(cx);
 }
+
+async fn close_abandoned_composition(mut composition: CompositionRoot) {
+    if let Err(error) = composition.close().await {
+        crate::logging::error(
+            "runtime.composition",
+            format_args!("failed to close unused composition ({error})"),
+        );
+    }
+}
+
+/// Terminal startup-failure view: composition never reached a usable window.
+struct StartupFailure;
 
 impl Render for StartupFailure {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -258,7 +278,7 @@ impl Render for StartupFailure {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(self.message.clone()),
+                    .child(t!("startup.failed_hint").to_string()),
             )
             .child(
                 Button::new("startup-quit")
@@ -272,7 +292,7 @@ impl Render for StartupFailure {
 /// Surface a fatal startup error in a dedicated window instead of leaving a
 /// windowless process behind. Quits when the user dismisses the window, and
 /// quits immediately when even that window cannot be opened.
-fn fail_startup(message: SharedString, cx: &mut AsyncApp) {
+fn fail_startup(cx: &mut AsyncApp) {
     let bounds = cx.update(|cx| Bounds::centered(None, size(px(480.), px(240.)), cx));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -282,7 +302,7 @@ fn fail_startup(message: SharedString, cx: &mut AsyncApp) {
     };
     let opened = cx.open_window(options, |window, cx| {
         window.set_window_title("Nostra");
-        let view = cx.new(|_| StartupFailure { message });
+        let view = cx.new(|_| StartupFailure);
         cx.new(|cx| Root::new(view, window, cx))
     });
     match opened {

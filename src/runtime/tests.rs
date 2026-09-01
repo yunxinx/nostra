@@ -3533,6 +3533,11 @@ fn selected_generation_provider_prepare_failure_aborts_composition_before_mount(
     };
 
     assert!(matches!(error, CompositionBuildError::Prepare(_)));
+    assert_eq!(error.diagnostic_kind(), "prepare");
+    assert!(error.startup_cleanup().is_none());
+    let settled = futures::executor::block_on(error.settle());
+    assert!(matches!(settled, CompositionBuildError::Prepare(_)));
+    assert_eq!(settled.diagnostic_kind(), "prepare");
     assert_eq!(prepares.load(Ordering::SeqCst), 1);
 }
 
@@ -3798,10 +3803,9 @@ fn startup_cleanup_failure_retains_ownership_until_explicit_retry() {
     assert_eq!(cleanup.stage(), StartupCleanupStage::GenerationPreparation);
     assert_eq!(cleanup.component(), Some(PREPARED_GENERATION_PROVIDER));
     assert_eq!(cleanup.retained_effect_count(), 1);
-    assert!(matches!(
-        futures::executor::block_on(error.retry_startup_cleanup()),
-        Ok(CompositionBuildError::Prepare(_))
-    ));
+    let settled = futures::executor::block_on(error.settle());
+    assert!(settled.startup_cleanup().is_none());
+    assert!(matches!(settled, CompositionBuildError::Prepare(_)));
     assert_eq!(events.borrow().as_slice(), ["async-stop-finished"]);
 }
 
