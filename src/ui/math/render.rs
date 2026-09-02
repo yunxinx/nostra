@@ -12,7 +12,7 @@ use gpui::{App, AppContext as _, Hsla, Pixels, RenderImage, Rgba, Task, Window, 
 use ratex_layout::{LayoutOptions, layout, to_display_list};
 use ratex_parser::parse;
 use ratex_svg::{SvgColorSyntax, SvgOptions, render_to_svg_with_color_syntax};
-use ratex_types::{Color, MathStyle};
+use ratex_types::{Color, DisplayList, MathStyle};
 
 use crate::ui::markdown::MarkdownContributionOwner;
 
@@ -452,14 +452,29 @@ fn render_formula_svg(
         return None;
     }
 
+    let svg = render_display_list_svg(&display_list, font_size, inline);
     let font_size = f64::from(font_size);
     let padding = if inline {
         INLINE_SVG_PADDING
     } else {
         DISPLAY_SVG_PADDING
     };
-    let svg = render_to_svg_with_color_syntax(
-        &display_list,
+    let width = (display_list.width * font_size + padding * 2.0) as f32;
+    let ascent = (display_list.height * font_size + padding) as f32;
+    let descent = (display_list.depth * font_size + padding) as f32;
+    let height = ascent + descent;
+    Some((svg, width, height, ascent, descent))
+}
+
+fn render_display_list_svg(display_list: &DisplayList, font_size: f32, inline: bool) -> String {
+    let font_size = f64::from(font_size);
+    let padding = if inline {
+        INLINE_SVG_PADDING
+    } else {
+        DISPLAY_SVG_PADDING
+    };
+    render_to_svg_with_color_syntax(
+        display_list,
         &SvgOptions {
             font_size,
             padding,
@@ -468,12 +483,7 @@ fn render_formula_svg(
             font_dir: String::new(),
         },
         SvgColorSyntax::Rgb,
-    );
-    let width = (display_list.width * font_size + padding * 2.0) as f32;
-    let ascent = (display_list.height * font_size + padding) as f32;
-    let descent = (display_list.depth * font_size + padding) as f32;
-    let height = ascent + descent;
-    Some((svg, width, height, ascent, descent))
+    )
 }
 
 fn ratex_color(color: Hsla) -> Color {
@@ -484,6 +494,7 @@ fn ratex_color(color: Hsla) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratex_types::DisplayItem;
 
     #[test]
     fn renders_path_based_self_contained_svg() {
@@ -576,5 +587,132 @@ mod tests {
         };
         assert_eq!(style.apply("x^2"), r"\sout{\boldsymbol{x^2}}");
         assert!(render_formula_svg("x^2", true, style, 16.0, Hsla::black()).is_some());
+    }
+
+    #[test]
+    fn unicode_edge_glyphs_always_have_visible_or_selectable_output() {
+        let cases = [
+            ('⌘', "ordinary symbol"),
+            ('\u{0301}', "combining mark"),
+            ('\u{fe0e}', "text variation selector"),
+            ('\u{fe0f}', "emoji variation selector"),
+            ('\u{200d}', "zero width joiner"),
+            ('\u{10ffff}', "missing glyph"),
+        ];
+
+        for (ch, label) in cases {
+            let svg = render_display_list_svg(&glyph_path_list("Main-Regular", ch), 16.0, true);
+            assert!(
+                svg.contains("<path") || svg.contains("<image") || svg.contains("<text"),
+                "{label} disappeared from SVG: {svg}"
+            );
+        }
+    }
+
+    #[test]
+    fn requested_font_miss_uses_main_regular_outline() {
+        let svg = render_display_list_svg(&glyph_path_list("Size4-Regular", 'x'), 16.0, true);
+        assert!(
+            svg.contains("<path"),
+            "main font fallback was not outlined: {svg}"
+        );
+    }
+
+    #[test]
+    fn implicit_geometry_inherits_non_black_layout_color() {
+        let color = gpui::hsla(0.0, 1.0, 0.5, 1.0);
+        let source = r"\frac{1}{2}";
+        let (svg, _, _, _, _) =
+            render_formula_svg(source, true, FormulaStyle::default(), 16.0, color)
+                .expect("formula should render");
+        let expected_color = ratex_color(color);
+        let expected_paint = rgb_paint(color);
+        let nodes = parse(source).expect("frac should parse");
+        let display_list = to_display_list(&layout(
+            &nodes,
+            &LayoutOptions::default()
+                .with_style(MathStyle::Text)
+                .with_color(expected_color),
+        ));
+        let rule_colors: Vec<_> = display_list
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Line {
+                    color: rule_color, ..
+                } => Some(*rule_color),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !rule_colors.is_empty(),
+            "fraction rule missing from display list"
+        );
+        assert!(
+            rule_colors
+                .iter()
+                .all(|rule_color| *rule_color == expected_color),
+            "implicit geometry used {rule_colors:?} instead of {expected_color:?}"
+        );
+
+        let rule_fills = svg_rect_fills(&svg);
+        assert!(
+            rule_fills.iter().any(|fill| fill == &expected_paint),
+            "fraction rule missing theme color {expected_paint}: {svg}"
+        );
+        assert!(
+            rule_fills.iter().all(|fill| !paint_is_black(fill)),
+            "fraction rule SVG paint stayed black: {svg}"
+        );
+    }
+
+    fn glyph_path_list(font: &str, ch: char) -> DisplayList {
+        DisplayList {
+            items: vec![DisplayItem::GlyphPath {
+                x: 0.0,
+                y: 1.0,
+                scale: 1.0,
+                font: font.to_string(),
+                char_code: u32::from(ch),
+                color: Color::BLACK,
+            }],
+            width: 1.2,
+            height: 1.2,
+            depth: 0.0,
+        }
+    }
+
+    fn rgb_paint(color: Hsla) -> String {
+        let rgba: Rgba = color.into();
+        format!(
+            "rgb({},{},{})",
+            (rgba.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgba.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (rgba.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        )
+    }
+
+    fn svg_rect_fills(svg: &str) -> Vec<String> {
+        let mut fills = Vec::new();
+        let mut rest = svg;
+        while let Some(start) = rest.find("<rect") {
+            rest = &rest[start + 5..];
+            let Some(end) = rest.find('>') else {
+                break;
+            };
+            let tag = &rest[..end];
+            if let Some(fill_at) = tag.find("fill=\"") {
+                let value = &tag[fill_at + 6..];
+                if let Some(close) = value.find('"') {
+                    fills.push(value[..close].to_string());
+                }
+            }
+            rest = &rest[end..];
+        }
+        fills
+    }
+
+    fn paint_is_black(paint: &str) -> bool {
+        paint == "rgb(0,0,0)" || paint.starts_with("rgba(0,0,0,")
     }
 }

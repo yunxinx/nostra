@@ -71,24 +71,16 @@ gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = 
 ] }
 gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "c6bc13642c147956ed0d628f97d4e37f60b41511" }
 
-# RaTeX publishes versioned crates on crates.io, so use a semver-compatible
-# requirement here; Cargo.lock records the exact verified release. The
-# `embed-fonts` feature makes formula images self-contained, so the desktop app
-# does not need Node.js, WebView, CSS, or a system KaTeX font installation.
-ratex-parser = "0.1.14"
-ratex-layout = "0.1.14"
-ratex-types = "0.1.14"
-ratex-svg = { version = "0.1.14", features = [
+# Frozen RaTeX git rev for the formula path (parser, layout, SVG, and fonts),
+# not crates.io 0.1.14. The `embed-fonts` feature makes formula images
+# self-contained, so the desktop app does not need Node.js, WebView, CSS, or a
+# system KaTeX font installation.
+ratex-parser = { git = "https://github.com/erweixin/RaTeX.git", rev = "3657473fa2e7a9734b7b62822dad881a288fea23" }
+ratex-layout = { git = "https://github.com/erweixin/RaTeX.git", rev = "3657473fa2e7a9734b7b62822dad881a288fea23" }
+ratex-types = { git = "https://github.com/erweixin/RaTeX.git", rev = "3657473fa2e7a9734b7b62822dad881a288fea23" }
+ratex-svg = { git = "https://github.com/erweixin/RaTeX.git", rev = "3657473fa2e7a9734b7b62822dad881a288fea23", features = [
     "embed-fonts",
 ] }
-
-# Nostra carries focused memory-management patches for RaTeX's font pipeline.
-# Keep the crates on 0.1.14 so the patch changes ownership, not parser/layout
-# behavior; vendor/README.md records the exact upstream revision.
-[patch.crates-io]
-ratex-font-loader = { path = "vendor/ratex-font-loader" }
-ratex-unicode-font = { path = "vendor/ratex-unicode-font" }
-ratex-svg = { path = "vendor/ratex-svg" }
 
 [dev-dependencies]
 gpui = { git = "https://github.com/yunxinx/zed.git", rev = "8d4c3af8efffdbaa3881f7d4fe50f44a662647d0", features = ["test-support"] }
