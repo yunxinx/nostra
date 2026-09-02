@@ -27,6 +27,7 @@ use crate::session::{
 };
 use crate::shell::app::chat_workspace::ChatTarget;
 
+use super::history_sidebar::is_pending_history_conversation;
 use super::*;
 
 type PreferenceSaver = Arc<dyn Fn(&Preferences) -> anyhow::Result<()> + Send + Sync>;
@@ -1339,6 +1340,73 @@ fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mu
     });
 }
 
+/// First send binds the draft. The catalog summary arrives on a later frame;
+/// the bound view must stay on the host list until that real summary exists,
+/// otherwise every remaining row shifts twice.
+#[gpui::test]
+fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestAppContext) {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let existing = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            let view = this.chat_snapshot().conversations()[0].view();
+            view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
+        })
+    });
+    cx.run_until_parked();
+
+    let bound = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            let view = this
+                .chat_snapshot()
+                .conversations()
+                .iter()
+                .find(|conversation| conversation.session_id().is_none())
+                .expect("fresh draft")
+                .view();
+            view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
+        })
+    });
+
+    app.read_with(cx, |this, _| {
+        let snapshot = this.chat_snapshot();
+        let summaries = snapshot.history().summaries();
+        assert!(
+            snapshot.opened_target(&bound).is_some(),
+            "binding keeps the open view"
+        );
+        assert!(
+            is_pending_history_conversation(Some(&bound), summaries),
+            "the bound view stays on the host list until a real catalog summary exists"
+        );
+        assert!(
+            summaries.iter().all(|summary| summary.session_id != bound),
+            "do not insert a placeholder catalog row for a just-bound session"
+        );
+        assert!(
+            summaries
+                .iter()
+                .any(|summary| summary.session_id == existing),
+            "existing catalog rows must survive the bind"
+        );
+    });
+
+    cx.run_until_parked();
+    app.read_with(cx, |this, _| {
+        let snapshot = this.chat_snapshot();
+        let summaries = snapshot.history().summaries();
+        assert!(
+            summaries.iter().any(|summary| summary.session_id == bound),
+            "the catalog snapshot receives the real summary"
+        );
+        assert!(
+            !is_pending_history_conversation(Some(&bound), summaries),
+            "once cataloged, the session is only a catalog row"
+        );
+    });
+}
 
 #[gpui::test]
 fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {

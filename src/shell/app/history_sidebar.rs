@@ -1,10 +1,12 @@
 //! Chat history catalog sidebar state, background loading, and rendering.
 //!
 //! The sidebar treats the catalog snapshot as the sole source of persisted
-//! rows. Drafts (unbound views) appear as temporary rows above the catalog.
-//! "Opened", "generating", and "active" are visual annotations derived from
-//! workspace state, never row identity. Every catalog read runs on the
-//! background executor; render only reads the snapshot.
+//! rows. Host-owned rows (unbound drafts, and bound views whose catalog
+//! summary has not landed yet) appear above that snapshot. "Opened",
+//! "generating", and "active" are visual annotations derived from workspace
+//! state, never row identity. Every catalog read runs on the background
+//! executor; render only reads the snapshot. Do not insert a placeholder
+//! `SessionSummary` to bridge the bind → catalog gap.
 
 use std::{collections::HashSet, rc::Rc};
 
@@ -475,9 +477,7 @@ impl ChatWorkspace {
 impl ChatApp {
     // ---------- Sidebar content rendering ----------
 
-    /// Render the scrollable catalog + draft list.  Replaces the previous
-    /// opened-views-only list with a catalog snapshot plus temporary draft rows
-    /// above it.
+    /// Render the scrollable catalog plus host-owned rows above it.
     pub(super) fn render_history_content(
         &self,
         window: &mut Window,
@@ -486,10 +486,15 @@ impl ChatApp {
         let snapshot = self.chat_snapshot();
         let mut children: Vec<AnyElement> = Vec::new();
 
-        let drafts: Vec<&ChatConversationSnapshot> = snapshot
+        let pending: Vec<&ChatConversationSnapshot> = snapshot
             .conversations()
             .iter()
-            .filter(|conversation| conversation.session_id().is_none())
+            .filter(|conversation| {
+                is_pending_history_conversation(
+                    conversation.session_id().as_ref(),
+                    snapshot.history().summaries(),
+                )
+            })
             .collect();
 
         let loading_and_empty =
@@ -500,12 +505,13 @@ impl ChatApp {
             children.push(self.render_history_loading_state(cx).into_any_element());
         }
 
-        // Draft rows sit above the catalog so a freshly created new chat is
-        // immediately reachable even before its first durable turn.
-        for conversation in &drafts {
+        // Host-owned rows sit above the catalog so a new chat stays reachable
+        // before its first durable turn, and a just-bound view does not vanish
+        // while the catalog summary is still in flight.
+        for conversation in &pending {
             let target = conversation.target();
             children.push(
-                self.render_draft_row(snapshot, conversation, target, window, cx)
+                self.render_host_row(snapshot, conversation, target, window, cx)
                     .into_any_element(),
             );
         }
@@ -522,7 +528,7 @@ impl ChatApp {
         let ready = matches!(snapshot.history().load_state(), HistoryLoadState::Ready);
         let error_and_empty = matches!(snapshot.history().load_state(), HistoryLoadState::Error(_))
             && snapshot.history().is_empty();
-        let no_rows = drafts.is_empty() && snapshot.history().is_empty();
+        let no_rows = pending.is_empty() && snapshot.history().is_empty();
 
         if error_and_empty {
             children.push(self.render_history_error_state(cx).into_any_element());
@@ -618,7 +624,7 @@ impl ChatApp {
         }
     }
 
-    fn render_draft_row(
+    fn render_host_row(
         &self,
         snapshot: &ChatWorkspaceSnapshot,
         conversation: &ChatConversationSnapshot,
@@ -979,6 +985,15 @@ fn chat_history_trailing(hovered: bool, confirming: bool, is_generating: bool) -
     (actions_visible, is_generating && !actions_visible)
 }
 
+/// Unbound drafts, and bound views that are not yet in the catalog snapshot.
+/// Catalog rows are only real `SessionSummary` records.
+pub(super) fn is_pending_history_conversation(
+    session_id: Option<&SessionId>,
+    summaries: &[SessionSummary],
+) -> bool {
+    session_id.is_none_or(|id| summaries.iter().all(|summary| &summary.session_id != id))
+}
+
 fn chat_history_generating_selector(target: &ChatTarget) -> String {
     match target {
         ChatTarget::View(entity) => format!("conversation-generating-{}", entity.as_u64()),
@@ -1094,3 +1109,38 @@ mod trailing_slot {
     }
 }
 
+#[cfg(test)]
+mod pending_history_rows {
+    use std::path::PathBuf;
+
+    use super::is_pending_history_conversation;
+    use crate::session::{SessionDomain, SessionId, SessionSummary};
+
+    fn summary(session_id: SessionId) -> SessionSummary {
+        SessionSummary {
+            session_id,
+            domain: SessionDomain::Chat,
+            project: None,
+            title: Some("cataloged".into()),
+            preview: None,
+            model: None,
+            total_tokens: 0,
+            created_at: 1,
+            updated_at: 1,
+            jsonl_path: PathBuf::from("sessions/cataloged.jsonl"),
+        }
+    }
+
+    #[test]
+    fn unbound_and_uncataloged_rows_stay_on_the_host_list() {
+        let cataloged = SessionId::new(SessionDomain::Chat);
+        let bound = SessionId::new(SessionDomain::Chat);
+        let summaries = vec![summary(cataloged.clone())];
+        assert!(is_pending_history_conversation(None, &summaries));
+        assert!(is_pending_history_conversation(Some(&bound), &summaries));
+        assert!(!is_pending_history_conversation(
+            Some(&cataloged),
+            &summaries
+        ));
+    }
+}
