@@ -109,6 +109,7 @@ impl ChatView {
                 message,
                 index,
                 this.preference_snapshot.user_message_markdown,
+                this.runtime_snapshot.is_generating() && index + 1 == this.messages.len(),
                 window,
                 cx,
             );
@@ -306,6 +307,7 @@ fn render_message(
     msg: &Message,
     message_index: usize,
     render_user_markdown: bool,
+    in_flight: bool,
     window: &mut Window,
     cx: &mut Context<ChatView>,
 ) -> impl IntoElement {
@@ -461,6 +463,7 @@ fn render_message(
         })
         .collect::<Vec<_>>();
 
+    let waiting = !is_user && in_flight && msg.error.is_none() && parts.is_empty();
     let inner: AnyElement = if is_user {
         // Right-aligned bubble for user turns.
         h_flex()
@@ -484,6 +487,16 @@ fn render_message(
                     .px_3()
                     .py_1p5()
                     .children(parts),
+            )
+            .into_any_element()
+    } else if waiting {
+        div()
+            .w_full()
+            .debug_selector(move || format!("assistant-waiting-{message_index}"))
+            .child(
+                ShimmerText::new(t!("chat.generating").to_string())
+                    .id(("assistant-waiting", message_ui_id))
+                    .text_color(muted_foreground),
             )
             .into_any_element()
     } else {

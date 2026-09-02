@@ -36,6 +36,7 @@ use gpui_component::{
     ActiveTheme, ElementExt as _, StyledExt as _, h_flex,
     input::{InputEvent, RopeExt as _},
     scroll::ScrollableElement as _,
+    shimmer::ShimmerText,
     text::{TextView, TextViewStyle},
     v_flex,
 };

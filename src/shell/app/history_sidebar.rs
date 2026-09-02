@@ -631,8 +631,9 @@ impl ChatApp {
         let is_generating = conversation.is_generating();
         let sidebar_target = ChatTarget::View(target);
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
-        let actions_visible =
-            is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
+        let hovered = snapshot.hovered() == Some(&sidebar_target);
+        let (actions_visible, show_spinner) =
+            chat_history_trailing(hovered, is_confirming, is_generating);
         let app = cx.entity().downgrade();
 
         self.render_history_row(
@@ -640,7 +641,7 @@ impl ChatApp {
             ("conv", target),
             title,
             is_active,
-            is_generating,
+            show_spinner,
             actions_visible,
             is_confirming,
             sidebar_target,
@@ -719,8 +720,9 @@ impl ChatApp {
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
 
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
-        let actions_visible =
-            is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
+        let hovered = snapshot.hovered() == Some(&sidebar_target);
+        let (actions_visible, show_spinner) =
+            chat_history_trailing(hovered, is_confirming, is_generating);
         let app = cx.entity().downgrade();
 
         self.render_history_row(
@@ -728,7 +730,7 @@ impl ChatApp {
             format!("history-button-{session_id}"),
             title,
             is_active,
-            is_generating,
+            show_spinner,
             actions_visible,
             is_confirming,
             sidebar_target.clone(),
@@ -784,7 +786,7 @@ impl ChatApp {
         button_id: impl Into<ElementId>,
         title: SharedString,
         is_active: bool,
-        is_generating: bool,
+        show_spinner: bool,
         actions_visible: bool,
         is_confirming: bool,
         target: ChatTarget,
@@ -800,11 +802,10 @@ impl ChatApp {
             .read(cx)
             .clone();
         let focus_ring = cx.theme().ring.opacity(0.2);
-        let target_for_hover = target.clone();
-        let target_for_actions = target;
         let workspace = self.chat_workspace().downgrade();
 
-        let title_element = if is_generating {
+        let title_element = if show_spinner {
+            let generating_selector = chat_history_generating_selector(&target);
             h_flex()
                 .min_w_0()
                 .flex_1()
@@ -819,9 +820,11 @@ impl ChatApp {
                         .child(title.clone()),
                 )
                 .child(
-                    Spinner::new()
-                        .xsmall()
-                        .color(cx.theme().sidebar_foreground.opacity(0.6)),
+                    div().debug_selector(move || generating_selector).child(
+                        Spinner::new()
+                            .xsmall()
+                            .color(cx.theme().sidebar_foreground.opacity(0.6)),
+                    ),
                 )
                 .into_any_element()
         } else {
@@ -831,6 +834,8 @@ impl ChatApp {
                 .child(title.clone())
                 .into_any_element()
         };
+        let target_for_hover = target.clone();
+        let target_for_actions = target;
 
         div()
             .id(row_id)
@@ -967,6 +972,20 @@ impl ChatApp {
     }
 }
 
+/// History-row trailing occupancy. Selection is not an input: selected accent
+/// is applied separately on the title button.
+fn chat_history_trailing(hovered: bool, confirming: bool, is_generating: bool) -> (bool, bool) {
+    let actions_visible = hovered || confirming;
+    (actions_visible, is_generating && !actions_visible)
+}
+
+fn chat_history_generating_selector(target: &ChatTarget) -> String {
+    match target {
+        ChatTarget::View(entity) => format!("conversation-generating-{}", entity.as_u64()),
+        ChatTarget::Session(session) => format!("history-generating-{session}"),
+    }
+}
+
 /// Stable UI identifiers and labels for one workspace-local sidebar target.
 pub(super) struct SidebarActionIds {
     pub(super) trigger_id: ElementId,
@@ -1048,3 +1067,30 @@ where
             .into_any_element()
     }
 }
+
+#[cfg(test)]
+mod trailing_slot {
+    use super::chat_history_trailing;
+
+    #[test]
+    fn selection_does_not_show_actions() {
+        let (actions, spinner) = chat_history_trailing(false, false, true);
+        assert!(!actions);
+        assert!(spinner);
+    }
+
+    #[test]
+    fn hover_or_confirm_hides_the_generating_spinner() {
+        assert_eq!(chat_history_trailing(true, false, true), (true, false));
+        assert_eq!(chat_history_trailing(false, true, true), (true, false));
+        assert_eq!(chat_history_trailing(true, true, true), (true, false));
+    }
+
+    #[test]
+    fn idle_row_shows_neither() {
+        assert_eq!(chat_history_trailing(false, false, false), (false, false));
+        assert_eq!(chat_history_trailing(true, false, false), (true, false));
+        assert_eq!(chat_history_trailing(false, true, false), (true, false));
+    }
+}
+

@@ -713,6 +713,63 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn selected_generating_history_row_keeps_actions_mounted_and_shows_spinner(
+    cx: &mut TestAppContext,
+) {
+    let (app, cx) = add_app_window(cx);
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            let view = this.chat_snapshot().conversations()[0].view();
+            let target = view.entity_id();
+            view.update(cx, |chat, cx| chat.mark_generating_for_test(cx));
+            this.chat_workspace()
+                .update(cx, |workspace, cx| workspace.select_target(target, cx));
+            target
+        })
+    });
+    redraw(cx);
+
+    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let generating =
+        Box::leak(format!("conversation-generating-{}", target.as_u64()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(generating).is_some(),
+        "a selected generating row without hover shows the spinner"
+    );
+    assert!(
+        cx.debug_bounds(actions).is_some(),
+        "more-actions stays mounted while invisible so delete clicks still resolve"
+    );
+
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.set_hovered(Some(ChatTarget::View(target)), cx)
+            });
+        });
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds(generating).is_none(),
+        "hovering the row hides the spinner so it cannot overlap more-actions"
+    );
+    assert!(cx.debug_bounds(actions).is_some());
+
+    click(cx, actions);
+    cx.simulate_keystrokes("down enter");
+    redraw(cx);
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
+        Some(ChatTarget::View(target))
+    );
+    assert!(
+        cx.debug_bounds(generating).is_none(),
+        "delete confirmation keeps more-actions visible and the spinner hidden"
+    );
+}
+
+#[gpui::test]
 fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext) {
     let folder = tempfile::tempdir().expect("project folder");
     let project = ProjectIdentity::new(folder.path(), "Draft project");
@@ -1281,6 +1338,7 @@ fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mu
         );
     });
 }
+
 
 #[gpui::test]
 fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {
