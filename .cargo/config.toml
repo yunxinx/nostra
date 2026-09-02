@@ -1,0 +1,4 @@
+# Zed is a large git dependency. Cargo's built-in libgit2 fetch often times
+# out partway through a clone; the git CLI is resumable and packed.
+[net]
+git-fetch-with-cli = true
