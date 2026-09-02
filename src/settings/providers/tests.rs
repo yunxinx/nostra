@@ -27,10 +27,11 @@ fn add_providers_window(
 ) -> (Entity<ProvidersPage>, &mut gpui::VisualTestContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        preferences::init_global(
-            preferences::Preferences {
-                provider_profiles: profiles,
-                ..Default::default()
+        preferences::init_global(preferences::Preferences::default(), cx);
+        crate::providers::init_global(
+            crate::providers::ProviderCatalogDocument {
+                profiles,
+                last_model_selection: None,
             },
             cx,
         );

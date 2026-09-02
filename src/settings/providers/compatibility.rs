@@ -81,7 +81,6 @@ impl ProvidersPage {
 
         v_flex()
             .w_full()
-            .gap_3()
             .text_sm()
             .child(dropdown_row(
                 "compat-max-tokens-row",
@@ -260,28 +259,25 @@ impl ProvidersPage {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let weak = cx.weak_entity();
-        h_flex()
-            .justify_between()
-            .child(ui::labelled(
-                text,
-                id,
-                info,
-                self.preference_snapshot.hide_settings_info_buttons,
-                cx,
-            ))
-            .child(
-                Switch::new(id)
-                    .small()
-                    .checked(checked)
-                    .on_click(move |checked, _, cx| {
-                        weak.update(cx, |this, cx| {
-                            this.update_compatibility(
-                                |compatibility| update(compatibility, *checked),
-                                cx,
-                            )
-                        })
-                        .ok();
-                    }),
-            )
+        ui::row(
+            id,
+            text,
+            Some(info),
+            Switch::new(id)
+                .small()
+                .checked(checked)
+                .on_click(move |checked, _, cx| {
+                    weak.update(cx, |this, cx| {
+                        this.update_compatibility(
+                            |compatibility| update(compatibility, *checked),
+                            cx,
+                        )
+                    })
+                    .ok();
+                })
+                .into_any_element(),
+            self.preference_snapshot.hide_settings_info_buttons,
+            cx,
+        )
     }
 }

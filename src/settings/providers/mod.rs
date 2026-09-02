@@ -11,11 +11,11 @@ mod render;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
-    AnyElement, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Pixels,
-    SharedString, Styled as _, Subscription, Window, px,
+    AnyElement, App, AppContext as _, Context, Entity, Pixels, SharedString, Subscription, Window,
+    px,
 };
 use gpui_component::{
-    WindowExt as _, h_flex,
+    WindowExt as _,
     input::{InputEvent, InputState},
     notification::NotificationType,
     resizable::ResizableState,
@@ -114,6 +114,8 @@ pub(super) struct ProvidersPage {
     list_width: Pixels,
     preference_handle: preferences::PreferenceHandle,
     preference_snapshot: preferences::Preferences,
+    catalog_handle: crate::providers::ProviderCatalogHandle,
+    catalog_snapshot: crate::providers::ProviderCatalogDocument,
     /// Wire-format switches stay folded away until asked for.
     compatibility_open: bool,
     /// Row the pointer is over, so its remove button can appear.
@@ -136,12 +138,14 @@ impl ProvidersPage {
         cx: &mut Context<Self>,
     ) -> Self {
         let preference_snapshot = preference_handle.snapshot();
-        let selected = providers::profiles_from(&preference_snapshot)
+        let catalog_handle = providers::ensure_global(cx);
+        let catalog_snapshot = catalog_handle.snapshot();
+        let selected = providers::profiles_from(&catalog_snapshot)
             .first()
             .map(|profile| profile.id.clone());
         let profile = selected
             .as_deref()
-            .and_then(|id| providers::find_in(id, &preference_snapshot))
+            .and_then(|id| providers::find_in(id, &catalog_snapshot))
             .cloned();
         let placeholders = ProviderPlaceholders::resolve();
         let name = input_with_placeholder(
@@ -172,6 +176,8 @@ impl ProvidersPage {
             layout: cx.new(|_| ResizableState::default()),
             preference_handle: preference_handle.clone(),
             preference_snapshot,
+            catalog_handle: catalog_handle.clone(),
+            catalog_snapshot,
             list_width: clamp_list_width(px(preference_handle.snapshot().provider_list_width)),
             compatibility_open: false,
             hovered: None,
@@ -192,6 +198,18 @@ impl ProvidersPage {
                     cx.notify();
                 }),
             );
+        this._subscriptions
+            .push(cx.observe_global_in::<crate::providers::ProviderCatalog>(
+                window,
+                move |this, _, cx| {
+                    let snapshot = catalog_handle.snapshot();
+                    if this.catalog_snapshot == snapshot {
+                        return;
+                    }
+                    this.catalog_snapshot = snapshot;
+                    cx.notify();
+                },
+            ));
         this.rebuild_models(profile.as_ref(), window, cx);
         this
     }
@@ -214,16 +232,11 @@ impl ProvidersPage {
                         return;
                     };
                     let value = input.read(cx).value().to_string();
-                    providers::update(
-                        &selected,
-                        &this.preference_handle,
-                        cx,
-                        |profile| match field {
-                            ProfileField::Name => profile.name = value,
-                            ProfileField::BaseUrl => profile.base_url = value,
-                            ProfileField::ApiKey => profile.api_key = SecretString::new(value),
-                        },
-                    );
+                    providers::update(&selected, &this.catalog_handle, cx, |profile| match field {
+                        ProfileField::Name => profile.name = value,
+                        ProfileField::BaseUrl => profile.base_url = value,
+                        ProfileField::ApiKey => profile.api_key = SecretString::new(value),
+                    });
                     cx.notify();
                 },
             ));
@@ -279,8 +292,8 @@ impl ProvidersPage {
                     }
                     InputEvent::Change => {
                         let value = input.read(cx).value().to_string();
-                        let preferences = this.preference_handle.snapshot();
-                        let Some(profile) = providers::find_in(&binding.profile_id, &preferences)
+                        let catalog = this.catalog_handle.snapshot();
+                        let Some(profile) = providers::find_in(&binding.profile_id, &catalog)
                         else {
                             return;
                         };
@@ -291,7 +304,7 @@ impl ProvidersPage {
                         providers::update_model(
                             &binding.profile_id,
                             &binding.config_id,
-                            &this.preference_handle,
+                            &this.catalog_handle,
                             cx,
                             |model| set_model_field(model, field, value),
                         );
@@ -299,8 +312,8 @@ impl ProvidersPage {
                     }
                     InputEvent::Blur | InputEvent::PressEnter { .. } => {
                         let value = input.read(cx).value().to_string();
-                        let preferences = this.preference_handle.snapshot();
-                        let duplicate = providers::find_in(&binding.profile_id, &preferences)
+                        let catalog = this.catalog_handle.snapshot();
+                        let duplicate = providers::find_in(&binding.profile_id, &catalog)
                             .is_some_and(|profile| !binding.value_is_available(profile, &value));
                         if !duplicate {
                             if matches!(event, InputEvent::PressEnter { .. }) {
@@ -329,7 +342,7 @@ impl ProvidersPage {
                             providers::update_model(
                                 &profile_id,
                                 &config_id,
-                                &this.preference_handle,
+                                &this.catalog_handle,
                                 cx,
                                 |model| set_model_field(model, field, previous.clone()),
                             );
@@ -353,8 +366,8 @@ impl ProvidersPage {
             return;
         }
         self.selected = Some(id.clone());
-        let preferences = self.preference_handle.snapshot();
-        let profile = providers::find_in(&id, &preferences).cloned();
+        let catalog = self.catalog_handle.snapshot();
+        let profile = providers::find_in(&id, &catalog).cloned();
         self.name.update(cx, |state, cx| {
             state.set_value(profile.as_ref().map_or("", |p| p.name.as_str()), window, cx)
         });
@@ -395,7 +408,7 @@ impl ProvidersPage {
             models: Vec::new(),
         };
         let id = profile.id.clone();
-        providers::add(profile, &self.preference_handle, cx);
+        providers::add(profile, &self.catalog_handle, cx);
         self.select(id, window, cx);
     }
 
@@ -418,7 +431,7 @@ impl ProvidersPage {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
         }
-        providers::remove(id, &self.preference_handle, cx);
+        providers::remove(id, &self.catalog_handle, cx);
         if self.hovered.as_deref() == Some(id) {
             self.hovered = None;
         }
@@ -427,8 +440,8 @@ impl ProvidersPage {
             return;
         }
 
-        let preferences = self.preference_handle.snapshot();
-        let next = providers::profiles_from(&preferences)
+        let catalog = self.catalog_handle.snapshot();
+        let next = providers::profiles_from(&catalog)
             .first()
             .map(|profile| profile.id.clone());
         self.selected = None;
@@ -455,7 +468,7 @@ impl ProvidersPage {
             model_id: String::new(),
             display_name: None,
         };
-        providers::add_model(&profile_id, model.clone(), &self.preference_handle, cx);
+        providers::add_model(&profile_id, model.clone(), &self.catalog_handle, cx);
         self.push_model_editor(&profile_id, &model, window, cx);
         cx.notify();
     }
@@ -464,7 +477,7 @@ impl ProvidersPage {
         let Some(profile_id) = self.selected.clone() else {
             return;
         };
-        providers::remove_model(&profile_id, id, &self.preference_handle, cx);
+        providers::remove_model(&profile_id, id, &self.catalog_handle, cx);
         self.models.retain(|model| model.id != id);
         cx.notify();
     }
@@ -473,7 +486,7 @@ impl ProvidersPage {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        providers::update(&id, &self.preference_handle, cx, |profile| {
+        providers::update(&id, &self.catalog_handle, cx, |profile| {
             profile.protocol = protocol
         });
         cx.notify();
@@ -487,7 +500,7 @@ impl ProvidersPage {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        providers::update(&id, &self.preference_handle, cx, |profile| {
+        providers::update(&id, &self.catalog_handle, cx, |profile| {
             update(&mut profile.compatibility)
         });
         cx.notify();
@@ -598,19 +611,14 @@ fn input_with_placeholder(
 /// Single-line control row: label plus info icon on the left, control on the
 /// right.
 fn dropdown_row(
-    id: &str,
+    id: &'static str,
     label: String,
     info: String,
     control: AnyElement,
     hide_info: bool,
     cx: &App,
-) -> impl IntoElement {
-    h_flex()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .child(super::ui::labelled(label, id, info, hide_info, cx))
-        .child(control)
+) -> AnyElement {
+    super::ui::row(id, label, Some(info), control, hide_info, cx)
 }
 
 #[cfg(test)]

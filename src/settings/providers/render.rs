@@ -132,7 +132,7 @@ impl ProvidersPage {
             return div().into_any_element();
         };
 
-        let profile = providers::find_in(&selected, &self.preference_snapshot);
+        let profile = providers::find_in(&selected, &self.catalog_snapshot);
         let protocol = profile.map(|profile| profile.protocol).unwrap_or_default();
         let compatibility = profile.map(|profile| profile.compatibility.clone());
 

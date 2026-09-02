@@ -58,12 +58,14 @@ pub fn run() {
         .with_assets(NostraAssets)
         .with_http_client(std::sync::Arc::new(ReqwestClient::new()));
     app.run(|cx| {
+        let catalog = providers::load();
         let prefs = preferences::load();
         logging::set_detailed(prefs.detailed_logging);
         logging::info("app.lifecycle", "application started");
-        init(prefs.clone(), cx);
+        init(prefs.clone(), catalog, cx);
         let preference_handle = preferences::handle(cx);
-        window::open_main_window(prefs, preference_handle, cx);
+        let catalog_handle = providers::handle(cx);
+        window::open_main_window(prefs, preference_handle, catalog_handle, cx);
     });
     logging::info("app.lifecycle", "application stopped");
     logging::shutdown();
@@ -71,11 +73,16 @@ pub fn run() {
 
 /// One-time application setup: initialise components, prefs, locale, theme,
 /// fonts, keys, menus.
-fn init(prefs: preferences::Preferences, cx: &mut App) {
+fn init(
+    prefs: preferences::Preferences,
+    catalog: providers::ProviderCatalogDocument,
+    cx: &mut App,
+) {
     gpui_component::init(cx);
 
-    // The Prefs global is the single source of truth at runtime; seed it
-    // before any subsystem reads or writes settings.
+    // Catalog is independent of preference schema: seed it first so a
+    // rejected preferences document cannot drop provider configuration.
+    providers::init_global(catalog, cx);
     preferences::init_global(prefs.clone(), cx);
     let preference_handle = preferences::handle(cx);
     let current = preference_handle.snapshot();

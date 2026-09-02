@@ -17,7 +17,6 @@ use gpui::{App, Global, Window};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    llm::{ModelSelection, ProviderCatalogSnapshot, ProviderCatalogSource, ProviderProfile},
     runtime::{CHAT_WORKSPACE_ID, PROJECT_WORKSPACE_ID, WorkspaceId},
     session::SessionId,
 };
@@ -99,10 +98,6 @@ pub struct Preferences {
     /// Last known settings-window geometry. `None` until that window has
     /// been opened; invalid values are discarded at restore time.
     pub settings_window: Option<WindowGeometry>,
-    /// User-managed OpenAI-compatible endpoints and their model catalogs.
-    pub provider_profiles: Vec<ProviderProfile>,
-    /// Selection inherited by newly-created conversations.
-    pub last_model_selection: Option<ModelSelection>,
     /// Folders the user opened as Agent work projects.  These exist in the UI
     /// before the store registers a project row with its first Agent session;
     /// the store catalog stays authoritative once a session exists.
@@ -157,8 +152,6 @@ impl Default for Preferences {
             dark_theme: None,
             window: None,
             settings_window: None,
-            provider_profiles: Vec::new(),
-            last_model_selection: None,
             agent_projects: Vec::new(),
         }
     }
@@ -468,16 +461,6 @@ impl PreferenceHandle {
     }
 }
 
-/// Provider routing is derived from the live preference state, so a profile
-/// edit reaches generation on the next request without replacing the
-/// generation Provider. Preferences remain the single writer; there is no
-/// second catalog to keep in step.
-impl ProviderCatalogSource for PreferenceHandle {
-    fn catalog(&self) -> ProviderCatalogSnapshot {
-        ProviderCatalogSnapshot::new(self.snapshot().provider_profiles)
-    }
-}
-
 /// App-global foreground adapter for the explicit preference capability.
 /// Render code can continue to borrow a stable snapshot while composition
 /// consumers receive the cloneable [`PreferenceHandle`].
@@ -636,7 +619,11 @@ pub fn save(prefs: &Preferences) -> anyhow::Result<()> {
 /// Persist preferences by atomically replacing the target with a fully
 /// written temporary file from the same directory.
 fn save_to_path(path: &Path, prefs: &Preferences) -> anyhow::Result<()> {
-    let json = serde_json::to_vec_pretty(prefs)?;
+    atomic_write_json(path, prefs)
+}
+
+pub(crate) fn atomic_write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    let json = serde_json::to_vec_pretty(value)?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -648,7 +635,6 @@ fn save_to_path(path: &Path, prefs: &Preferences) -> anyhow::Result<()> {
     temporary.as_file_mut().sync_all()?;
     temporary.persist(path).map_err(|error| error.error)?;
 
-    // Persist the directory entry as well as the file contents on Unix.
     #[cfg(unix)]
     std::fs::File::open(parent)?.sync_all()?;
 
@@ -774,31 +760,6 @@ mod tests {
         handle.update_in_memory(|prefs| prefs.sidebar_collapsed = false);
         assert!(!handle.snapshot().sidebar_collapsed);
         assert_eq!(saves.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn preference_handle_catalog_reflects_live_profile_edits() {
-        let handle = PreferenceHandle::in_memory(Preferences::default());
-        assert!(handle.catalog().profiles().is_empty());
-
-        handle.update_in_memory(|prefs| {
-            prefs.provider_profiles.push(ProviderProfile {
-                id: "provider".into(),
-                name: "Provider".into(),
-                base_url: "https://example.com/v1".into(),
-                api_key: crate::llm::SecretString::default(),
-                protocol: crate::llm::Protocol::Responses,
-                compatibility: crate::llm::CompatibilityProfile::default(),
-                models: vec![crate::llm::ModelConfig {
-                    id: "model".into(),
-                    model_id: "vendor/model".into(),
-                    display_name: None,
-                }],
-            });
-        });
-
-        assert_eq!(handle.catalog().profiles().len(), 1);
-        assert_eq!(handle.catalog().profiles()[0].id, "provider");
     }
 
     #[test]
@@ -1068,74 +1029,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_profiles_and_plaintext_secret_round_trip() {
-        let prefs = Preferences {
-            provider_profiles: vec![ProviderProfile {
-                id: "profile-1".into(),
-                name: "Local gateway".into(),
-                base_url: "http://localhost:8080/v1".into(),
-                api_key: crate::llm::SecretString::new("plain-text-key"),
-                protocol: crate::llm::Protocol::Responses,
-                compatibility: crate::llm::CompatibilityProfile::default(),
-                models: vec![crate::llm::ModelConfig {
-                    id: "model-1".into(),
-                    model_id: "gpt-compatible".into(),
-                    display_name: Some("Local model".into()),
-                }],
-            }],
-            last_model_selection: Some(ModelSelection {
-                profile_id: "profile-1".into(),
-                model_id: "model-1".into(),
-            }),
-            ..Preferences::default()
-        };
-
-        let json = serde_json::to_string(&prefs).expect("serialize provider settings");
-        assert!(json.contains("plain-text-key"));
-        let back: Preferences = serde_json::from_str(&json).expect("deserialize provider settings");
-        assert_eq!(back.provider_profiles, prefs.provider_profiles);
-        assert_eq!(back.last_model_selection, prefs.last_model_selection);
-    }
-
-    #[test]
-    fn provider_preferences_reject_unknown_nested_fields() {
-        let prefs = Preferences {
-            provider_profiles: vec![ProviderProfile {
-                id: "profile-1".into(),
-                name: "Provider".into(),
-                base_url: "https://example.com/v1".into(),
-                api_key: crate::llm::SecretString::default(),
-                protocol: crate::llm::Protocol::Responses,
-                compatibility: crate::llm::CompatibilityProfile::default(),
-                models: vec![crate::llm::ModelConfig {
-                    id: "model-1".into(),
-                    model_id: "gpt".into(),
-                    display_name: None,
-                }],
-            }],
-            last_model_selection: Some(ModelSelection {
-                profile_id: "profile-1".into(),
-                model_id: "model-1".into(),
-            }),
-            ..Preferences::default()
-        };
-
-        for path in [
-            "/provider_profiles/0/legacy",
-            "/provider_profiles/0/models/0/legacy",
-            "/provider_profiles/0/compatibility/legacy",
-            "/last_model_selection/legacy",
-        ] {
-            let mut value = serde_json::to_value(&prefs).expect("serialize");
-            value
-                .pointer_mut(path.rsplit_once('/').map_or("", |(parent, _)| parent))
-                .and_then(serde_json::Value::as_object_mut)
-                .expect("object")
-                .insert("legacy".into(), serde_json::Value::Bool(true));
-            assert!(
-                serde_json::from_value::<Preferences>(value).is_err(),
-                "{path}"
-            );
-        }
+    fn leftover_provider_keys_reject_the_current_preferences_schema() {
+        let mut value = serde_json::to_value(Preferences::default()).expect("serialize");
+        value["provider_profiles"] = serde_json::json!([]);
+        value["last_model_selection"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<Preferences>(value).is_err());
     }
 }

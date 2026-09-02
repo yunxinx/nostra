@@ -25,7 +25,7 @@ impl ProvidersPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let profiles = self.preference_snapshot.provider_profiles.clone();
+        let profiles = self.catalog_snapshot.profiles.clone();
         let selected = self.selected.clone();
         let rows = profiles
             .iter()

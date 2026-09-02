@@ -34,7 +34,7 @@ pub use types::{
 };
 pub(crate) use types::{MessageNodeRow, ProjectionIntent};
 
-pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 6;
+pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 7;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 30;
 const REPAIR_REQUIRED_KEY: &str = "repair_required";
 const PROJECTION_INTENT_PREFIX: &str = "projection_intent:";

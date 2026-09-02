@@ -25,7 +25,6 @@ use gpui_component::{
 use rust_i18n::t;
 
 use crate::llm::ModelSelection;
-use crate::preferences;
 use crate::providers::{self, SelectableModel};
 use crate::ui::popover::PopoverDismissHandle;
 
@@ -55,19 +54,19 @@ pub(crate) struct ModelPicker {
 impl ModelPicker {
     pub(crate) fn new(
         selection: Option<ModelSelection>,
-        preference_handle: preferences::PreferenceHandle,
+        catalog_handle: crate::providers::ProviderCatalogHandle,
         on_confirm: impl Fn(ModelSelection, &mut App) -> bool + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let models = providers::selectable_models_from_preferences(&preference_handle.snapshot());
+        crate::providers::ensure_global(cx);
+        let models = providers::selectable_models_from_catalog(&catalog_handle.snapshot());
         let label = find_model_label(&models, selection.as_ref());
         let on_confirm = Rc::new(on_confirm);
         let popover = PopoverDismissHandle::default();
         let catalog_subscription =
-            cx.observe_global_in::<preferences::Prefs>(window, move |this, window, cx| {
-                let models =
-                    providers::selectable_models_from_preferences(&preference_handle.snapshot());
+            cx.observe_global_in::<providers::ProviderCatalog>(window, move |this, window, cx| {
+                let models = providers::selectable_models_from_catalog(&catalog_handle.snapshot());
                 if this.models != models {
                     this.refresh_catalog(models, window, cx);
                     cx.notify();

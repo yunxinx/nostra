@@ -598,7 +598,7 @@ fn table_declaration(table: &TableSchema) -> String {
         sql.push_str(", ");
         sql.push_str(constraint);
     }
-    sql.push(')');
+    sql.push_str(") STRICT");
     sql
 }
 

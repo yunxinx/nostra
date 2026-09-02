@@ -10,6 +10,7 @@ mod writer;
 
 use std::{
     fmt::Display,
+    path::PathBuf,
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -47,7 +48,7 @@ pub(crate) enum LogLevel {
 }
 
 impl LogLevel {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Error => "ERROR",
             Self::Warn => "WARN",
@@ -200,6 +201,69 @@ pub(crate) fn error(component: &'static str, message: impl Display) {
     record(LogLevel::Error, component, message);
 }
 
+/// Candidate log files, oldest backup first, then the active file.
+pub(crate) fn log_file_paths() -> Option<Vec<PathBuf>> {
+    let active = crate::paths::nostra_config_dir()?
+        .join("logs")
+        .join(LOG_FILE_NAME);
+    let mut paths: Vec<PathBuf> = (1..=LOG_BACKUPS)
+        .rev()
+        .map(|index| writer::backup_path(&active, index))
+        .collect();
+    paths.push(active);
+    Some(paths)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedLogLine {
+    pub timestamp: Option<String>,
+    pub level: Option<LogLevel>,
+    pub rest: String,
+}
+
+pub(crate) fn parse_log_line(line: &str) -> ParsedLogLine {
+    let line = line.trim_end_matches(['\n', '\r']);
+    let Some((timestamp, after_ts)) = line.split_once(' ') else {
+        return ParsedLogLine {
+            timestamp: None,
+            level: None,
+            rest: line.to_string(),
+        };
+    };
+    if !timestamp.contains('T') {
+        return ParsedLogLine {
+            timestamp: None,
+            level: None,
+            rest: line.to_string(),
+        };
+    }
+    let Some((level_token, rest)) = after_ts.split_once(' ') else {
+        return ParsedLogLine {
+            timestamp: Some(timestamp.to_string()),
+            level: None,
+            rest: after_ts.to_string(),
+        };
+    };
+    let level = match level_token {
+        "ERROR" => Some(LogLevel::Error),
+        "WARN" => Some(LogLevel::Warn),
+        "INFO" => Some(LogLevel::Info),
+        _ => None,
+    };
+    if level.is_none() {
+        return ParsedLogLine {
+            timestamp: Some(timestamp.to_string()),
+            level: None,
+            rest: after_ts.to_string(),
+        };
+    }
+    ParsedLogLine {
+        timestamp: Some(timestamp.to_string()),
+        level,
+        rest: rest.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, process::Command};
@@ -213,6 +277,34 @@ mod tests {
         assert_eq!(LogLevel::Error.as_str(), "ERROR");
         assert_eq!(LogLevel::Warn.as_str(), "WARN");
         assert_eq!(LogLevel::Info.as_str(), "INFO");
+    }
+
+    #[test]
+    fn parse_log_line_reads_the_current_record_shape() {
+        let record = encode_record("ERROR providers: boom".into());
+        let parsed = parse_log_line(record.trim_end());
+        assert!(
+            parsed
+                .timestamp
+                .as_ref()
+                .is_some_and(|timestamp| timestamp.contains('T')),
+            "{parsed:?}"
+        );
+        assert_eq!(parsed.level, Some(LogLevel::Error));
+        assert_eq!(parsed.rest, "providers: boom");
+    }
+
+    #[test]
+    fn parse_log_line_keeps_malformed_rows() {
+        let parsed = parse_log_line("not a log line");
+        assert_eq!(
+            parsed,
+            ParsedLogLine {
+                timestamp: None,
+                level: None,
+                rest: "not a log line".into(),
+            }
+        );
     }
 
     #[test]

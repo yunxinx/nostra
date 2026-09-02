@@ -8,12 +8,12 @@ A desktop chat client.
 cargo run
 ```
 
-Preferences are persisted to:
+Preferences and provider settings are persisted to:
 
-- macOS: `~/Library/Application Support/nostra/preferences.json`
-- Linux: `$XDG_CONFIG_HOME/nostra/preferences.json`
-  (falls back to `~/.config/nostra/preferences.json`)
-- Windows: `%APPDATA%\nostra\preferences.json`
+- Config root: `$XDG_CONFIG_HOME/nostra` (falls back to `~/.config/nostra`;
+  `USERPROFILE/.config/nostra` on Windows)
+- `preferences.json` — window, theme, language, and other UI settings
+- `providers.json` — supplier endpoints, models, and API keys
 
 ## Keyboard shortcuts
 

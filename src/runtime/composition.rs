@@ -21,6 +21,7 @@ use crate::{
         ProviderCatalogSource,
     },
     preferences::{JSON_PROVIDER_NAME, PreferenceHandle, Preferences},
+    providers::ProviderCatalogHandle,
     session::{ConversationContext, ProjectIdentity, SessionStores},
     ui::markdown::{
         MarkdownExtensionKey, MarkdownExtensionSnapshot, builtin_extension_contributions,
@@ -125,6 +126,17 @@ fn default_preference_handle() -> PreferenceHandle {
     }
 }
 
+fn default_catalog_handle() -> ProviderCatalogHandle {
+    #[cfg(test)]
+    {
+        ProviderCatalogHandle::in_memory(crate::providers::ProviderCatalogDocument::default())
+    }
+    #[cfg(not(test))]
+    {
+        ProviderCatalogHandle::json(crate::providers::ProviderCatalogDocument::default())
+    }
+}
+
 /// Build the first-party generation Provider over a live routing source.
 ///
 /// The source is read once per request, so a provider profile edit reaches
@@ -176,6 +188,7 @@ impl CapabilityKey for GenerationCapability {
 pub struct RuntimeServices {
     session_services: SessionStores,
     preference_handle: PreferenceHandle,
+    provider_catalog: ProviderCatalogHandle,
     generation_service: Arc<dyn GenerationService>,
     markdown_extensions: MarkdownExtensionSnapshot,
     runtime_snapshots: RuntimeSnapshotReader,
@@ -184,9 +197,11 @@ pub struct RuntimeServices {
 }
 
 impl RuntimeServices {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         session_services: SessionStores,
         preference_handle: PreferenceHandle,
+        provider_catalog: ProviderCatalogHandle,
         generation_service: Arc<dyn GenerationService>,
         markdown_extensions: MarkdownExtensionSnapshot,
         runtime_snapshots: RuntimeSnapshotReader,
@@ -196,6 +211,7 @@ impl RuntimeServices {
         Self {
             session_services,
             preference_handle,
+            provider_catalog,
             generation_service,
             markdown_extensions,
             runtime_snapshots,
@@ -241,6 +257,11 @@ impl RuntimeServices {
     #[must_use]
     pub fn preference_handle(&self) -> &PreferenceHandle {
         &self.preference_handle
+    }
+
+    #[must_use]
+    pub fn provider_catalog(&self) -> &ProviderCatalogHandle {
+        &self.provider_catalog
     }
 
     #[must_use]
@@ -1464,6 +1485,7 @@ pub struct CompositionRootBuilder {
     selected_session_provider: ComponentId,
     preferences: PreferenceHandle,
     preference_provider: ComponentId,
+    provider_catalog_handle: ProviderCatalogHandle,
     generation_providers: Vec<(ComponentId, ProviderFactory<GenerationCapability>)>,
     selected_generation_provider: ComponentId,
     provider_catalog: Option<Arc<dyn ProviderCatalogSource>>,
@@ -1506,6 +1528,12 @@ impl CompositionRootBuilder {
     #[must_use = "composition builders must be built to install their capabilities"]
     pub fn with_preferences(mut self, preferences: PreferenceHandle) -> Self {
         self.preferences = preferences;
+        self
+    }
+
+    #[must_use = "composition builders must be built to install their capabilities"]
+    pub fn with_provider_catalog_handle(mut self, catalog: ProviderCatalogHandle) -> Self {
+        self.provider_catalog_handle = catalog;
         self
     }
 
@@ -1557,8 +1585,8 @@ impl CompositionRootBuilder {
     }
 
     /// Route generation through an explicit catalog source instead of the
-    /// preference capability. A fixed [`ProviderCatalogSnapshot`] is itself a
-    /// source, so tests can pin one validated routing view.
+    /// live provider-catalog handle. A fixed [`ProviderCatalogSnapshot`] is
+    /// itself a source, so tests can pin one validated routing view.
     #[must_use = "composition builders must be built to install their capabilities"]
     pub fn with_provider_catalog(mut self, catalog: Arc<dyn ProviderCatalogSource>) -> Self {
         self.provider_catalog = Some(catalog);
@@ -1577,6 +1605,7 @@ impl CompositionRootBuilder {
             selected_session_provider,
             preferences: preference_handle,
             preference_provider,
+            provider_catalog_handle,
             generation_providers,
             selected_generation_provider,
             provider_catalog,
@@ -1588,7 +1617,7 @@ impl CompositionRootBuilder {
         )
         .map_err(CompositionBuildError::Providers)?;
         let catalog: Arc<dyn ProviderCatalogSource> = provider_catalog.unwrap_or_else(|| {
-            Arc::new(preference_handle.clone()) as Arc<dyn ProviderCatalogSource>
+            Arc::new(provider_catalog_handle.clone()) as Arc<dyn ProviderCatalogSource>
         });
         let default_generation_factory = provider_factory::<GenerationCapability>(move || {
             Ok(default_generation_service(
@@ -1863,6 +1892,7 @@ impl CompositionRootBuilder {
             preference_provider,
             preferences: Some(preferences),
             preference_failure: None,
+            provider_catalog_handle,
             generation_definitions,
             generation_provider,
             generation_revision: DesiredRevision::INITIAL,
@@ -1898,6 +1928,7 @@ pub struct CompositionRoot {
     preference_provider: ComponentId,
     preferences: Option<ActiveProvider<PreferenceCapability>>,
     preference_failure: Option<ReconcileFailure>,
+    provider_catalog_handle: ProviderCatalogHandle,
     generation_definitions: ProviderDefinitions<GenerationCapability>,
     generation_provider: ComponentId,
     generation_revision: DesiredRevision,
@@ -1925,6 +1956,7 @@ impl CompositionRoot {
             selected_session_provider: LOCAL_SESSION_PROVIDER,
             preferences: default_preference_handle(),
             preference_provider: JSON_PREFERENCE_PROVIDER,
+            provider_catalog_handle: default_catalog_handle(),
             generation_providers: Vec::new(),
             selected_generation_provider: GATEWAY_GENERATION_PROVIDER,
             provider_catalog: None,
@@ -2292,6 +2324,7 @@ impl CompositionRoot {
         Some(RuntimeServices::new(
             self.session_services()?.handle().clone(),
             self.preferences()?.handle().clone(),
+            self.provider_catalog_handle.clone(),
             self.generation_mount.service(),
             self.markdown_extensions()?.clone(),
             self.runtime_snapshots.reader(),

@@ -9,6 +9,7 @@
 mod about;
 mod appearance;
 mod general;
+mod logs;
 mod providers;
 mod ui;
 
@@ -158,14 +159,16 @@ enum Page {
     General,
     Appearance,
     Providers,
+    Logs,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [
+    const ALL: [Page; 5] = [
         Page::General,
         Page::Appearance,
         Page::Providers,
+        Page::Logs,
         Page::About,
     ];
 
@@ -174,6 +177,7 @@ impl Page {
             Page::General => t!("settings.page.general").to_string(),
             Page::Appearance => t!("settings.page.appearance").to_string(),
             Page::Providers => t!("settings.page.providers").to_string(),
+            Page::Logs => t!("settings.page.logs").to_string(),
             Page::About => t!("settings.page.about").to_string(),
         }
     }
@@ -183,6 +187,7 @@ impl Page {
             Page::General => IconName::Settings2,
             Page::Appearance => IconName::Palette,
             Page::Providers => IconName::Globe,
+            Page::Logs => IconName::FileText,
             Page::About => IconName::Info,
         }
     }
@@ -192,6 +197,7 @@ impl Page {
             Page::General => "nav-general",
             Page::Appearance => "nav-appearance",
             Page::Providers => "nav-providers",
+            Page::Logs => "nav-logs",
             Page::About => "nav-about",
         }
     }
@@ -202,6 +208,7 @@ struct SettingsWindow {
     focus_handle: FocusHandle,
     active: Page,
     providers: Entity<providers::ProvidersPage>,
+    logs: Entity<logs::LogsPage>,
     #[cfg(target_os = "macos")]
     glass_opacity: Entity<SliderState>,
     window_geometry: WindowGeometry,
@@ -278,6 +285,7 @@ impl SettingsWindow {
             active: Page::General,
             providers: cx
                 .new(|cx| providers::ProvidersPage::new(preference_handle.clone(), window, cx)),
+            logs: cx.new(|cx| logs::LogsPage::new(window, cx)),
             #[cfg(target_os = "macos")]
             glass_opacity,
             window_geometry: WindowGeometry::from_window(window),
@@ -288,6 +296,20 @@ impl SettingsWindow {
                 subscriptions
             },
         }
+    }
+
+    fn set_active(&mut self, page: Page, cx: &mut Context<Self>) {
+        if self.active == page {
+            return;
+        }
+        if self.active == Page::Logs {
+            self.logs.update(cx, |logs, cx| logs.set_visible(false, cx));
+        }
+        self.active = page;
+        if page == Page::Logs {
+            self.logs.update(cx, |logs, cx| logs.set_visible(true, cx));
+        }
+        cx.notify();
     }
 
     fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -325,16 +347,12 @@ impl SettingsWindow {
                         .text_color(cx.theme().sidebar_accent_foreground)
                 })
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    if consume_button_key(event, window, cx) && this.active != page {
-                        this.active = page;
-                        cx.notify();
+                    if consume_button_key(event, window, cx) {
+                        this.set_active(page, cx);
                     }
                 }))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if this.active != page {
-                        this.active = page;
-                        cx.notify();
-                    }
+                    this.set_active(page, cx);
                 }))
                 .child(
                     Icon::new(page.icon())
@@ -381,14 +399,15 @@ impl SettingsWindow {
                 &self.glass_opacity,
             ),
             Page::Providers => self.providers.clone().into_any_element(),
+            Page::Logs => self.logs.clone().into_any_element(),
             Page::About => about::render(cx),
         };
 
         // The providers page is a split view whose two columns scroll
         // independently, so it takes the content box at full height and owns
-        // its own scrolling.  Every other page is a plain column inside one
-        // shared scroll view.
-        let immersive = matches!(self.active, Page::Providers);
+        // its own scrolling. The logs page owns a readonly editor the same way.
+        // Every other page is a plain column inside one shared scroll view.
+        let immersive = matches!(self.active, Page::Providers | Page::Logs);
         let content = match self.active {
             Page::Providers => div()
                 .flex_1()
@@ -400,6 +419,7 @@ impl SettingsWindow {
                 .pl_3()
                 .child(body)
                 .into_any_element(),
+            Page::Logs => div().flex_1().min_h_0().child(body).into_any_element(),
             _ => div()
                 .id("settings-content")
                 .flex_1()

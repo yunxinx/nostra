@@ -355,7 +355,7 @@ fn rotate(path: &Path, backups: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn backup_path(path: &Path, index: usize) -> PathBuf {
+pub(super) fn backup_path(path: &Path, index: usize) -> PathBuf {
     let mut backup = path.as_os_str().to_os_string();
     backup.push(format!(".{index}"));
     PathBuf::from(backup)

@@ -21,6 +21,9 @@ use crate::preferences;
 
 const INFO_BUTTON_SIZE: gpui::Pixels = px(18.);
 const INFO_ICON_SIZE: gpui::Pixels = px(14.);
+/// Matches `Button::small()` (`Size::Small` → `size_6`) so switch rows and
+/// dropdown rows share one control box height.
+const CONTROL_MIN_HEIGHT: gpui::Pixels = px(24.);
 const DROPDOWN_MENU_MAX_HEIGHT: gpui::Pixels = px(190.);
 // PopupMenu uses 26px medium items by default; six items plus gaps and padding
 // fit below the cap, while a seventh item overflows it.
@@ -80,7 +83,13 @@ pub(super) fn row(
                     |this, button| this.child(button),
                 ),
         )
-        .child(control)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .min_h(CONTROL_MIN_HEIGHT)
+                .child(control),
+        )
         .into_any_element()
 }
 

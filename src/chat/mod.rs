@@ -162,7 +162,8 @@ pub struct ChatView {
     list_state: ListState,
     smooth_scroll: SmoothScrollState,
     preference_snapshot: crate::preferences::Preferences,
-    preference_handle: crate::preferences::PreferenceHandle,
+    catalog_handle: crate::providers::ProviderCatalogHandle,
+    catalog_snapshot: crate::providers::ProviderCatalogDocument,
     markdown_presentation: MarkdownPresentation,
     selection: Option<ModelSelection>,
     selection_available: bool,
@@ -247,10 +248,13 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         let preference_snapshot = preference_handle.snapshot();
+        let catalog_handle = crate::providers::ensure_global(cx);
+        let catalog_snapshot = catalog_handle.snapshot();
         let preference_state = preference_handle.shared_preferences();
         let markdown_presentation =
             MarkdownPresentation::new(preference_state, markdown_extensions);
         let preferences_for_observer = preference_handle.clone();
+        let catalog_for_observer = catalog_handle.clone();
         let references_enabled = runtime.read(cx).supports_references();
         let references = runtime.read(cx).references();
         let placeholder: SharedString = if references_enabled {
@@ -309,9 +313,9 @@ impl ChatView {
             }
         });
 
-        let selection = providers::last_selection_from(&preference_snapshot);
+        let selection = providers::last_selection_from(&catalog_snapshot);
         let selection_available =
-            providers::selection_is_available_from(selection.as_ref(), &preference_snapshot);
+            providers::selection_is_available_from(selection.as_ref(), &catalog_snapshot);
         let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
@@ -335,7 +339,8 @@ impl ChatView {
             list_state,
             smooth_scroll: SmoothScrollState::default(),
             preference_snapshot,
-            preference_handle,
+            catalog_handle,
+            catalog_snapshot,
             markdown_presentation,
             selection,
             selection_available,
@@ -351,14 +356,21 @@ impl ChatView {
                     if this.preference_snapshot == snapshot {
                         return;
                     }
-                    let profiles_changed =
-                        this.preference_snapshot.provider_profiles != snapshot.provider_profiles;
                     this.preference_snapshot = snapshot;
-                    if profiles_changed {
-                        this.sync_selection_availability();
-                    }
                     cx.notify();
                 }),
+                cx.observe_global_in::<crate::providers::ProviderCatalog>(
+                    window,
+                    move |this, _, cx| {
+                        let snapshot = catalog_for_observer.snapshot();
+                        if this.catalog_snapshot == snapshot {
+                            return;
+                        }
+                        this.catalog_snapshot = snapshot;
+                        this.sync_selection_availability();
+                        cx.notify();
+                    },
+                ),
             ],
             #[cfg(test)]
             materialized_message_indices: std::collections::BTreeSet::new(),
@@ -927,7 +939,7 @@ impl ChatView {
         if !self.update_selection(selection.clone()) {
             return;
         }
-        providers::select_model(selection.clone(), &self.preference_handle, cx);
+        providers::select_model(selection.clone(), &self.catalog_handle, cx);
         cx.emit(ChatEvent::SelectionChanged(selection));
         cx.notify();
     }
@@ -953,10 +965,8 @@ impl ChatView {
     }
 
     fn sync_selection_availability(&mut self) {
-        self.selection_available = providers::selection_is_available_from(
-            self.selection.as_ref(),
-            &self.preference_snapshot,
-        );
+        self.selection_available =
+            providers::selection_is_available_from(self.selection.as_ref(), &self.catalog_snapshot);
     }
 }
 

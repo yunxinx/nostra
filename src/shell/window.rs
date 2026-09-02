@@ -92,6 +92,7 @@ const MIN_SIZE: Size<Pixels> = Size {
 pub fn open_main_window(
     prefs: Preferences,
     preference_handle: crate::preferences::PreferenceHandle,
+    catalog_handle: crate::providers::ProviderCatalogHandle,
     cx: &mut App,
 ) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
@@ -105,6 +106,7 @@ pub fn open_main_window(
         let stores = stores.await;
         let composition = match CompositionRoot::builder(stores)
             .with_preferences(preference_handle)
+            .with_provider_catalog_handle(catalog_handle)
             .with_http_client(http_client)
             .build()
             .await

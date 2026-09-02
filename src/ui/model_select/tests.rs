@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use gpui::{Focusable as _, TestAppContext};
 
 use crate::llm::{CompatibilityProfile, ModelConfig, Protocol, ProviderProfile, SecretString};
+use crate::preferences;
 
 use super::*;
 
@@ -154,19 +155,22 @@ fn picker_observes_catalog_changes_outside_render(cx: &mut TestAppContext) {
     };
     cx.update(|cx| {
         gpui_component::init(cx);
-        let prefs = preferences::Preferences {
-            provider_profiles: vec![provider_profile("Initial")],
-            ..Default::default()
-        };
+        let prefs = preferences::Preferences::default();
         preferences::init_global(prefs, cx);
+        crate::providers::init_global(
+            crate::providers::ProviderCatalogDocument {
+                profiles: vec![provider_profile("Initial")],
+                last_model_selection: None,
+            },
+            cx,
+        );
     });
     let cx = cx.add_empty_window();
     let picker = cx.update(|window, cx| {
-        let preference_handle = preferences::handle(cx);
         cx.new(|cx| {
             ModelPicker::new(
                 selection.clone().into(),
-                preference_handle,
+                crate::providers::handle(cx),
                 |_, _| true,
                 window,
                 cx,
@@ -256,11 +260,14 @@ fn deferred_focus_moves_from_replaced_list_to_new_search_input(cx: &mut TestAppC
 fn reopening_after_search_resets_all_state_and_repeated_query_confirms(cx: &mut TestAppContext) {
     cx.update(|cx| {
         gpui_component::init(cx);
-        let prefs = preferences::Preferences {
-            provider_profiles: vec![provider_profile("gpt-5.2")],
-            ..Default::default()
-        };
-        preferences::init_global(prefs, cx);
+        preferences::init_global(preferences::Preferences::default(), cx);
+        crate::providers::init_global(
+            crate::providers::ProviderCatalogDocument {
+                profiles: vec![provider_profile("gpt-5.2")],
+                last_model_selection: None,
+            },
+            cx,
+        );
     });
     let confirmed = Rc::new(RefCell::new(Vec::new()));
     let cx = cx.add_empty_window();
@@ -270,7 +277,7 @@ fn reopening_after_search_resets_all_state_and_repeated_query_confirms(cx: &mut 
             cx.new(|cx| {
                 ModelPicker::new(
                     None,
-                    preferences::handle(cx),
+                    crate::providers::handle(cx),
                     move |selection, _| {
                         confirmed.borrow_mut().push(selection);
                         true

@@ -759,7 +759,8 @@ fn failed_delete_of_an_active_turn_recovers_for_the_next_submit(cx: &mut TestApp
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
-            this.select_model(selection, cx);
+            this.selection = Some(selection);
+            this.selection_available = true;
             assert!(this.submit("first turn".into(), window, cx));
         });
     });
@@ -825,7 +826,8 @@ fn failed_delete_preserves_an_uncommitted_cancelled_terminal_for_exact_retry(
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
-            this.select_model(selection, cx);
+            this.selection = Some(selection);
+            this.selection_available = true;
             assert!(this.submit("first turn".into(), window, cx));
         });
     });

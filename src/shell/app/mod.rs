@@ -157,6 +157,9 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Self {
         let preference_handle = services.preference_handle().clone();
+        let catalog_handle = services.provider_catalog().clone();
+        crate::providers::init_global_with_handle(catalog_handle.clone(), cx);
+        let last_model_selection = catalog_handle.snapshot().last_model_selection;
         let exit_coordinator = services.exit_coordinator();
         let runtime_snapshots = services.runtime_snapshots();
         let runtime_snapshot = runtime_snapshots.current();
@@ -184,8 +187,8 @@ impl ChatApp {
         };
         let model_picker = cx.new(|cx| {
             ModelPicker::new(
-                prefs.last_model_selection.clone(),
-                preference_handle.clone(),
+                last_model_selection,
+                catalog_handle,
                 move |selection, cx| {
                     parent
                         .update(cx, |app, cx| app.select_model_from_picker(selection, cx))
