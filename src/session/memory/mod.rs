@@ -482,6 +482,9 @@ impl SessionCatalogStore for InMemorySessionStore {
                     .is_some_and(|project| project.project_id == project_id)
             });
         }
+        if let Some(favorited) = query.favorited {
+            sessions.retain(|summary| summary.favorited == favorited);
+        }
         sessions.sort_by(|left, right| {
             right
                 .created_at

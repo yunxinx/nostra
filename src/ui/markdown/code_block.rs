@@ -1,5 +1,6 @@
 //! Fenced-code extension, retained highlight cache, and code-block layout.
 
+use crate::appearance::contrast;
 use crate::runtime::ContributionId;
 
 use super::*;
@@ -626,7 +627,7 @@ pub(super) fn render(
         .min_w_0()
         .rounded(cx.theme().radius)
         .overflow_hidden()
-        .bg(cx.theme().tokens.muted)
+        .bg(code_body_surface(cx))
         .font_family(cx.theme().mono_font_family.clone())
         .text_size(cx.theme().mono_font_size)
         .child(
@@ -787,78 +788,32 @@ pub(super) fn spawn_background_highlight(
     });
 }
 
-#[derive(Clone, Copy)]
-pub(super) struct CodeSurface {
-    pub(super) background: Background,
-    pub(super) color: Hsla,
+/// The code body, flattened and held apart from the pane: everything a code
+/// block paints sits on this, including its own header's floor.
+pub(super) fn code_body_surface(cx: &App) -> Hsla {
+    contrast::pane_block(cx.theme().muted, cx)
 }
 
-pub(super) fn code_header_surface(cx: &App) -> CodeSurface {
-    let body = opaque_surface(cx.theme().background, cx.theme().muted);
-    themed_distinct_surface(
+pub(super) fn code_header_surface(cx: &App) -> contrast::Surface {
+    let body = code_body_surface(cx);
+    contrast::distinct_surface(
         cx.theme().tokens.secondary.background,
-        opaque_surface(body, cx.theme().secondary),
+        contrast::opaque(body, cx.theme().secondary),
         body,
+        contrast::MIN_NESTED_SURFACE_CONTRAST,
         cx.theme().is_dark(),
     )
 }
 
-pub(super) fn wrap_toggle_surface(wrap: bool, cx: &App) -> Option<CodeSurface> {
+pub(super) fn wrap_toggle_surface(wrap: bool, cx: &App) -> Option<contrast::Surface> {
     wrap.then(|| {
         let header = code_header_surface(cx);
-        themed_distinct_surface(
+        contrast::distinct_surface(
             cx.theme().tokens.secondary_active.background,
-            opaque_surface(header.color, cx.theme().secondary_active),
+            contrast::opaque(header.color, cx.theme().secondary_active),
             header.color,
+            contrast::MIN_NESTED_SURFACE_CONTRAST,
             cx.theme().is_dark(),
         )
     })
-}
-
-pub(super) fn opaque_surface(background: Hsla, surface: Hsla) -> Hsla {
-    background.blend(surface).alpha(1.)
-}
-
-pub(super) fn themed_distinct_surface(
-    preferred_background: Background,
-    mut preferred_color: Hsla,
-    reference: Hsla,
-    dark: bool,
-) -> CodeSurface {
-    if surface_contrast(preferred_color, reference) >= MIN_ADJACENT_SURFACE_CONTRAST {
-        return CodeSurface {
-            background: preferred_background,
-            color: preferred_color,
-        };
-    }
-
-    let step = if dark { 0.01 } else { -0.01 };
-    while surface_contrast(preferred_color, reference) < MIN_ADJACENT_SURFACE_CONTRAST {
-        let next_lightness = (preferred_color.l + step).clamp(0., 1.);
-        if next_lightness == preferred_color.l {
-            break;
-        }
-        preferred_color.l = next_lightness;
-    }
-    CodeSurface {
-        background: preferred_color.into(),
-        color: preferred_color,
-    }
-}
-
-pub(super) fn surface_contrast(a: Hsla, b: Hsla) -> f32 {
-    let luminance = |color: Hsla| {
-        let rgb = Rgba::from(color);
-        let channel = |value: f32| {
-            if value <= 0.03928 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * channel(rgb.r) + 0.7152 * channel(rgb.g) + 0.0722 * channel(rgb.b)
-    };
-    let (a, b) = (luminance(a), luminance(b));
-    let (lighter, darker) = if a > b { (a, b) } else { (b, a) };
-    (lighter + 0.05) / (darker + 0.05)
 }

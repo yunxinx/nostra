@@ -47,12 +47,12 @@ impl ChatApp {
         v_flex()
             .size_full()
             .bg(glass::background(
-                cx.theme().sidebar,
+                contrast::sidebar_surface(cx),
                 self.preference_snapshot.glass_effect,
                 self.preference_snapshot.glass_tint_opacity,
                 cx,
             ))
-            .text_color(cx.theme().sidebar_foreground)
+            .text_color(contrast::sidebar_text(cx))
             .child(self.render_sidebar_top_row(cx))
             .child(self.render_sidebar_content(window, cx))
             .child(self.render_sidebar_footer(cx))
@@ -117,7 +117,7 @@ impl ChatApp {
                         div()
                             .text_sm()
                             .font_medium()
-                            .text_color(cx.theme().sidebar_foreground)
+                            .text_color(contrast::sidebar_text(cx))
                             .child("yuewei"),
                     ),
             )

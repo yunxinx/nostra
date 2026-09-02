@@ -1,5 +1,7 @@
 //! Chat workspace instance state and lifecycle.
 
+use std::collections::{HashMap, HashSet};
+
 use gpui::{Context, Entity, Subscription, Task, Window};
 use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
@@ -10,11 +12,15 @@ use crate::chat::{
 use crate::llm::ModelSelection;
 use crate::preferences::PreferenceHandle;
 use crate::runtime::RuntimeServices;
-use crate::session::{ChatSessionCatalogController, ResolvedSessionState, SessionId};
+use crate::session::{
+    ChatSessionCatalogController, FavoriteChange, MAX_FAVORITES, ResolvedSessionState,
+    SessionEntryKind, SessionId, SessionLifecycleStore,
+};
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
 use super::{
     conversation_host::{Conversation, ConversationHost, ConversationHostSnapshot},
+    history_groups::HistorySectionKind,
     history_sidebar::ChatHistorySidebar,
 };
 
@@ -50,13 +56,27 @@ impl SelectionEpoch {
 
 pub(super) type ChatConversationSnapshot = super::conversation_host::ConversationSnapshot<()>;
 
+/// Where the pointer was when the history list last reordered beneath it.
+///
+/// Rows take hover from the pointer's position, recomputed every frame, so a
+/// list that reorders under a stationary pointer would hand the highlight to
+/// whichever row slid underneath — a row the user never pointed at.  While the
+/// pointer has not moved from `at`, only `owner` (the row the user acted on)
+/// may take hover; it is the one row the pointer really is on.
+#[derive(Clone)]
+struct ParkedPointer {
+    at: gpui::Point<gpui::Pixels>,
+    owner: Option<ChatTarget>,
+}
+
 #[derive(Clone)]
 pub(super) struct ChatWorkspaceSnapshot {
     conversations: ConversationHostSnapshot<()>,
     history: ChatHistorySidebar,
-    hovered: Option<ChatTarget>,
     confirming: Option<ChatTarget>,
+    collapsed_history_sections: HashSet<HistorySectionKind>,
     delete_confirmation: InlineDeleteConfirmationHandle,
+    parked_pointer: Option<ParkedPointer>,
 }
 
 impl ChatWorkspaceSnapshot {
@@ -64,9 +84,10 @@ impl ChatWorkspaceSnapshot {
         Self {
             conversations: ConversationHostSnapshot::empty(),
             history: ChatHistorySidebar::new(),
-            hovered: None,
             confirming: None,
+            collapsed_history_sections: HashSet::new(),
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
+            parked_pointer: None,
         }
     }
 
@@ -105,16 +126,34 @@ impl ChatWorkspaceSnapshot {
         &self.history
     }
 
-    pub(super) fn hovered(&self) -> Option<&ChatTarget> {
-        self.hovered.as_ref()
-    }
-
     pub(super) fn confirming(&self) -> Option<&ChatTarget> {
         self.confirming.as_ref()
     }
 
     pub(super) fn delete_confirmation(&self) -> InlineDeleteConfirmationHandle {
         self.delete_confirmation.clone()
+    }
+
+    pub(super) fn history_section_open(&self, kind: HistorySectionKind) -> bool {
+        !self.collapsed_history_sections.contains(&kind)
+    }
+
+    /// Whether `target`'s row may take hover with the pointer at `pointer`.
+    /// See [`ParkedPointer`].
+    pub(super) fn row_takes_hover(
+        &self,
+        target: &ChatTarget,
+        pointer: gpui::Point<gpui::Pixels>,
+    ) -> bool {
+        match &self.parked_pointer {
+            Some(parked) if parked.at == pointer => parked.owner.as_ref() == Some(target),
+            _ => true,
+        }
+    }
+
+    /// The position hover is frozen at, if the pointer has not left it yet.
+    pub(super) fn parked_pointer(&self) -> Option<gpui::Point<gpui::Pixels>> {
+        self.parked_pointer.as_ref().map(|parked| parked.at)
     }
 }
 
@@ -131,12 +170,17 @@ pub(super) struct ChatWorkspace {
     pub(super) history: ChatHistorySidebar,
     pub(super) _catalog_initial_task: Option<Task<()>>,
     pub(super) _catalog_load_more_task: Option<Task<()>>,
-    pub(super) _summary_refresh_task: Option<Task<()>>,
+    /// Keyed by session: a per-session slot cancels a superseded write for
+    /// *that* row without dropping another row's in-flight one.  A single slot
+    /// would let a second star silently cancel the first one's append.
+    pub(super) _summary_refresh_tasks: HashMap<SessionId, Task<()>>,
     pub(super) _history_delete_task: Option<Task<()>>,
+    pub(super) _favorite_tasks: HashMap<SessionId, Task<()>>,
     pub(super) startup_restore_attempted: bool,
-    pub(super) hovered: Option<ChatTarget>,
     pub(super) confirming: Option<ChatTarget>,
+    pub(super) collapsed_history_sections: HashSet<HistorySectionKind>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
+    parked_pointer: Option<ParkedPointer>,
     pub(super) runtime_services: RuntimeServices,
     pub(super) preference_handle: PreferenceHandle,
     pub(super) snapshot: ChatWorkspaceSnapshot,
@@ -156,12 +200,14 @@ impl ChatWorkspace {
             history: ChatHistorySidebar::new(),
             _catalog_initial_task: None,
             _catalog_load_more_task: None,
-            _summary_refresh_task: None,
+            _summary_refresh_tasks: HashMap::new(),
             _history_delete_task: None,
+            _favorite_tasks: HashMap::new(),
             startup_restore_attempted: false,
-            hovered: None,
             confirming: None,
+            collapsed_history_sections: HashSet::new(),
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
+            parked_pointer: None,
             runtime_services: services,
             preference_handle,
             snapshot: ChatWorkspaceSnapshot::empty(),
@@ -179,9 +225,10 @@ impl ChatWorkspace {
         self.snapshot = ChatWorkspaceSnapshot {
             conversations: self.conversations.snapshot(),
             history: self.history.clone(),
-            hovered: self.hovered.clone(),
             confirming: self.confirming.clone(),
+            collapsed_history_sections: self.collapsed_history_sections.clone(),
             delete_confirmation: self.delete_confirmation.clone(),
+            parked_pointer: self.parked_pointer.clone(),
         };
     }
 
@@ -566,11 +613,143 @@ impl ChatWorkspace {
         }
     }
 
-    pub(super) fn set_hovered(&mut self, target: Option<ChatTarget>, cx: &mut Context<Self>) {
-        if self.hovered != target {
-            self.hovered = target;
+    /// Freeze row hover at the pointer's current position because the history
+    /// list is about to reorder beneath it.  `owner` is the row the user acted
+    /// on, the only one that may keep hover until the pointer moves again.
+    pub(super) fn park_pointer(&mut self, owner: Option<ChatTarget>, window: &Window) {
+        self.parked_pointer = Some(ParkedPointer {
+            at: window.mouse_position(),
+            owner,
+        });
+    }
+
+    /// Let hover follow the pointer again after it has moved.
+    pub(super) fn release_parked_pointer(&mut self, cx: &mut Context<Self>) {
+        if self.parked_pointer.take().is_some() {
             self.notify_changed(cx);
         }
+    }
+
+    pub(super) fn toggle_history_section(
+        &mut self,
+        kind: HistorySectionKind,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.collapsed_history_sections.remove(&kind) {
+            self.collapsed_history_sections.insert(kind);
+        }
+        self.notify_changed(cx);
+    }
+
+    pub(super) fn toggle_favorite(
+        &mut self,
+        target: ChatTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = match &target {
+            ChatTarget::Session(session_id) => session_id.clone(),
+            ChatTarget::View(entity) => {
+                let Some(session_id) = self
+                    .conversations
+                    .conversation(*entity)
+                    .and_then(|conversation| conversation.session_id.clone())
+                else {
+                    return;
+                };
+                session_id
+            }
+        };
+        let Some(current) = self.history.summary(&session_id).cloned() else {
+            return;
+        };
+        let next = !current.favorited;
+        // The favorite group is a pinned shortlist loaded in one unpaginated
+        // query, so it has a cap; going over it would drop rows out of both
+        // lists silently.  Refuse at the boundary and say so.
+        if next && self.history.favorites().len() >= MAX_FAVORITES {
+            window.push_notification(
+                (
+                    NotificationType::Warning,
+                    t!("sidebar.favorite_limit", limit = MAX_FAVORITES).to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
+        let mut optimistic = current;
+        optimistic.favorited = next;
+        self.history.upsert(optimistic);
+        // The row leaves for the Favorites section on the next frame, sliding
+        // another row under a pointer that never moved.
+        self.park_pointer(Some(target.clone()), window);
+
+        let stores = self.runtime_services.session_services().clone();
+        let store = match stores.chat() {
+            Ok(store) => store,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.workspace",
+                    format_args!("cannot toggle favorite: {error}"),
+                );
+                self.refresh_history_summary(session_id, cx);
+                self.notify_changed(cx);
+                return;
+            }
+        };
+
+        let app = cx.entity();
+        let window_handle = window.window_handle();
+        let result_session_id = session_id.clone();
+        let task_session_id = session_id.clone();
+        let task = cx.spawn(async move |_this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let guard = store.reserve_operation()?;
+                    let mut authorized = guard.authorized_store();
+                    authorized.append(
+                        &session_id,
+                        vec![SessionEntryKind::FavoriteChange(FavoriteChange {
+                            favorited: next,
+                        })],
+                    )?;
+                    Ok(())
+                })
+                .await;
+            let _ = window_handle.update(cx, |_, window, cx| {
+                app.update(cx, |this, cx| {
+                    this.apply_favorite_toggle(result_session_id, result, window, cx);
+                });
+            });
+        });
+        self._favorite_tasks.insert(task_session_id, task);
+        self.notify_changed(cx);
+    }
+
+    fn apply_favorite_toggle(
+        &mut self,
+        session_id: SessionId,
+        result: Result<(), crate::session::SessionError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self._favorite_tasks.remove(&session_id);
+        if let Err(error) = result {
+            crate::logging::error(
+                "chat.workspace",
+                format_args!("failed to toggle favorite: {error}"),
+            );
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    t!("sidebar.favorite_failed").to_string(),
+                ),
+                cx,
+            );
+        }
+        self.refresh_history_summary(session_id, cx);
+        self.notify_changed(cx);
     }
 
     pub(super) fn confirm_delete_target(

@@ -141,7 +141,10 @@ pub fn render(error: &TurnError, message_id: u64, window: &mut Window, cx: &mut 
     // Same tinting recipe as the component library's error Alert, so the card
     // reads as part of the same visual system.
     let surface = danger.mix_oklab(transparent_white(), 0.04);
-    let edge = danger.mix_oklab(transparent_white(), 0.3);
+    // The fill is a deliberate wash, so the border is what delimits the card:
+    // it is the one part that must not fade into the pane.
+    let edge =
+        crate::appearance::contrast::pane_outline(danger.mix_oklab(transparent_white(), 0.3), cx);
 
     // Collapse state lives in window-keyed state so it survives re-renders
     // without the transcript owning a flag per message.

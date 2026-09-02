@@ -8,7 +8,7 @@ use gpui::{
     Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, point,
 };
 use gpui_base::TextSelection;
-use gpui_component::{ActiveTheme as _, Root};
+use gpui_component::Root;
 
 use crate::runtime::{ContributionDefinition, ContributionId, ContributionRegistry, ScopeId};
 
@@ -778,17 +778,18 @@ fn code_block_surfaces_remain_distinct_in_every_theme(cx: &mut TestAppContext) {
             for name in crate::appearance::theme::theme_names(dark, cx) {
                 crate::appearance::theme::select_theme_for_test(name.as_ref(), cx);
 
-                let body = opaque_surface(cx.theme().background, cx.theme().muted);
+                let body = code_body_surface(cx);
                 let header = code_header_surface(cx);
                 let active_wrap = wrap_toggle_surface(true, cx).expect("active surface");
                 assert!(wrap_toggle_surface(false, cx).is_none());
                 assert!(
-                    surface_contrast(header.color, body) >= MIN_ADJACENT_SURFACE_CONTRAST,
+                    crate::appearance::contrast::ratio(header.color, body)
+                        >= crate::appearance::contrast::MIN_NESTED_SURFACE_CONTRAST,
                     "{name}: code header must stand out from the code body"
                 );
                 assert!(
-                    surface_contrast(active_wrap.color, header.color)
-                        >= MIN_ADJACENT_SURFACE_CONTRAST,
+                    crate::appearance::contrast::ratio(active_wrap.color, header.color)
+                        >= crate::appearance::contrast::MIN_NESTED_SURFACE_CONTRAST,
                     "{name}: active wrap control must stand out from the code header"
                 );
             }

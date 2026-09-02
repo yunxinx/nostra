@@ -418,6 +418,33 @@ fn click(cx: &mut gpui::VisualTestContext, selector: &'static str) {
     redraw(cx);
 }
 
+/// A catalog row with no store behind it, for state-level checks that never
+/// reach persistence.
+fn chat_summary(created_at: i64, favorited: bool) -> crate::session::SessionSummary {
+    crate::session::SessionSummary {
+        session_id: crate::session::SessionId::new(SessionDomain::Chat),
+        domain: SessionDomain::Chat,
+        project: None,
+        title: Some(format!("session {created_at}")),
+        preview: None,
+        model: None,
+        total_tokens: 0,
+        created_at,
+        updated_at: created_at,
+        favorited,
+        jsonl_path: std::path::PathBuf::from("sessions/row.jsonl"),
+    }
+}
+
+/// Park the pointer on an element and let the frame that reveals its
+/// hover-bound chrome land.  Sidebar rows reveal their trailing controls
+/// through `group_hover`, so only a real pointer position can show them.
+fn hover(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+    let bounds = cx.debug_bounds(selector).expect("element should be drawn");
+    cx.simulate_mouse_move(bounds.center(), None, Default::default());
+    redraw(cx);
+}
+
 #[gpui::test]
 fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAppContext) {
     let (app, cx) = add_app_window(cx);
@@ -679,9 +706,10 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
         })
     });
     redraw(cx);
+    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
     let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    hover(cx, row);
     click(cx, actions);
-    cx.simulate_keystrokes("down enter");
     redraw(cx);
     assert_eq!(
         app.read_with(cx, |this, _| { this.chat_snapshot().confirming().cloned() }),
@@ -714,9 +742,7 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn selected_generating_history_row_keeps_actions_mounted_and_shows_spinner(
-    cx: &mut TestAppContext,
-) {
+fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppContext) {
     let (app, cx) = add_app_window(cx);
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
@@ -731,42 +757,38 @@ fn selected_generating_history_row_keeps_actions_mounted_and_shows_spinner(
     });
     redraw(cx);
 
+    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
     let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
     let generating =
         Box::leak(format!("conversation-generating-{}", target.as_u64()).into_boxed_str());
     assert!(
         cx.debug_bounds(generating).is_some(),
-        "a selected generating row without hover shows the spinner"
+        "a selected generating row shows its spinner"
     );
     assert!(
         cx.debug_bounds(actions).is_some(),
-        "more-actions stays mounted while invisible so delete clicks still resolve"
+        "the delete trigger stays mounted so it keeps its identity and bounds"
     );
 
-    cx.update(|_, cx| {
-        app.update(cx, |this, cx| {
-            this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.set_hovered(Some(ChatTarget::View(target)), cx)
-            });
-        });
-    });
-    redraw(cx);
-    assert!(
-        cx.debug_bounds(generating).is_none(),
-        "hovering the row hides the spinner so it cannot overlap more-actions"
-    );
-    assert!(cx.debug_bounds(actions).is_some());
-
+    // The trailing controls are revealed by the row's hover group, and a
+    // control that is not painted has no listeners: an unhovered row cannot
+    // arm a delete.
     click(cx, actions);
-    cx.simulate_keystrokes("down enter");
-    redraw(cx);
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
+        None,
+        "an unhovered row's delete trigger is inert"
+    );
+
+    hover(cx, row);
+    click(cx, actions);
     assert_eq!(
         app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
         Some(ChatTarget::View(target))
     );
     assert!(
-        cx.debug_bounds(generating).is_none(),
-        "delete confirmation keeps more-actions visible and the spinner hidden"
+        cx.debug_bounds(actions).is_some(),
+        "the confirmation keeps its anchor mounted"
     );
 }
 
@@ -892,6 +914,16 @@ fn delete_chat_labels_resolve_in_every_locale() {
             "sidebar.delete_chat_confirm",
             "sidebar.delete_chat_cancel",
             "sidebar.more_actions",
+            "sidebar.favorite_chat",
+            "sidebar.unfavorite_chat",
+            "sidebar.favorite_failed",
+            "sidebar.favorite_limit",
+            "sidebar.group_favorites",
+            "sidebar.group_today",
+            "sidebar.group_yesterday",
+            "sidebar.group_this_week",
+            "sidebar.group_this_month",
+            "sidebar.group_earlier",
             "menu.delete_chat",
             "chat.error.runtime_unavailable",
             "chat.error.persistence_delete_failed",
@@ -1372,23 +1404,21 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
 
     app.read_with(cx, |this, _| {
         let snapshot = this.chat_snapshot();
-        let summaries = snapshot.history().summaries();
+        let history = snapshot.history();
         assert!(
             snapshot.opened_target(&bound).is_some(),
             "binding keeps the open view"
         );
         assert!(
-            is_pending_history_conversation(Some(&bound), summaries),
+            is_pending_history_conversation(Some(&bound), history),
             "the bound view stays on the host list until a real catalog summary exists"
         );
         assert!(
-            summaries.iter().all(|summary| summary.session_id != bound),
+            !history.contains_session(&bound),
             "do not insert a placeholder catalog row for a just-bound session"
         );
         assert!(
-            summaries
-                .iter()
-                .any(|summary| summary.session_id == existing),
+            history.contains_session(&existing),
             "existing catalog rows must survive the bind"
         );
     });
@@ -1396,13 +1426,13 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
     cx.run_until_parked();
     app.read_with(cx, |this, _| {
         let snapshot = this.chat_snapshot();
-        let summaries = snapshot.history().summaries();
+        let history = snapshot.history();
         assert!(
-            summaries.iter().any(|summary| summary.session_id == bound),
+            history.contains_session(&bound),
             "the catalog snapshot receives the real summary"
         );
         assert!(
-            !is_pending_history_conversation(Some(&bound), summaries),
+            !is_pending_history_conversation(Some(&bound), history),
             "once cataloged, the session is only a catalog row"
         );
     });
@@ -1427,6 +1457,276 @@ fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {
         assert!(this.chat_snapshot().active().is_some());
         assert!(this.chat_snapshot().opened_session_index().is_empty());
     });
+}
+
+#[gpui::test]
+fn section_header_toggles_only_from_its_label(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+        });
+    });
+    redraw(cx);
+
+    let surface = cx
+        .debug_bounds("sidebar-list-surface")
+        .expect("sidebar list surface");
+    let toggle = cx
+        .debug_bounds("history-section-header-sidebar.group_today")
+        .expect("section header toggle");
+    assert!(
+        toggle.right() < surface.right() - px(24.),
+        "the toggle must hug its label instead of spanning the header band"
+    );
+    assert!(toggle.left() >= surface.left());
+}
+
+#[gpui::test]
+fn row_actions_stay_centered_and_never_reflow_the_title(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.chat_snapshot().conversations()[0].target()
+        })
+    });
+    redraw(cx);
+
+    let row_selector = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
+    let action_selector =
+        Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let idle = cx.debug_bounds(action_selector).expect("row actions");
+
+    hover(cx, row_selector);
+
+    let row = cx.debug_bounds(row_selector).expect("history row");
+    let hovered = cx.debug_bounds(action_selector).expect("row actions");
+    assert_eq!(
+        idle, hovered,
+        "the trailing controls float above the row, so revealing them must \
+         not move them or take width from the title"
+    );
+    assert!(
+        (row.center().y - hovered.center().y).abs() < px(1.),
+        "the trailing actions must sit on the row's vertical center"
+    );
+    assert!(
+        hovered.right() <= row.right() && hovered.left() > row.center().x,
+        "the trailing actions stay inside the row, at its trailing edge"
+    );
+}
+
+/// End to end for the favorite fact: the star writes it, the catalog projects
+/// it, and the sidebar moves the row into the Favorites section above.
+#[gpui::test]
+fn starring_a_row_lifts_it_into_the_favorites_section(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let mut lifecycle = stores.chat().expect("Chat lifecycle store");
+    for _ in 0..2 {
+        lifecycle
+            .create_session(SessionHeader::new(SessionDomain::Chat, None))
+            .expect("create Chat session");
+    }
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    cx.run_until_parked();
+    redraw(cx);
+
+    let moving = app.read_with(cx, |this, _| {
+        let timeline = this.chat_snapshot().history().timeline();
+        assert_eq!(timeline.len(), 2, "both sessions are cataloged");
+        timeline[1].session_id.clone()
+    });
+    let row = Box::leak(format!("history-row-{moving}").into_boxed_str());
+    let star = Box::leak(format!("history-favorite-{moving}").into_boxed_str());
+
+    hover(cx, row);
+    let before = cx.debug_bounds(row).expect("hovered row");
+    click(cx, star);
+    cx.run_until_parked();
+    redraw(cx);
+
+    let after = cx.debug_bounds(row).expect("favorited row");
+    assert!(
+        after.origin.y < before.origin.y,
+        "the favorited row moves up into the Favorites section"
+    );
+    app.read_with(cx, |this, _| {
+        let history = this.chat_snapshot().history();
+        assert_eq!(
+            history
+                .favorites()
+                .iter()
+                .map(|summary| summary.session_id.clone())
+                .collect::<Vec<_>>(),
+            vec![moving.clone()],
+            "the durable favorite lands in the favorites list"
+        );
+        assert!(
+            history
+                .timeline()
+                .iter()
+                .all(|summary| summary.session_id != moving),
+            "and leaves the timeline"
+        );
+    });
+}
+
+/// The favorite group is loaded in one unpaginated query, so it is capped.
+/// Going over the cap would drop rows out of both lists, so the toggle refuses
+/// instead — the notification is what tells the user why.
+#[gpui::test]
+fn favoriting_past_the_cap_is_refused(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    let candidate = cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, _| {
+                for index in 0..crate::session::MAX_FAVORITES {
+                    workspace.history.upsert(chat_summary(index as i64, true));
+                }
+                let candidate = chat_summary(-1, false);
+                let session_id = candidate.session_id.clone();
+                workspace.history.upsert(candidate);
+                session_id
+            })
+        })
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.toggle_favorite(ChatTarget::Session(candidate.clone()), window, cx)
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, cx| {
+        let history = &this.chat_workspace().read(cx).history;
+        assert_eq!(
+            history.favorites().len(),
+            crate::session::MAX_FAVORITES,
+            "the cap is not exceeded"
+        );
+        assert!(
+            history
+                .summary(&candidate)
+                .is_some_and(|summary| !summary.favorited),
+            "the refused row keeps its unfavorited state"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_row_that_slides_under_a_still_pointer_does_not_take_hover(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let mut lifecycle = stores.chat().expect("Chat lifecycle store");
+    for _ in 0..3 {
+        lifecycle
+            .create_session(SessionHeader::new(SessionDomain::Chat, None))
+            .expect("create Chat session");
+    }
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    cx.run_until_parked();
+    redraw(cx);
+
+    let ids = app.read_with(cx, |this, _| {
+        this.chat_snapshot()
+            .history()
+            .timeline()
+            .iter()
+            .map(|summary| summary.session_id.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(ids.len(), 3, "all three sessions are cataloged");
+    // Park the pointer on the last row, then favorite the middle one: the
+    // Favorites section it creates pushes the untouched rows down, so a row
+    // the pointer never visited ends up underneath it.
+    let parked_row = Box::leak(format!("history-row-{}", ids[2]).into_boxed_str());
+    hover(cx, parked_row);
+    let pointer = cx.debug_bounds(parked_row).expect("parked row").center();
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.toggle_favorite(ChatTarget::Session(ids[1].clone()), window, cx)
+            });
+        });
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    let slid_under = ids
+        .iter()
+        .map(|id| Box::leak(format!("history-row-{id}").into_boxed_str()) as &'static str)
+        .find(|selector| {
+            cx.debug_bounds(selector)
+                .is_some_and(|bounds| bounds.contains(&pointer))
+        })
+        .expect("a row moved under the still pointer");
+    let delete = Box::leak(
+        slid_under
+            .replace("history-row-", "history-actions-")
+            .into_boxed_str(),
+    );
+    click(cx, delete);
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
+        None,
+        "a row that slid under a still pointer must not be armed: the pointer \
+         never arrived there"
+    );
+}
+
+#[gpui::test]
+fn arming_a_delete_does_not_resize_its_trigger(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.chat_snapshot().conversations()[0].target()
+        })
+    });
+    redraw(cx);
+
+    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
+    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    hover(cx, row);
+    let idle = cx.debug_bounds(actions).expect("row actions");
+    click(cx, actions);
+
+    let armed = cx.debug_bounds(actions).expect("row actions");
+    assert_eq!(
+        idle.size, armed.size,
+        "a trigger that becomes a confirmation anchor must keep its box, or \
+         the row's controls shift the moment one is armed"
+    );
+}
+
+#[gpui::test]
+fn history_section_header_collapses_pending_rows(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.chat_snapshot().conversations()[0].target()
+        })
+    });
+    redraw(cx);
+    let header = "history-section-header-sidebar.group_today";
+    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    assert!(cx.debug_bounds(header).is_some());
+    assert!(cx.debug_bounds(actions).is_some());
+    click(cx, header);
+    redraw(cx);
+    assert!(
+        cx.debug_bounds(actions).is_none(),
+        "collapsing Today unmounts the pending row"
+    );
+    click(cx, header);
+    redraw(cx);
+    assert!(cx.debug_bounds(actions).is_some());
 }
 
 #[gpui::test]

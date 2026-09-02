@@ -4,11 +4,13 @@
 //! place its axis is mutated: [`theme`] wraps gpui-component's `ThemeRegistry`
 //! (bundled themes, light/dark slots, mode), [`fonts`] registers the bundled
 //! composer fonts and tracks the active one, and [`glass`] owns the macOS
-//! native glass appearance and its tint.
+//! native glass appearance and its tint.  [`contrast`] holds the floors this
+//! app enforces on colour pairs a theme cannot know about.
 //!
 //! Views read the resulting colors through `cx.theme()` and never reach into
 //! these modules' state directly.
 
+pub(crate) mod contrast;
 pub(crate) mod fonts;
 pub(crate) mod glass;
 pub(crate) mod theme;

@@ -86,6 +86,19 @@ mod tests {
         assert!(super::embedded("icons/wrap-text.svg").is_some());
     }
 
+    /// App-owned icons are addressed by path, so a rename or a missed embed
+    /// include shows up as a silently blank button rather than a build error.
+    #[test]
+    fn app_owned_icons_are_embedded() {
+        for path in [
+            "icons/square-pen.svg",
+            "icons/wrap-text.svg",
+            "icons/trash-2.svg",
+        ] {
+            assert!(super::embedded(path).is_some(), "missing embed: {path}");
+        }
+    }
+
     #[test]
     fn bundled_fonts_are_static_borrowed_bytes_in_every_profile() {
         for (path, _) in super::BUNDLED_FONTS {

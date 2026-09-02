@@ -12,19 +12,22 @@ use std::{collections::HashSet, rc::Rc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, InteractiveElement as _, IntoElement,
-    KeyDownEvent, MouseButton, ParentElement as _, Pixels, Role, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    AnyElement, App, ClickEvent, Context, ElementId, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, ParentElement as _, Pixels, Role, SharedString, StatefulInteractiveElement as _,
+    Styled, Window, div, linear_color_stop, linear_gradient, px,
 };
 use gpui_component::{
-    ActiveTheme, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme, Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
+    collapsible::Collapsible,
     h_flex,
     menu::DropdownMenu as _,
     spinner::Spinner,
     v_flex,
 };
 use rust_i18n::t;
+
+use crate::appearance::contrast;
 
 use crate::preferences;
 use crate::session::{
@@ -37,12 +40,29 @@ use super::ChatApp;
 use super::chat_workspace::{
     ChatConversationSnapshot, ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot,
 };
+use super::history_groups::{HistoryRow, history_sections};
 use super::workspace_host::WorkspaceCommand;
 use crate::runtime::CHAT_WORKSPACE_ID;
 
 /// Row height for both draft and catalog rows, matching the previous
 /// conversation row so the sidebar density is unchanged.
 const HISTORY_ROW_HEIGHT: Pixels = px(32.);
+/// Height of a section header band.  Smaller than a row so the header reads as
+/// a label rather than another entry.
+const HISTORY_SECTION_HEIGHT: Pixels = px(22.);
+/// Trailing action button box, its gap, and the cluster's inset from the row's
+/// trailing edge.  The title fade is derived from these, so the geometry is
+/// stated once.
+const HISTORY_ACTION_BUTTON: Pixels = px(24.);
+const HISTORY_ACTION_GAP: Pixels = px(2.);
+const HISTORY_ACTION_INSET: Pixels = px(4.);
+/// Distance in front of the cluster over which a long title fades out.
+const HISTORY_ACTION_FADE_RAMP: Pixels = px(40.);
+/// Hover group declared by a section header's toggle.  The chevron binds to it
+/// so it only appears while the pointer is over the label itself; because the
+/// group is pushed and popped around the toggle's children, every section
+/// resolves to its own toggle even though they share one name.
+const HISTORY_SECTION_HOVER_GROUP: &str = "history-section-toggle";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum HistoryLoadState {
@@ -55,7 +75,8 @@ pub(super) enum HistoryLoadState {
 /// UI-independent snapshot of the Chat catalog sidebar.
 #[derive(Clone)]
 pub(super) struct ChatHistorySidebar {
-    summaries: Vec<SessionSummary>,
+    favorites: Vec<SessionSummary>,
+    timeline: Vec<SessionSummary>,
     load_state: HistoryLoadState,
     next_cursor: Option<CatalogCursor>,
     load_more_in_flight: bool,
@@ -67,7 +88,8 @@ pub(super) struct ChatHistorySidebar {
 impl ChatHistorySidebar {
     pub(super) fn new() -> Self {
         Self {
-            summaries: Vec::new(),
+            favorites: Vec::new(),
+            timeline: Vec::new(),
             load_state: HistoryLoadState::Unloaded,
             next_cursor: None,
             load_more_in_flight: false,
@@ -75,11 +97,21 @@ impl ChatHistorySidebar {
         }
     }
 
-    pub(super) fn summaries(&self) -> &[SessionSummary] {
-        &self.summaries
+    pub(super) fn favorites(&self) -> &[SessionSummary] {
+        &self.favorites
     }
 
-    #[allow(dead_code)]
+    pub(super) fn timeline(&self) -> &[SessionSummary] {
+        &self.timeline
+    }
+
+    pub(super) fn contains_session(&self, session_id: &SessionId) -> bool {
+        self.favorites
+            .iter()
+            .chain(self.timeline.iter())
+            .any(|summary| &summary.session_id == session_id)
+    }
+
     pub(super) fn load_state(&self) -> &HistoryLoadState {
         &self.load_state
     }
@@ -93,7 +125,7 @@ impl ChatHistorySidebar {
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.summaries.is_empty()
+        self.favorites.is_empty() && self.timeline.is_empty()
     }
 
     fn next_generation(&mut self) -> u64 {
@@ -101,31 +133,46 @@ impl ChatHistorySidebar {
         self.generation
     }
 
-    /// Apply the initial catalog page.  Returns `true` if the snapshot changed.
-    pub(super) fn apply_initial(&mut self, generation: u64, page: CatalogPage) -> bool {
+    /// Apply the initial catalog pages.  Returns `true` if the snapshot changed.
+    pub(super) fn apply_initial(
+        &mut self,
+        generation: u64,
+        favorites: CatalogPage,
+        timeline: CatalogPage,
+    ) -> bool {
         if generation != self.generation {
             return false;
         }
-        self.summaries = dedup_summaries(page.sessions);
-        self.next_cursor = page.next_cursor;
+        self.favorites = dedup_summaries(favorites.sessions);
+        let favorite_ids: HashSet<SessionId> = self
+            .favorites
+            .iter()
+            .map(|summary| summary.session_id.clone())
+            .collect();
+        self.timeline = dedup_summaries(timeline.sessions)
+            .into_iter()
+            .filter(|summary| !favorite_ids.contains(&summary.session_id))
+            .collect();
+        self.next_cursor = timeline.next_cursor;
         self.load_state = HistoryLoadState::Ready;
         true
     }
 
     /// Apply a load-more page.  New rows are appended in catalog order without
-    /// duplicating existing rows.
+    /// duplicating existing rows or leaking favorites into the timeline.
     pub(super) fn apply_load_more(&mut self, generation: u64, page: CatalogPage) -> bool {
         if generation != self.generation {
             return false;
         }
         let existing: HashSet<SessionId> = self
-            .summaries
+            .favorites
             .iter()
+            .chain(self.timeline.iter())
             .map(|summary| summary.session_id.clone())
             .collect();
         for summary in dedup_summaries(page.sessions) {
-            if !existing.contains(&summary.session_id) {
-                self.summaries.push(summary);
+            if !existing.contains(&summary.session_id) && !summary.favorited {
+                self.timeline.push(summary);
             }
         }
         self.next_cursor = page.next_cursor;
@@ -141,36 +188,46 @@ impl ChatHistorySidebar {
     }
 
     /// Insert or refresh a single session summary.  Used after a durable begin
-    /// binds a new session so the row appears without a full reload.  The row
-    /// keeps catalog creation order: a brand-new session is the newest, so it
-    /// lands at the front; an existing row is updated in place.
+    /// binds a new session so the row appears without a full reload, and after
+    /// a favorite toggle.  The row keeps catalog creation order within its
+    /// destination vec.
     pub(super) fn upsert(&mut self, summary: SessionSummary) {
         let session_id = summary.session_id.clone();
-        if let Some(existing) = self
-            .summaries
-            .iter_mut()
-            .find(|row| row.session_id == session_id)
-        {
-            *existing = summary;
-            return;
-        }
-        // Keep newest-first by created_at, then session_id, matching the
-        // catalog's keyset ordering so an inserted row does not jump later.
-        let created_at = summary.created_at;
-        let uuid = summary.session_id.uuid();
-        let position = self
-            .summaries
-            .partition_point(|row| (row.created_at, row.session_id.uuid()) > (created_at, uuid));
-        self.summaries.insert(position, summary);
+        self.favorites.retain(|row| row.session_id != session_id);
+        self.timeline.retain(|row| row.session_id != session_id);
+        insert_sorted_summary(
+            if summary.favorited {
+                &mut self.favorites
+            } else {
+                &mut self.timeline
+            },
+            summary,
+        );
     }
 
     /// Remove a session from the snapshot.  Called after a permanent delete
     /// succeeds so the row disappears regardless of whether it was opened.
     pub(super) fn remove(&mut self, session_id: &SessionId) -> bool {
-        let before = self.summaries.len();
-        self.summaries.retain(|row| &row.session_id != session_id);
-        self.summaries.len() != before
+        let before = self.favorites.len() + self.timeline.len();
+        self.favorites.retain(|row| &row.session_id != session_id);
+        self.timeline.retain(|row| &row.session_id != session_id);
+        self.favorites.len() + self.timeline.len() != before
     }
+
+    pub(super) fn summary(&self, session_id: &SessionId) -> Option<&SessionSummary> {
+        self.favorites
+            .iter()
+            .chain(self.timeline.iter())
+            .find(|row| &row.session_id == session_id)
+    }
+}
+
+fn insert_sorted_summary(rows: &mut Vec<SessionSummary>, summary: SessionSummary) {
+    let created_at = summary.created_at;
+    let uuid = summary.session_id.uuid();
+    let position =
+        rows.partition_point(|row| (row.created_at, row.session_id.uuid()) > (created_at, uuid));
+    rows.insert(position, summary);
 }
 
 fn dedup_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
@@ -215,7 +272,11 @@ impl ChatWorkspace {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    catalog_store.list_sessions(SessionDomain::Chat, CatalogQuery::first_page())
+                    let favorites = catalog_store
+                        .list_sessions(SessionDomain::Chat, CatalogQuery::favorites())?;
+                    let timeline = catalog_store
+                        .list_sessions(SessionDomain::Chat, CatalogQuery::timeline_first_page())?;
+                    Ok((favorites, timeline))
                 })
                 .await;
             let _ = window_handle.update(cx, |_, window, cx| {
@@ -231,13 +292,25 @@ impl ChatWorkspace {
     fn apply_catalog_initial(
         &mut self,
         generation: u64,
-        result: Result<CatalogPage, CatalogError>,
+        result: Result<(CatalogPage, CatalogPage), CatalogError>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(page) => {
-                self.history.apply_initial(generation, page);
+            Ok((favorites, timeline)) => {
+                if favorites.next_cursor.is_some() {
+                    // Only reachable if the cap was raised or the files were
+                    // edited outside the app: the extra rows are in neither
+                    // list, so say where they went.
+                    crate::logging::warn(
+                        "chat.workspace",
+                        format_args!(
+                            "more than {} favorites on disk; the rest are not listed",
+                            crate::session::MAX_FAVORITES
+                        ),
+                    );
+                }
+                self.history.apply_initial(generation, favorites, timeline);
             }
             Err(error) => {
                 let message = error.to_string().into();
@@ -284,6 +357,7 @@ impl ChatWorkspace {
                         SessionDomain::Chat,
                         CatalogQuery {
                             cursor: Some(cursor),
+                            favorited: Some(false),
                             ..CatalogQuery::first_page()
                         },
                     )
@@ -329,24 +403,27 @@ impl ChatWorkspace {
             Err(_) => return,
         };
         let app = cx.entity();
+        let task_session_id = session_id.clone();
         let task = cx.spawn(async move |_this, cx| {
+            let refreshed = session_id.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move { catalog_store.get_session_summary(&session_id) })
                 .await;
             app.update(cx, |this, cx| {
-                this.apply_history_summary_refresh(result, cx);
+                this.apply_history_summary_refresh(refreshed, result, cx);
             });
         });
-        self._summary_refresh_task = Some(task);
+        self._summary_refresh_tasks.insert(task_session_id, task);
     }
 
     fn apply_history_summary_refresh(
         &mut self,
+        session_id: SessionId,
         result: Result<Option<SessionSummary>, CatalogError>,
         cx: &mut Context<Self>,
     ) {
-        self._summary_refresh_task = None;
+        self._summary_refresh_tasks.remove(&session_id);
         if let Ok(Some(summary)) = result {
             self.history.upsert(summary);
             self.notify_changed(cx);
@@ -366,12 +443,7 @@ impl ChatWorkspace {
         let Some(session_id) = prefs.last_active_chat_session.clone() else {
             return;
         };
-        if !self
-            .history
-            .summaries()
-            .iter()
-            .any(|summary| summary.session_id == session_id)
-        {
+        if !self.history.contains_session(&session_id) {
             // The session is gone or the catalog is empty; fall back to the
             // empty workspace rather than fabricating a draft.
             return;
@@ -454,6 +526,9 @@ impl ChatWorkspace {
         match result {
             Ok(()) => {
                 self.history.remove(&session_id);
+                // The rows below close the gap, so one of them lands under a
+                // pointer that never moved.
+                self.park_pointer(None, window);
             }
             Err(error) => {
                 crate::logging::error(
@@ -492,7 +567,7 @@ impl ChatApp {
             .filter(|conversation| {
                 is_pending_history_conversation(
                     conversation.session_id().as_ref(),
-                    snapshot.history().summaries(),
+                    snapshot.history(),
                 )
             })
             .collect();
@@ -505,22 +580,114 @@ impl ChatApp {
             children.push(self.render_history_loading_state(cx).into_any_element());
         }
 
-        // Host-owned rows sit above the catalog so a new chat stays reachable
-        // before its first durable turn, and a just-bound view does not vanish
-        // while the catalog summary is still in flight.
-        for conversation in &pending {
-            let target = conversation.target();
-            children.push(
-                self.render_host_row(snapshot, conversation, target, window, cx)
-                    .into_any_element(),
-            );
-        }
-
-        // Catalog rows.
+        let tints = contrast::sidebar_row_tints(cx);
+        let now_millis = chrono::Local::now().timestamp_millis();
+        let sections = history_sections(
+            now_millis,
+            pending,
+            snapshot.history().favorites(),
+            snapshot.history().timeline(),
+            |summary: &&SessionSummary| summary.created_at,
+        );
         let active_session_id = snapshot.active_session_id();
-        for summary in snapshot.history().summaries() {
+        for section in sections {
+            let kind = section.kind;
+            let open = snapshot.history_section_open(kind);
+            let header_label = t!(kind.i18n_key()).to_string();
+            let workspace = self.chat_workspace().downgrade();
+            let workspace_for_key = workspace.clone();
+            let toggle_id = format!("history-section-toggle-{}", kind.i18n_key());
+            let focus_handle = window
+                .use_keyed_state(SharedString::from(toggle_id.clone()), cx, |_, cx| {
+                    cx.focus_handle()
+                })
+                .read(cx)
+                .clone();
+            // Only the label and its chevron toggle the section, so the header
+            // band itself stays inert: no full-width highlight, no stray click
+            // target next to the rows.
+            let header = h_flex().w_full().h(HISTORY_SECTION_HEIGHT).px_1().child(
+                h_flex()
+                    .id(toggle_id)
+                    .debug_selector(move || format!("history-section-header-{}", kind.i18n_key()))
+                    .group(HISTORY_SECTION_HOVER_GROUP)
+                    // Every other interactive row in this sidebar is a tab stop
+                    // that Enter/Space activates; a collapse control that only
+                    // answers the mouse would be the one exception.
+                    .role(Role::Button)
+                    .aria_label(header_label.clone())
+                    .aria_expanded(open)
+                    .track_focus(&focus_handle.tab_stop(true))
+                    .focus_visible(|this| {
+                        this.border_1().border_color(cx.theme().ring.opacity(0.2))
+                    })
+                    .h_full()
+                    .items_center()
+                    .gap_0p5()
+                    .px_1()
+                    .rounded(cx.theme().radius)
+                    .cursor_default()
+                    .text_xs()
+                    .text_color(contrast::sidebar_muted_text(cx, 0.6))
+                    .hover(|this| this.bg(tints.hover))
+                    .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                        if crate::ui::consume_button_key(event, window, cx) {
+                            workspace_for_key
+                                .update(cx, |workspace, cx| {
+                                    workspace.toggle_history_section(kind, cx)
+                                })
+                                .ok();
+                        }
+                    })
+                    .on_click(move |_, _, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.toggle_history_section(kind, cx)
+                            })
+                            .ok();
+                    })
+                    .child(header_label)
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover(HISTORY_SECTION_HOVER_GROUP, |this| this.visible())
+                            .child(Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })),
+                    ),
+            );
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for row in section.rows {
+                match row {
+                    HistoryRow::Pending(conversation) => {
+                        let target = conversation.target();
+                        rows.push(
+                            self.render_host_row(snapshot, conversation, target, window, cx)
+                                .into_any_element(),
+                        );
+                    }
+                    HistoryRow::Catalog(summary) => {
+                        rows.push(
+                            self.render_catalog_row(
+                                snapshot,
+                                summary,
+                                active_session_id.as_ref(),
+                                window,
+                                cx,
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
+            }
             children.push(
-                self.render_catalog_row(snapshot, summary, active_session_id.as_ref(), window, cx)
+                Collapsible::new()
+                    .open(open)
+                    .w_full()
+                    .child(header)
+                    .content(v_flex().w_full().gap_1().children(rows))
                     .into_any_element(),
             );
         }
@@ -528,7 +695,9 @@ impl ChatApp {
         let ready = matches!(snapshot.history().load_state(), HistoryLoadState::Ready);
         let error_and_empty = matches!(snapshot.history().load_state(), HistoryLoadState::Error(_))
             && snapshot.history().is_empty();
-        let no_rows = pending.is_empty() && snapshot.history().is_empty();
+        let no_rows = snapshot.conversations().iter().all(|conversation| {
+            !is_pending_history_conversation(conversation.session_id().as_ref(), snapshot.history())
+        }) && snapshot.history().is_empty();
 
         if error_and_empty {
             children.push(self.render_history_error_state(cx).into_any_element());
@@ -538,6 +707,13 @@ impl ChatApp {
             children.push(self.render_load_more_row(cx).into_any_element());
         }
 
+        // While hover is parked no row binds a hover style, so nothing in the
+        // list asks for a repaint when the pointer starts moving again.  This
+        // listener exists only for those frames, and the frame it triggers
+        // releases it.
+        let pointer_parked = snapshot.parked_pointer() == Some(window.mouse_position());
+        let workspace = self.chat_workspace().downgrade();
+
         v_flex()
             .id("chats")
             .debug_selector(|| "sidebar-list-surface".to_string())
@@ -545,6 +721,13 @@ impl ChatApp {
             .min_h_0()
             .overflow_y_scroll()
             .gap_1()
+            .when(pointer_parked, |this| {
+                this.on_mouse_move(move |_, _, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| workspace.release_parked_pointer(cx))
+                        .ok();
+                })
+            })
             .children(children)
             .into_any_element()
     }
@@ -557,7 +740,7 @@ impl ChatApp {
             .items_center()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(Spinner::new().small())
             .child(t!("sidebar.loading_chats").to_string())
     }
@@ -568,7 +751,7 @@ impl ChatApp {
             .py_3()
             .gap_1()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(div().child(t!("sidebar.empty").to_string()))
             .child(div().text_xs().child(t!("sidebar.empty_hint").to_string()))
     }
@@ -580,7 +763,7 @@ impl ChatApp {
             .py_2()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(div().child(t!("sidebar.load_failed").to_string()))
             .child(
                 Button::new("history-retry")
@@ -609,7 +792,7 @@ impl ChatApp {
             .justify_center()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.7))
+            .text_color(contrast::sidebar_muted_text(cx, 0.7))
             .cursor_default()
             .on_click(move |_: &ClickEvent, _, cx| {
                 workspace
@@ -637,9 +820,6 @@ impl ChatApp {
         let is_generating = conversation.is_generating();
         let sidebar_target = ChatTarget::View(target);
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
-        let hovered = snapshot.hovered() == Some(&sidebar_target);
-        let (actions_visible, show_spinner) =
-            chat_history_trailing(hovered, is_confirming, is_generating);
         let app = cx.entity().downgrade();
 
         self.render_history_row(
@@ -647,9 +827,10 @@ impl ChatApp {
             ("conv", target),
             title,
             is_active,
-            show_spinner,
-            actions_visible,
+            is_generating,
             is_confirming,
+            false,
+            false,
             sidebar_target,
             {
                 let app = app.clone();
@@ -726,9 +907,6 @@ impl ChatApp {
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
 
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
-        let hovered = snapshot.hovered() == Some(&sidebar_target);
-        let (actions_visible, show_spinner) =
-            chat_history_trailing(hovered, is_confirming, is_generating);
         let app = cx.entity().downgrade();
 
         self.render_history_row(
@@ -736,9 +914,10 @@ impl ChatApp {
             format!("history-button-{session_id}"),
             title,
             is_active,
-            show_spinner,
-            actions_visible,
+            is_generating,
             is_confirming,
+            true,
+            summary.favorited,
             sidebar_target.clone(),
             {
                 let session_id = session_id.clone();
@@ -781,20 +960,25 @@ impl ChatApp {
         )
     }
 
-    /// Shared row renderer for draft and catalog rows.  The two `on_click` /
-    /// `on_key_down` callbacks are already in listener form (`Fn(&Event, &mut
-    /// Window, &mut App)`); everything else (annotations, actions button, focus
-    /// ring) is identical.
+    /// Shared row renderer for draft and catalog rows.  The row itself is the
+    /// activation control and declares the hover group its own trailing chrome
+    /// binds to, so revealing the actions costs no state and cannot go stale.
+    /// The title always spans the row; the actions float above its trailing
+    /// edge behind a fade, so the text dissolves under them instead of
+    /// reflowing when they appear.  The two `on_click` / `on_key_down`
+    /// callbacks are already in listener form (`Fn(&Event, &mut Window, &mut
+    /// App)`); everything else (annotations, actions, focus ring) is identical.
     #[allow(clippy::too_many_arguments)]
     fn render_history_row(
         &self,
         row_id: impl Into<ElementId>,
-        button_id: impl Into<ElementId>,
+        focus_key: impl Into<ElementId>,
         title: SharedString,
         is_active: bool,
-        show_spinner: bool,
-        actions_visible: bool,
+        is_generating: bool,
         is_confirming: bool,
+        can_favorite: bool,
+        favorited: bool,
         target: ChatTarget,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_key_down: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
@@ -802,113 +986,118 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let row_id: ElementId = row_id.into();
-        let button_id: ElementId = button_id.into();
         let focus_handle = window
-            .use_keyed_state(button_id.clone(), cx, |_, cx| cx.focus_handle())
+            .use_keyed_state(focus_key.into(), cx, |_, cx| cx.focus_handle())
             .read(cx)
             .clone();
         let focus_ring = cx.theme().ring.opacity(0.2);
-        let workspace = self.chat_workspace().downgrade();
-
-        let title_element = if show_spinner {
-            let generating_selector = chat_history_generating_selector(&target);
-            h_flex()
-                .min_w_0()
-                .flex_1()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .flex_1()
-                        .min_w_0()
-                        .child(title.clone()),
-                )
-                .child(
-                    div().debug_selector(move || generating_selector).child(
-                        Spinner::new()
-                            .xsmall()
-                            .color(cx.theme().sidebar_foreground.opacity(0.6)),
-                    ),
-                )
-                .into_any_element()
+        let row_selector = chat_history_row_selector(&target);
+        let reveal = RowReveal {
+            hover_group: format!("{row_selector}-hover").into(),
+            pinned: is_confirming,
+            parked: !self
+                .chat_snapshot()
+                .row_takes_hover(&target, window.mouse_position()),
+        };
+        let hover_group = reveal.hover_group.clone();
+        let tints = contrast::sidebar_row_tints(cx);
+        let selected = is_active || is_confirming;
+        // The fade has to match whatever tint the row is wearing when the
+        // actions show, or it reads as a patch instead of the row fading out.
+        let fade_tint = if selected {
+            tints.selected
         } else {
+            tints.hover
+        };
+        let (fade_width, fade_ramp_end) = history_actions_fade(can_favorite);
+
+        let mut title_element = h_flex().min_w_0().flex_1().items_center().gap_2().child(
             div()
                 .overflow_hidden()
                 .text_ellipsis()
-                .child(title.clone())
-                .into_any_element()
-        };
-        let target_for_hover = target.clone();
-        let target_for_actions = target;
+                .min_w_0()
+                .flex_1()
+                .child(title.clone()),
+        );
+        if is_generating {
+            let generating_selector = chat_history_generating_selector(&target);
+            // The spinner shares the trailing edge with the actions, so it
+            // steps aside for them rather than sitting underneath.
+            title_element = title_element.child(
+                div()
+                    .flex_none()
+                    .debug_selector(move || generating_selector)
+                    .hide_on_row_hover(&reveal)
+                    .child(
+                        Spinner::new()
+                            .xsmall()
+                            .color(contrast::sidebar_muted_text(cx, 0.6)),
+                    ),
+            );
+        }
 
         div()
             .id(row_id)
+            .debug_selector(move || row_selector)
+            .group(hover_group.clone())
+            .role(Role::Button)
+            .aria_label(title.clone())
+            .aria_selected(is_active)
+            .track_focus(&focus_handle.tab_stop(true))
+            .focus_visible(|this| this.border_1().border_color(focus_ring))
             .relative()
             .w_full()
             .h(HISTORY_ROW_HEIGHT)
-            .on_hover(move |hovered: &bool, _, cx| {
-                let entered = *hovered;
-                if entered {
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.set_hovered(Some(target_for_hover.clone()), cx)
-                        })
-                        .ok();
-                } else {
-                    let target = target_for_hover.clone();
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            if workspace.snapshot().hovered() == Some(&target) {
-                                workspace.set_hovered(None, cx);
-                            }
-                        })
-                        .ok();
-                }
+            .flex()
+            .items_center()
+            .px_2()
+            .rounded(cx.theme().radius)
+            .text_sm()
+            .text_color(contrast::sidebar_text(cx))
+            .cursor_default()
+            .whitespace_nowrap()
+            .when(selected, |this| {
+                this.bg(tints.selected).text_color(tints.selected_text)
             })
-            .child(
-                div()
-                    .id(button_id)
-                    .role(Role::Button)
-                    .aria_label(title.clone())
-                    .aria_selected(is_active)
-                    .track_focus(&focus_handle.tab_stop(true))
-                    .focus_visible(|this| this.border_1().border_color(focus_ring))
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .rounded(cx.theme().radius)
-                    .text_sm()
-                    .text_color(cx.theme().sidebar_foreground)
-                    .cursor_default()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .when(is_active || actions_visible, |this| {
-                        this.bg(cx.theme().sidebar_accent)
-                            .text_color(cx.theme().sidebar_accent_foreground)
-                    })
-                    .on_key_down(on_key_down)
-                    .on_click(on_click)
-                    .child(title_element)
-                    .when(!actions_visible, |this| {
-                        this.child(div().absolute().right_2().top(px(6.)).size_5().occlude())
-                    }),
-            )
+            .when(!selected && !reveal.parked, |this| {
+                this.hover(|this| this.bg(tints.hover).text_color(tints.hover_text))
+            })
+            .on_key_down(on_key_down)
+            .on_click(on_click)
+            .child(title_element)
+            // Painted between the title and the actions, and tinted with the
+            // row's own hover background, so a long title fades out under the
+            // buttons instead of being cut by a hard edge.  It carries the
+            // row's radius so it cannot square off the corners, and no listener
+            // or `occlude()`, so it can never block the row's hitbox.
             .child(
                 div()
                     .absolute()
-                    .right_2()
-                    .top(px(6.))
-                    .size_5()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(fade_width)
+                    .rounded(cx.theme().radius)
+                    .bg(linear_gradient(
+                        90.,
+                        linear_color_stop(fade_tint.opacity(0.), 0.),
+                        linear_color_stop(fade_tint, fade_ramp_end),
+                    ))
+                    .reveal_on_row_hover(&reveal),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(HISTORY_ACTION_INSET)
+                    .items_center()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(self.render_chat_sidebar_actions(
-                        target_for_actions,
-                        actions_visible,
-                        is_confirming,
+                        target,
+                        &reveal,
+                        can_favorite,
+                        favorited,
                         cx,
                     )),
             )
@@ -918,10 +1107,12 @@ impl ChatApp {
     fn render_chat_sidebar_actions(
         &self,
         target: ChatTarget,
-        visible: bool,
-        confirming: bool,
-        _cx: &mut Context<Self>,
+        reveal: &RowReveal,
+        can_favorite: bool,
+        favorited: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let confirming = reveal.pinned;
         let workspace = self.chat_workspace().downgrade();
         let ids = match &target {
             ChatTarget::View(entity) => SidebarActionIds {
@@ -939,65 +1130,206 @@ impl ChatApp {
                 confirm_title: t!("sidebar.delete_chat_title").to_string(),
             },
         };
-        render_sidebar_actions(
-            SidebarActionSpec {
-                target,
-                visible,
-                confirming,
-                ids,
-                handle: self.chat_snapshot().delete_confirmation(),
-            },
-            move |target, window, cx| {
-                workspace
+        let warning = cx.theme().warning;
+        let trigger_debug_selector = ids.trigger_debug_selector.clone();
+        let favorite_selector = chat_history_favorite_selector(&target);
+        // The bundled `IconName::Delete` is the keyboard delete-key glyph,
+        // which reads as "backspace" next to a title; a bin says "destroy this
+        // conversation" and the danger colour says it once more.
+        let delete = history_action_button(ids.trigger_id)
+            .icon(
+                Icon::default()
+                    .path("icons/trash-2.svg")
+                    .text_color(cx.theme().danger),
+            )
+            .tooltip(ids.delete_label.clone())
+            .debug_selector(move || trigger_debug_selector.clone())
+            .reveal_on_row_hover(reveal);
+        let delete = if confirming {
+            let target_for_open = target.clone();
+            let target_for_confirm = target.clone();
+            let on_clear_workspace = workspace.clone();
+            let on_confirm_workspace = workspace.clone();
+            InlineDeleteConfirmation::new(
+                ids.confirm_id,
+                delete,
+                ids.confirm_title,
+                t!("sidebar.delete_chat_cancel").to_string(),
+                t!("sidebar.delete_chat_confirm").to_string(),
+                self.chat_snapshot().delete_confirmation(),
+            )
+            .on_open_change(move |open: &bool, window, cx| {
+                if !*open {
+                    on_clear_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.clear_delete_confirmation(&target_for_open, window, cx)
+                        })
+                        .ok();
+                }
+            })
+            .on_confirm(move |window, cx| {
+                on_confirm_workspace
                     .update(cx, |workspace, cx| {
-                        workspace.clear_delete_confirmation(&target, window, cx)
+                        workspace.confirm_delete_target(target_for_confirm.clone(), window, cx)
                     })
                     .ok();
-            },
-            {
-                let workspace = self.chat_workspace().downgrade();
-                move |target, window, cx| {
-                    workspace
+            })
+            .into_any_element()
+        } else {
+            let target_for_begin = target.clone();
+            let on_begin = workspace.clone();
+            delete
+                .on_click(move |_, window, cx| {
+                    on_begin
                         .update(cx, |workspace, cx| {
-                            workspace.confirm_delete_target(target, window, cx)
+                            workspace.begin_delete_confirmation(
+                                target_for_begin.clone(),
+                                window,
+                                cx,
+                            )
                         })
                         .ok();
-                }
-            },
-            {
-                let workspace = self.chat_workspace().downgrade();
-                move |target, window, cx| {
-                    workspace
+                })
+                .into_any_element()
+        };
+
+        let star = can_favorite.then(|| {
+            let target_for_star = target;
+            let on_star = workspace;
+            // Amber in both states so the control is legible at a glance;
+            // fill, not colour, is what carries the favorited state.
+            let icon = Icon::new(if favorited {
+                IconName::StarFill
+            } else {
+                IconName::Star
+            })
+            .text_color(warning);
+            history_action_button(favorite_selector.clone())
+                .debug_selector(move || favorite_selector)
+                .icon(icon)
+                .tooltip(
+                    if favorited {
+                        t!("sidebar.unfavorite_chat")
+                    } else {
+                        t!("sidebar.favorite_chat")
+                    }
+                    .to_string(),
+                )
+                .reveal_on_row_hover(reveal)
+                .on_click(move |_, window, cx| {
+                    on_star
                         .update(cx, |workspace, cx| {
-                            workspace.begin_delete_confirmation(target, window, cx)
+                            workspace.toggle_favorite(target_for_star.clone(), window, cx)
                         })
                         .ok();
-                }
-            },
-        )
+                })
+        });
+
+        h_flex()
+            .gap(HISTORY_ACTION_GAP)
+            .items_center()
+            .child(delete)
+            .children(star)
+            .into_any_element()
     }
 }
 
-/// History-row trailing occupancy. Selection is not an input: selected accent
-/// is applied separately on the title button.
-fn chat_history_trailing(hovered: bool, confirming: bool, is_generating: bool) -> (bool, bool) {
-    let actions_visible = hovered || confirming;
-    (actions_visible, is_generating && !actions_visible)
+/// Trailing action button.  The box is pinned instead of left to `Button`'s
+/// icon-only sizing: a delete trigger that opens a confirmation gains a
+/// prepaint hook, which appends a canvas child, and `Button` then treats it as
+/// a labelled button and swaps its square box for label padding — the row's
+/// controls would resize the moment one of them is armed.
+fn history_action_button(id: impl Into<ElementId>) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .size(HISTORY_ACTION_BUTTON)
+        .p_0()
+}
+
+/// How a row's trailing chrome decides whether to show itself.
+struct RowReveal {
+    hover_group: SharedString,
+    /// A confirmation is open: stay visible even with the pointer away, or the
+    /// popover loses the trigger it is anchored to.
+    pinned: bool,
+    /// The list reordered under a stationary pointer and this row is not the
+    /// one the user acted on: it slid under the cursor and was never pointed
+    /// at, so it stays quiet until the pointer moves.
+    parked: bool,
+}
+
+trait RevealOnRowHover: Styled + InteractiveElement + Sized {
+    fn reveal_on_row_hover(self, reveal: &RowReveal) -> Self {
+        if reveal.pinned {
+            self
+        } else if reveal.parked {
+            self.invisible()
+        } else {
+            self.invisible()
+                .group_hover(reveal.hover_group.clone(), |this| this.visible())
+        }
+    }
+
+    /// The inverse: chrome that gives its place up to the trailing actions
+    /// whenever those are showing.
+    fn hide_on_row_hover(self, reveal: &RowReveal) -> Self {
+        if reveal.pinned {
+            self.invisible()
+        } else if reveal.parked {
+            self
+        } else {
+            self.group_hover(reveal.hover_group.clone(), |this| this.invisible())
+        }
+    }
+}
+
+impl<T: Styled + InteractiveElement + Sized> RevealOnRowHover for T {}
+
+/// Width the trailing cluster covers, including its inset from the row edge.
+fn history_actions_width(can_favorite: bool) -> Pixels {
+    let cluster = HISTORY_ACTION_INSET + HISTORY_ACTION_BUTTON;
+    if can_favorite {
+        cluster + HISTORY_ACTION_GAP + HISTORY_ACTION_BUTTON
+    } else {
+        cluster
+    }
+}
+
+/// Fade box in front of the trailing cluster: fully transparent where the
+/// title still has to be readable, opaque everywhere the buttons sit.
+fn history_actions_fade(can_favorite: bool) -> (Pixels, f32) {
+    let width = HISTORY_ACTION_FADE_RAMP + history_actions_width(can_favorite);
+    (width, HISTORY_ACTION_FADE_RAMP.as_f32() / width.as_f32())
 }
 
 /// Unbound drafts, and bound views that are not yet in the catalog snapshot.
 /// Catalog rows are only real `SessionSummary` records.
 pub(super) fn is_pending_history_conversation(
     session_id: Option<&SessionId>,
-    summaries: &[SessionSummary],
+    history: &ChatHistorySidebar,
 ) -> bool {
-    session_id.is_none_or(|id| summaries.iter().all(|summary| &summary.session_id != id))
+    session_id.is_none_or(|id| !history.contains_session(id))
 }
 
 fn chat_history_generating_selector(target: &ChatTarget) -> String {
     match target {
         ChatTarget::View(entity) => format!("conversation-generating-{}", entity.as_u64()),
         ChatTarget::Session(session) => format!("history-generating-{session}"),
+    }
+}
+
+fn chat_history_row_selector(target: &ChatTarget) -> String {
+    match target {
+        ChatTarget::View(entity) => format!("conversation-row-{}", entity.as_u64()),
+        ChatTarget::Session(session) => format!("history-row-{session}"),
+    }
+}
+
+fn chat_history_favorite_selector(target: &ChatTarget) -> String {
+    match target {
+        ChatTarget::View(entity) => format!("conversation-favorite-{}", entity.as_u64()),
+        ChatTarget::Session(session) => format!("history-favorite-{session}"),
     }
 }
 
@@ -1084,28 +1416,91 @@ where
 }
 
 #[cfg(test)]
-mod trailing_slot {
-    use super::chat_history_trailing;
+mod trailing_geometry {
+    use super::{HISTORY_ACTION_BUTTON, history_actions_fade, history_actions_width};
+    use gpui::px;
 
     #[test]
-    fn selection_does_not_show_actions() {
-        let (actions, spinner) = chat_history_trailing(false, false, true);
-        assert!(!actions);
-        assert!(spinner);
+    fn a_favoritable_row_reserves_both_buttons() {
+        let with_star = history_actions_width(true);
+        let without = history_actions_width(false);
+        assert_eq!(with_star - without, HISTORY_ACTION_BUTTON + px(2.));
     }
 
     #[test]
-    fn hover_or_confirm_hides_the_generating_spinner() {
-        assert_eq!(chat_history_trailing(true, false, true), (true, false));
-        assert_eq!(chat_history_trailing(false, true, true), (true, false));
-        assert_eq!(chat_history_trailing(true, true, true), (true, false));
+    fn the_fade_is_opaque_before_the_buttons_begin() {
+        for can_favorite in [false, true] {
+            let (width, ramp_end) = history_actions_fade(can_favorite);
+            let opaque_from = width * ramp_end;
+            assert!(
+                width - opaque_from >= history_actions_width(can_favorite),
+                "the gradient must reach full opacity before the cluster starts"
+            );
+            assert!(ramp_end > 0. && ramp_end < 1.);
+        }
+    }
+}
+
+#[cfg(test)]
+mod favorite_routing {
+    use super::ChatHistorySidebar;
+    use crate::session::{SessionDomain, SessionId, SessionSummary};
+    use std::path::PathBuf;
+
+    fn summary(created_at: i64, favorited: bool) -> SessionSummary {
+        SessionSummary {
+            session_id: SessionId::new(SessionDomain::Chat),
+            domain: SessionDomain::Chat,
+            project: None,
+            title: Some(format!("session {created_at}")),
+            preview: None,
+            model: None,
+            total_tokens: 0,
+            created_at,
+            updated_at: created_at,
+            favorited,
+            jsonl_path: PathBuf::from("sessions/row.jsonl"),
+        }
     }
 
+    fn ids(rows: &[SessionSummary]) -> Vec<SessionId> {
+        rows.iter().map(|row| row.session_id.clone()).collect()
+    }
+
+    /// A session lives in exactly one of the two lists, and unstarring returns
+    /// it to its place in the timeline rather than to the end of it.
     #[test]
-    fn idle_row_shows_neither() {
-        assert_eq!(chat_history_trailing(false, false, false), (false, false));
-        assert_eq!(chat_history_trailing(true, false, false), (true, false));
-        assert_eq!(chat_history_trailing(false, true, false), (true, false));
+    fn starring_moves_a_row_between_the_lists_and_keeps_its_time_order() {
+        let mut history = ChatHistorySidebar::new();
+        let (old, middle, recent) = (summary(1, false), summary(2, false), summary(3, false));
+        let middle_id = middle.session_id.clone();
+        for row in [old.clone(), middle.clone(), recent.clone()] {
+            history.upsert(row);
+        }
+        assert_eq!(
+            ids(history.timeline()),
+            ids(&[recent.clone(), middle.clone(), old.clone()]),
+            "the timeline is newest first"
+        );
+
+        let mut starred = middle.clone();
+        starred.favorited = true;
+        history.upsert(starred.clone());
+        assert_eq!(ids(history.favorites()), vec![middle_id.clone()]);
+        assert_eq!(
+            ids(history.timeline()),
+            ids(&[recent.clone(), old.clone()]),
+            "a starred session leaves its time bucket"
+        );
+        assert!(history.contains_session(&middle_id));
+
+        history.upsert(middle);
+        assert!(history.favorites().is_empty());
+        assert_eq!(
+            ids(history.timeline()),
+            ids(&[recent, starred, old]),
+            "unstarring returns the row to its created_at position"
+        );
     }
 }
 
@@ -1127,6 +1522,7 @@ mod pending_history_rows {
             total_tokens: 0,
             created_at: 1,
             updated_at: 1,
+            favorited: false,
             jsonl_path: PathBuf::from("sessions/cataloged.jsonl"),
         }
     }
@@ -1135,12 +1531,10 @@ mod pending_history_rows {
     fn unbound_and_uncataloged_rows_stay_on_the_host_list() {
         let cataloged = SessionId::new(SessionDomain::Chat);
         let bound = SessionId::new(SessionDomain::Chat);
-        let summaries = vec![summary(cataloged.clone())];
-        assert!(is_pending_history_conversation(None, &summaries));
-        assert!(is_pending_history_conversation(Some(&bound), &summaries));
-        assert!(!is_pending_history_conversation(
-            Some(&cataloged),
-            &summaries
-        ));
+        let mut history = super::ChatHistorySidebar::new();
+        history.upsert(summary(cataloged.clone()));
+        assert!(is_pending_history_conversation(None, &history));
+        assert!(is_pending_history_conversation(Some(&bound), &history));
+        assert!(!is_pending_history_conversation(Some(&cataloged), &history));
     }
 }

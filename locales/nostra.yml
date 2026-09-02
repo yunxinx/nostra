@@ -58,6 +58,36 @@ sidebar:
   generating:
     en: Generating…
     zh-CN: 生成中…
+  group_favorites:
+    en: Favorites
+    zh-CN: 收藏
+  group_today:
+    en: Today
+    zh-CN: 今天
+  group_yesterday:
+    en: Yesterday
+    zh-CN: 昨天
+  group_this_week:
+    en: This week
+    zh-CN: 本周
+  group_this_month:
+    en: This month
+    zh-CN: 本月
+  group_earlier:
+    en: Earlier
+    zh-CN: 更早
+  favorite_chat:
+    en: Favorite
+    zh-CN: 收藏
+  unfavorite_chat:
+    en: Unfavorite
+    zh-CN: 取消收藏
+  favorite_failed:
+    en: Could not update favorite
+    zh-CN: 无法更新收藏
+  favorite_limit:
+    en: "Favorites are limited to %{limit}. Unfavorite one to add another."
+    zh-CN: "收藏最多 %{limit} 个，取消一个后再添加。"
 account:
   settings:
     en: Settings…

@@ -10,9 +10,9 @@ use std::{
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Axis, Background, Entity, HighlightStyle, Hsla,
-    InteractiveElement as _, IntoElement as _, ParentElement as _, Rgba, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Task, Window, div, px,
+    AnyElement, App, AppContext as _, Axis, Entity, HighlightStyle, Hsla, InteractiveElement as _,
+    IntoElement as _, ParentElement as _, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, Rope, Sizable as _,
@@ -79,7 +79,6 @@ impl MarkdownPresentation {
 }
 
 const NODE_NAME: &str = "nostra-fenced-code";
-const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
 
 /// Code blocks at or below this many bytes are highlighted synchronously on
 /// the render path: no perceptible delay and no flash from a placeholder. Larger

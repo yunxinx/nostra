@@ -144,6 +144,14 @@ const SESSIONS_COLUMNS: &[ColumnSchema] = &[
         primary_key_position: 0,
     },
     ColumnSchema {
+        name: "favorited",
+        declaration: "favorited INTEGER NOT NULL DEFAULT 0",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: Some("0"),
+        primary_key_position: 0,
+    },
+    ColumnSchema {
         name: "jsonl_path",
         declaration: "jsonl_path TEXT NOT NULL",
         data_type: "TEXT",

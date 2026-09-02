@@ -960,6 +960,7 @@ impl ChatReferenceComposer {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let tints = crate::appearance::contrast::popover_row_tints(cx);
         let title: SharedString = group
             .session_title
             .as_deref()
@@ -996,10 +997,10 @@ impl ChatReferenceComposer {
             .py_1p5()
             .rounded(theme.radius)
             .cursor_default()
-            .when(!selected, |this| {
-                this.hover(|this| this.bg(theme.accent.opacity(0.7)))
+            .when(!selected, |this| this.hover(|this| this.bg(tints.hover)))
+            .when(selected, |this| {
+                this.bg(tints.selected).text_color(tints.selected_text)
             })
-            .when(selected, |this| this.bg(theme.accent))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.complete_session(&confirm_group, window, cx);
             }))
@@ -1074,6 +1075,7 @@ impl ChatReferenceComposer {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
+        let tints = crate::appearance::contrast::popover_row_tints(cx);
         let role_tag = match row.role {
             Role::User => Tag::primary(),
             _ => Tag::secondary(),
@@ -1096,10 +1098,10 @@ impl ChatReferenceComposer {
             .px_2()
             .py_1p5()
             .rounded(theme.radius)
-            .when(!selected, |this| {
-                this.hover(|this| this.bg(theme.accent.opacity(0.7)))
+            .when(!selected, |this| this.hover(|this| this.bg(tints.hover)))
+            .when(selected, |this| {
+                this.bg(tints.selected).text_color(tints.selected_text)
             })
-            .when(selected, |this| this.bg(theme.accent))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.completion.cursor = visible_index;
                 if let Some(row) = this.completion.search.results.get(result_index).cloned() {

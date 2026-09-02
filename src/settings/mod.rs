@@ -27,7 +27,7 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::appearance::glass;
+use crate::appearance::{contrast, glass};
 use crate::preferences::{self, PreferenceHandle, WindowGeometry};
 use crate::shell::window;
 use crate::ui::consume_button_key;
@@ -313,6 +313,7 @@ impl SettingsWindow {
     }
 
     fn render_nav(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tints = contrast::sidebar_row_tints(cx);
         let items = Page::ALL.map(|page| {
             let is_active = page == self.active;
             let title = page.title();
@@ -336,15 +337,13 @@ impl SettingsWindow {
                 .items_center()
                 .rounded(cx.theme().radius)
                 .text_sm()
-                .text_color(cx.theme().sidebar_foreground)
+                .text_color(contrast::sidebar_text(cx))
                 .cursor_default()
                 .when(is_active, |this| {
-                    this.bg(cx.theme().sidebar_accent)
-                        .text_color(cx.theme().sidebar_accent_foreground)
+                    this.bg(tints.selected).text_color(tints.selected_text)
                 })
-                .hover(|this| {
-                    this.bg(cx.theme().sidebar_accent)
-                        .text_color(cx.theme().sidebar_accent_foreground)
+                .when(!is_active, |this| {
+                    this.hover(|this| this.bg(tints.hover).text_color(tints.hover_text))
                 })
                 .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                     if consume_button_key(event, window, cx) {
@@ -357,7 +356,7 @@ impl SettingsWindow {
                 .child(
                     Icon::new(page.icon())
                         .size_4()
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.8)),
+                        .text_color(contrast::sidebar_muted_text(cx, 0.8)),
                 )
                 .child(title)
         });
@@ -367,12 +366,12 @@ impl SettingsWindow {
             .h_full()
             .flex_shrink_0()
             .bg(glass::background(
-                cx.theme().sidebar,
+                contrast::sidebar_surface(cx),
                 self.preference_snapshot.glass_effect,
                 self.preference_snapshot.glass_tint_opacity,
                 cx,
             ))
-            .text_color(cx.theme().sidebar_foreground)
+            .text_color(contrast::sidebar_text(cx))
             .border_r_1()
             .border_color(cx.theme().sidebar_border)
             // Immersive: the rail's background extends behind the traffic

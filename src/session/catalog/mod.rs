@@ -34,8 +34,18 @@ pub use types::{
 };
 pub(crate) use types::{MessageNodeRow, ProjectionIntent};
 
-pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 7;
+pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 8;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 30;
+/// Product cap on favorites.  The favorite group is not paginated — it is a
+/// pinned shortlist, and one query has to return all of it — so the cap is
+/// what keeps that query bounded.  Callers must refuse to add beyond it rather
+/// than letting the extra rows fall out of both lists.
+pub const MAX_FAVORITES: usize = 500;
+
+const SESSION_SUMMARY_COLUMNS: &str =
+    "session_id, domain, project_id, canonical_path, display_name,
+                    title, preview, model_profile_id, model_id, total_tokens,
+                    created_at, updated_at, favorited, jsonl_path";
 const REPAIR_REQUIRED_KEY: &str = "repair_required";
 const PROJECTION_INTENT_PREFIX: &str = "projection_intent:";
 
@@ -289,12 +299,10 @@ impl Catalog {
     }
 
     pub(crate) fn source_rows(&self) -> Result<Vec<SessionSummary>, CatalogError> {
-        let mut statement = self.connection.prepare(
-            "SELECT session_id, domain, project_id, canonical_path, display_name,
-                    title, preview, model_profile_id, model_id, total_tokens,
-                    created_at, updated_at, jsonl_path
-             FROM sessions WHERE domain = ?1 ORDER BY session_id",
-        )?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS}
+             FROM sessions WHERE domain = ?1 ORDER BY session_id"
+        ))?;
         let rows = statement.query_map(params![self.domain.prefix()], summary_from_row)?;
         rows.map(|row| row.map_err(CatalogError::from)).collect()
     }
@@ -424,16 +432,18 @@ impl Catalog {
     pub(crate) fn list(&self, query: &CatalogQuery) -> Result<CatalogPage, CatalogError> {
         let limit = query.limit.max(1);
         let fetch_limit = limit.saturating_add(1).min(i64::MAX as usize);
-        let mut sql = String::from(
-            "SELECT session_id, domain, project_id, canonical_path, display_name,
-                    title, preview, model_profile_id, model_id, total_tokens,
-                    created_at, updated_at, jsonl_path
-             FROM sessions WHERE domain = ?",
+        let mut sql = format!(
+            "SELECT {SESSION_SUMMARY_COLUMNS}
+             FROM sessions WHERE domain = ?"
         );
         let mut values: Vec<Box<dyn ToSql>> = vec![Box::new(self.domain.prefix().to_string())];
         if let Some(project_id) = &query.project_id {
             sql.push_str(" AND project_id = ?");
             values.push(Box::new(project_id.clone()));
+        }
+        if let Some(favorited) = query.favorited {
+            sql.push_str(" AND favorited = ?");
+            values.push(Box::new(i64::from(favorited)));
         }
         if let Some(cursor) = &query.cursor {
             sql.push_str(" AND (created_at < ? OR (created_at = ? AND session_id < ?))");
@@ -477,10 +487,10 @@ impl Catalog {
     ) -> Result<Option<SessionSummary>, CatalogError> {
         self.connection
             .query_row(
-                "SELECT session_id, domain, project_id, canonical_path, display_name,
-                        title, preview, model_profile_id, model_id, total_tokens,
-                        created_at, updated_at, jsonl_path
-                 FROM sessions WHERE session_id = ?1 AND domain = ?2",
+                &format!(
+                    "SELECT {SESSION_SUMMARY_COLUMNS}
+                 FROM sessions WHERE session_id = ?1 AND domain = ?2"
+                ),
                 params![session_id.to_string(), self.domain.prefix()],
                 summary_from_row,
             )

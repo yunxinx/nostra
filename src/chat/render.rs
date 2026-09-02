@@ -1,5 +1,7 @@
 //! Rendering and scroll behavior for the conversation transcript.
 
+use crate::appearance::contrast;
+
 use super::*;
 
 impl Render for ChatView {
@@ -465,6 +467,10 @@ fn render_message(
 
     let waiting = !is_user && in_flight && msg.error.is_none() && parts.is_empty();
     let inner: AnyElement = if is_user {
+        // A user turn is a borderless block on the transcript: it has to hold
+        // its own against the pane, and its text against it.
+        let bubble = contrast::pane_block(secondary, cx);
+        let bubble_text = contrast::text_on(secondary_foreground, bubble, cx);
         // Right-aligned bubble for user turns.
         h_flex()
             .w_full()
@@ -478,8 +484,8 @@ fn render_message(
                     .min_w_0()
                     .max_w(px(560.))
                     .rounded(radius_lg)
-                    .bg(secondary)
-                    .text_color(secondary_foreground)
+                    .bg(bubble)
+                    .text_color(bubble_text)
                     // Kept tight on purpose: the body inherits the window's
                     // 16px base size, so its line box is already ~24px tall and
                     // generous padding on top of that makes a one-word turn

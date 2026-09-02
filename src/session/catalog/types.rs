@@ -73,6 +73,9 @@ pub struct CatalogQuery {
     pub project_id: Option<String>,
     pub cursor: Option<CatalogCursor>,
     pub limit: usize,
+    /// `None` returns every session. `Some(true)` is the favorite group;
+    /// `Some(false)` is the time-ordered timeline that excludes favorites.
+    pub favorited: Option<bool>,
 }
 
 impl CatalogQuery {
@@ -82,6 +85,24 @@ impl CatalogQuery {
             project_id: None,
             cursor: None,
             limit: DEFAULT_PAGE_SIZE,
+            favorited: None,
+        }
+    }
+
+    #[must_use]
+    pub fn timeline_first_page() -> Self {
+        Self {
+            favorited: Some(false),
+            ..Self::first_page()
+        }
+    }
+
+    #[must_use]
+    pub fn favorites() -> Self {
+        Self {
+            favorited: Some(true),
+            limit: super::MAX_FAVORITES,
+            ..Self::first_page()
         }
     }
 
@@ -107,6 +128,7 @@ pub struct SessionSummary {
     pub total_tokens: u64,
     pub created_at: i64,
     pub updated_at: i64,
+    pub favorited: bool,
     /// Local implementation detail used to locate the append-only source.
     /// Product callers restore through a typed store capability rather than
     /// opening this path themselves.

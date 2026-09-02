@@ -18,6 +18,8 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
+use crate::appearance::contrast;
+
 use super::{
     ChatApp,
     history_sidebar::{SidebarActionIds, SidebarActionSpec, render_sidebar_actions},
@@ -651,7 +653,7 @@ impl ChatApp {
     }
 
     fn render_agent_projects_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let muted = cx.theme().sidebar_foreground.opacity(0.6);
+        let muted = contrast::sidebar_muted_text(cx, 0.6);
         let app = cx.entity().downgrade();
         h_flex()
             .id("agent-projects-header")
@@ -817,6 +819,7 @@ impl ChatApp {
         let workspace = self.project_workspace().downgrade();
         let workspace_for_key = workspace.clone();
         let app = cx.entity().downgrade();
+        let tints = contrast::sidebar_row_tints(cx);
 
         v_flex()
             .w_full()
@@ -830,10 +833,11 @@ impl ChatApp {
                     .px_1()
                     .rounded_md()
                     .when(is_open_project, |this| {
-                        this.bg(cx.theme().sidebar_accent.opacity(0.35))
-                            .text_color(cx.theme().sidebar_accent_foreground)
+                        this.bg(tints.selected).text_color(tints.selected_text)
                     })
-                    .hover(|this| this.bg(cx.theme().sidebar_accent.opacity(0.6)))
+                    .when(!is_open_project, |this| {
+                        this.hover(|this| this.bg(tints.hover).text_color(tints.hover_text))
+                    })
                     .child(
                         div()
                             .id(format!("agent-project-name-{project_id}"))
@@ -871,7 +875,7 @@ impl ChatApp {
                             .child(
                                 Icon::new(chevron)
                                     .size_3p5()
-                                    .text_color(cx.theme().sidebar_foreground.opacity(0.6)),
+                                    .text_color(contrast::sidebar_muted_text(cx, 0.6)),
                             )
                             .child(
                                 div()
@@ -1114,6 +1118,7 @@ impl ChatApp {
         let is_confirming = target
             .as_ref()
             .is_some_and(|target| self.project_snapshot().confirming() == Some(target));
+        let tints = contrast::sidebar_row_tints(cx);
 
         div()
             .id(row_id)
@@ -1132,10 +1137,11 @@ impl ChatApp {
             .rounded_md()
             .cursor_default()
             .when(is_selected, |this| {
-                this.bg(cx.theme().sidebar_accent)
-                    .text_color(cx.theme().sidebar_accent_foreground)
+                this.bg(tints.selected).text_color(tints.selected_text)
             })
-            .hover(|this| this.bg(cx.theme().sidebar_accent.opacity(0.6)))
+            .when(!is_selected, |this| {
+                this.hover(|this| this.bg(tints.hover).text_color(tints.hover_text))
+            })
             .on_click({
                 let on_activate = on_activate.clone();
                 move |_, window, cx| on_activate(window, cx)
@@ -1162,7 +1168,7 @@ impl ChatApp {
                     div()
                         .flex_shrink_0()
                         .text_xs()
-                        .text_color(cx.theme().sidebar_foreground.opacity(0.5))
+                        .text_color(contrast::sidebar_muted_text(cx, 0.5))
                         .child(time),
                 )
             })
@@ -1197,7 +1203,7 @@ impl ChatApp {
             .items_center()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(Spinner::new().small())
             .child(t!("agent.loading").to_string())
     }
@@ -1208,7 +1214,7 @@ impl ChatApp {
             .py_3()
             .gap_1()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(div().child(t!("agent.no_projects").to_string()))
             .child(
                 div()
@@ -1223,7 +1229,7 @@ impl ChatApp {
             .px_2()
             .py_2()
             .text_xs()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(t!("agent.no_sessions").to_string())
     }
 
@@ -1234,7 +1240,7 @@ impl ChatApp {
             .py_3()
             .gap_2()
             .text_sm()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(div().child(t!("agent.load_failed").to_string()))
             .child(
                 Button::new("agent-retry-projects")
@@ -1262,7 +1268,7 @@ impl ChatApp {
             .py_2()
             .gap_1()
             .text_xs()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .child(div().child(t!("agent.load_failed").to_string()))
             .child(
                 Button::new(format!("agent-retry-sessions-{project_id}"))
@@ -1355,9 +1361,9 @@ impl ChatApp {
             .items_center()
             .px_2()
             .text_xs()
-            .text_color(cx.theme().sidebar_foreground.opacity(0.6))
+            .text_color(contrast::sidebar_muted_text(cx, 0.6))
             .cursor_default()
-            .hover(|this| this.bg(cx.theme().sidebar_accent.opacity(0.5)))
+            .hover(|this| this.bg(contrast::sidebar_row_tints(cx).hover))
             .on_click({
                 let on_activate = on_activate.clone();
                 move |_, _, cx| on_activate(cx)
@@ -1619,6 +1625,7 @@ mod tests {
             total_tokens: 0,
             created_at: 100,
             updated_at: 100,
+            favorited: false,
             jsonl_path: std::path::PathBuf::from("/tmp/session.jsonl"),
         }
     }

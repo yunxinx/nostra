@@ -408,11 +408,19 @@ pub enum SessionEntryKind {
     Message(MessageEntry),
     TurnResult(TurnResult),
     ConfigChange(ConfigChange),
+    FavoriteChange(FavoriteChange),
     Compaction(Compaction),
     BranchSummary(BranchSummary),
     TranscriptReplay(TranscriptReplay),
     Reference(Reference),
     Leaf(Leaf),
+}
+
+/// Session-level favorite flag. Last write in the file wins; it is not
+/// branch-scoped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FavoriteChange {
+    pub favorited: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

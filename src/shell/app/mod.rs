@@ -3,6 +3,7 @@
 mod agent_workspace;
 mod chat_workspace;
 mod conversation_host;
+mod history_groups;
 mod history_sidebar;
 mod project_workspace;
 mod render;
@@ -29,7 +30,7 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use crate::appearance::{glass, theme};
+use crate::appearance::{contrast, glass, theme};
 use crate::chat::ChatView;
 use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle, Preferences, WindowGeometry};

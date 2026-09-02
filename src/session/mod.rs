@@ -20,7 +20,7 @@ mod tree;
 
 pub use crate::llm::{FinishReason, Usage};
 pub use catalog::{
-    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
+    CatalogCursor, CatalogError, CatalogPage, CatalogQuery, MAX_FAVORITES, ProjectCatalogCursor,
     ProjectCatalogPage, ProjectCatalogQuery, ProjectSummary, RepairReport, SessionSummary,
 };
 pub use chat::{
@@ -32,9 +32,9 @@ pub use chat_catalog::{
 };
 pub use domain::{
     BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, ChatSessionRef, Compaction,
-    ConfigChange, EntryId, Leaf, MessageEntry, ProjectIdentity, Reference, SafeError,
-    SafeErrorCategory, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader, SessionId,
-    TranscriptReplay, TurnResult, TurnStatus,
+    ConfigChange, EntryId, FavoriteChange, Leaf, MessageEntry, ProjectIdentity, Reference,
+    SafeError, SafeErrorCategory, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
+    SessionId, TranscriptReplay, TurnResult, TurnStatus,
 };
 pub use error::{DiagnosticKind, JsonlDiagnostic, SessionError};
 pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};

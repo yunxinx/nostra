@@ -83,6 +83,7 @@ fn tagged_entry_kinds_and_project_identity_round_trip() {
             },
             system_prompt: Some("updated system".into()),
         }),
+        SessionEntryKind::FavoriteChange(FavoriteChange { favorited: true }),
         SessionEntryKind::Compaction(Compaction {
             summary: "summary".into(),
             first_kept_entry_id: EntryId::new(),

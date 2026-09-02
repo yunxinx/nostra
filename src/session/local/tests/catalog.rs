@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::FavoriteChange;
 
 #[test]
 fn repair_rebuilds_a_deleted_catalog_and_delete_is_permanent() {
@@ -495,4 +496,96 @@ fn list_projects_rejects_chat_domain() {
             actual: SessionDomain::Chat,
         })
     ));
+}
+
+#[test]
+fn favorite_change_projects_and_filters_the_catalog() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let mut store =
+        LocalSessionStore::open(LocalStoreConfig::new(root.path(), SessionDomain::Chat))
+            .expect("open");
+    let starred = SessionHeader::new(SessionDomain::Chat, None);
+    let starred_id = starred.session_id.clone();
+    store.create_session(starred).expect("create starred");
+    let plain = SessionHeader::new(SessionDomain::Chat, None);
+    let plain_id = plain.session_id.clone();
+    store.create_session(plain).expect("create plain");
+    store
+        .append(
+            &starred_id,
+            vec![SessionEntryKind::FavoriteChange(FavoriteChange {
+                favorited: true,
+            })],
+        )
+        .expect("star");
+
+    let favorites = store
+        .list(CatalogQuery::favorites())
+        .expect("favorites")
+        .sessions;
+    assert_eq!(favorites.len(), 1);
+    assert_eq!(favorites[0].session_id, starred_id);
+    assert!(favorites[0].favorited);
+
+    let timeline = store
+        .list(CatalogQuery::timeline_first_page())
+        .expect("timeline")
+        .sessions;
+    assert_eq!(timeline.len(), 1);
+    assert_eq!(timeline[0].session_id, plain_id);
+    assert!(!timeline[0].favorited);
+
+    store
+        .append(
+            &starred_id,
+            vec![SessionEntryKind::FavoriteChange(FavoriteChange {
+                favorited: false,
+            })],
+        )
+        .expect("unstar");
+    assert!(
+        store
+            .list(CatalogQuery::favorites())
+            .expect("empty favorites")
+            .sessions
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list(CatalogQuery::timeline_first_page())
+            .expect("full timeline")
+            .sessions
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn favorite_survives_catalog_rebuild_from_jsonl() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let config = LocalStoreConfig::new(root.path(), SessionDomain::Chat);
+    let mut store = LocalSessionStore::open(config.clone()).expect("open");
+    let header = SessionHeader::new(SessionDomain::Chat, None);
+    let id = header.session_id.clone();
+    store.create_session(header).expect("create");
+    store
+        .append(
+            &id,
+            vec![SessionEntryKind::FavoriteChange(FavoriteChange {
+                favorited: true,
+            })],
+        )
+        .expect("star");
+    fs::remove_file(store.catalog_path()).expect("remove index");
+    drop(store);
+
+    let mut rebuilt = LocalSessionStore::open(config).expect("reopen");
+    rebuilt.repair().expect("repair");
+    let favorites = rebuilt
+        .list(CatalogQuery::favorites())
+        .expect("favorites")
+        .sessions;
+    assert_eq!(favorites.len(), 1);
+    assert_eq!(favorites[0].session_id, id);
+    assert!(favorites[0].favorited);
 }

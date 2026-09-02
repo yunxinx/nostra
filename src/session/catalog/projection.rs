@@ -57,8 +57,8 @@ pub(super) fn write_projection_in_transaction(
         "INSERT INTO sessions (
             session_id, domain, project_id, canonical_path, display_name,
             title, preview, model_profile_id, model_id, total_tokens,
-            created_at, updated_at, jsonl_path
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            created_at, updated_at, favorited, jsonl_path
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
         ON CONFLICT(session_id) DO UPDATE SET
             domain = excluded.domain,
             project_id = excluded.project_id,
@@ -71,6 +71,7 @@ pub(super) fn write_projection_in_transaction(
             total_tokens = excluded.total_tokens,
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
+            favorited = excluded.favorited,
             jsonl_path = excluded.jsonl_path",
         params![
             header.session_id.to_string(),
@@ -91,6 +92,7 @@ pub(super) fn write_projection_in_transaction(
             projection.total_tokens.min(i64::MAX as u64) as i64,
             header.created_at,
             projection.updated_at,
+            i64::from(projection.favorited),
             jsonl_path.to_string_lossy().into_owned(),
         ],
     )?;
@@ -182,6 +184,7 @@ pub(crate) struct SessionProjection {
     total_tokens: u64,
     tokens_by_turn: HashMap<String, u64>,
     updated_at: i64,
+    favorited: bool,
     pub(super) messages: Vec<MessageNodeProjection>,
 }
 
@@ -218,6 +221,7 @@ impl SessionProjection {
             total_tokens: 0,
             tokens_by_turn: HashMap::new(),
             updated_at: header.created_at,
+            favorited: false,
             messages: Vec::new(),
         };
         for entry in entries {
@@ -266,6 +270,9 @@ impl SessionProjection {
 
     fn observe_durable_entry(&mut self, entry: &SessionEntry) {
         self.updated_at = self.updated_at.max(entry.timestamp);
+        if let SessionEntryKind::FavoriteChange(change) = &entry.kind {
+            self.favorited = change.favorited;
+        }
     }
 
     fn apply_active_entry_metadata(&mut self, entry: &SessionEntry) {
@@ -314,6 +321,7 @@ impl SessionProjection {
             total_tokens: self.total_tokens,
             created_at: header.created_at,
             updated_at: self.updated_at,
+            favorited: self.favorited,
             jsonl_path,
         }
     }
@@ -432,7 +440,8 @@ pub(super) fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sess
         total_tokens: row.get::<_, i64>(9)?.max(0) as u64,
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
-        jsonl_path: PathBuf::from(row.get::<_, String>(12)?),
+        favorited: row.get::<_, i64>(12)? != 0,
+        jsonl_path: PathBuf::from(row.get::<_, String>(13)?),
     })
 }
 
