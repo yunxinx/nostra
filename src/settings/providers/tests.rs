@@ -36,7 +36,8 @@ fn add_providers_window(
         );
     });
     let (root, cx) = cx.add_window_view(|window, cx| {
-        let page = cx.new(|cx| ProvidersPage::new(window, cx));
+        let preference_handle = preferences::handle(cx);
+        let page = cx.new(|cx| ProvidersPage::new(preference_handle, window, cx));
         Root::new(page, window, cx)
     });
     let page = root.read_with(cx, |root, _| {
@@ -83,7 +84,10 @@ fn page_restores_the_persisted_divider_position(cx: &mut TestAppContext) {
         );
     });
     let cx = cx.add_empty_window();
-    let page = cx.update(|window, cx| cx.new(|cx| ProvidersPage::new(window, cx)));
+    let page = cx.update(|window, cx| {
+        let preference_handle = preferences::handle(cx);
+        cx.new(|cx| ProvidersPage::new(preference_handle, window, cx))
+    });
 
     cx.update(|_, cx| assert_eq!(page.read(cx).list_width, px(288.)));
 }

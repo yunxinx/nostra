@@ -1,9 +1,4 @@
-//! Agent project workspace state, background loading, and rendering.
-//!
-//! The workspace is read-only: it browses persisted Agent projects, their
-//! sessions, and the resolved transcript for a selected session. No tools are
-//! executed and no runtime is impersonated. Every catalog and session read runs
-//! on the background executor; render only reads the snapshot.
+//! Project catalog state, background loading, and rendering.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -23,12 +18,17 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
-use super::{ChatApp, SidebarTarget};
-use crate::llm::{ContentBlock, Role};
+use super::{
+    ChatApp,
+    history_sidebar::{SidebarActionIds, SidebarActionSpec, render_sidebar_actions},
+    project_workspace::{ProjectTarget, ProjectWorkspace},
+    workspace_host::WorkspaceCommand,
+};
+use crate::runtime::PROJECT_WORKSPACE_ID;
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, ProjectCatalogCursor,
     ProjectCatalogPage, ProjectCatalogQuery, ProjectSessionStore, ProjectSummary, SessionId,
-    SessionStores, SessionSummary,
+    SessionSummary,
 };
 
 const AGENT_ROW_HEIGHT: Pixels = px(32.);
@@ -57,7 +57,7 @@ pub(super) enum AgentOpen {
 }
 
 /// Per-project session list snapshot, loaded lazily on first expand.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct ProjectSessionList {
     sessions: Vec<SessionSummary>,
     load_state: AgentLoadState,
@@ -84,6 +84,7 @@ impl ProjectSessionList {
 }
 
 /// UI-independent snapshot of the Agent workspace.
+#[derive(Clone)]
 pub(super) struct AgentWorkspace {
     projects: Vec<ProjectSummary>,
     projects_load_state: AgentLoadState,
@@ -94,10 +95,6 @@ pub(super) struct AgentWorkspace {
     expanded_project_ids: HashSet<String>,
     sessions_by_project: HashMap<String, ProjectSessionList>,
     open: Option<AgentOpen>,
-
-    session_state: Option<crate::session::ResolvedSessionState>,
-    session_load_state: AgentLoadState,
-    session_generation: u64,
 }
 
 impl AgentWorkspace {
@@ -111,9 +108,6 @@ impl AgentWorkspace {
             expanded_project_ids: HashSet::new(),
             sessions_by_project: HashMap::new(),
             open: None,
-            session_state: None,
-            session_load_state: AgentLoadState::Unloaded,
-            session_generation: 0,
         }
     }
 
@@ -148,17 +142,21 @@ impl AgentWorkspace {
         }
     }
 
-    #[allow(dead_code)]
-    pub(super) fn session_state(&self) -> Option<&crate::session::ResolvedSessionState> {
-        self.session_state.as_ref()
-    }
-
     pub(super) fn is_project_expanded(&self, project_id: &str) -> bool {
         self.expanded_project_ids.contains(project_id)
     }
 
     pub(super) fn session_list(&self, project_id: &str) -> Option<&ProjectSessionList> {
         self.sessions_by_project.get(project_id)
+    }
+
+    pub(super) fn sessions_need_load(&self, project_id: &str) -> bool {
+        self.sessions_by_project.get(project_id).is_none_or(|list| {
+            matches!(
+                list.load_state,
+                AgentLoadState::Unloaded | AgentLoadState::Error(_)
+            )
+        })
     }
 
     fn session_list_mut(&mut self, project_id: &str) -> &mut ProjectSessionList {
@@ -170,11 +168,6 @@ impl AgentWorkspace {
     fn next_projects_generation(&mut self) -> u64 {
         self.projects_generation = self.projects_generation.wrapping_add(1);
         self.projects_generation
-    }
-
-    fn next_session_generation(&mut self) -> u64 {
-        self.session_generation = self.session_generation.wrapping_add(1);
-        self.session_generation
     }
 
     fn apply_projects_initial(&mut self, generation: u64, page: ProjectCatalogPage) -> bool {
@@ -216,7 +209,9 @@ impl AgentWorkspace {
         generation: u64,
         page: CatalogPage,
     ) -> bool {
-        let list = self.session_list_mut(project_id);
+        let Some(list) = self.sessions_by_project.get_mut(project_id) else {
+            return false;
+        };
         if generation != list.generation {
             return false;
         }
@@ -232,7 +227,9 @@ impl AgentWorkspace {
         generation: u64,
         page: CatalogPage,
     ) -> bool {
-        let list = self.session_list_mut(project_id);
+        let Some(list) = self.sessions_by_project.get_mut(project_id) else {
+            return false;
+        };
         if generation != list.generation {
             return false;
         }
@@ -253,46 +250,14 @@ impl AgentWorkspace {
         generation: u64,
         message: SharedString,
     ) -> bool {
-        let list = self.session_list_mut(project_id);
+        let Some(list) = self.sessions_by_project.get_mut(project_id) else {
+            return false;
+        };
         if generation != list.generation {
             return false;
         }
         list.load_state = AgentLoadState::Error(message);
         true
-    }
-
-    fn apply_session_state(
-        &mut self,
-        generation: u64,
-        state: crate::session::ResolvedSessionState,
-    ) -> bool {
-        if generation != self.session_generation {
-            return false;
-        }
-        self.session_state = Some(state);
-        self.session_load_state = AgentLoadState::Ready;
-        true
-    }
-
-    fn mark_session_error(&mut self, generation: u64, message: SharedString) -> bool {
-        if generation != self.session_generation {
-            return false;
-        }
-        self.session_load_state = AgentLoadState::Error(message);
-        true
-    }
-
-    fn clear_open_detail(&mut self) {
-        self.session_state = None;
-        self.session_load_state = AgentLoadState::Unloaded;
-    }
-
-    /// Invalidate any detail load that belongs to the previously opened
-    /// session before a new project target is selected.  The task may still
-    /// finish, but its generation can no longer publish into this workspace.
-    pub(super) fn invalidate_session_load(&mut self) {
-        self.next_session_generation();
-        self.clear_open_detail();
     }
 
     /// Expand a project without changing the open conversation.
@@ -313,7 +278,6 @@ impl AgentWorkspace {
 
     /// Open a session in the main pane without leaving the grouped tree.
     pub(super) fn select_session(&mut self, project_id: String, session_id: SessionId) {
-        self.invalidate_session_load();
         self.open = Some(AgentOpen::Session {
             project_id,
             session_id,
@@ -324,7 +288,6 @@ impl AgentWorkspace {
     /// project, and open the composer. No session id exists until a future
     /// send runtime persists the first turn.
     pub(super) fn new_project_draft(&mut self, project_id: String) {
-        self.invalidate_session_load();
         self.expanded_project_ids.insert(project_id.clone());
         self.open = Some(AgentOpen::Draft { project_id });
     }
@@ -334,7 +297,6 @@ impl AgentWorkspace {
     }
 
     pub(super) fn bind_draft_session(&mut self, project_id: String, session_id: SessionId) {
-        self.invalidate_session_load();
         self.open = Some(AgentOpen::Session {
             project_id,
             session_id,
@@ -344,7 +306,6 @@ impl AgentWorkspace {
     pub(super) fn discard_draft(&mut self, project_id: &str) {
         if matches!(self.open, Some(AgentOpen::Draft { project_id: ref id }) if id == project_id) {
             self.open = None;
-            self.invalidate_session_load();
         }
     }
 
@@ -356,7 +317,6 @@ impl AgentWorkspace {
         if matches!(self.open, Some(AgentOpen::Session { project_id: ref pid, session_id: ref sid }) if pid == project_id && sid == session_id)
         {
             self.open = None;
-            self.invalidate_session_load();
         }
     }
 
@@ -367,7 +327,6 @@ impl AgentWorkspace {
         self.expanded_project_ids.remove(project_id);
         if self.open_project_id() == Some(project_id) {
             self.open = None;
-            self.invalidate_session_load();
         }
     }
 }
@@ -428,31 +387,28 @@ fn format_sidebar_relative_time(now_millis: i64, timestamp_millis: i64) -> Strin
     }
 }
 
-impl ChatApp {
+impl ProjectWorkspace {
     // ---------- Background project catalog loading ----------
 
     pub(super) fn start_agent_projects_load(&mut self, cx: &mut Context<Self>) {
         if !matches!(
-            self.agent.projects_load_state,
+            self.catalog.projects_load_state,
             AgentLoadState::Unloaded | AgentLoadState::Error(_)
         ) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.projects_load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
-                self.agent.projects_load_state = AgentLoadState::Error(error.to_string().into());
+                self.catalog.projects_load_state = AgentLoadState::Error(error.to_string().into());
+                self.notify_changed(cx);
                 return;
             }
         };
 
-        let generation = self.agent.next_projects_generation();
-        self.agent.projects_load_state = AgentLoadState::Loading;
+        let generation = self.catalog.next_projects_generation();
+        self.catalog.projects_load_state = AgentLoadState::Loading;
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -465,7 +421,8 @@ impl ChatApp {
             })
             .ok();
         });
-        self._agent_projects_task = Some(task);
+        self._projects_task = Some(task);
+        self.notify_changed(cx);
     }
 
     fn apply_agent_projects_initial(
@@ -476,34 +433,32 @@ impl ChatApp {
     ) {
         match result {
             Ok(page) => {
-                self.agent.apply_projects_initial(generation, page);
+                self.catalog.apply_projects_initial(generation, page);
             }
             Err(error) => {
                 let message = error.to_string().into();
-                self.agent.mark_projects_error(generation, message);
+                self.catalog.mark_projects_error(generation, message);
             }
         }
-        self._agent_projects_task = None;
-        cx.notify();
+        self._projects_task = None;
+        self.notify_changed(cx);
     }
 
     pub(super) fn start_agent_projects_load_more(&mut self, cx: &mut Context<Self>) {
-        if self.agent.projects_load_more_in_flight() || !self.agent.projects_has_more() {
+        if self.catalog.projects_load_more_in_flight() || !self.catalog.projects_has_more() {
             return;
         }
-        let Some(cursor) = self.agent.projects_next_cursor.clone() else {
+        let Some(cursor) = self.catalog.projects_next_cursor.clone() else {
             return;
         };
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
         };
 
-        self.agent.projects_load_more_in_flight = true;
-        let generation = self.agent.projects_generation;
+        self.catalog.projects_load_more_in_flight = true;
+        let generation = self.catalog.projects_generation;
         let task = cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -519,8 +474,8 @@ impl ChatApp {
             })
             .ok();
         });
-        self._agent_projects_task = Some(task);
-        cx.notify();
+        self._projects_task = Some(task);
+        self.notify_changed(cx);
     }
 
     fn apply_agent_projects_load_more(
@@ -530,45 +485,37 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         if let Ok(page) = result {
-            self.agent.apply_projects_load_more(generation, page);
+            self.catalog.apply_projects_load_more(generation, page);
         }
-        self.agent.projects_load_more_in_flight = false;
-        self._agent_projects_task = None;
-        cx.notify();
+        self.catalog.projects_load_more_in_flight = false;
+        self._projects_task = None;
+        self.notify_changed(cx);
     }
 
     // ---------- Background session list loading ----------
 
     pub(super) fn refresh_agent_sessions(&mut self, project_id: String, cx: &mut Context<Self>) {
-        self._agent_session_list_tasks.remove(&project_id);
-        self.agent.sessions_by_project.remove(&project_id);
+        self._session_list_tasks.remove(&project_id);
+        self.catalog.sessions_by_project.remove(&project_id);
         self.start_agent_sessions_load(project_id, cx);
     }
 
     pub(super) fn start_agent_sessions_load(&mut self, project_id: String, cx: &mut Context<Self>) {
-        if let Some(list) = self.agent.sessions_by_project.get(&project_id)
-            && !matches!(
-                list.load_state,
-                AgentLoadState::Unloaded | AgentLoadState::Error(_)
-            )
-        {
+        if !self.catalog.sessions_need_load(&project_id) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.session_list_mut(&project_id).load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(error) => {
-                self.agent.session_list_mut(&project_id).load_state =
+                self.catalog.session_list_mut(&project_id).load_state =
                     AgentLoadState::Error(error.to_string().into());
+                self.notify_changed(cx);
                 return;
             }
         };
         let generation = {
-            let list = self.agent.session_list_mut(&project_id);
+            let list = self.catalog.session_list_mut(&project_id);
             let generation = list.next_generation();
             list.load_state = AgentLoadState::Loading;
             generation
@@ -588,7 +535,8 @@ impl ChatApp {
             })
             .ok();
         });
-        self._agent_session_list_tasks.insert(project_id, task);
+        self._session_list_tasks.insert(project_id, task);
+        self.notify_changed(cx);
     }
 
     fn apply_agent_sessions_initial(
@@ -600,17 +548,17 @@ impl ChatApp {
     ) {
         match result {
             Ok(page) => {
-                self.agent
+                self.catalog
                     .apply_sessions_initial(project_id, generation, page);
             }
             Err(error) => {
                 let message = error.to_string().into();
-                self.agent
+                self.catalog
                     .mark_sessions_error(project_id, generation, message);
             }
         }
-        self._agent_session_list_tasks.remove(project_id);
-        cx.notify();
+        self._session_list_tasks.remove(project_id);
+        self.notify_changed(cx);
     }
 
     pub(super) fn start_agent_sessions_load_more(
@@ -618,7 +566,7 @@ impl ChatApp {
         project_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(list) = self.agent.sessions_by_project.get(&project_id) else {
+        let Some(list) = self.catalog.sessions_by_project.get(&project_id) else {
             return;
         };
         if list.load_more_in_flight || list.next_cursor.is_none() {
@@ -628,15 +576,13 @@ impl ChatApp {
             return;
         };
         let generation = list.generation;
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let project_store = match stores.agent_projects() {
             Ok(store) => store,
             Err(_) => return,
         };
 
-        if let Some(list) = self.agent.sessions_by_project.get_mut(&project_id) {
+        if let Some(list) = self.catalog.sessions_by_project.get_mut(&project_id) {
             list.load_more_in_flight = true;
         }
         let load_project_id = project_id.clone();
@@ -659,8 +605,8 @@ impl ChatApp {
             })
             .ok();
         });
-        self._agent_session_list_tasks.insert(project_id, task);
-        cx.notify();
+        self._session_list_tasks.insert(project_id, task);
+        self.notify_changed(cx);
     }
 
     fn apply_agent_sessions_load_more(
@@ -671,88 +617,18 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) {
         if let Ok(page) = result {
-            self.agent
+            self.catalog
                 .apply_sessions_load_more(project_id, generation, page);
         }
-        if let Some(list) = self.agent.sessions_by_project.get_mut(project_id) {
+        if let Some(list) = self.catalog.sessions_by_project.get_mut(project_id) {
             list.load_more_in_flight = false;
         }
-        self._agent_session_list_tasks.remove(project_id);
-        cx.notify();
+        self._session_list_tasks.remove(project_id);
+        self.notify_changed(cx);
     }
+}
 
-    // ---------- Background session detail loading ----------
-
-    pub(super) fn start_agent_session_load(&mut self, cx: &mut Context<Self>) {
-        let Some(AgentOpen::Session {
-            project_id,
-            session_id,
-        }) = self.agent.open.clone()
-        else {
-            return;
-        };
-        if !matches!(
-            self.agent.session_load_state,
-            AgentLoadState::Unloaded | AgentLoadState::Error(_)
-        ) {
-            return;
-        }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.agent.session_load_state =
-                AgentLoadState::Error(t!("agent.load_failed").to_string().into());
-            return;
-        };
-        let project_store = match stores.agent_projects() {
-            Ok(store) => store,
-            Err(error) => {
-                self.agent.session_load_state = AgentLoadState::Error(error.to_string().into());
-                return;
-            }
-        };
-
-        let generation = self.agent.next_session_generation();
-        self.agent.session_load_state = AgentLoadState::Loading;
-        let task = cx.spawn(async move |this, cx| {
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        project_store.load_project_session(&project_id, &session_id, None)
-                    })
-                    .await;
-            this.update(cx, |state, cx| {
-                state.apply_agent_session_state(generation, result, cx);
-            })
-            .ok();
-        });
-        self._agent_session_task = Some(task);
-    }
-
-    fn apply_agent_session_state(
-        &mut self,
-        generation: u64,
-        result: Result<crate::session::ResolvedSessionState, crate::session::SessionError>,
-        cx: &mut Context<Self>,
-    ) {
-        match result {
-            Ok(state) => {
-                self.agent.apply_session_state(generation, state);
-            }
-            Err(error) => {
-                let message = error.to_string().into();
-                self.agent.mark_session_error(generation, message);
-            }
-        }
-        self._agent_session_task = None;
-        cx.notify();
-    }
-
-    pub(super) fn merged_agent_projects(&self, cx: &App) -> Vec<ProjectSummary> {
-        merge_persisted_projects(
-            self.agent.projects(),
-            &crate::preferences::get(cx).agent_projects,
-        )
-    }
-
+impl ChatApp {
     // ---------- Agent sidebar rendering ----------
 
     pub(super) fn render_agent_content(
@@ -776,6 +652,7 @@ impl ChatApp {
 
     fn render_agent_projects_header(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().sidebar_foreground.opacity(0.6);
+        let app = cx.entity().downgrade();
         h_flex()
             .id("agent-projects-header")
             .h(px(28.))
@@ -797,7 +674,17 @@ impl ChatApp {
                     .compact()
                     .icon(IconName::Plus)
                     .tooltip(t!("agent.open_folder").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| this.open_project_folder(cx))),
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                PROJECT_WORKSPACE_ID,
+                                WorkspaceCommand::OpenProjectFolder,
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
             )
             .into_any_element()
     }
@@ -808,10 +695,11 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let mut children: Vec<AnyElement> = Vec::new();
-        let projects = self.merged_agent_projects(cx);
+        let catalog = self.project_snapshot().catalog();
+        let projects = self.project_snapshot().projects();
 
-        let loading_and_empty = matches!(self.agent.projects_load_state, AgentLoadState::Loading)
-            && projects.is_empty();
+        let loading_and_empty =
+            matches!(catalog.projects_load_state, AgentLoadState::Loading) && projects.is_empty();
         if loading_and_empty {
             children.push(
                 self.render_agent_loading_state(false, cx)
@@ -819,13 +707,13 @@ impl ChatApp {
             );
         }
 
-        for project in &projects {
+        for project in projects {
             children.push(self.render_agent_project_block(project, window, cx));
         }
 
-        let ready = matches!(self.agent.projects_load_state, AgentLoadState::Ready);
-        let error_and_empty = matches!(self.agent.projects_load_state, AgentLoadState::Error(_))
-            && projects.is_empty();
+        let ready = matches!(catalog.projects_load_state, AgentLoadState::Ready);
+        let error_and_empty =
+            matches!(catalog.projects_load_state, AgentLoadState::Error(_)) && projects.is_empty();
         if error_and_empty {
             children.push(
                 self.render_agent_projects_error_state(cx)
@@ -836,7 +724,7 @@ impl ChatApp {
                 self.render_agent_projects_empty_state(cx)
                     .into_any_element(),
             );
-        } else if self.agent.projects_has_more() {
+        } else if catalog.projects_has_more() {
             children.push(
                 self.render_agent_projects_load_more_row(window, cx)
                     .into_any_element(),
@@ -852,11 +740,13 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let project_id = project.project_id.clone();
-        let expanded = self.agent.is_project_expanded(&project_id);
-        let list = self.agent.session_list(&project_id);
-        let draft_here = self.agent_conversations.iter().any(|conversation| {
-            conversation.project_id == project_id && conversation.session_id.is_none()
-        });
+        let catalog = self.project_snapshot().catalog();
+        let expanded = catalog.is_project_expanded(&project_id);
+        let list = catalog.session_list(&project_id);
+        let draft_here = self
+            .project_snapshot()
+            .draft_for_project(&project_id)
+            .is_some();
 
         let mut block = v_flex().w_full().gap_0p5();
         block = block.child(self.render_agent_project_row(project, expanded, window, cx));
@@ -869,7 +759,7 @@ impl ChatApp {
                 if draft_here {
                     block = block.child(self.render_agent_draft_row(&project_id, window, cx));
                 }
-                let selected = self.agent.selected_session_id();
+                let selected = catalog.selected_session_id();
                 for summary in &list.sessions {
                     block = block.child(self.render_agent_session_row(
                         &project_id,
@@ -912,7 +802,8 @@ impl ChatApp {
         } else {
             IconName::ChevronRight
         };
-        let is_open_project = self.agent.open_project_id() == Some(project.project_id.as_str());
+        let is_open_project = self.project_snapshot().catalog().open_project_id()
+            == Some(project.project_id.as_str());
         let toggle_id = format!("agent-project-{project_id}");
         let hover_group: SharedString = format!("agent-project-hover-{project_id}").into();
         let focus_handle = window
@@ -921,8 +812,11 @@ impl ChatApp {
             .clone();
         let focus_ring = cx.theme().ring.opacity(0.2);
         let name_for_key = project_id.clone();
-        let target = SidebarTarget::AgentProject(project_id.clone());
-        let is_confirming = self.confirming == Some(target.clone());
+        let target = ProjectTarget::Project(project_id.clone());
+        let is_confirming = self.project_snapshot().confirming() == Some(&target);
+        let workspace = self.project_workspace().downgrade();
+        let workspace_for_key = workspace.clone();
+        let app = cx.entity().downgrade();
 
         v_flex()
             .w_full()
@@ -955,19 +849,25 @@ impl ChatApp {
                             .gap_1()
                             .px_1()
                             .cursor_default()
-                            .on_click(cx.listener({
+                            .on_click({
                                 let project_id = project_id.clone();
-                                move |this, _: &ClickEvent, _, cx| {
-                                    this.toggle_agent_project(project_id.clone(), cx);
+                                move |_: &ClickEvent, _, cx| {
+                                    workspace
+                                        .update(cx, |workspace, cx| {
+                                            workspace.toggle_project(project_id.clone(), cx)
+                                        })
+                                        .ok();
                                 }
-                            }))
-                            .on_key_down(cx.listener(
-                                move |this, event: &KeyDownEvent, window, cx| {
-                                    if crate::ui::consume_button_key(event, window, cx) {
-                                        this.toggle_agent_project(name_for_key.clone(), cx);
-                                    }
-                                },
-                            ))
+                            })
+                            .on_key_down(move |event: &KeyDownEvent, window, cx| {
+                                if crate::ui::consume_button_key(event, window, cx) {
+                                    workspace_for_key
+                                        .update(cx, |workspace, cx| {
+                                            workspace.toggle_project(name_for_key.clone(), cx)
+                                        })
+                                        .ok();
+                                }
+                            })
                             .child(
                                 Icon::new(chevron)
                                     .size_3p5()
@@ -999,18 +899,25 @@ impl ChatApp {
                                             .compact()
                                             .icon(IconName::Plus)
                                             .tooltip(t!("agent.new_in_project").to_string())
-                                            .on_click(cx.listener({
+                                            .on_click({
+                                                let app = app.clone();
                                                 let project_id = project_id.clone();
-                                                move |this, _, window, cx| {
-                                                    this.new_agent_project_draft(
-                                                        project_id.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                move |_, window, cx| {
+                                                    app.update(cx, |app, cx| {
+                                                        app.dispatch_workspace_command(
+                                                            PROJECT_WORKSPACE_ID,
+                                                            WorkspaceCommand::OpenProjectDraft(
+                                                                project_id.clone(),
+                                                            ),
+                                                            Some(window),
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .ok();
                                                 }
-                                            })),
+                                            }),
                                     )
-                                    .child(self.render_sidebar_actions(
+                                    .child(self.render_project_sidebar_actions(
                                         target,
                                         true,
                                         is_confirming,
@@ -1030,18 +937,15 @@ impl ChatApp {
     ) -> AnyElement {
         let title: SharedString = t!("agent.new_draft").to_string().into();
         let is_selected = matches!(
-            self.agent.open(),
+            self.project_snapshot().catalog().open(),
             Some(AgentOpen::Draft { project_id: open_id }) if open_id == project_id
         );
-        let weak = cx.weak_entity();
+        let app = cx.entity().downgrade();
         let project_id = project_id.to_string();
         let target = self
-            .agent_conversations
-            .iter()
-            .find(|conversation| {
-                conversation.project_id == project_id && conversation.session_id.is_none()
-            })
-            .map(|conversation| SidebarTarget::AgentView(conversation.view.entity_id()));
+            .project_snapshot()
+            .draft_for_project(&project_id)
+            .map(|conversation| ProjectTarget::View(conversation.target()));
         self.render_indented_session_row(
             format!("agent-draft-{project_id}"),
             title,
@@ -1050,8 +954,13 @@ impl ChatApp {
             window,
             cx,
             move |window, cx| {
-                weak.update(cx, |this, cx| {
-                    this.new_agent_project_draft(project_id.clone(), window, cx);
+                app.update(cx, |app, cx| {
+                    app.dispatch_workspace_command(
+                        PROJECT_WORKSPACE_ID,
+                        WorkspaceCommand::OpenProjectDraft(project_id.clone()),
+                        Some(window),
+                        cx,
+                    );
                 })
                 .ok();
             },
@@ -1080,8 +989,8 @@ impl ChatApp {
             summary.updated_at,
         );
         let project_id = project_id.to_string();
-        let weak = cx.weak_entity();
-        let target = SidebarTarget::AgentSession {
+        let app = cx.entity().downgrade();
+        let target = ProjectTarget::Session {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
         };
@@ -1093,12 +1002,93 @@ impl ChatApp {
             window,
             cx,
             move |window, cx| {
-                weak.update(cx, |this, cx| {
-                    this.open_agent_session(project_id.clone(), session_id.clone(), window, cx);
+                app.update(cx, |app, cx| {
+                    app.dispatch_workspace_command(
+                        PROJECT_WORKSPACE_ID,
+                        WorkspaceCommand::RestoreProjectSession {
+                            project_id: project_id.clone(),
+                            session_id: session_id.clone(),
+                        },
+                        Some(window),
+                        cx,
+                    );
                 })
                 .ok();
             },
             Some(target),
+        )
+    }
+
+    fn render_project_sidebar_actions(
+        &self,
+        target: ProjectTarget,
+        visible: bool,
+        confirming: bool,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ids = match &target {
+            ProjectTarget::View(entity) => SidebarActionIds {
+                trigger_id: ("agent-conversation-actions", *entity).into(),
+                confirm_id: ("agent-conversation-delete-confirm", *entity).into(),
+                trigger_debug_selector: format!("agent-conversation-actions-{}", entity.as_u64()),
+                delete_label: t!("agent.delete_session").to_string(),
+                confirm_title: t!("agent.delete_session_title").to_string(),
+            },
+            ProjectTarget::Session {
+                project_id,
+                session_id,
+            } => SidebarActionIds {
+                trigger_id: format!("agent-session-actions-{project_id}-{session_id}").into(),
+                confirm_id: format!("agent-session-delete-confirm-{project_id}-{session_id}")
+                    .into(),
+                trigger_debug_selector: format!("agent-session-actions-{project_id}-{session_id}"),
+                delete_label: t!("agent.delete_session").to_string(),
+                confirm_title: t!("agent.delete_session_title").to_string(),
+            },
+            ProjectTarget::Project(project_id) => SidebarActionIds {
+                trigger_id: format!("agent-project-actions-{project_id}").into(),
+                confirm_id: format!("agent-project-delete-confirm-{project_id}").into(),
+                trigger_debug_selector: format!("agent-project-actions-{project_id}"),
+                delete_label: t!("agent.delete_project").to_string(),
+                confirm_title: t!("agent.delete_project_title").to_string(),
+            },
+        };
+        let workspace = self.project_workspace().downgrade();
+        render_sidebar_actions(
+            SidebarActionSpec {
+                target,
+                visible,
+                confirming,
+                ids,
+                handle: self.project_snapshot().delete_confirmation(),
+            },
+            {
+                let workspace = workspace.clone();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.clear_delete_confirmation(&target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+            {
+                let workspace = workspace.clone();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.confirm_delete_target(target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+            move |target, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.begin_delete_confirmation(target, window, cx)
+                    })
+                    .ok();
+            },
         )
     }
 
@@ -1112,7 +1102,7 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
         on_activate: impl Fn(&mut Window, &mut App) + 'static,
-        target: Option<SidebarTarget>,
+        target: Option<ProjectTarget>,
     ) -> AnyElement {
         let focus_handle = window
             .use_keyed_state(row_id.clone(), cx, |_, cx| cx.focus_handle())
@@ -1123,7 +1113,7 @@ impl ChatApp {
         let hover_group: SharedString = format!("{row_id}-hover").into();
         let is_confirming = target
             .as_ref()
-            .is_some_and(|target| self.confirming == Some(target.clone()));
+            .is_some_and(|target| self.project_snapshot().confirming() == Some(target));
 
         div()
             .id(row_id)
@@ -1183,7 +1173,12 @@ impl ChatApp {
                     .group_hover(hover_group, |this| this.visible())
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .when_some(target, |this, target| {
-                        this.child(self.render_sidebar_actions(target, true, is_confirming, cx))
+                        this.child(self.render_project_sidebar_actions(
+                            target,
+                            true,
+                            is_confirming,
+                            cx,
+                        ))
                     }),
             )
             .into_any_element()
@@ -1233,6 +1228,7 @@ impl ChatApp {
     }
 
     fn render_agent_projects_error_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let workspace = self.project_workspace().downgrade();
         v_flex()
             .px_2()
             .py_3()
@@ -1245,10 +1241,11 @@ impl ChatApp {
                     .ghost()
                     .small()
                     .label(t!("agent.retry").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.start_agent_projects_load(cx);
-                        cx.notify();
-                    })),
+                    .on_click(move |_, _, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx))
+                            .ok();
+                    }),
             )
     }
 
@@ -1258,6 +1255,7 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let project_id = project_id.to_string();
+        let workspace = self.project_workspace().downgrade();
         v_flex()
             .ml_4()
             .px_2()
@@ -1271,10 +1269,13 @@ impl ChatApp {
                     .ghost()
                     .small()
                     .label(t!("agent.retry").to_string())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.start_agent_sessions_load(project_id.clone(), cx);
-                        cx.notify();
-                    })),
+                    .on_click(move |_, _, cx| {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.start_agent_sessions_load(project_id.clone(), cx)
+                            })
+                            .ok();
+                    }),
             )
     }
 
@@ -1284,13 +1285,20 @@ impl ChatApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let label = t!("agent.load_more").to_string();
+        let workspace = self.project_workspace().downgrade();
         self.render_sidebar_action_row(
             "agent-load-more-projects",
             label,
             false,
             window,
             cx,
-            |this, cx| this.start_agent_projects_load_more(cx),
+            move |cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.start_agent_projects_load_more(cx)
+                    })
+                    .ok();
+            },
         )
     }
 
@@ -1302,13 +1310,20 @@ impl ChatApp {
     ) -> impl IntoElement {
         let project_id = project_id.to_string();
         let label = t!("agent.show_more").to_string();
+        let workspace = self.project_workspace().downgrade();
         self.render_sidebar_action_row(
             format!("agent-show-more-{project_id}"),
             label,
             true,
             window,
             cx,
-            move |this, cx| this.start_agent_sessions_load_more(project_id.clone(), cx),
+            move |cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.start_agent_sessions_load_more(project_id.clone(), cx)
+                    })
+                    .ok();
+            },
         )
     }
 
@@ -1319,7 +1334,7 @@ impl ChatApp {
         indented: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-        on_activate: impl Fn(&mut ChatApp, &mut Context<ChatApp>) + 'static,
+        on_activate: impl Fn(&mut App) + 'static,
     ) -> impl IntoElement {
         let row_id = row_id.into();
         let focus_handle = window
@@ -1345,34 +1360,17 @@ impl ChatApp {
             .hover(|this| this.bg(cx.theme().sidebar_accent.opacity(0.5)))
             .on_click({
                 let on_activate = on_activate.clone();
-                cx.listener(move |this, _, _, cx| on_activate(this, cx))
+                move |_, _, cx| on_activate(cx)
             })
             .on_key_down({
                 let on_activate = on_activate.clone();
-                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                move |event: &KeyDownEvent, window, cx| {
                     if crate::ui::consume_button_key(event, window, cx) {
-                        on_activate(this, cx);
+                        on_activate(cx);
                     }
-                })
+                }
             })
             .child(label)
-    }
-
-    fn toggle_agent_project(&mut self, project_id: String, cx: &mut Context<Self>) {
-        let expanded = self.agent.toggle_project_expanded(project_id.clone());
-        if expanded {
-            self.start_agent_sessions_load(project_id, cx);
-        }
-        cx.notify();
-    }
-
-    fn new_agent_project_draft(
-        &mut self,
-        project_id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_agent_draft(project_id, window, cx);
     }
 
     // ---------- Agent main area rendering ----------
@@ -1382,17 +1380,17 @@ impl ChatApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let has_projects = !self.merged_agent_projects(cx).is_empty();
+        let catalog = self.project_snapshot().catalog();
+        let has_projects = !self.project_snapshot().projects().is_empty();
         if !has_projects {
             return self.render_agent_folder_guide(cx).into_any_element();
         }
-        if self.agent.open().is_none() {
+        if catalog.open().is_none() {
             return self.render_agent_idle_workspace(cx).into_any_element();
         }
-        if self
-            .agent
+        if catalog
             .open_project_id()
-            .is_some_and(|project_id| self.agent_deleting_projects.contains(project_id))
+            .is_some_and(|project_id| self.project_snapshot().is_deleting_project(project_id))
         {
             return v_flex()
                 .flex_1()
@@ -1409,7 +1407,8 @@ impl ChatApp {
                 .into_any_element();
         }
 
-        self.active_agent_view()
+        self.project_snapshot()
+            .active_view()
             .map(IntoElement::into_any_element)
             .unwrap_or_else(|| self.render_agent_main_empty(cx).into_any_element())
     }
@@ -1441,6 +1440,7 @@ impl ChatApp {
     /// Full-area guide shown in Agent mode before any folder is opened.
     fn render_agent_folder_guide(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
+        let app = cx.entity().downgrade();
         v_flex()
             .flex_1()
             .min_h_0()
@@ -1469,78 +1469,27 @@ impl ChatApp {
                 Button::new("agent-guide-open-folder")
                     .primary()
                     .label(t!("agent.open_folder").to_string())
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_project_folder(cx);
-                    })),
+                    .on_click(move |_, _, cx| {
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                PROJECT_WORKSPACE_ID,
+                                WorkspaceCommand::OpenProjectFolder,
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
             )
-            .into_any_element()
-    }
-
-    #[allow(dead_code)]
-    fn render_agent_transcript(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(state) = self.agent.session_state() else {
-            return self.render_agent_main_empty(cx).into_any_element();
-        };
-
-        let mut children: Vec<AnyElement> = Vec::new();
-
-        if !state.transcript_replays.is_empty() {
-            children.push(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{} replay fact(s)", state.transcript_replays.len()))
-                    .into_any_element(),
-            );
-        }
-
-        if state.latest_compaction.is_some() {
-            children.push(
-                div()
-                    .px_4()
-                    .py_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("agent.compacted").to_string())
-                    .into_any_element(),
-            );
-        }
-
-        for message in &state.messages {
-            children.push(self.render_agent_message(message, cx).into_any_element());
-        }
-
-        if state.messages.is_empty()
-            && state.transcript_replays.is_empty()
-            && state.latest_compaction.is_none()
-        {
-            children.push(
-                div()
-                    .px_4()
-                    .py_8()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t!("agent.empty_session").to_string())
-                    .into_any_element(),
-            );
-        }
-
-        v_flex()
-            .id("agent-transcript")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .py_4()
-            .gap_2()
-            .children(children)
             .into_any_element()
     }
 
     fn render_agent_main_empty(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let loading = matches!(self.agent.session_load_state, AgentLoadState::Loading);
+        let loading = matches!(
+            self.project_snapshot().session_load_state(),
+            AgentLoadState::Loading
+        );
 
         if loading {
             return v_flex()
@@ -1558,7 +1507,11 @@ impl ChatApp {
                 .into_any_element();
         }
 
-        if matches!(self.agent.session_load_state, AgentLoadState::Error(_)) {
+        if matches!(
+            self.project_snapshot().session_load_state(),
+            AgentLoadState::Error(_)
+        ) {
+            let workspace = self.project_workspace().downgrade();
             return v_flex()
                 .size_full()
                 .items_center()
@@ -1575,10 +1528,13 @@ impl ChatApp {
                         .ghost()
                         .small()
                         .label(t!("agent.retry").to_string())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.start_agent_session_load(cx);
-                            cx.notify();
-                        })),
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.retry_open_session(window, cx)
+                                })
+                                .ok();
+                        }),
                 )
                 .into_any_element();
         }
@@ -1606,85 +1562,30 @@ impl ChatApp {
             .into_any_element()
     }
 
-    #[allow(dead_code)]
-    fn render_agent_message(
-        &self,
-        message: &crate::session::ResolvedMessage,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let role = &message.message.role;
-        let (role_label, role_color) = match role {
-            Role::User => (t!("agent.role_user").to_string(), theme.primary),
-            Role::Assistant => (
-                t!("agent.role_assistant").to_string(),
-                theme.muted_foreground,
-            ),
-            Role::System => (t!("agent.role_system").to_string(), theme.muted_foreground),
-            Role::Developer => (
-                t!("agent.role_developer").to_string(),
-                theme.muted_foreground,
-            ),
-            Role::Tool => (t!("agent.role_tool").to_string(), theme.muted_foreground),
-        };
-
-        let mut text_parts: Vec<String> = Vec::new();
-        for block in &message.message.content {
-            match block {
-                ContentBlock::Text { text, .. } => {
-                    text_parts.push(text.clone());
-                }
-                ContentBlock::Reasoning { .. } => {
-                    text_parts.push(t!("agent.reasoning_block").to_string());
-                }
-                ContentBlock::ToolCall { tool_call } => {
-                    text_parts.push(format!("{}: {}", t!("agent.tool_call"), tool_call.name));
-                }
-                ContentBlock::ToolResult { .. } => {
-                    text_parts.push(t!("agent.tool_result").to_string());
-                }
-            }
-        }
-        let body = text_parts.join("\n\n");
-
-        v_flex()
-            .px_4()
-            .py_2()
-            .gap_1()
-            .child(
-                div()
-                    .text_xs()
-                    .font_semibold()
-                    .text_color(role_color)
-                    .child(role_label),
-            )
-            .child(div().text_sm().text_color(theme.foreground).child(body))
-            .into_any_element()
-    }
-
-    pub(super) fn switch_workspace_mode(
+    pub(super) fn switch_workspace(
         &mut self,
-        mode: super::WorkspaceMode,
+        workspace_id: crate::runtime::WorkspaceId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_mode == mode {
+        if self.workspace_id == workspace_id {
             return;
         }
-        if matches!(self.workspace_mode, super::WorkspaceMode::Project)
-            && let Some(view) = self.active_agent_view()
-        {
-            view.update(cx, |view, cx| view.dismiss_composer_completion(cx));
+        if self.workspace_id == crate::runtime::PROJECT_WORKSPACE_ID {
+            self.project_workspace()
+                .update(cx, |workspace, cx| workspace.dismiss_active_completion(cx));
         }
-        self.workspace_mode = mode;
-        crate::preferences::set_last_workspace_mode(mode, cx);
-        if matches!(mode, super::WorkspaceMode::Project)
+        self.workspace_id = workspace_id;
+        crate::preferences::set_last_workspace_id(workspace_id, cx);
+        self.sync_workspace_snapshot(cx);
+        if workspace_id == crate::runtime::PROJECT_WORKSPACE_ID
             && matches!(
-                self.agent.projects_load_state,
+                self.project_snapshot().catalog().projects_load_state,
                 AgentLoadState::Unloaded | AgentLoadState::Error(_)
             )
         {
-            self.start_agent_projects_load(cx);
+            self.project_workspace()
+                .update(cx, |workspace, cx| workspace.start_agent_projects_load(cx));
         }
         self.sync_model_picker_to_active(window, cx);
         cx.notify();
@@ -1792,29 +1693,18 @@ mod tests {
             })
         );
         assert!(workspace.selected_session_id().is_none());
-        assert!(matches!(
-            workspace.session_load_state,
-            AgentLoadState::Unloaded
-        ));
     }
 
     #[test]
-    fn select_session_clears_previous_state_without_leaving_the_tree() {
+    fn select_session_updates_the_open_target_without_leaving_the_tree() {
         let mut workspace = AgentWorkspace::new();
         workspace.expand_project("project-a".into());
         workspace.new_project_draft("project-a".into());
         let session_id = SessionId::new(SessionDomain::Agent);
-        workspace.session_load_state = AgentLoadState::Ready;
-
         workspace.select_session("project-a".into(), session_id.clone());
 
         assert_eq!(workspace.selected_session_id(), Some(&session_id));
         assert!(workspace.is_project_expanded("project-a"));
-        assert!(workspace.session_state.is_none());
-        assert!(matches!(
-            workspace.session_load_state,
-            AgentLoadState::Unloaded
-        ));
         assert_eq!(
             workspace.open(),
             Some(&AgentOpen::Session {
@@ -1894,6 +1784,23 @@ mod tests {
                 .map(|list| list.sessions.is_empty())
                 .unwrap_or(true)
         );
+    }
+
+    #[test]
+    fn stale_session_load_does_not_recreate_removed_project() {
+        let mut workspace = AgentWorkspace::new();
+        let generation = workspace.session_list_mut("project-x").next_generation();
+        workspace.remove_project("project-x");
+
+        assert!(!workspace.apply_sessions_initial(
+            "project-x",
+            generation,
+            CatalogPage {
+                sessions: vec![sample_session(&ProjectIdentity::new("/tmp/x", "X"))],
+                next_cursor: None,
+            },
+        ));
+        assert!(workspace.session_list("project-x").is_none());
     }
 
     #[test]

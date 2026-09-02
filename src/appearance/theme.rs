@@ -51,20 +51,23 @@ pub fn init(prefs: &Preferences, cx: &mut App) {
 
 /// Change the theme mode preference (`None` = follow system), persist it,
 /// and apply it to all windows.
-pub fn set_mode(mode: Option<preferences::ThemeMode>, cx: &mut App) {
-    preferences::update(cx, |p| p.theme_mode = mode);
+pub fn set_mode(
+    mode: Option<preferences::ThemeMode>,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    preferences::update_with(cx, preference_handle, |p| p.theme_mode = mode);
     apply_mode(mode, cx);
-}
-
-/// The persisted mode preference (`None` = follow system).
-pub fn mode_preference(cx: &App) -> Option<preferences::ThemeMode> {
-    preferences::get(cx).theme_mode
 }
 
 /// Apply a system appearance change when the user has chosen to follow the
 /// system. Explicit light/dark preferences deliberately ignore the event.
-pub fn sync_system_appearance(window: &mut Window, cx: &mut App) {
-    if mode_preference(cx).is_some() {
+pub fn sync_system_appearance(
+    mode: Option<preferences::ThemeMode>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if mode.is_some() {
         return;
     }
 
@@ -75,7 +78,7 @@ pub fn sync_system_appearance(window: &mut Window, cx: &mut App) {
 /// Select a registered theme by name.  The theme lands in the slot matching
 /// its own light/dark mode; the visible palette only changes when that slot
 /// is the active one.  The choice is persisted.
-pub fn select_theme(name: &str, cx: &mut App) {
+pub fn select_theme(name: &str, preference_handle: &preferences::PreferenceHandle, cx: &mut App) {
     let Some(config) = ThemeRegistry::global(cx).themes().get(name).cloned() else {
         crate::logging::warn(
             "appearance.theme",
@@ -87,7 +90,7 @@ pub fn select_theme(name: &str, cx: &mut App) {
     let dark_slot = config.mode.is_dark();
     let saved: String = config.name.to_string();
     apply_theme_config(config, cx);
-    preferences::update(cx, |p| {
+    preferences::update_with(cx, preference_handle, |p| {
         let slot = if dark_slot {
             &mut p.dark_theme
         } else {

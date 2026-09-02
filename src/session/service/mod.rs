@@ -11,7 +11,8 @@ mod domains;
 mod tests;
 
 pub use capabilities::{
-    SharedAgentProjectStore, SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
+    ConversationContext, SharedAgentProjectStore, SharedChatReferenceStore, SharedSessionCatalog,
+    SharedSessionStore,
 };
 pub use domains::{SessionStores, SessionStoresError};
 

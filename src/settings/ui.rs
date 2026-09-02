@@ -56,6 +56,7 @@ pub(super) fn row(
     label: String,
     info: Option<String>,
     control: AnyElement,
+    hide_info: bool,
     cx: &App,
 ) -> AnyElement {
     h_flex()
@@ -75,7 +76,7 @@ pub(super) fn row(
                 .gap_1p5()
                 .child(div().text_color(cx.theme().foreground).child(label))
                 .when_some(
-                    info.and_then(|text| info_button(id, text, cx)),
+                    info.and_then(|text| info_button(id, text, hide_info, cx)),
                     |this, button| this.child(button),
                 ),
         )
@@ -93,8 +94,8 @@ pub(super) fn section(rows: Vec<AnyElement>, _: &App) -> AnyElement {
 /// or Space.
 /// Shared by the flat rows above and the providers form, so every settings
 /// field explains itself the same way and in the same place.
-pub(super) fn info_button(id: &str, text: String, cx: &App) -> Option<AnyElement> {
-    (!info_buttons_hidden(cx)).then(|| {
+pub(super) fn info_button(id: &str, text: String, hidden: bool, _cx: &App) -> Option<AnyElement> {
+    (!hidden).then(|| {
         InfoButton {
             id: id.to_string(),
             text: text.into(),
@@ -104,12 +105,14 @@ pub(super) fn info_button(id: &str, text: String, cx: &App) -> Option<AnyElement
     })
 }
 
-pub(super) fn info_buttons_hidden(cx: &App) -> bool {
-    preferences::get(cx).hide_settings_info_buttons
-}
-
-pub(super) fn set_info_buttons_hidden(hidden: bool, cx: &mut App) {
-    preferences::update(cx, |prefs| prefs.hide_settings_info_buttons = hidden);
+pub(super) fn set_info_buttons_hidden(
+    hidden: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.hide_settings_info_buttons = hidden
+    });
     cx.refresh_windows();
 }
 
@@ -153,6 +156,7 @@ pub(super) fn labelled(
     label: impl IntoElement,
     id: &str,
     info: String,
+    hide_info: bool,
     cx: &App,
 ) -> impl IntoElement {
     h_flex()
@@ -160,7 +164,9 @@ pub(super) fn labelled(
         .items_center()
         .gap_1p5()
         .child(label)
-        .when_some(info_button(id, info, cx), |this, button| this.child(button))
+        .when_some(info_button(id, info, hide_info, cx), |this, button| {
+            this.child(button)
+        })
 }
 
 /// Compact dropdown control: an outline button whose popup menu lists the

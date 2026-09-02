@@ -55,17 +55,19 @@ pub(crate) struct ModelPicker {
 impl ModelPicker {
     pub(crate) fn new(
         selection: Option<ModelSelection>,
+        preference_handle: preferences::PreferenceHandle,
         on_confirm: impl Fn(ModelSelection, &mut App) -> bool + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let models = providers::selectable_models(cx);
+        let models = providers::selectable_models_from_preferences(&preference_handle.snapshot());
         let label = find_model_label(&models, selection.as_ref());
         let on_confirm = Rc::new(on_confirm);
         let popover = PopoverDismissHandle::default();
         let catalog_subscription =
-            cx.observe_global_in::<preferences::Prefs>(window, |this, window, cx| {
-                let models = providers::selectable_models(cx);
+            cx.observe_global_in::<preferences::Prefs>(window, move |this, window, cx| {
+                let models =
+                    providers::selectable_models_from_preferences(&preference_handle.snapshot());
                 if this.models != models {
                     this.refresh_catalog(models, window, cx);
                     cx.notify();
@@ -132,11 +134,8 @@ impl ModelPicker {
 
     fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open {
-            let models = providers::selectable_models(cx);
-            self.label = find_model_label(&models, self.selection.as_ref());
-            self.models = models.clone();
             let list = new_model_list(
-                models,
+                self.models.clone(),
                 self.selection.clone(),
                 self.on_confirm.clone(),
                 self.popover.clone(),

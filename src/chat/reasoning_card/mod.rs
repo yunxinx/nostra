@@ -44,7 +44,7 @@ use gpui_component::{
 use rust_i18n::t;
 
 use super::hover_reveal::hover_reveal_copy;
-use crate::ui::markdown::MarkdownBody;
+use crate::ui::markdown::{MarkdownBody, MarkdownPresentation};
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
 /// card without accidentally matching another card in the same turn.
@@ -143,8 +143,12 @@ pub(crate) struct ReasoningTrace {
 impl ReasoningTrace {
     /// Open a trace for a block that just started reasoning. Auto-expanded: the
     /// point of streaming reasoning is that it is visible as it arrives.
-    pub(crate) fn new(owner_id: u64, cx: &mut App) -> Self {
-        let body = MarkdownBody::new("", owner_id, cx);
+    pub(crate) fn new_with_presentation(
+        owner_id: u64,
+        presentation: &MarkdownPresentation,
+        cx: &mut App,
+    ) -> Self {
+        let body = MarkdownBody::new_with_presentation("", owner_id, presentation, cx);
         Self {
             body,
             expanded: true,
@@ -159,8 +163,13 @@ impl ReasoningTrace {
     }
 
     /// Build a closed trace from an authoritative terminal message.
-    pub(crate) fn completed(source: String, owner_id: u64, cx: &mut App) -> Self {
-        let body = MarkdownBody::new(&source, owner_id, cx);
+    pub(crate) fn completed_with_presentation(
+        source: String,
+        owner_id: u64,
+        presentation: &MarkdownPresentation,
+        cx: &mut App,
+    ) -> Self {
+        let body = MarkdownBody::new_with_presentation(&source, owner_id, presentation, cx);
         let scroll = if source.len() >= VIRTUALIZED_SOURCE_BYTES {
             ReasoningScroll::Virtualized(body.scroll_state(cx))
         } else {
@@ -178,6 +187,16 @@ impl ReasoningTrace {
             follow: true,
             smooth_scroll: super::SmoothScrollState::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(owner_id: u64, cx: &mut App) -> Self {
+        Self::new_with_presentation(owner_id, &MarkdownPresentation::for_test(cx), cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed(source: String, owner_id: u64, cx: &mut App) -> Self {
+        Self::completed_with_presentation(source, owner_id, &MarkdownPresentation::for_test(cx), cx)
     }
 
     /// Append a reasoning delta, and keep the newest text in view.

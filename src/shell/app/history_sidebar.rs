@@ -6,7 +6,7 @@
 //! workspace state, never row identity. Every catalog read runs on the
 //! background executor; render only reads the snapshot.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, rc::Rc};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -27,11 +27,16 @@ use rust_i18n::t;
 use crate::preferences;
 use crate::session::{
     CatalogCursor, CatalogError, CatalogPage, CatalogQuery, SessionCatalogStore, SessionDomain,
-    SessionId, SessionLifecycleStore, SessionStores, SessionSummary,
+    SessionId, SessionLifecycleStore, SessionSummary,
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmation;
 
-use super::{ChatApp, Conversation, SidebarTarget};
+use super::ChatApp;
+use super::chat_workspace::{
+    ChatConversationSnapshot, ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot,
+};
+use super::workspace_host::WorkspaceCommand;
+use crate::runtime::CHAT_WORKSPACE_ID;
 
 /// Row height for both draft and catalog rows, matching the previous
 /// conversation row so the sidebar density is unchanged.
@@ -46,6 +51,7 @@ pub(super) enum HistoryLoadState {
 }
 
 /// UI-independent snapshot of the Chat catalog sidebar.
+#[derive(Clone)]
 pub(super) struct ChatHistorySidebar {
     summaries: Vec<SessionSummary>,
     load_state: HistoryLoadState,
@@ -173,7 +179,7 @@ fn dedup_summaries(sessions: Vec<SessionSummary>) -> Vec<SessionSummary> {
         .collect()
 }
 
-impl ChatApp {
+impl ChatWorkspace {
     // ---------- Background catalog loading ----------
 
     /// Kick off the initial catalog page on the background executor.  The first
@@ -190,11 +196,7 @@ impl ChatApp {
         ) {
             return;
         }
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            self.history.load_state =
-                HistoryLoadState::Error(t!("sidebar.load_failed").to_string().into());
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(error) => {
@@ -221,7 +223,7 @@ impl ChatApp {
             });
         });
         self._catalog_initial_task = Some(task);
-        cx.notify();
+        self.notify_changed(cx);
     }
 
     fn apply_catalog_initial(
@@ -241,7 +243,7 @@ impl ChatApp {
             }
         }
         self._catalog_initial_task = None;
-        cx.notify();
+        self.notify_changed(cx);
 
         // Startup restore is a separate, cancellable selection that must not
         // block the first catalog frame.  Only attempt it once, immediately
@@ -263,9 +265,7 @@ impl ChatApp {
         let Some(cursor) = self.history.next_cursor.clone() else {
             return;
         };
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -292,7 +292,7 @@ impl ChatApp {
             });
         });
         self._catalog_load_more_task = Some(task);
-        cx.notify();
+        self.notify_changed(cx);
     }
 
     fn apply_catalog_load_more(
@@ -310,7 +310,7 @@ impl ChatApp {
             // can retry via the button, which remains available because the
             // cursor did not advance.
         }
-        cx.notify();
+        self.notify_changed(cx);
     }
 
     /// Refresh a single session's summary in the background.  Used after a
@@ -321,9 +321,7 @@ impl ChatApp {
         session_id: SessionId,
         cx: &mut Context<Self>,
     ) {
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let catalog_store = match stores.chat_catalog() {
             Ok(store) => store,
             Err(_) => return,
@@ -349,7 +347,7 @@ impl ChatApp {
         self._summary_refresh_task = None;
         if let Ok(Some(summary)) = result {
             self.history.upsert(summary);
-            cx.notify();
+            self.notify_changed(cx);
         }
     }
 
@@ -359,7 +357,7 @@ impl ChatApp {
     /// enabled the preference and the session is still present in the catalog.
     /// This is a cancellable background selection that never creates a draft.
     fn maybe_restore_last_chat_on_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let prefs = preferences::get(cx);
+        let prefs = self.preference_handle.snapshot();
         if !prefs.restore_last_chat_on_start {
             return;
         }
@@ -383,11 +381,11 @@ impl ChatApp {
     /// startup restore can re-target it next launch.  Only persisted sessions
     /// are recorded; drafts never have a session id.
     pub(super) fn record_active_session(&self, session_id: &SessionId, cx: &mut Context<Self>) {
-        let current = preferences::get(cx).last_active_chat_session.as_ref();
-        if current == Some(session_id) {
+        let current = self.preference_handle.snapshot().last_active_chat_session;
+        if current.as_ref() == Some(session_id) {
             return;
         }
-        preferences::update(cx, |prefs| {
+        preferences::update_with(cx, &self.preference_handle, |prefs| {
             prefs.last_active_chat_session = Some(session_id.clone());
         });
     }
@@ -404,14 +402,12 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.confirming == Some(SidebarTarget::Session(session_id.clone())) {
+        if self.confirming == Some(ChatTarget::Session(session_id.clone())) {
             self.delete_confirmation.dismiss_for_unmount(window, cx);
             self.confirming = None;
         }
 
-        let Some(stores) = cx.try_global::<SessionStores>().cloned() else {
-            return;
-        };
+        let stores = self.runtime_services.session_services().clone();
         let store = match stores.chat() {
             Ok(store) => store,
             Err(error) => {
@@ -442,7 +438,7 @@ impl ChatApp {
             });
         });
         self._history_delete_task = Some(task);
-        cx.notify();
+        self.notify_changed(cx);
     }
 
     fn apply_unopened_session_delete(
@@ -472,9 +468,11 @@ impl ChatApp {
                 );
             }
         }
-        cx.notify();
+        self.notify_changed(cx);
     }
+}
 
+impl ChatApp {
     // ---------- Sidebar content rendering ----------
 
     /// Render the scrollable catalog + draft list.  Replaces the previous
@@ -485,16 +483,18 @@ impl ChatApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let snapshot = self.chat_snapshot();
         let mut children: Vec<AnyElement> = Vec::new();
 
-        let drafts: Vec<&Conversation> = self
-            .conversations
+        let drafts: Vec<&ChatConversationSnapshot> = snapshot
+            .conversations()
             .iter()
-            .filter(|conversation| conversation.session_id.is_none())
+            .filter(|conversation| conversation.session_id().is_none())
             .collect();
 
         let loading_and_empty =
-            matches!(self.history.load_state, HistoryLoadState::Loading) && self.history.is_empty();
+            matches!(snapshot.history().load_state(), HistoryLoadState::Loading)
+                && snapshot.history().is_empty();
 
         if loading_and_empty {
             children.push(self.render_history_loading_state(cx).into_any_element());
@@ -503,32 +503,32 @@ impl ChatApp {
         // Draft rows sit above the catalog so a freshly created new chat is
         // immediately reachable even before its first durable turn.
         for conversation in &drafts {
-            let target = conversation.view.entity_id();
+            let target = conversation.target();
             children.push(
-                self.render_draft_row(conversation, target, window, cx)
+                self.render_draft_row(snapshot, conversation, target, window, cx)
                     .into_any_element(),
             );
         }
 
         // Catalog rows.
-        let active_session_id = self.active_session_id();
-        for summary in self.history.summaries() {
+        let active_session_id = snapshot.active_session_id();
+        for summary in snapshot.history().summaries() {
             children.push(
-                self.render_catalog_row(summary, active_session_id.as_ref(), window, cx)
+                self.render_catalog_row(snapshot, summary, active_session_id.as_ref(), window, cx)
                     .into_any_element(),
             );
         }
 
-        let ready = matches!(self.history.load_state, HistoryLoadState::Ready);
-        let error_and_empty = matches!(self.history.load_state, HistoryLoadState::Error(_))
-            && self.history.is_empty();
-        let no_rows = drafts.is_empty() && self.history.is_empty();
+        let ready = matches!(snapshot.history().load_state(), HistoryLoadState::Ready);
+        let error_and_empty = matches!(snapshot.history().load_state(), HistoryLoadState::Error(_))
+            && snapshot.history().is_empty();
+        let no_rows = drafts.is_empty() && snapshot.history().is_empty();
 
         if error_and_empty {
             children.push(self.render_history_error_state(cx).into_any_element());
         } else if ready && no_rows {
             children.push(self.render_history_empty_state(cx).into_any_element());
-        } else if self.history.has_more() {
+        } else if snapshot.history().has_more() {
             children.push(self.render_load_more_row(cx).into_any_element());
         }
 
@@ -568,7 +568,7 @@ impl ChatApp {
     }
 
     fn render_history_error_state(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let weak = cx.weak_entity();
+        let workspace = self.chat_workspace().downgrade();
         v_flex()
             .px_2()
             .py_2()
@@ -582,14 +582,18 @@ impl ChatApp {
                     .small()
                     .label(t!("sidebar.retry").to_string())
                     .on_click(move |_, window, cx| {
-                        weak.update(cx, |this, cx| this.start_catalog_initial_load(window, cx))
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.start_catalog_initial_load(window, cx)
+                            })
                             .ok();
                     }),
             )
     }
 
     fn render_load_more_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let in_flight = self.history.load_more_in_flight();
+        let in_flight = self.chat_snapshot().history().load_more_in_flight();
+        let workspace = self.chat_workspace().downgrade();
         let row = div()
             .id("history-load-more")
             .w_full()
@@ -601,9 +605,11 @@ impl ChatApp {
             .text_sm()
             .text_color(cx.theme().sidebar_foreground.opacity(0.7))
             .cursor_default()
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.start_catalog_load_more(cx);
-            }));
+            .on_click(move |_: &ClickEvent, _, cx| {
+                workspace
+                    .update(cx, |workspace, cx| workspace.start_catalog_load_more(cx))
+                    .ok();
+            });
         if in_flight {
             row.child(Spinner::new().small())
                 .child(t!("sidebar.loading_chats").to_string())
@@ -614,23 +620,20 @@ impl ChatApp {
 
     fn render_draft_row(
         &self,
-        conversation: &Conversation,
+        snapshot: &ChatWorkspaceSnapshot,
+        conversation: &ChatConversationSnapshot,
         target: gpui::EntityId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let title = conversation.title.clone();
-        let is_active = self.active == Some(target);
-        let is_generating = conversation.view.read(cx).is_generating();
-        let sidebar_target = SidebarTarget::View(target);
-        let is_confirming = self.confirming == Some(sidebar_target.clone());
+        let title = conversation.title();
+        let is_active = snapshot.active() == Some(target);
+        let is_generating = conversation.is_generating();
+        let sidebar_target = ChatTarget::View(target);
+        let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
-            is_active || self.hovered == Some(sidebar_target.clone()) || is_confirming;
-        let index = self
-            .conversations
-            .iter()
-            .position(|conv| conv.view.entity_id() == target)
-            .expect("draft is in conversations");
+            is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
+        let app = cx.entity().downgrade();
 
         self.render_history_row(
             ("conv-row", target),
@@ -641,12 +644,36 @@ impl ChatApp {
             actions_visible,
             is_confirming,
             sidebar_target,
-            cx.listener(move |this, _, window, cx| this.select(index, window, cx)),
-            cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                if crate::ui::consume_button_key(event, window, cx) {
-                    this.select(index, window, cx);
+            {
+                let app = app.clone();
+                move |_, _, cx| {
+                    app.update(cx, |app, cx| {
+                        app.dispatch_workspace_command(
+                            CHAT_WORKSPACE_ID,
+                            WorkspaceCommand::SelectView(target),
+                            None,
+                            cx,
+                        );
+                    })
+                    .ok();
                 }
-            }),
+            },
+            {
+                let app = app.clone();
+                move |event: &KeyDownEvent, window, cx| {
+                    if crate::ui::consume_button_key(event, window, cx) {
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                CHAT_WORKSPACE_ID,
+                                WorkspaceCommand::SelectView(target),
+                                None,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                }
+            },
             window,
             cx,
         )
@@ -654,34 +681,27 @@ impl ChatApp {
 
     fn render_catalog_row(
         &self,
+        snapshot: &ChatWorkspaceSnapshot,
         summary: &SessionSummary,
         active_session_id: Option<&SessionId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let session_id = summary.session_id.clone();
-        let sidebar_target = SidebarTarget::Session(session_id.clone());
-        let opened_target = self.opened_session_index.get(&session_id).copied();
+        let sidebar_target = ChatTarget::Session(session_id.clone());
+        let opened_target = snapshot.opened_target(&session_id);
         let is_active = active_session_id == Some(&session_id);
         let is_generating = opened_target
-            .and_then(|target| {
-                self.conversations
-                    .iter()
-                    .find(|conv| conv.view.entity_id() == target)
-            })
-            .map(|conv| conv.view.read(cx).is_generating())
+            .and_then(|target| snapshot.conversation(target))
+            .map(ChatConversationSnapshot::is_generating)
             .unwrap_or(false);
 
         // Prefer the live conversation title (which tracks in-flight edits)
         // when the session is opened; otherwise fall back to the catalog title
         // or a localized placeholder.
         let title: SharedString = opened_target
-            .and_then(|target| {
-                self.conversations
-                    .iter()
-                    .find(|conv| conv.view.entity_id() == target)
-            })
-            .map(|conv| conv.title.clone())
+            .and_then(|target| snapshot.conversation(target))
+            .map(ChatConversationSnapshot::title)
             .or_else(|| {
                 summary
                     .title
@@ -698,9 +718,10 @@ impl ChatApp {
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
 
-        let is_confirming = self.confirming == Some(sidebar_target.clone());
+        let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let actions_visible =
-            is_active || self.hovered == Some(sidebar_target.clone()) || is_confirming;
+            is_active || snapshot.hovered() == Some(&sidebar_target) || is_confirming;
+        let app = cx.entity().downgrade();
 
         self.render_history_row(
             format!("history-row-{session_id}"),
@@ -713,17 +734,39 @@ impl ChatApp {
             sidebar_target.clone(),
             {
                 let session_id = session_id.clone();
-                cx.listener(move |this, _, window, cx| {
-                    this.select_session(session_id.clone(), window, cx);
-                })
+                {
+                    let app = app.clone();
+                    move |_, window, cx| {
+                        app.update(cx, |app, cx| {
+                            app.dispatch_workspace_command(
+                                CHAT_WORKSPACE_ID,
+                                WorkspaceCommand::RestoreChatSession(session_id.clone()),
+                                Some(window),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                }
             },
             {
                 let session_id = session_id.clone();
-                cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                    if crate::ui::consume_button_key(event, window, cx) {
-                        this.select_session(session_id.clone(), window, cx);
+                {
+                    let app = app.clone();
+                    move |event: &KeyDownEvent, window, cx| {
+                        if crate::ui::consume_button_key(event, window, cx) {
+                            app.update(cx, |app, cx| {
+                                app.dispatch_workspace_command(
+                                    CHAT_WORKSPACE_ID,
+                                    WorkspaceCommand::RestoreChatSession(session_id.clone()),
+                                    Some(window),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                        }
                     }
-                })
+                }
             },
             window,
             cx,
@@ -744,7 +787,7 @@ impl ChatApp {
         is_generating: bool,
         actions_visible: bool,
         is_confirming: bool,
-        target: SidebarTarget,
+        target: ChatTarget,
         on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
         on_key_down: impl Fn(&KeyDownEvent, &mut Window, &mut App) + 'static,
         window: &mut Window,
@@ -759,6 +802,7 @@ impl ChatApp {
         let focus_ring = cx.theme().ring.opacity(0.2);
         let target_for_hover = target.clone();
         let target_for_actions = target;
+        let workspace = self.chat_workspace().downgrade();
 
         let title_element = if is_generating {
             h_flex()
@@ -793,17 +837,25 @@ impl ChatApp {
             .relative()
             .w_full()
             .h(HISTORY_ROW_HEIGHT)
-            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            .on_hover(move |hovered: &bool, _, cx| {
                 let entered = *hovered;
-                if !entered && this.hovered != Some(target_for_hover.clone()) {
-                    return;
+                if entered {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.set_hovered(Some(target_for_hover.clone()), cx)
+                        })
+                        .ok();
+                } else {
+                    let target = target_for_hover.clone();
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            if workspace.snapshot().hovered() == Some(&target) {
+                                workspace.set_hovered(None, cx);
+                            }
+                        })
+                        .ok();
                 }
-                let next = entered.then(|| target_for_hover.clone());
-                if this.hovered != next {
-                    this.hovered = next;
-                    cx.notify();
-                }
-            }))
+            })
             .child(
                 div()
                     .id(button_id)
@@ -842,7 +894,7 @@ impl ChatApp {
                     .top(px(6.))
                     .size_5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(self.render_sidebar_actions(
+                    .child(self.render_chat_sidebar_actions(
                         target_for_actions,
                         actions_visible,
                         is_confirming,
@@ -852,126 +904,147 @@ impl ChatApp {
             .into_any_element()
     }
 
-    /// Render the trailing actions button for any sidebar row.  When
-    /// confirming, the button becomes a Popover trigger with an inline delete
-    /// card; otherwise it opens a dropdown menu with a delete entry.
-    pub(super) fn render_sidebar_actions(
+    fn render_chat_sidebar_actions(
         &self,
-        target: SidebarTarget,
+        target: ChatTarget,
         visible: bool,
         confirming: bool,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> AnyElement {
-        let weak = cx.weak_entity();
-        let (trigger_id, confirm_id, trigger_debug_selector, delete_label, confirm_title): (
-            ElementId,
-            ElementId,
-            String,
-            String,
-            String,
-        ) = match &target {
-            SidebarTarget::View(entity) => (
-                ("conversation-actions", *entity).into(),
-                ("conversation-delete-confirm", *entity).into(),
-                format!("conversation-actions-{}", entity.as_u64()),
-                t!("sidebar.delete_chat").to_string(),
-                t!("sidebar.delete_chat_title").to_string(),
-            ),
-            SidebarTarget::Session(session) => (
-                format!("history-actions-{session}").into(),
-                format!("history-delete-confirm-{session}").into(),
-                format!("history-actions-{session}"),
-                t!("sidebar.delete_chat").to_string(),
-                t!("sidebar.delete_chat_title").to_string(),
-            ),
-            SidebarTarget::AgentView(entity) => (
-                ("agent-conversation-actions", *entity).into(),
-                ("agent-conversation-delete-confirm", *entity).into(),
-                format!("agent-conversation-actions-{}", entity.as_u64()),
-                t!("agent.delete_session").to_string(),
-                t!("agent.delete_session_title").to_string(),
-            ),
-            SidebarTarget::AgentSession {
-                project_id,
-                session_id,
-            } => (
-                format!("agent-session-actions-{project_id}-{session_id}").into(),
-                format!("agent-session-delete-confirm-{project_id}-{session_id}").into(),
-                format!("agent-session-actions-{project_id}-{session_id}"),
-                t!("agent.delete_session").to_string(),
-                t!("agent.delete_session_title").to_string(),
-            ),
-            SidebarTarget::AgentProject(project_id) => (
-                format!("agent-project-actions-{project_id}").into(),
-                format!("agent-project-delete-confirm-{project_id}").into(),
-                format!("agent-project-actions-{project_id}"),
-                t!("agent.delete_project").to_string(),
-                t!("agent.delete_project_title").to_string(),
-            ),
+        let workspace = self.chat_workspace().downgrade();
+        let ids = match &target {
+            ChatTarget::View(entity) => SidebarActionIds {
+                trigger_id: ("conversation-actions", *entity).into(),
+                confirm_id: ("conversation-delete-confirm", *entity).into(),
+                trigger_debug_selector: format!("conversation-actions-{}", entity.as_u64()),
+                delete_label: t!("sidebar.delete_chat").to_string(),
+                confirm_title: t!("sidebar.delete_chat_title").to_string(),
+            },
+            ChatTarget::Session(session) => SidebarActionIds {
+                trigger_id: format!("history-actions-{session}").into(),
+                confirm_id: format!("history-delete-confirm-{session}").into(),
+                trigger_debug_selector: format!("history-actions-{session}"),
+                delete_label: t!("sidebar.delete_chat").to_string(),
+                confirm_title: t!("sidebar.delete_chat_title").to_string(),
+            },
         };
-        let trigger = Button::new(trigger_id)
-            .ghost()
-            .xsmall()
-            .icon(IconName::Ellipsis)
-            .tooltip(t!("sidebar.more_actions").to_string())
-            .debug_selector(move || trigger_debug_selector.clone());
-
-        if confirming {
-            let target_for_open = target.clone();
-            let target_for_confirm = target;
-            InlineDeleteConfirmation::new(
-                confirm_id,
-                trigger,
-                confirm_title,
-                t!("sidebar.delete_chat_cancel").to_string(),
-                t!("sidebar.delete_chat_confirm").to_string(),
-                self.delete_confirmation.clone(),
-            )
-            .on_open_change(cx.listener(move |this, open: &bool, _, cx| {
-                if !*open && this.confirming == Some(target_for_open.clone()) {
-                    this.confirming = None;
-                    cx.notify();
-                }
-            }))
-            .on_confirm({
-                let weak = weak.clone();
-                move |window, cx| {
-                    weak.update(cx, |this, cx| {
-                        this.confirm_delete_target(target_for_confirm.clone(), window, cx);
+        render_sidebar_actions(
+            SidebarActionSpec {
+                target,
+                visible,
+                confirming,
+                ids,
+                handle: self.chat_snapshot().delete_confirmation(),
+            },
+            move |target, window, cx| {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.clear_delete_confirmation(&target, window, cx)
                     })
                     .ok();
+            },
+            {
+                let workspace = self.chat_workspace().downgrade();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.confirm_delete_target(target, window, cx)
+                        })
+                        .ok();
                 }
+            },
+            {
+                let workspace = self.chat_workspace().downgrade();
+                move |target, window, cx| {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.begin_delete_confirmation(target, window, cx)
+                        })
+                        .ok();
+                }
+            },
+        )
+    }
+}
+
+/// Stable UI identifiers and labels for one workspace-local sidebar target.
+pub(super) struct SidebarActionIds {
+    pub(super) trigger_id: ElementId,
+    pub(super) confirm_id: ElementId,
+    pub(super) trigger_debug_selector: String,
+    pub(super) delete_label: String,
+    pub(super) confirm_title: String,
+}
+
+pub(super) struct SidebarActionSpec<T> {
+    pub(super) target: T,
+    pub(super) visible: bool,
+    pub(super) confirming: bool,
+    pub(super) ids: SidebarActionIds,
+    pub(super) handle: crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle,
+}
+
+/// Render the common trailing action control without understanding the target
+/// type or which workspace owns it.
+pub(super) fn render_sidebar_actions<T>(
+    spec: SidebarActionSpec<T>,
+    on_clear: impl Fn(T, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(T, &mut Window, &mut App) + 'static,
+    on_begin: impl Fn(T, &mut Window, &mut App) + 'static,
+) -> AnyElement
+where
+    T: Clone + 'static,
+{
+    let SidebarActionSpec {
+        target,
+        visible,
+        confirming,
+        ids,
+        handle,
+    } = spec;
+    let on_begin = Rc::new(on_begin);
+    let trigger = Button::new(ids.trigger_id)
+        .ghost()
+        .xsmall()
+        .icon(IconName::Ellipsis)
+        .tooltip(t!("sidebar.more_actions").to_string())
+        .debug_selector(move || ids.trigger_debug_selector.clone());
+
+    if confirming {
+        let target_for_open = target.clone();
+        let target_for_confirm = target;
+        InlineDeleteConfirmation::new(
+            ids.confirm_id,
+            trigger,
+            ids.confirm_title,
+            t!("sidebar.delete_chat_cancel").to_string(),
+            t!("sidebar.delete_chat_confirm").to_string(),
+            handle,
+        )
+        .on_open_change(move |open: &bool, window, cx| {
+            if !*open {
+                on_clear(target_for_open.clone(), window, cx);
+            }
+        })
+        .on_confirm(move |window, cx| {
+            on_confirm(target_for_confirm.clone(), window, cx);
+        })
+        .into_any_element()
+    } else {
+        let target_for_begin = target;
+        trigger
+            .when(!visible, |this| this.invisible())
+            .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
+                let target = target_for_begin.clone();
+                let on_begin = Rc::clone(&on_begin);
+                menu.item(
+                    gpui_component::menu::PopupMenuItem::new(ids.delete_label.clone()).on_click(
+                        move |_, window, cx| {
+                            on_begin(target.clone(), window, cx);
+                        },
+                    ),
+                )
             })
             .into_any_element()
-        } else {
-            trigger
-                .when(!visible, |this| this.invisible())
-                .dropdown_menu_with_anchor(gpui::Anchor::TopRight, move |menu, _, _| {
-                    let weak = weak.clone();
-                    let target = target.clone();
-                    let delete_label = delete_label.clone();
-                    menu.item(
-                        gpui_component::menu::PopupMenuItem::new(delete_label).on_click(
-                            move |_, window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.begin_delete_confirmation(target.clone(), window, cx)
-                                })
-                                .ok();
-                            },
-                        ),
-                    )
-                })
-                .into_any_element()
-        }
-    }
-
-    /// The session id of the currently active conversation, if any.  Used to
-    /// annotate catalog rows without iterating conversations per row.
-    fn active_session_id(&self) -> Option<SessionId> {
-        let target = self.active?;
-        self.conversations
-            .iter()
-            .find(|conv| conv.view.entity_id() == target)
-            .and_then(|conv| conv.session_id.clone())
     }
 }

@@ -1,18 +1,60 @@
-use super::*;
+use gpui::{Context, SharedString};
 
-use crate::session::{ResolvedSessionState, SessionId};
+use crate::{
+    chat::conversation_runtime::ConversationRuntime,
+    chat::{ChatEvent, ChatView, Message, derive_title},
+    llm::{ContentBlock, ModelSelection},
+    session::{ChatSessionControllerError, ResolvedSessionState, SessionId},
+};
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
 pub enum ChatRestoreError {
     #[error("chat session controller lock is poisoned")]
     ControllerLockPoisoned,
-    #[error("chat view is busy with a pending turn, persistence, or deletion")]
+    #[error("conversation runtime is busy with a pending turn, persistence, or deletion")]
     Busy,
     #[error("chat session storage has not been initialized")]
     StorageUnavailable,
     #[error(transparent)]
     Controller(#[from] ChatSessionControllerError),
+}
+
+impl ConversationRuntime {
+    fn restore_session(
+        &mut self,
+        session_id: &SessionId,
+        state: &ResolvedSessionState,
+        cx: &mut Context<Self>,
+    ) -> Result<Option<ModelSelection>, ChatRestoreError> {
+        if self.generating
+            || self.persistence_pending
+            || self.deletion_requested
+            || self.deletion_pending
+            || self.shutdown_requested
+            || self.pending_turn_id.is_some()
+            || self.terminal_persistence.is_some()
+            || self.pending_terminal.is_some()
+        {
+            return Err(ChatRestoreError::Busy);
+        }
+        let controller = self
+            .session_controller
+            .clone()
+            .ok_or(ChatRestoreError::StorageUnavailable)?;
+        let restored_model = {
+            let mut guard = controller
+                .lock()
+                .map_err(|_| ChatRestoreError::ControllerLockPoisoned)?;
+            guard.restore(session_id)?;
+            guard.current_model().cloned()
+        };
+        self.advance_generation();
+        self.session_id = Some(session_id.clone());
+        self.next_turn_id = next_turn_id_for(state).saturating_add(1);
+        self.publish_state(cx);
+        Ok(restored_model)
+    }
 }
 
 impl ChatView {
@@ -34,52 +76,34 @@ impl ChatView {
         state: &ResolvedSessionState,
         cx: &mut Context<Self>,
     ) -> Result<(), ChatRestoreError> {
-        if self.pending
-            || self.persistence_pending
-            || self.deletion_requested
-            || self.deletion_pending
-            || self.shutdown_requested
-            || self.pending_turn_id.is_some()
-            || self.terminal_persistence.is_some()
-            || self.pending_terminal.is_some()
-        {
-            return Err(ChatRestoreError::Busy);
-        }
-
-        let controller = self
-            .session_controller
-            .clone()
-            .ok_or(ChatRestoreError::StorageUnavailable)?;
-        let restored_model = {
-            let mut guard = controller
-                .lock()
-                .map_err(|_| ChatRestoreError::ControllerLockPoisoned)?;
-            guard.restore(session_id)?;
-            guard.current_model().cloned()
-        };
+        let (restored_model, snapshot) = self.runtime.update(cx, |runtime, cx| {
+            let restored_model = runtime.restore_session(session_id, state, cx);
+            (restored_model, runtime.snapshot())
+        });
+        let restored_model = restored_model?;
+        self.apply_runtime_snapshot(snapshot);
 
         let messages = state
             .messages
             .iter()
-            .map(|resolved| Message::from_canonical(resolved.message.clone(), cx))
+            .map(|resolved| {
+                Message::from_canonical_with_presentation(
+                    resolved.message.clone(),
+                    &self.markdown_presentation,
+                    cx,
+                )
+            })
             .collect::<Vec<_>>();
         let previous_len = self.messages.len();
         self.messages = messages;
         let new_len = self.messages.len();
         if previous_len != new_len {
             self.list_state.splice(previous_len..previous_len, new_len);
-        } else {
-            cx.notify();
         }
-
-        self.conversation_id = session_id.to_string();
-        self.next_turn_id = next_turn_id_for(state).saturating_add(1);
 
         if let Some(model) = restored_model {
             self.selection = Some(model);
-            self.selection_available =
-                providers::selection_is_available(self.selection.as_ref(), cx);
-            self.provider_catalog_revision = providers::catalog_revision();
+            self.sync_selection_availability();
         }
 
         if let Some(title) = derive_title_from_state(state) {
@@ -89,7 +113,6 @@ impl ChatView {
         if let Some(model) = self.selection.clone() {
             cx.emit(ChatEvent::SelectionChanged(model));
         }
-        cx.notify();
         Ok(())
     }
 }
@@ -116,8 +139,9 @@ fn turn_id_index(turn_id: &str) -> Option<u64> {
         .and_then(|rest| rest.parse::<u64>().ok())
 }
 
-#[allow(dead_code)]
-fn derive_title_from_state(state: &ResolvedSessionState) -> Option<SharedString> {
+/// Derive a conversation title from the first non-empty user message in a
+/// resolved session state.
+pub(crate) fn derive_title_from_state(state: &ResolvedSessionState) -> Option<SharedString> {
     state
         .messages
         .iter()

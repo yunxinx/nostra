@@ -1,13 +1,37 @@
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
 use gpui::{
     Context, IntoElement, Modifiers, MouseButton, Render, TestAppContext, VisualTestContext, point,
 };
 use gpui_base::TextSelection;
 use gpui_component::{ActiveTheme as _, Root};
 
+use crate::runtime::{ContributionDefinition, ContributionId, ContributionRegistry, ScopeId};
+
 use super::*;
 
 struct CodeSelectionTestRoot {
     body: MarkdownBody,
+}
+
+struct DropSignal {
+    drops: Arc<AtomicUsize>,
+}
+
+impl DropSignal {
+    fn new(drops: Arc<AtomicUsize>) -> Self {
+        Self { drops }
+    }
+}
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Render for CodeSelectionTestRoot {
@@ -25,6 +49,645 @@ fn init_markdown_test(cx: &mut TestAppContext) {
         preferences::init_global(prefs.clone(), cx);
         crate::appearance::theme::init(&prefs, cx);
     });
+}
+
+#[test]
+fn markdown_contribution_snapshot_preserves_stable_builtin_order() {
+    const SCOPE: ScopeId = ScopeId::new(800);
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    registry
+        .register_batch(
+            SCOPE,
+            [
+                code_block::fenced_code_contribution(),
+                crate::ui::math::markdown_contribution(),
+                extension_registry::cjk_emphasis_contribution(),
+            ],
+        )
+        .expect("register built-in Markdown contributions");
+
+    let snapshot = registry.snapshot(SCOPE).expect("Markdown snapshot");
+    assert_eq!(
+        snapshot
+            .contributions()
+            .iter()
+            .map(|entry| (entry.id().as_str(), entry.order()))
+            .collect::<Vec<_>>(),
+        [
+            ("nostra.markdown.cjk", 10),
+            ("nostra.markdown.math", 20),
+            ("nostra.markdown.fenced-code", 30),
+        ]
+    );
+}
+
+#[test]
+fn markdown_contribution_installation_uses_snapshot_order_and_body_context() {
+    const SCOPE: ScopeId = ScopeId::new(801);
+    const EARLY: ContributionId = ContributionId::new("nostra.markdown.test-early");
+    const LATE: ContributionId = ContributionId::new("nostra.markdown.test-late");
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let contribution = |id, order, label| {
+        let calls = Rc::clone(&calls);
+        ContributionDefinition::new(
+            id,
+            order,
+            MarkdownExtensionInstaller::new(move |extensions, context| {
+                calls
+                    .borrow_mut()
+                    .push((label, context.owner_id(), context.source_offset()));
+                extensions
+            }),
+        )
+    };
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    registry
+        .register_batch(
+            SCOPE,
+            [
+                contribution(LATE, 20, "late"),
+                contribution(EARLY, 10, "early"),
+            ],
+        )
+        .expect("register test Markdown contributions");
+    let snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("Markdown snapshot"));
+    let context = MarkdownExtensionInstallContext::new(
+        42,
+        17,
+        Arc::new(Mutex::new(preferences::Preferences::default())),
+    );
+
+    let _ = snapshot.install(&context);
+
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [("early", 42, 17), ("late", 42, 17)]
+    );
+}
+
+#[gpui::test]
+fn markdown_body_materializes_snapshots_once_and_rejects_stale_revision_completion(
+    cx: &mut TestAppContext,
+) {
+    const SCOPE: ScopeId = ScopeId::new(802);
+    const EXTENSION: ContributionId = ContributionId::new("nostra.markdown.test-revision");
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let contribution = |label| {
+        let calls = Rc::clone(&calls);
+        ContributionDefinition::new(
+            EXTENSION,
+            10,
+            MarkdownExtensionInstaller::new(move |extensions, context| {
+                calls.borrow_mut().push((label, context.owner_id()));
+                extensions
+            }),
+        )
+    };
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    let old_registration = registry
+        .register(SCOPE, contribution("old"))
+        .expect("register old Markdown contribution");
+    let old_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old Markdown snapshot"));
+    cx.update(gpui_component::init);
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(Arc::clone(&preferences), old_snapshot.clone());
+    let mut body =
+        cx.update(|cx| MarkdownBody::new_with_presentation("body", 42, &presentation, cx));
+
+    assert_eq!(calls.borrow().as_slice(), [("old", 42)]);
+    assert_eq!(body.extension_revision(), old_snapshot.revision());
+    assert!(!body.update_extension_snapshot(&old_snapshot));
+    let _ = body.text_view(TextViewStyle::default());
+    let _ = body.text_view(TextViewStyle::default());
+    assert_eq!(calls.borrow().as_slice(), [("old", 42)]);
+
+    assert!(
+        registry
+            .revoke(&old_registration)
+            .expect("revoke old Markdown contribution")
+    );
+    registry
+        .register(SCOPE, contribution("new"))
+        .expect("register new Markdown contribution");
+    let new_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("new Markdown snapshot"));
+
+    assert!(body.update_extension_snapshot(&new_snapshot));
+    assert_eq!(body.extension_revision(), new_snapshot.revision());
+    assert_eq!(calls.borrow().as_slice(), [("old", 42), ("new", 42)]);
+
+    assert!(!body.update_extension_snapshot(&old_snapshot));
+    assert_eq!(body.extension_revision(), new_snapshot.revision());
+    assert_eq!(calls.borrow().as_slice(), [("old", 42), ("new", 42)]);
+}
+
+#[gpui::test]
+fn newer_markdown_snapshot_reparses_existing_state_without_render_time_registry_access(
+    cx: &mut TestAppContext,
+) {
+    const SCOPE: ScopeId = ScopeId::new(803);
+    const EXTENSION: ContributionId = ContributionId::new("nostra.markdown.test-renderer");
+    let contribution = |node_name: &'static str| {
+        ContributionDefinition::new(
+            EXTENSION,
+            10,
+            MarkdownExtensionInstaller::new(move |extensions, _| {
+                extensions
+                    .block_parser(move |node, cx| {
+                        let markdown_ast::Node::Paragraph(_) = node else {
+                            return None;
+                        };
+                        let source = cx.node_source(node)?;
+                        Some(
+                            MarkdownNode::new(node_name, ())
+                                .text(source.to_string())
+                                .markdown(source.to_string()),
+                        )
+                    })
+                    .block_renderer(node_name, move |node, _, _| {
+                        div()
+                            .debug_selector(move || node_name.into())
+                            .child(node.as_text().to_string())
+                    })
+            }),
+        )
+    };
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    let old_registration = registry
+        .register(SCOPE, contribution("markdown-snapshot-old"))
+        .expect("register old renderer");
+    let old_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old renderer snapshot"));
+    init_markdown_test(cx);
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(preferences, old_snapshot.clone());
+    let content = cx.update(|cx| {
+        cx.new(|cx| CodeSelectionTestRoot {
+            body: MarkdownBody::new_with_presentation("existing body", 43, &presentation, cx),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("markdown-snapshot-old").is_some());
+
+    assert!(
+        registry
+            .revoke(&old_registration)
+            .expect("revoke old renderer")
+    );
+    registry
+        .register(SCOPE, contribution("markdown-snapshot-new"))
+        .expect("register new renderer");
+    let new_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("new renderer snapshot"));
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&new_snapshot));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    assert!(cx.debug_bounds("markdown-snapshot-old").is_none());
+    assert!(cx.debug_bounds("markdown-snapshot-new").is_some());
+
+    content.update(cx, |root, cx| {
+        assert!(!root.body.update_extension_snapshot(&old_snapshot));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("markdown-snapshot-old").is_none());
+    assert!(cx.debug_bounds("markdown-snapshot-new").is_some());
+}
+
+#[gpui::test]
+fn replacing_and_removing_a_contribution_releases_parser_and_renderer_owners(
+    cx: &mut TestAppContext,
+) {
+    const SCOPE: ScopeId = ScopeId::new(804);
+    const EXTENSION: ContributionId = ContributionId::new("nostra.markdown.test-lifecycle");
+    let contribution = |node_name: &'static str,
+                        parser_drops: Arc<AtomicUsize>,
+                        renderer_drops: Arc<AtomicUsize>,
+                        parsed_sources: Arc<Mutex<Vec<String>>>| {
+        ContributionDefinition::new(
+            EXTENSION,
+            10,
+            MarkdownExtensionInstaller::new(move |extensions, _| {
+                let parser_owner = DropSignal::new(Arc::clone(&parser_drops));
+                let renderer_owner = DropSignal::new(Arc::clone(&renderer_drops));
+                let parsed_sources = Arc::clone(&parsed_sources);
+                extensions
+                    .block_parser(move |node, cx| {
+                        let _owner = &parser_owner;
+                        let markdown_ast::Node::Paragraph(_) = node else {
+                            return None;
+                        };
+                        let source = cx.node_source(node)?;
+                        parsed_sources
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push(source.to_string());
+                        Some(
+                            MarkdownNode::new(node_name, ())
+                                .text(source.to_string())
+                                .markdown(source.to_string()),
+                        )
+                    })
+                    .block_renderer(node_name, move |node, _, _| {
+                        let _owner = &renderer_owner;
+                        div()
+                            .debug_selector(move || node_name.into())
+                            .child(node.as_text().to_string())
+                    })
+            }),
+        )
+    };
+    let old_parser_drops = Arc::new(AtomicUsize::new(0));
+    let old_renderer_drops = Arc::new(AtomicUsize::new(0));
+    let old_sources = Arc::new(Mutex::new(Vec::new()));
+    let new_parser_drops = Arc::new(AtomicUsize::new(0));
+    let new_renderer_drops = Arc::new(AtomicUsize::new(0));
+    let new_sources = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    let old_registration = registry
+        .register(
+            SCOPE,
+            contribution(
+                "markdown-lifecycle-old",
+                Arc::clone(&old_parser_drops),
+                Arc::clone(&old_renderer_drops),
+                Arc::clone(&old_sources),
+            ),
+        )
+        .expect("register old lifecycle contribution");
+    let old_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old lifecycle snapshot"));
+
+    init_markdown_test(cx);
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(preferences, old_snapshot.clone());
+    let content = cx.update(|cx| {
+        cx.new(|cx| CodeSelectionTestRoot {
+            body: MarkdownBody::new_with_presentation("alpha", 44, &presentation, cx),
+        })
+    });
+    let body_entity = content.read_with(cx, |root, _| root.body.entity_id());
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(cx.debug_bounds("markdown-lifecycle-old").is_some());
+
+    cx.update(|_, cx| {
+        content.update(cx, |root, cx| root.body.push_str(" before", cx));
+    });
+    assert!(
+        registry
+            .revoke(&old_registration)
+            .expect("revoke old lifecycle contribution")
+    );
+    let new_registration = registry
+        .register(
+            SCOPE,
+            contribution(
+                "markdown-lifecycle-new",
+                Arc::clone(&new_parser_drops),
+                Arc::clone(&new_renderer_drops),
+                Arc::clone(&new_sources),
+            ),
+        )
+        .expect("register successor lifecycle contribution");
+    let new_snapshot = MarkdownExtensionSnapshot::from(
+        &registry
+            .snapshot(SCOPE)
+            .expect("successor lifecycle snapshot"),
+    );
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&new_snapshot));
+        root.body.push_str(" after", cx);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    assert_eq!(old_parser_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(old_renderer_drops.load(Ordering::SeqCst), 1);
+    assert!(cx.debug_bounds("markdown-lifecycle-old").is_none());
+    assert!(cx.debug_bounds("markdown-lifecycle-new").is_some());
+    assert!(
+        new_sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|source| source == "alpha before after")
+    );
+    assert_eq!(
+        content
+            .update(cx, |root, cx| root.body.select_all_text(cx))
+            .trim_end(),
+        "alpha before after"
+    );
+    assert_eq!(
+        content.read_with(cx, |root, _| root.body.entity_id()),
+        body_entity
+    );
+
+    assert!(
+        registry
+            .revoke(&new_registration)
+            .expect("remove successor lifecycle contribution")
+    );
+    let empty_snapshot = MarkdownExtensionSnapshot::from(
+        &registry.snapshot(SCOPE).expect("empty lifecycle snapshot"),
+    );
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&empty_snapshot));
+        root.body.push_str(" removed", cx);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    assert_eq!(new_parser_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(new_renderer_drops.load(Ordering::SeqCst), 1);
+    assert!(cx.debug_bounds("markdown-lifecycle-new").is_none());
+    assert_eq!(
+        content
+            .update(cx, |root, cx| root.body.select_all_text(cx))
+            .trim_end(),
+        "alpha before after removed"
+    );
+    assert_eq!(
+        content.read_with(cx, |root, _| root.body.entity_id()),
+        body_entity
+    );
+}
+
+#[gpui::test]
+fn replacing_and_removing_fenced_code_releases_generation_owned_cache_and_task(
+    cx: &mut TestAppContext,
+) {
+    const SCOPE: ScopeId = ScopeId::new(805);
+    const OWNER_ID: u64 = 8_005;
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    let old_registration = registry
+        .register(SCOPE, code_block::fenced_code_contribution())
+        .expect("register old fenced-code contribution");
+    let old_owner =
+        MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, old_registration.generation());
+    let old_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old fenced snapshot"));
+    let source = format!(
+        "```rust\n{}\n```",
+        "let value = 42;\nprintln!(\"{value}\");\n".repeat(700)
+    );
+
+    init_markdown_test(cx);
+    reset_background_probe();
+    let background_gates = block_background_highlights(2);
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(preferences, old_snapshot);
+    let content = cx.update(|cx| {
+        cx.new(|cx| CodeSelectionTestRoot {
+            body: MarkdownBody::new_with_presentation(&source, OWNER_ID, &presentation, cx),
+        })
+    });
+    let body_entity = content.read_with(cx, |root, _| root.body.entity_id());
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let first = background_probe();
+    assert_eq!(first.background_spawns, 1);
+    assert_eq!(first.active_caches, 1);
+    assert_eq!(first.active_task_owners, 1);
+    assert_eq!(first.last_created_owner, Some(old_owner));
+
+    cx.update(|_, cx| {
+        content.update(cx, |root, cx| {
+            root.body.push_str("\nbefore replacement", cx)
+        });
+    });
+    assert!(
+        registry
+            .revoke(&old_registration)
+            .expect("revoke old fenced-code contribution")
+    );
+    let successor_registration = registry
+        .register(SCOPE, code_block::fenced_code_contribution())
+        .expect("register successor fenced-code contribution");
+    let successor_owner = MarkdownContributionOwner::new(
+        FENCED_CODE_EXTENSION_ID,
+        successor_registration.generation(),
+    );
+    let successor_snapshot = MarkdownExtensionSnapshot::from(
+        &registry.snapshot(SCOPE).expect("successor fenced snapshot"),
+    );
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&successor_snapshot));
+        root.body.push_str(" after replacement", cx);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let replaced = background_probe();
+    assert_eq!(replaced.background_spawns, 2);
+    assert_eq!(replaced.cache_releases, 1);
+    assert_eq!(replaced.task_owner_releases, 1);
+    assert_eq!(replaced.active_caches, 1);
+    assert_eq!(replaced.active_task_owners, 1);
+    assert_eq!(replaced.last_released_owner, Some(old_owner));
+    assert_eq!(replaced.last_created_owner, Some(successor_owner));
+
+    assert!(
+        registry
+            .revoke(&successor_registration)
+            .expect("remove successor fenced-code contribution")
+    );
+    let empty_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("empty fenced snapshot"));
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&empty_snapshot));
+        root.body.push_str(" after removal", cx);
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let removed = background_probe();
+    assert_eq!(removed.cache_releases, 2);
+    assert_eq!(removed.task_owner_releases, 2);
+    assert_eq!(removed.active_caches, 0);
+    assert_eq!(removed.active_task_owners, 0);
+    assert_eq!(removed.last_released_owner, Some(successor_owner));
+    assert_eq!(removed.background_installs, 0);
+
+    drop(background_gates);
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert_eq!(
+        background_probe().background_installs,
+        0,
+        "released highlight workers cannot install into a successor or removed cache"
+    );
+    let selected = content.update(cx, |root, cx| root.body.select_all_text(cx));
+    assert!(selected.contains("let value = 42;"));
+    assert!(
+        selected
+            .trim_end()
+            .ends_with("before replacement after replacement after removal")
+    );
+    assert_eq!(
+        content.read_with(cx, |root, _| root.body.entity_id()),
+        body_entity
+    );
+}
+
+#[gpui::test]
+fn replacing_and_removing_math_releases_generation_owned_formula_cache(cx: &mut TestAppContext) {
+    const SCOPE: ScopeId = ScopeId::new(806);
+    const OWNER_ID: u64 = 8_006;
+    const FORMULA_START: usize = 0;
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(SCOPE);
+    let old_registration = registry
+        .register(SCOPE, crate::ui::math::markdown_contribution())
+        .expect("register old math contribution");
+    let old_owner = MarkdownContributionOwner::new(
+        crate::ui::math::MATH_EXTENSION_ID,
+        old_registration.generation(),
+    );
+    let old_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("old math snapshot"));
+
+    init_markdown_test(cx);
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::default()));
+    let presentation = MarkdownPresentation::new(preferences, old_snapshot);
+    let content = cx.update(|cx| {
+        cx.new(|cx| CodeSelectionTestRoot {
+            body: MarkdownBody::new_with_presentation("$x$", OWNER_ID, &presentation, cx),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let old_cache =
+        crate::ui::math::formula_cache_snapshot_for_owner(old_owner, OWNER_ID, FORMULA_START)
+            .expect("old formula cache");
+    assert!(old_cache.active);
+
+    assert!(
+        registry
+            .revoke(&old_registration)
+            .expect("revoke old math contribution")
+    );
+    let successor_registration = registry
+        .register(SCOPE, crate::ui::math::markdown_contribution())
+        .expect("register successor math contribution");
+    let successor_owner = MarkdownContributionOwner::new(
+        crate::ui::math::MATH_EXTENSION_ID,
+        successor_registration.generation(),
+    );
+    let successor_snapshot = MarkdownExtensionSnapshot::from(
+        &registry.snapshot(SCOPE).expect("successor math snapshot"),
+    );
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&successor_snapshot));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let old_cache =
+        crate::ui::math::formula_cache_snapshot_for_owner(old_owner, OWNER_ID, FORMULA_START)
+            .expect("released old formula cache");
+    assert!(!old_cache.active);
+    assert_eq!(old_cache.release_count, 1);
+    let successor_cache =
+        crate::ui::math::formula_cache_snapshot_for_owner(successor_owner, OWNER_ID, FORMULA_START)
+            .expect("successor formula cache");
+    assert!(successor_cache.active);
+
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(
+        crate::ui::math::formula_cache_snapshot_for_owner(
+            successor_owner,
+            OWNER_ID,
+            FORMULA_START,
+        )
+        .is_some_and(|cache| cache.active && cache.ready)
+    );
+
+    assert!(
+        registry
+            .revoke(&successor_registration)
+            .expect("remove successor math contribution")
+    );
+    let empty_snapshot =
+        MarkdownExtensionSnapshot::from(&registry.snapshot(SCOPE).expect("empty math snapshot"));
+    content.update(cx, |root, cx| {
+        assert!(root.body.update_extension_snapshot(&empty_snapshot));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let successor_cache =
+        crate::ui::math::formula_cache_snapshot_for_owner(successor_owner, OWNER_ID, FORMULA_START)
+            .expect("released successor formula cache");
+    assert!(!successor_cache.active);
+    assert_eq!(successor_cache.release_count, 1);
+    assert_eq!(successor_cache.image_drop_count, 1);
 }
 
 fn assert_fenced_code_drag_copy(cx: &mut TestAppContext, wrap: bool) {
@@ -180,7 +843,13 @@ fn highlight_cache_matches_language_identifiers_case_insensitively(cx: &mut Test
         language: Some("PYTHON".into()),
         ..original.clone()
     };
-    let cache = cx.update(|cx| HighlightCache::new(&original, cx));
+    let cache = cx.update(|cx| {
+        HighlightCache::new(
+            &original,
+            MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1),
+            cx,
+        )
+    });
 
     assert!(cx.update(|cx| cache.matches(&casing_changed, cx)));
 }
@@ -378,8 +1047,9 @@ fn background_threshold_boundary_is_inclusive_for_sync(cx: &mut TestAppContext) 
         language: Some("text".into()),
         start: 0,
     };
-    let at_cache = cx.update(|cx| HighlightCache::new(&at_threshold, cx));
-    let over_cache = cx.update(|cx| HighlightCache::new(&over_threshold, cx));
+    let owner = MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1);
+    let at_cache = cx.update(|cx| HighlightCache::new(&at_threshold, owner, cx));
+    let over_cache = cx.update(|cx| HighlightCache::new(&over_threshold, owner, cx));
     assert!(
         at_cache.styles.is_some(),
         "a block at exactly the byte threshold must highlight synchronously"
@@ -457,8 +1127,9 @@ fn cache_replacement_drops_stale_task_and_discards_stale_result(cx: &mut TestApp
         language: Some("Rust".into()),
         start: 0,
     };
-    let mut cache = cx.update(|cx| HighlightCache::new(&old_source, cx));
-    cache.highlight_task = Some(Task::ready(()));
+    let owner = MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1);
+    let mut cache = cx.update(|cx| HighlightCache::new(&old_source, owner, cx));
+    cache.own_highlight_task(Task::ready(()));
     cache.highlight_task_generation = Some(cache.generation);
     let old_generation = cache.generation;
     cx.update(|cx| cache.replace(&new_source, cx));

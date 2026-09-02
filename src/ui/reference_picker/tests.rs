@@ -335,7 +335,7 @@ use gpui::TestAppContext;
 
 use crate::session::{
     InMemorySessionStore, MessageEntry, SessionEntryKind, SessionHeader, SessionLifecycleStore,
-    SessionStores, Usage,
+    SessionStores, SharedChatReferenceStore, Usage,
 };
 
 fn seed_chat_message(store: &mut InMemorySessionStore, text: &str) -> crate::session::SessionId {
@@ -365,19 +365,28 @@ fn seed_chat_message(store: &mut InMemorySessionStore, text: &str) -> crate::ses
     session_id
 }
 
-/// Install a global session-stores singleton seeded with Chat messages.
-fn seed_global_stores(cx: &mut TestAppContext, seed: impl FnOnce(&mut InMemorySessionStore)) {
+fn seed_stores(
+    cx: &mut TestAppContext,
+    seed: impl FnOnce(&mut InMemorySessionStore),
+) -> SessionStores {
     cx.update(|cx| {
         gpui_component::init(cx);
         crate::appearance::fonts::init(Default::default(), cx);
-        let mut memory = InMemorySessionStore::new();
-        seed(&mut memory);
-        cx.set_global(SessionStores::with_chat_store(memory));
     });
+    let mut memory = InMemorySessionStore::new();
+    seed(&mut memory);
+    SessionStores::with_chat_store(memory)
 }
 
-fn new_composer(cx: &mut gpui::VisualTestContext) -> gpui::Entity<ChatReferenceComposer> {
-    cx.update(|window, cx| cx.new(|cx| ChatReferenceComposer::new(window, cx)))
+fn new_composer(
+    cx: &mut gpui::VisualTestContext,
+    reference_store: Option<SharedChatReferenceStore>,
+) -> gpui::Entity<ChatReferenceComposer> {
+    cx.update(|window, cx| {
+        cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        })
+    })
 }
 
 /// `set_value` suppresses change events, so drive the same path real typing
@@ -400,12 +409,12 @@ fn set_input_value(
 
 #[gpui::test]
 fn dollar_token_drives_inline_completion(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "the unique needle message");
         seed_chat_message(memory, "an unrelated conversation");
     });
     let cx = cx.add_empty_window();
-    let composer = new_composer(cx);
+    let composer = new_composer(cx, stores.chat_references().ok());
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
 
     set_input_value(cx, &input, "note the $ne");
@@ -449,11 +458,11 @@ fn dollar_token_drives_inline_completion(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn confirming_completion_removes_token_and_adds_chip(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "the unique needle message");
     });
     let cx = cx.add_empty_window();
-    let composer = new_composer(cx);
+    let composer = new_composer(cx, stores.chat_references().ok());
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
 
     set_input_value(cx, &input, "note the $needle");
@@ -494,12 +503,12 @@ fn confirming_completion_removes_token_and_adds_chip(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn popup_cursor_moves_within_results(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "needle alpha");
         seed_chat_message(memory, "needle beta");
     });
     let cx = cx.add_empty_window();
-    let composer = new_composer(cx);
+    let composer = new_composer(cx, stores.chat_references().ok());
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
     set_input_value(cx, &input, "$needle");
 
@@ -530,11 +539,11 @@ fn popup_cursor_moves_within_results(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "soon deleted needle");
     });
     let cx = cx.add_empty_window();
-    let composer = new_composer(cx);
+    let composer = new_composer(cx, stores.chat_references().ok());
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
     set_input_value(cx, &input, "$soon");
 
@@ -544,20 +553,16 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
     });
 
     // Delete the source session between search and confirm.
-    cx.update(|_, cx| {
-        let mut lifecycle = cx
-            .global::<SessionStores>()
-            .clone()
-            .chat()
-            .expect("Chat lifecycle capability");
-        let session_id = composer.read(cx).completion.search.results[0]
+    let session_id = cx.update(|_, cx| {
+        composer.read(cx).completion.search.results[0]
             .reference
             .session_id
-            .clone();
-        lifecycle
-            .delete_session(&session_id)
-            .expect("delete source");
+            .clone()
     });
+    let mut lifecycle = stores.chat().expect("Chat lifecycle capability");
+    lifecycle
+        .delete_session(&session_id)
+        .expect("delete source");
 
     cx.update(|window, cx| {
         composer.update(cx, |composer, cx| composer.confirm_completion(window, cx));
@@ -578,12 +583,12 @@ fn confirm_reports_typed_unavailability(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn confirm_reports_oversized_messages(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         let oversized = format!("giant needle {}", "x".repeat(60_000));
         seed_chat_message(memory, &oversized);
     });
     let cx = cx.add_empty_window();
-    let composer = new_composer(cx);
+    let composer = new_composer(cx, stores.chat_references().ok());
     let input = cx.update(|_, cx| composer.read(cx).input.clone());
     set_input_value(cx, &input, "$giant");
 
@@ -642,16 +647,19 @@ fn press_key(cx: &mut gpui::VisualTestContext, key: &str, control: bool) {
 
 #[gpui::test]
 fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "needle alpha");
         seed_chat_message(memory, "needle beta");
     });
     let composer_cell: std::rc::Rc<
         std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
     > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let reference_store = stores.chat_references().ok();
     let cell = composer_cell.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {
-        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        let composer = cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        });
         composer.update(cx, |composer, cx| composer.focus_input(window, cx));
         *cell.borrow_mut() = Some(composer.clone());
         let host = cx.new(|_| ComposerHost(composer));
@@ -699,15 +707,18 @@ fn completion_keys_route_through_real_keystrokes(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn tab_expands_session_and_enter_confirms_message(cx: &mut TestAppContext) {
-    seed_global_stores(cx, |memory| {
+    let stores = seed_stores(cx, |memory| {
         seed_chat_message(memory, "the unique needle message");
     });
     let composer_cell: std::rc::Rc<
         std::cell::RefCell<Option<gpui::Entity<ChatReferenceComposer>>>,
     > = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let reference_store = stores.chat_references().ok();
     let cell = composer_cell.clone();
     let (_, cx) = cx.add_window_view(move |window, cx| {
-        let composer = cx.new(|cx| ChatReferenceComposer::new(window, cx));
+        let composer = cx.new(|cx| {
+            ChatReferenceComposer::new_with_reference_store(reference_store.clone(), window, cx)
+        });
         composer.update(cx, |composer, cx| composer.focus_input(window, cx));
         *cell.borrow_mut() = Some(composer.clone());
         let host = cx.new(|_| ComposerHost(composer));

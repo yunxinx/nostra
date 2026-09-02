@@ -16,9 +16,7 @@ use gpui_component::{
 use rust_i18n::t;
 
 use super::{ProvidersPage, ROW_HEIGHT, icon_button};
-use crate::{
-    llm::ProviderProfile, providers, ui::inline_delete_confirmation::InlineDeleteConfirmation,
-};
+use crate::{llm::ProviderProfile, ui::inline_delete_confirmation::InlineDeleteConfirmation};
 
 impl ProvidersPage {
     /// Left column: one row per profile, then the add row as the last item.
@@ -27,7 +25,7 @@ impl ProvidersPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let profiles = providers::profiles(cx).to_vec();
+        let profiles = self.preference_snapshot.provider_profiles.clone();
         let selected = self.selected.clone();
         let rows = profiles
             .iter()

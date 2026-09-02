@@ -16,7 +16,8 @@ use std::{
 use crate::llm::{
     ContentBlock, FinishReason, GatewayError, GenerationEvent, GenerationOutcome,
     IndexedContentBlock, IndexedMessage, ModelSelection, OutcomeObserver, OutcomeStatus, Protocol,
-    ProtocolSession, ProviderMetadata, ProviderProfile, ReasoningContent, Role, ToolCall, Usage,
+    ProtocolSession, ProviderCatalogSnapshot, ProviderMetadata, ReasoningContent, Role, ToolCall,
+    Usage,
     transport::{HttpTransport, TransportEvent, TransportRequest},
 };
 
@@ -37,13 +38,13 @@ impl Gateway {
 
     pub fn prepare(
         &self,
-        profiles: &[ProviderProfile],
+        catalog: &ProviderCatalogSnapshot,
         selection: &ModelSelection,
         mut request: crate::llm::GenerateRequest,
     ) -> Result<Generation, GatewayError> {
         // Resolve and encode before creating Generation: setup failures have no
         // stream lifecycle and therefore must not emit a terminal outcome.
-        let (profile, model) = crate::llm::resolve_selection(profiles, selection)?;
+        let (profile, model) = catalog.resolve_selection(selection)?;
         request.model = model.model_id.trim().to_string();
 
         let protocol = ProtocolSession::new(profile.protocol, profile.compatibility.clone());

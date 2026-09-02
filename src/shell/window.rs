@@ -6,14 +6,21 @@
 //! and restoring the previous session's window geometry.
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, Focusable as _, Global, Menu, MenuItem, Pixels, Size,
-    Styled as _, WeakEntity, Window, WindowBounds, WindowKind, WindowOptions, point, px, size,
+    App, AppContext as _, AsyncApp, Bounds, Context, Focusable as _, FontWeight, Global,
+    IntoElement, Menu, MenuItem, ParentElement as _, Pixels, Render, Size, Styled as _, WeakEntity,
+    Window, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
 };
-use gpui_component::{ActiveTheme, Root, TitleBar};
+use gpui_component::{
+    ActiveTheme, Root, TitleBar,
+    button::{Button, ButtonVariants as _},
+    v_flex,
+};
 use rust_i18n::t;
+use std::{cell::RefCell, rc::Rc};
 
 use crate::appearance::glass;
 use crate::preferences::{Preferences, WindowGeometry};
+use crate::runtime::{CompositionBuildError, CompositionRoot, QUIT_FALLBACK_TIMEOUT};
 use crate::session::SessionStores;
 use crate::shell::actions::{DeleteChat, NewChat, OpenSettings, Quit, ToggleSidebar, ToggleTheme};
 use crate::shell::app::ChatApp;
@@ -82,16 +89,41 @@ const MIN_SIZE: Size<Pixels> = Size {
 };
 
 /// Open the main chat window and wire up per-window platform hooks.
-pub fn open_main_window(prefs: Preferences, cx: &mut App) {
+pub fn open_main_window(
+    prefs: Preferences,
+    preference_handle: crate::preferences::PreferenceHandle,
+    cx: &mut App,
+) {
     let bounds = restored_bounds(prefs.window, PREFERRED_SIZE, MIN_SIZE, cx);
     // Opening SQLite catalogs and replaying a pending repair can scan every
     // source file. Keep that work off the application thread before the first
     // window and its ChatView are constructed.
     let stores = cx.background_spawn(async { SessionStores::open_default() });
+    let http_client = cx.http_client();
 
     cx.spawn(async move |cx| {
         let stores = stores.await;
-        cx.update(|cx| cx.set_global(stores));
+        let composition = match CompositionRoot::builder(stores)
+            .with_preferences(preference_handle)
+            .with_http_client(http_client)
+            .build()
+            .await
+        {
+            Ok(composition) => composition,
+            Err(error) => {
+                report_startup_failure(error.settle().await, cx);
+                return;
+            }
+        };
+        let Some(services) = composition.services() else {
+            crate::logging::error(
+                "runtime.composition",
+                "composition build did not publish active services",
+            );
+            close_abandoned_composition(composition).await;
+            fail_startup(cx);
+            return;
+        };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitleBar::title_bar_options()),
@@ -111,7 +143,7 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
         };
 
         let window = match cx.open_window(options, |window, cx| {
-            let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), window, cx));
+            let app_view = cx.new(|cx| ChatApp::new(prefs.clone(), services.clone(), window, cx));
             cx.set_global(MainView(Some(app_view.downgrade())));
 
             // Default focus to the app root so global keybindings dispatch to it
@@ -133,9 +165,12 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
                     "shell.window",
                     format_args!("failed to open main window: {error:?}"),
                 );
+                close_abandoned_composition(composition).await;
+                fail_startup(cx);
                 return;
             }
         };
+        let composition = Rc::new(RefCell::new(Some(composition)));
 
         if let Err(error) = window.update(cx, |_, window, cx| {
             window.activate_window();
@@ -148,8 +183,143 @@ pub fn open_main_window(prefs: Preferences, cx: &mut App) {
                 format_args!("failed to finish main-window setup: {error:?}"),
             );
         }
+
+        let composition_for_quit = Rc::clone(&composition);
+        cx.update(|cx| {
+            App::on_app_quit(cx, move |cx| {
+                let composition = composition_for_quit.borrow_mut().take();
+                let task = composition.as_ref().map(|composition_ref| {
+                    let coordinator = composition_ref.exit_coordinator();
+                    let snapshot = composition_ref
+                        .preferences()
+                        .map(|lease| lease.handle().snapshot())
+                        .unwrap_or_default();
+                    cx.background_executor()
+                        .spawn(coordinator.run(snapshot, QUIT_FALLBACK_TIMEOUT))
+                });
+                async move {
+                    if let Some(mut composition) = composition {
+                        let Some(task) = task else {
+                            return;
+                        };
+                        let report = task.await;
+                        if let Some(error) = report.dispose_error() {
+                            crate::logging::error(
+                                "runtime.composition",
+                                format_args!("failed to close application composition: {error}"),
+                            );
+                        }
+                        if report.session.is_err() {
+                            return;
+                        }
+                        if let Err(error) = composition.close_after_exit().await {
+                            crate::logging::error(
+                                "runtime.composition",
+                                format_args!("failed to close application composition: {error}"),
+                            );
+                        }
+                    }
+                }
+            })
+            .detach();
+        });
     })
     .detach();
+}
+
+fn report_startup_failure(error: CompositionBuildError, cx: &mut AsyncApp) {
+    match error.startup_cleanup() {
+        Some(cleanup) => crate::logging::error(
+            "runtime.composition",
+            format_args!(
+                "composition build failed ({}) at {} with {} retained effects",
+                error.diagnostic_kind(),
+                cleanup.stage(),
+                cleanup.retained_effect_count()
+            ),
+        ),
+        None => crate::logging::error(
+            "runtime.composition",
+            format_args!("composition build failed ({})", error.diagnostic_kind()),
+        ),
+    }
+    fail_startup(cx);
+}
+
+async fn close_abandoned_composition(mut composition: CompositionRoot) {
+    if let Err(error) = composition.close().await {
+        crate::logging::error(
+            "runtime.composition",
+            format_args!("failed to close unused composition ({error})"),
+        );
+    }
+}
+
+/// Terminal startup-failure view: composition never reached a usable window.
+struct StartupFailure;
+
+impl Render for StartupFailure {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .p_8()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .text_lg()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(t!("startup.failed_title").to_string()),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t!("startup.failed_hint").to_string()),
+            )
+            .child(
+                Button::new("startup-quit")
+                    .primary()
+                    .label(t!("startup.quit").to_string())
+                    .on_click(|_, _, cx| cx.quit()),
+            )
+    }
+}
+
+/// Surface a fatal startup error in a dedicated window instead of leaving a
+/// windowless process behind. Quits when the user dismisses the window, and
+/// quits immediately when even that window cannot be opened.
+fn fail_startup(cx: &mut AsyncApp) {
+    let bounds = cx.update(|cx| Bounds::centered(None, size(px(480.), px(240.)), cx));
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_min_size: Some(size(px(360.), px(180.))),
+        kind: WindowKind::Normal,
+        ..Default::default()
+    };
+    let opened = cx.open_window(options, |window, cx| {
+        window.set_window_title("Nostra");
+        let view = cx.new(|_| StartupFailure);
+        cx.new(|cx| Root::new(view, window, cx))
+    });
+    match opened {
+        Ok(window) => {
+            let _ = window.update(cx, |_, window, cx| {
+                window.activate_window();
+                cx.on_release(|_, cx| cx.quit()).detach();
+            });
+        }
+        Err(error) => {
+            crate::logging::error(
+                "shell.window",
+                format_args!("failed to open startup-failure window: {error:?}"),
+            );
+            cx.update(|cx| cx.quit());
+        }
+    }
 }
 
 /// Install (or re-install after a language change) the macOS native menu

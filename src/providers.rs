@@ -1,13 +1,11 @@
 //! Provider profile persistence boundary shared by settings and generation UI.
 //!
-//! Mutations persist through preferences and advance a process-local catalog
-//! revision. Menus use the same validated model projection as gateway routing,
-//! preventing UI selection rules from drifting from generation rules.
+//! Preferences are the single owner of provider configuration. Mutations write
+//! there, and every reader — menus, composer availability, and gateway routing
+//! — derives from that one live state, so UI selection rules cannot drift from
+//! generation rules.
 
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
 
 use gpui::App;
 
@@ -23,39 +21,50 @@ pub struct SelectableModel {
     pub model_name: String,
 }
 
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
-
-pub fn catalog_revision() -> u64 {
-    CATALOG_REVISION.load(Ordering::Relaxed)
-}
-
-fn update_preferences(cx: &mut App, change: impl FnOnce(&mut preferences::Preferences)) {
+fn update_preferences(
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+    change: impl FnOnce(&mut preferences::Preferences),
+) {
     #[cfg(test)]
-    preferences::update_in_memory(cx, change);
+    preferences::update_with_in_memory(cx, preference_handle, change);
     #[cfg(not(test))]
-    preferences::update(cx, change);
+    preferences::update_with(cx, preference_handle, change);
 }
 
-fn update_catalog(cx: &mut App, change: impl FnOnce(&mut Vec<ProviderProfile>)) {
-    update_preferences(cx, |prefs| change(&mut prefs.provider_profiles));
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+fn update_catalog(
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+    change: impl FnOnce(&mut Vec<ProviderProfile>),
+) {
+    update_preferences(preference_handle, cx, |prefs| {
+        change(&mut prefs.provider_profiles)
+    });
     cx.refresh_windows();
 }
 
+#[cfg(test)]
 pub fn profiles(cx: &App) -> &[ProviderProfile] {
     &preferences::get(cx).provider_profiles
 }
 
-pub fn snapshot(cx: &App) -> Vec<ProviderProfile> {
-    profiles(cx).to_vec()
+pub fn profiles_from(preferences: &preferences::Preferences) -> &[ProviderProfile] {
+    &preferences.provider_profiles
 }
 
+#[cfg(test)]
 pub fn last_selection(cx: &App) -> Option<ModelSelection> {
     preferences::get(cx).last_model_selection.clone()
 }
 
-pub fn selectable_models(cx: &App) -> Vec<SelectableModel> {
-    selectable_models_from(profiles(cx))
+pub fn last_selection_from(preferences: &preferences::Preferences) -> Option<ModelSelection> {
+    preferences.last_model_selection.clone()
+}
+
+pub fn selectable_models_from_preferences(
+    preferences: &preferences::Preferences,
+) -> Vec<SelectableModel> {
+    selectable_models_from(profiles_from(preferences))
 }
 
 fn selectable_models_from(profiles: &[ProviderProfile]) -> Vec<SelectableModel> {
@@ -96,31 +105,48 @@ fn selectable_models_from(profiles: &[ProviderProfile]) -> Vec<SelectableModel> 
         .collect()
 }
 
-pub fn selection_is_available(selection: Option<&ModelSelection>, cx: &App) -> bool {
-    selection.is_some_and(|selection| resolve_selection(profiles(cx), selection).is_ok())
+pub fn selection_is_available_from(
+    selection: Option<&ModelSelection>,
+    preferences: &preferences::Preferences,
+) -> bool {
+    selection
+        .is_some_and(|selection| resolve_selection(profiles_from(preferences), selection).is_ok())
 }
 
-pub fn find<'a>(id: &str, cx: &'a App) -> Option<&'a ProviderProfile> {
-    profiles(cx).iter().find(|profile| profile.id == id)
+pub fn find_in<'a>(
+    id: &str,
+    preferences: &'a preferences::Preferences,
+) -> Option<&'a ProviderProfile> {
+    profiles_from(preferences)
+        .iter()
+        .find(|profile| profile.id == id)
 }
 
-pub fn add(profile: ProviderProfile, cx: &mut App) {
-    update_catalog(cx, |profiles| profiles.push(profile));
+pub fn add(
+    profile: ProviderProfile,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    update_catalog(preference_handle, cx, |profiles| profiles.push(profile));
 }
 
-pub fn update(id: &str, cx: &mut App, change: impl FnOnce(&mut ProviderProfile)) {
-    update_catalog(cx, |profiles| {
+pub fn update(
+    id: &str,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+    change: impl FnOnce(&mut ProviderProfile),
+) {
+    update_catalog(preference_handle, cx, |profiles| {
         if let Some(profile) = profiles.iter_mut().find(|profile| profile.id == id) {
             change(profile);
         }
     });
 }
 
-pub fn remove(id: &str, cx: &mut App) {
-    update_preferences(cx, |prefs| {
+pub fn remove(id: &str, preference_handle: &preferences::PreferenceHandle, cx: &mut App) {
+    update_preferences(preference_handle, cx, |prefs| {
         remove_profile_from_preferences(id, prefs);
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
@@ -135,17 +161,25 @@ fn remove_profile_from_preferences(id: &str, prefs: &mut preferences::Preference
     }
 }
 
-pub fn add_model(profile_id: &str, model: ModelConfig, cx: &mut App) {
-    update(profile_id, cx, |profile| profile.models.push(model));
+pub fn add_model(
+    profile_id: &str,
+    model: ModelConfig,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    update(profile_id, preference_handle, cx, |profile| {
+        profile.models.push(model)
+    });
 }
 
 pub fn update_model(
     profile_id: &str,
     model_id: &str,
+    preference_handle: &preferences::PreferenceHandle,
     cx: &mut App,
     change: impl FnOnce(&mut ModelConfig),
 ) {
-    update(profile_id, cx, |profile| {
+    update(profile_id, preference_handle, cx, |profile| {
         if let Some(model) = profile.models.iter_mut().find(|model| model.id == model_id) {
             change(model);
         }
@@ -172,12 +206,16 @@ pub(crate) fn update_model_in_memory(
         };
         change(model);
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
-pub fn remove_model(profile_id: &str, model_id: &str, cx: &mut App) {
-    update_preferences(cx, |prefs| {
+pub fn remove_model(
+    profile_id: &str,
+    model_id: &str,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    update_preferences(preference_handle, cx, |prefs| {
         if let Some(profile) = prefs
             .provider_profiles
             .iter_mut()
@@ -195,16 +233,21 @@ pub fn remove_model(profile_id: &str, model_id: &str, cx: &mut App) {
             prefs.last_model_selection = None;
         }
     });
-    CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
     cx.refresh_windows();
 }
 
-pub fn select_model(selection: ModelSelection, cx: &mut App) {
+pub fn select_model(
+    selection: ModelSelection,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
     // Entity tests exercise the same ChatView::select_model -> provider
     // persistence boundary as production. Keep that path intact while avoiding
     // writes to the developer's real configuration directory under `cargo
     // test`; the in-memory global remains the authoritative observable state.
-    update_preferences(cx, |prefs| prefs.last_model_selection = Some(selection));
+    update_preferences(preference_handle, cx, |prefs| {
+        prefs.last_model_selection = Some(selection)
+    });
 }
 
 #[cfg(test)]

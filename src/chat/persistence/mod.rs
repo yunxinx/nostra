@@ -1,18 +1,16 @@
 mod lifecycle;
 pub(crate) mod restore;
 
-use super::*;
+use super::conversation_runtime::{
+    ChatSessionControllerHandle, ConversationQuiescence, ConversationRuntime, PendingBeginRequest,
+};
 
 use futures::channel::oneshot;
+use gpui::{AppContext as _, Context};
 
-#[derive(Clone)]
-struct PendingBeginRequest {
-    text: String,
-    user_message: LlmMessage,
-    selection: ModelSelection,
-    turn_id: String,
-    composer_revision: u64,
-}
+use crate::session::{
+    ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal, SessionOperationGuard,
+};
 
 #[derive(Debug, thiserror::Error)]
 enum BeginPersistenceError {
@@ -79,14 +77,17 @@ impl TurnPersistenceCoordinator {
         request: PendingBeginRequest,
         pending_terminal: Option<(String, ChatTurnTerminal)>,
         operation_guard: SessionOperationGuard,
-        cx: &mut Context<ChatView>,
+        quiescence: ConversationQuiescence,
+        cx: &mut Context<ConversationRuntime>,
     ) -> (Self, oneshot::Receiver<BeginPersistenceOutcome>) {
         let attempted_terminal_retry = pending_terminal.is_some();
         let turn_id = request.turn_id.clone();
         let (begin_tx, begin_rx) = oneshot::channel();
         let (command_tx, command_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
+        let work = quiescence.begin_work();
         cx.background_spawn(async move {
+            let _work = work;
             let mut terminal_committed = false;
             let begin = (|| {
                 let mut controller = controller
@@ -159,11 +160,14 @@ impl TurnPersistenceCoordinator {
         controller: ChatSessionControllerHandle,
         turn_id: String,
         operation_guard: SessionOperationGuard,
-        cx: &mut Context<ChatView>,
+        quiescence: ConversationQuiescence,
+        cx: &mut Context<ConversationRuntime>,
     ) -> Self {
         let (command_tx, command_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
+        let work = quiescence.begin_work();
         cx.background_spawn(async move {
+            let _work = work;
             let result = match command_rx.await {
                 Ok(terminal) => {
                     persist_terminal_with_retry(&controller, &operation_guard, &turn_id, &terminal)

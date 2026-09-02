@@ -162,7 +162,16 @@ fn picker_observes_catalog_changes_outside_render(cx: &mut TestAppContext) {
     });
     let cx = cx.add_empty_window();
     let picker = cx.update(|window, cx| {
-        cx.new(|cx| ModelPicker::new(selection.clone().into(), |_, _| true, window, cx))
+        let preference_handle = preferences::handle(cx);
+        cx.new(|cx| {
+            ModelPicker::new(
+                selection.clone().into(),
+                preference_handle,
+                |_, _| true,
+                window,
+                cx,
+            )
+        })
     });
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -261,6 +270,7 @@ fn reopening_after_search_resets_all_state_and_repeated_query_confirms(cx: &mut 
             cx.new(|cx| {
                 ModelPicker::new(
                     None,
+                    preferences::handle(cx),
                     move |selection, _| {
                         confirmed.borrow_mut().push(selection);
                         true

@@ -1,7 +1,9 @@
 use std::{
     cell::RefCell,
+    future::Future,
+    pin::Pin,
     rc::Rc,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -13,14 +15,16 @@ use gpui::{
 use gpui_component::input::InputEvent;
 
 use crate::llm::{
-    ContentBlock, IndexedContentBlock, IndexedMessage, Message as LlmMessage, ModelSelection,
-    ProviderMetadata, ResponsesReplayMetadata,
+    ContentBlock, FinishReason, GatewayError, GenerationEvent, GenerationHandle, GenerationOutcome,
+    GenerationRequest, GenerationRunner, GenerationService, IndexedContentBlock, IndexedMessage,
+    Message as LlmMessage, ModelSelection, OutcomeStatus, Protocol, ProviderMetadata,
+    ResponsesReplayMetadata, Usage,
 };
 use crate::preferences;
 use crate::session::{
-    CatalogQuery, ChatTurnTerminal, InMemorySessionStore, LocalSessionStore, LocalStoreConfig,
-    ProjectIdentity, ResolvedSessionState, SessionCatalogStore, SessionDomain, SessionId,
-    SessionReadStore, SessionStores, TurnStatus,
+    CatalogQuery, ChatTurnTerminal, ConversationContext, InMemorySessionStore, LocalSessionStore,
+    LocalStoreConfig, ProjectIdentity, ResolvedSessionState, SessionCatalogStore, SessionDomain,
+    SessionId, SessionReadStore, SessionStores, TurnStatus,
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
@@ -56,6 +60,53 @@ fn smooth_scroll_state_eases_and_accumulates_wheel_distance() {
 
     state.enqueue(px(2_400.));
     assert_eq!(state.remaining, px(2_400.));
+}
+
+#[gpui::test]
+fn delayed_runtime_snapshots_cannot_revert_the_chat_view_projection(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+
+    let (older, latest) = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            let older = this.runtime.update(cx, |runtime, cx| {
+                runtime.generating = true;
+                runtime.publish_state(cx);
+                runtime.snapshot()
+            });
+            let latest = this.runtime.update(cx, |runtime, cx| {
+                runtime.generating = false;
+                runtime.publish_state(cx);
+                runtime.snapshot()
+            });
+
+            assert!(older.revision() < latest.revision());
+            assert!(this.apply_runtime_snapshot(latest.clone()));
+            (older, latest)
+        })
+    });
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, _| {
+            assert!(
+                !this.apply_runtime_snapshot(older),
+                "a delayed runtime snapshot must not replace a newer projection"
+            );
+            let current = this.runtime_snapshot_for_test();
+            assert_eq!(current.revision(), latest.revision());
+            assert!(!current.is_generating());
+        });
+    });
+
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        chat.read_with(cx, |this, _| {
+            let current = this.runtime_snapshot_for_test();
+            assert_eq!(current.revision(), latest.revision());
+            assert!(!current.is_generating());
+        });
+    });
 }
 
 /// A completed user turn plus the assistant placeholder a reply streams
@@ -129,8 +180,22 @@ fn init_app(cx: &mut TestAppContext) {
 fn add_chat_window(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
+    add_chat_window_with_session_services(cx, SessionStores::default().chat_conversation())
+}
+
+fn add_chat_window_with_stores(
+    cx: &mut TestAppContext,
+    stores: SessionStores,
+) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
+    add_chat_window_with_session_services(cx, stores.chat_conversation())
+}
+
+fn add_chat_window_with_session_services(
+    cx: &mut TestAppContext,
+    conversation: ConversationContext,
+) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
     let (root, cx) = cx.add_window_view(|window, cx| {
-        let chat = ChatView::view(window, cx);
+        let chat = ChatView::view_with_session_services(conversation, window, cx);
         gpui_component::Root::new(chat, window, cx)
     });
     // Test windows start inactive even though a real main window is activated
@@ -148,21 +213,168 @@ fn add_chat_window(
     (chat, cx)
 }
 
+fn add_chat_window_with_generation_service(
+    cx: &mut TestAppContext,
+    stores: SessionStores,
+    generation_service: Arc<dyn GenerationService>,
+) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
+    let conversation = stores.chat_conversation();
+    let preference_handle = cx.update(|cx| preferences::handle(cx));
+    let scope = crate::runtime::ConversationScopeHandle::for_test();
+    let (root, cx) = cx.add_window_view(move |window, cx| {
+        let runtime =
+            super::create_conversation_runtime(scope, conversation, generation_service, cx);
+        let chat = ChatView::view_with_generation_service_and_preferences(
+            runtime,
+            preference_handle,
+            window,
+            cx,
+        );
+        gpui_component::Root::new(chat, window, cx)
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    let chat = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<ChatView>()
+            .expect("Root must contain the ChatView")
+    });
+    (chat, cx)
+}
+
+struct ScriptedGenerationService {
+    events: Arc<Vec<GenerationEvent>>,
+    pending: bool,
+}
+
+impl ScriptedGenerationService {
+    fn completed(events: Vec<GenerationEvent>) -> Self {
+        Self {
+            events: Arc::new(events),
+            pending: false,
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            events: Arc::new(Vec::new()),
+            pending: true,
+        }
+    }
+}
+
+impl GenerationService for ScriptedGenerationService {
+    fn start(&self, _: GenerationRequest) -> Result<GenerationHandle, GatewayError> {
+        Ok(GenerationHandle::from_runner(ScriptedGenerationRunner {
+            events: self.events.iter().cloned().collect(),
+            pending: self.pending,
+        }))
+    }
+}
+
+struct ScriptedGenerationRunner {
+    events: Vec<GenerationEvent>,
+    pending: bool,
+}
+
+impl GenerationRunner for ScriptedGenerationRunner {
+    fn run<'a>(
+        &'a mut self,
+        on_event: &'a mut dyn FnMut(GenerationEvent) -> bool,
+    ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+        let events = std::mem::take(&mut self.events);
+        let pending = self.pending;
+        Box::pin(async move {
+            if pending {
+                std::future::pending::<()>().await;
+                return;
+            }
+            for event in events {
+                if !on_event(event) {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn cancel(&mut self) -> Option<GenerationEvent> {
+        Some(GenerationEvent::Finished(Box::new(GenerationOutcome {
+            request_id: "scripted-cancel".into(),
+            profile_id: "profile".into(),
+            model_id: "model".into(),
+            protocol: Protocol::Responses,
+            status: OutcomeStatus::Cancelled,
+            finish_reason: None,
+            usage: Usage::default(),
+            response_id: None,
+            upstream_model: None,
+            time_to_first_event: None,
+            latency: Duration::ZERO,
+            message: None,
+            error: None,
+        })))
+    }
+}
+
+fn scripted_completed_events() -> Vec<GenerationEvent> {
+    vec![
+        GenerationEvent::TextStarted {
+            content_index: 0,
+            id: "text-0".into(),
+        },
+        GenerationEvent::TextDelta {
+            content_index: 0,
+            id: "text-0".into(),
+            delta: "scripted".into(),
+        },
+        GenerationEvent::TextFinished {
+            content_index: 0,
+            id: "text-0".into(),
+            replay: None,
+        },
+        GenerationEvent::Finished(Box::new(GenerationOutcome {
+            request_id: "scripted-complete".into(),
+            profile_id: "profile".into(),
+            model_id: "model".into(),
+            protocol: Protocol::Responses,
+            status: OutcomeStatus::Completed,
+            finish_reason: Some(FinishReason::Stop),
+            usage: Usage::default(),
+            response_id: Some("response".into()),
+            upstream_model: Some("model".into()),
+            time_to_first_event: None,
+            latency: Duration::ZERO,
+            message: Some(IndexedMessage {
+                role: crate::llm::Role::Assistant,
+                content: vec![IndexedContentBlock {
+                    content_index: 0,
+                    block: ContentBlock::Text {
+                        text: "scripted".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                }],
+                provider_metadata: ProviderMetadata::default(),
+            }),
+            error: None,
+        })),
+    ]
+}
+
 #[gpui::test]
 fn chat_and_project_modes_share_the_composer_entity_with_project_references_enabled(
     cx: &mut TestAppContext,
 ) {
     init_app(cx);
-    cx.update(|cx| {
-        cx.set_global(SessionStores::with_stores(
-            InMemorySessionStore::new(),
-            InMemorySessionStore::new(),
-        ));
-    });
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
     let project = ProjectIdentity::new("/tmp/nostra-shared-composer", "Shared composer");
+    let chat_conversation = stores.chat_conversation();
+    let project_conversation = stores.project_conversation(project.clone());
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let chat = ChatView::view(window, cx);
-        let project = ChatView::project_view(project.clone(), window, cx);
+        let chat = ChatView::view_with_session_services(chat_conversation, window, cx);
+        let project =
+            ChatView::project_view_with_session_services(project_conversation, window, cx);
         let pair = cx.new(|_| ComposerPair { chat, project });
         gpui_component::Root::new(pair, window, cx)
     });

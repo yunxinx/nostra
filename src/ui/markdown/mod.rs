@@ -1,8 +1,12 @@
 //! Markdown fenced-code rendering and its application-wide display preferences.
 
 mod code_block;
+mod extension_registry;
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    ops::Range,
+    sync::{Arc, Mutex},
+};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -27,9 +31,52 @@ use rust_i18n::t;
 
 use crate::preferences;
 
-use self::code_block::extensions;
+pub(crate) type PreferenceState = Arc<Mutex<preferences::Preferences>>;
+
 #[cfg(test)]
 use self::code_block::*;
+pub(crate) use self::extension_registry::{
+    MarkdownContributionOwner, MarkdownExtensionContext, MarkdownExtensionDefinition,
+    MarkdownExtensionInstallContext, MarkdownExtensionInstaller, MarkdownExtensionKey,
+    MarkdownExtensionSnapshot, builtin_extension_contributions,
+};
+
+#[cfg(test)]
+pub(crate) use self::{code_block::FENCED_CODE_EXTENSION_ID, extension_registry::CJK_EMPHASIS_ID};
+
+#[cfg(test)]
+pub(crate) use self::extension_registry::test_extension_snapshot;
+
+#[derive(Clone)]
+pub(crate) struct MarkdownPresentation {
+    preference_state: PreferenceState,
+    extension_snapshot: MarkdownExtensionSnapshot,
+}
+
+impl MarkdownPresentation {
+    pub(crate) fn new(
+        preference_state: PreferenceState,
+        extension_snapshot: MarkdownExtensionSnapshot,
+    ) -> Self {
+        Self {
+            preference_state,
+            extension_snapshot,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(cx: &App) -> Self {
+        Self::new(
+            preferences::test_handle(cx).shared_preferences(),
+            test_extension_snapshot(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn extension_revision(&self) -> u64 {
+        self.extension_snapshot.revision()
+    }
+}
 
 const NODE_NAME: &str = "nostra-fenced-code";
 const MIN_ADJACENT_SURFACE_CONTRAST: f32 = 1.2;
@@ -101,6 +148,12 @@ pub(crate) struct BackgroundHighlightProbe {
     pub(crate) last_style_count: usize,
     /// Generation carried by the most recent successful worker.
     pub(crate) last_generation: Option<u64>,
+    pub(crate) active_caches: usize,
+    pub(crate) cache_releases: usize,
+    pub(crate) active_task_owners: usize,
+    pub(crate) task_owner_releases: usize,
+    pub(crate) last_created_owner: Option<MarkdownContributionOwner>,
+    pub(crate) last_released_owner: Option<MarkdownContributionOwner>,
 }
 
 #[cfg(test)]
@@ -117,15 +170,36 @@ define_probe!(
 /// revision from forcing a full Markdown reparse on every frame.
 pub(crate) struct MarkdownBody {
     state: Entity<TextViewState>,
+    extension_context: MarkdownExtensionInstallContext,
+    extension_snapshot: MarkdownExtensionSnapshot,
     extensions: MarkdownExtensions,
 }
 
 impl MarkdownBody {
-    pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
-        Self {
+    pub(crate) fn new_with_presentation(
+        source: &str,
+        owner_id: u64,
+        presentation: &MarkdownPresentation,
+        cx: &mut App,
+    ) -> Self {
+        let extension_context = MarkdownExtensionInstallContext::new(
+            owner_id,
+            0,
+            presentation.preference_state.clone(),
+        );
+        let mut body = Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
-            extensions: extensions(owner_id, 0),
-        }
+            extension_context,
+            extension_snapshot: MarkdownExtensionSnapshot::empty(),
+            extensions: MarkdownExtensions::default(),
+        };
+        _ = body.update_extension_snapshot(&presentation.extension_snapshot);
+        body
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
+        Self::new_with_presentation(source, owner_id, &MarkdownPresentation::for_test(cx), cx)
     }
 
     pub(crate) fn push_str(&mut self, delta: &str, cx: &mut App) {
@@ -138,6 +212,19 @@ impl MarkdownBody {
     pub(crate) fn set_text(&mut self, source: &str, cx: &mut App) {
         self.state
             .update(cx, |state, cx| state.set_text(source, cx));
+    }
+
+    pub(crate) fn update_extension_snapshot(
+        &mut self,
+        snapshot: &MarkdownExtensionSnapshot,
+    ) -> bool {
+        if snapshot.revision() <= self.extension_snapshot.revision() {
+            return false;
+        }
+
+        self.extensions = snapshot.install(&self.extension_context);
+        self.extension_snapshot = snapshot.clone();
+        true
     }
 
     pub(crate) fn text_view(&self, style: TextViewStyle) -> TextView {
@@ -164,37 +251,52 @@ impl MarkdownBody {
     }
 
     #[cfg(test)]
+    pub(crate) const fn extension_revision(&self) -> u64 {
+        self.extension_snapshot.revision()
+    }
+
+    #[cfg(test)]
     pub(crate) fn select_all_text(&self, cx: &mut App) -> String {
         self.state.update(cx, |state, cx| state.select_all(cx));
         self.state.read(cx).selected_text()
     }
 }
 
+#[cfg(test)]
 pub(crate) fn global_wrap_enabled(cx: &App) -> bool {
-    preferences::get(cx).code_block_wrap
+    preferences::handle(cx).snapshot().code_block_wrap
 }
 
+#[cfg(test)]
 pub(crate) fn line_numbers_enabled(cx: &App) -> bool {
-    preferences::get(cx).code_block_line_numbers
+    preferences::handle(cx).snapshot().code_block_line_numbers
 }
 
-pub(crate) fn user_message_markdown_enabled(cx: &App) -> bool {
-    preferences::get(cx).user_message_markdown
-}
-
-pub(crate) fn set_user_message_markdown(enabled: bool, cx: &mut App) {
-    if user_message_markdown_enabled(cx) == enabled {
+pub(crate) fn set_user_message_markdown(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().user_message_markdown == enabled {
         return;
     }
-    preferences::update(cx, |prefs| prefs.user_message_markdown = enabled);
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.user_message_markdown = enabled
+    });
     cx.refresh_windows();
 }
 
-pub(crate) fn set_global_wrap(enabled: bool, cx: &mut App) {
-    if global_wrap_enabled(cx) == enabled {
+pub(crate) fn set_global_wrap(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().code_block_wrap == enabled {
         return;
     }
-    preferences::update(cx, |prefs| reset_global_wrap(prefs, enabled));
+    preferences::update_with(cx, preference_handle, |prefs| {
+        reset_global_wrap(prefs, enabled)
+    });
     cx.refresh_windows();
 }
 
@@ -212,11 +314,17 @@ pub(crate) fn set_global_wrap_in_memory(enabled: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
-pub(crate) fn set_line_numbers(enabled: bool, cx: &mut App) {
-    if line_numbers_enabled(cx) == enabled {
+pub(crate) fn set_line_numbers(
+    enabled: bool,
+    preference_handle: &preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().code_block_line_numbers == enabled {
         return;
     }
-    preferences::update(cx, |prefs| prefs.code_block_line_numbers = enabled);
+    preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.code_block_line_numbers = enabled
+    });
     cx.refresh_windows();
 }
 

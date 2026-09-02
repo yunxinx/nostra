@@ -482,13 +482,13 @@ fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContex
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.pending = true;
+            this.mark_generating_for_test(cx);
             // Drive the public command path, not the state projection helper:
             // this also proves persistence and SelectionChanged emission stay
             // enabled while the current generation remains pending.
             this.select_model(next.clone(), cx);
             assert!(
-                this.pending,
+                this.runtime_snapshot_for_test().is_generating(),
                 "switching models must not alter the active reply"
             );
             assert_eq!(this.selection.as_ref(), Some(&next));

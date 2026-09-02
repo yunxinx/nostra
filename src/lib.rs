@@ -11,11 +11,13 @@
 //! * `settings` — the standalone settings window.
 //! * [`llm`] — the UI-independent model generation gateway.
 //! * [`preferences`] — persisted user settings and the live `Prefs` global.
+//! * [`runtime`] — typed identities and composition primitives.
+//! * [`session`] — durable conversation facts and storage capabilities.
 //! * `providers`, `i18n`, `assets` — provider profiles, locale management, and
 //!   embedded assets.
 //!
-//! Only `llm` and `preferences` are part of the crate's public surface; the rest
-//! are internal and linked here as plain names.
+//! The linked modules form the crate's public surface; the rest are internal
+//! and linked here as plain names.
 
 mod appearance;
 mod assets;
@@ -26,6 +28,7 @@ mod logging;
 mod paths;
 pub mod preferences;
 mod providers;
+pub mod runtime;
 pub mod session;
 mod settings;
 mod shell;
@@ -59,7 +62,8 @@ pub fn run() {
         logging::set_detailed(prefs.detailed_logging);
         logging::info("app.lifecycle", "application started");
         init(prefs.clone(), cx);
-        window::open_main_window(prefs, cx);
+        let preference_handle = preferences::handle(cx);
+        window::open_main_window(prefs, preference_handle, cx);
     });
     logging::info("app.lifecycle", "application stopped");
     logging::shutdown();
@@ -72,9 +76,11 @@ fn init(prefs: preferences::Preferences, cx: &mut App) {
 
     // The Prefs global is the single source of truth at runtime; seed it
     // before any subsystem reads or writes settings.
-    i18n::init(prefs.language);
-    fonts::init(prefs.composer_font, cx);
     preferences::init_global(prefs.clone(), cx);
+    let preference_handle = preferences::handle(cx);
+    let current = preference_handle.snapshot();
+    i18n::init(current.language);
+    fonts::init(current.composer_font, cx);
     glass::init(cx);
     theme::init(&prefs, cx);
 
@@ -96,7 +102,8 @@ fn install_action_handlers(cx: &mut App) {
         } else {
             preferences::ThemeMode::Dark
         };
-        theme::set_mode(Some(next), cx);
+        let preference_handle = preferences::handle(cx);
+        theme::set_mode(Some(next), &preference_handle, cx);
     });
 
     cx.on_action(|_: &OpenSettings, cx: &mut App| settings::open(cx));

@@ -2,6 +2,9 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+use unicode_segmentation::UnicodeSegmentation as _;
+
 pub(super) const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 pub(super) const PACED_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const MAX_PENDING_QUEUE_ENTRIES: usize = 32;

@@ -25,7 +25,7 @@ pub use catalog::{
 };
 pub use chat::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
-    ConversationScope,
+    ConversationDescriptor,
 };
 pub use chat_catalog::{
     ChatSessionCatalogController, ChatSessionCatalogError, SelectedChatSession,
@@ -50,8 +50,8 @@ pub use reference::{
     ReferencedContentBlock, ReferencedMessage,
 };
 pub use service::{
-    SessionStores, SessionStoresError, SharedAgentProjectStore, SharedChatReferenceStore,
-    SharedSessionCatalog, SharedSessionStore,
+    ConversationContext, SessionStores, SessionStoresError, SharedAgentProjectStore,
+    SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
 };
 pub use tree::{
     ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,

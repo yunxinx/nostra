@@ -133,26 +133,63 @@ struct PendingTurn {
     terminal: Option<ChatTurnTerminal>,
 }
 
-/// Durable conversation scope owned by one controller.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ConversationScope {
-    Chat,
-    Project(ProjectIdentity),
+/// Durable target selected by a conversation.
+///
+/// The storage domain remains the source of truth for persistence isolation;
+/// an optional project identity supplies the durable owner for Agent sessions.
+/// UI workspaces may add their own presentation metadata without extending
+/// this storage-facing descriptor.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ConversationDescriptor {
+    domain: SessionDomain,
+    project: Option<ProjectIdentity>,
 }
 
-impl ConversationScope {
-    fn domain(&self) -> SessionDomain {
-        match self {
-            Self::Chat => SessionDomain::Chat,
-            Self::Project(_) => SessionDomain::Agent,
+impl ConversationDescriptor {
+    #[must_use]
+    pub fn chat() -> Self {
+        Self {
+            domain: SessionDomain::Chat,
+            project: None,
         }
     }
 
-    fn project(&self) -> Option<ProjectIdentity> {
-        match self {
-            Self::Chat => None,
-            Self::Project(project) => Some(project.clone()),
+    #[must_use]
+    pub fn for_project(project: ProjectIdentity) -> Self {
+        Self {
+            domain: SessionDomain::Agent,
+            project: Some(project),
         }
+    }
+
+    /// Build a descriptor from the storage target while validating the same
+    /// domain/project relationship required by [`SessionHeader`].
+    pub fn new(
+        domain: SessionDomain,
+        project: Option<ProjectIdentity>,
+    ) -> Result<Self, SessionError> {
+        match (domain, project.as_ref()) {
+            (SessionDomain::Chat, Some(_)) => return Err(SessionError::ChatHasProject),
+            (SessionDomain::Agent, None) => return Err(SessionError::AgentMissingProject),
+            (_, Some(project)) => project.validate()?,
+            _ => {}
+        }
+        Ok(Self { domain, project })
+    }
+
+    #[must_use]
+    pub const fn domain(&self) -> SessionDomain {
+        self.domain
+    }
+
+    #[must_use]
+    pub fn project(&self) -> Option<&ProjectIdentity> {
+        self.project.as_ref()
+    }
+
+    #[must_use]
+    pub const fn supports_references(&self) -> bool {
+        matches!(self.domain, SessionDomain::Agent)
     }
 }
 
@@ -163,7 +200,7 @@ impl ConversationScope {
 /// an entity update or render pass.
 pub struct ChatSessionController<S> {
     store: S,
-    scope: ConversationScope,
+    descriptor: ConversationDescriptor,
     session_id: Option<SessionId>,
     current_model: Option<ModelSelection>,
     pending_turn: Option<PendingTurn>,
@@ -198,18 +235,19 @@ where
 {
     #[must_use]
     pub fn new(store: S) -> Self {
-        Self::with_scope(store, ConversationScope::Chat)
+        Self::with_descriptor(store, ConversationDescriptor::chat())
     }
 
     #[must_use]
     pub fn for_project(store: S, project: ProjectIdentity) -> Self {
-        Self::with_scope(store, ConversationScope::Project(project))
+        Self::with_descriptor(store, ConversationDescriptor::for_project(project))
     }
 
-    fn with_scope(store: S, scope: ConversationScope) -> Self {
+    #[must_use]
+    pub fn with_descriptor(store: S, descriptor: ConversationDescriptor) -> Self {
         Self {
             store,
-            scope,
+            descriptor,
             session_id: None,
             current_model: None,
             pending_turn: None,
@@ -288,7 +326,8 @@ where
 
         let created = self.session_id.is_none();
         let (session_id, session_header, session_created) = if created {
-            let mut header = SessionHeader::new(self.scope.domain(), self.scope.project());
+            let mut header =
+                SessionHeader::new(self.descriptor.domain(), self.descriptor.project().cloned());
             header.initial_model = Some(model.clone());
             (header.session_id.clone(), Some(header), false)
         } else {
@@ -340,10 +379,20 @@ where
         if self.deleted {
             return Err(ChatSessionControllerError::Deleted);
         }
-        let pending = self
-            .pending_turn
-            .as_ref()
-            .ok_or(ChatSessionControllerError::NoTurnInProgress)?;
+        let Some(pending) = self.pending_turn.as_ref() else {
+            if let Some(session_id) = &self.session_id {
+                let state = self.store.load_session(session_id, None)?;
+                let expected = turn_result(turn_id, terminal);
+                if state
+                    .turn_results
+                    .iter()
+                    .any(|resolved| resolved.result == expected)
+                {
+                    return Ok(());
+                }
+            }
+            return Err(ChatSessionControllerError::NoTurnInProgress);
+        };
         if pending.turn_id != turn_id {
             return Err(ChatSessionControllerError::TurnIdMismatch {
                 expected: pending.turn_id.clone(),
@@ -535,7 +584,7 @@ where
                 turn_id: pending.turn_id.clone(),
             });
         }
-        if session_id.domain() != self.scope.domain() {
+        if session_id.domain() != self.descriptor.domain() {
             return Err(ChatSessionControllerError::NotChatSession {
                 session_id: session_id.clone(),
             });

@@ -11,11 +11,12 @@ mod gateway;
 mod metrics;
 mod model;
 mod protocol;
+mod service;
 mod transport;
 
 pub use config::{
-    ModelConfig, ModelId, ModelSelection, ProfileId, ProviderProfile, SecretString,
-    resolve_selection,
+    ModelConfig, ModelId, ModelSelection, ProfileId, ProviderCatalogSnapshot,
+    ProviderCatalogSource, ProviderProfile, SecretString, resolve_selection,
 };
 pub use error::{ErrorKind, GatewayError};
 pub use event::{
@@ -28,6 +29,10 @@ pub use model::*;
 pub use protocol::{
     CompatibilityProfile, MaxTokensField, Protocol, ReasoningField, ResponsesInstructionsPolicy,
     SystemRolePolicy,
+};
+pub use service::{
+    GatewayGenerationService, GenerationHandle, GenerationRequest, GenerationRunner,
+    GenerationService,
 };
 pub use transport::HttpTransport;
 
