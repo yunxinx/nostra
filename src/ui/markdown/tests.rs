@@ -1037,6 +1037,56 @@ fn parse_failures_display_the_localized_markdown_error(cx: &mut TestAppContext) 
     );
 }
 
+/// A streamed fragment can be transiently unparseable (here a preparer that
+/// refuses a half-written token). The last stable document must stay visible
+/// without an error, and the next append that completes the token recovers.
+#[gpui::test]
+fn transient_streaming_failure_keeps_stable_document_and_recovers(cx: &mut TestAppContext) {
+    const REFUSING: ContributionId = ContributionId::new("nostra.markdown.test-refusing-preparer");
+    init_markdown_test(cx);
+    let snapshot = snapshot_with(
+        ScopeId::new(813),
+        None,
+        [ContributionDefinition::new(
+            REFUSING,
+            90,
+            MarkdownExtensionInstaller::new(|extensions, _| {
+                extensions.try_prepare_source(|source| {
+                    if source.ends_with('[') {
+                        Err("temporarily incomplete")
+                    } else {
+                        Ok(source.to_string())
+                    }
+                })
+            }),
+        )],
+    );
+    let (content, cx) = render_rooted_body(cx, "stable", 16, snapshot);
+
+    content.update(cx, |root, cx| root.body.push_str(" [", cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    content.update(cx, |root, cx| {
+        assert_eq!(root.body.select_all_text(cx).trim(), "stable");
+        assert!(
+            root.body.display_error(cx).is_none(),
+            "a transient append error must not replace the stable document"
+        );
+    });
+
+    content.update(cx, |root, cx| root.body.push_str("]", cx));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    content.update(cx, |root, cx| {
+        assert_eq!(root.body.select_all_text(cx).trim(), "stable []");
+        assert!(root.body.display_error(cx).is_none());
+    });
+}
+
 #[gpui::test]
 fn streamed_extension_syntax_stays_in_the_authoritative_text_state(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
