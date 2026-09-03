@@ -767,6 +767,124 @@ fn wrapped_fenced_code_drag_copy_preserves_lines_and_empty_line_height(cx: &mut 
     assert_fenced_code_drag_copy(cx, true);
 }
 
+struct ScrolledCodeSelectionTestRoot {
+    body: MarkdownBody,
+    scroll_handle: gpui::ScrollHandle,
+}
+
+impl Render for ScrolledCodeSelectionTestRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("deep-code-viewport")
+            .debug_selector(|| "deep-code-viewport".to_string())
+            .w(px(480.))
+            .h(px(200.))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .child(self.body.text_view(TextViewStyle::default()))
+    }
+}
+
+/// A long wrapped code block with line numbers, scrolled deep into a bounded
+/// viewport: dragging across visible rows (including an empty one) must copy
+/// exactly those source lines. The fork keeps only viewport rows as selection
+/// geometry, so this guards the row-to-source mapping after a deep scroll.
+#[gpui::test]
+fn deep_scrolled_wrapped_code_with_line_numbers_copies_source_lines(cx: &mut TestAppContext) {
+    const OWNER_ID: u64 = 7;
+    const LINE_COUNT: usize = 240;
+
+    let lines = (0..LINE_COUNT)
+        .map(|index| {
+            if index % 3 == 2 {
+                String::new()
+            } else {
+                format!("line {index}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let source = format!("```text\n{}\n```", lines.join("\n"));
+
+    init_markdown_test(cx);
+    cx.update(|cx| {
+        set_global_wrap_in_memory(true, cx);
+        preferences::update_in_memory(cx, |prefs| {
+            prefs.code_block_line_numbers = true;
+        });
+    });
+    let scroll_handle = gpui::ScrollHandle::new();
+    let (_, cx) = cx.add_window_view({
+        let scroll_handle = scroll_handle.clone();
+        move |window, cx| {
+            let content = cx.new(|cx| ScrolledCodeSelectionTestRoot {
+                body: MarkdownBody::new(&source, OWNER_ID, cx),
+                scroll_handle,
+            });
+            Root::new(content, window, cx)
+        }
+    });
+    let cx: &mut VisualTestContext = cx;
+
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let max_offset = scroll_handle.max_offset().y;
+    assert!(max_offset > px(0.), "fixture must overflow the viewport");
+    scroll_handle.set_offset(point(px(0.), -max_offset / 2.));
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let viewport = cx
+        .debug_bounds("deep-code-viewport")
+        .expect("scroll viewport bounds");
+    let code = cx
+        .debug_bounds("markdown-code-line-7-0-0")
+        .expect("continuous code bounds");
+    let line_height = code.size.height / LINE_COUNT as f32;
+    assert!(line_height > px(0.));
+    assert!(
+        code.top() < viewport.top() - px(100.),
+        "the code block must start well above the viewport: code={code:?} viewport={viewport:?}"
+    );
+
+    // Start on the first fully visible row that holds text and whose successor
+    // is the fixture's empty line, then take three rows: text, empty, text.
+    // Markdown-format copy trims outer whitespace by contract, so the empty
+    // line must sit in the middle to survive into the clipboard.
+    let mut first_visible = ((viewport.top() - code.top()) / line_height).ceil() as usize + 1;
+    while first_visible % 3 != 1 {
+        first_visible += 1;
+    }
+    let last_selected = first_visible + 2;
+    let row_center = |line: usize| code.top() + line_height * line as f32 + line_height / 2.;
+    assert!(row_center(last_selected) < viewport.bottom());
+    let start = point(code.left() + px(1.), row_center(first_visible));
+    let end = point(code.right() - px(1.), row_center(last_selected));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+    let expected = lines[first_visible..=last_selected].join("\n");
+    assert!(
+        expected.contains("\n\n"),
+        "the selected rows must surround an empty line: {expected:?}"
+    );
+    let selected = cx.update(TextSelection::selected_text);
+    assert_eq!(selected.trim_end_matches('\n'), expected);
+
+    cx.dispatch_action(gpui_component::input::Copy);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(expected),
+        "deep-scrolled drag-copy must map visible rows back to their source lines"
+    );
+}
+
 #[gpui::test]
 fn code_block_surfaces_remain_distinct_in_every_theme(cx: &mut TestAppContext) {
     use gpui_component::{Theme, ThemeMode};
