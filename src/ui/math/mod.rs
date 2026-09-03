@@ -40,7 +40,6 @@ use self::{
 pub(crate) use self::render::{
     formula_cache_snapshot, formula_cache_snapshot_for_owner, formula_cache_snapshots,
 };
-
 const NODE_NAME: &str = "nostra-math";
 const LITERAL_NODE_NAME: &str = "nostra-math-literal";
 pub(crate) const MATH_EXTENSION_ID: ContributionId = ContributionId::new("nostra.markdown.math");

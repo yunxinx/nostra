@@ -42,6 +42,19 @@ impl Render for CodeSelectionTestRoot {
     }
 }
 
+struct RootedBodyTestRoot {
+    body: MarkdownBody,
+}
+
+impl Render for RootedBodyTestRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(640.))
+            .debug_selector(|| "markdown-rooted-body".into())
+            .child(self.body.text_view(TextViewStyle::default()))
+    }
+}
+
 fn init_markdown_test(cx: &mut TestAppContext) {
     let prefs = preferences::Preferences::default();
     cx.update(|cx| {
@@ -908,6 +921,120 @@ fn distinguishes_fenced_code_from_indented_code_source() {
             "indented source: {source:?}"
         );
     }
+}
+
+/// A snapshot of the built-in contributions with `excluded` removed and
+/// `extra` appended, mirroring what the runtime registry would hand out.
+fn snapshot_with(
+    scope: ScopeId,
+    excluded: Option<ContributionId>,
+    extra: impl IntoIterator<Item = MarkdownExtensionDefinition>,
+) -> MarkdownExtensionSnapshot {
+    let mut registry = ContributionRegistry::<extension_registry::MarkdownExtensionKey>::new(scope);
+    registry
+        .register_batch(
+            scope,
+            extension_registry::builtin_extension_contributions()
+                .into_iter()
+                .filter(|contribution| Some(contribution.id()) != excluded)
+                .chain(extra),
+        )
+        .expect("register Markdown contributions");
+    MarkdownExtensionSnapshot::from(&registry.snapshot(scope).expect("Markdown snapshot"))
+}
+
+/// Render `source` through `MarkdownBody` in a real window so the installed
+/// extensions reach the fork's `TextViewState` exactly as in production.
+fn render_rooted_body<'a>(
+    cx: &'a mut TestAppContext,
+    source: &str,
+    owner_id: u64,
+    snapshot: MarkdownExtensionSnapshot,
+) -> (gpui::Entity<RootedBodyTestRoot>, &'a mut VisualTestContext) {
+    let presentation = MarkdownPresentation::new(
+        Arc::new(Mutex::new(preferences::Preferences::default())),
+        snapshot,
+    );
+    let content = cx.update(|cx| {
+        cx.new(|cx| RootedBodyTestRoot {
+            body: MarkdownBody::new_with_presentation(source, owner_id, &presentation, cx),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    (content, cx)
+}
+
+/// The fork's CJK emphasis compatibility is a Nostra contribution
+/// (`nostra.markdown.cjk`); it must actually reach the parser.
+#[gpui::test]
+fn cjk_emphasis_contribution_renders_punctuation_adjacent_strong(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    for (owner_id, source, expected) in [
+        (11, "一次**“强调内容”**说明", "一次“强调内容”说明"),
+        (12, "**H01M（电池）**1,560件", "H01M（电池）1,560件"),
+    ] {
+        let (content, cx) = render_rooted_body(cx, source, owner_id, test_extension_snapshot());
+        assert_eq!(
+            content
+                .update(cx, |root, cx| root.body.select_all_text(cx))
+                .trim(),
+            expected,
+            "the CJK contribution must consume the emphasis markers for {source:?}"
+        );
+    }
+
+    // Without the contribution CommonMark's strict flanking rule keeps the
+    // markers literal, proving the behavior comes from the registration.
+    let (content, cx) = render_rooted_body(
+        cx,
+        "一次**“强调内容”**说明",
+        13,
+        snapshot_with(ScopeId::new(810), Some(CJK_EMPHASIS_ID), []),
+    );
+    assert_eq!(
+        content
+            .update(cx, |root, cx| root.body.select_all_text(cx))
+            .trim(),
+        "一次**“强调内容”**说明"
+    );
+}
+
+/// Parse diagnostics reach the user through the registered
+/// `parse_error_formatter`, i.e. the localized `chat.error.markdown` text.
+#[gpui::test]
+fn parse_failures_display_the_localized_markdown_error(cx: &mut TestAppContext) {
+    const FAILING: ContributionId = ContributionId::new("nostra.markdown.test-failing-preparer");
+    init_markdown_test(cx);
+    let snapshot = snapshot_with(
+        ScopeId::new(811),
+        None,
+        [ContributionDefinition::new(
+            FAILING,
+            90,
+            MarkdownExtensionInstaller::new(|extensions, _| {
+                extensions.try_prepare_source(|_| Err::<String, _>("preparation-code"))
+            }),
+        )],
+    );
+    let (content, cx) = render_rooted_body(cx, "body", 14, snapshot);
+
+    let expected = t!("chat.error.markdown").to_string();
+    assert!(!expected.contains("chat.error.markdown"));
+    assert_eq!(
+        content
+            .read_with(cx, |root, cx| root.body.display_error(cx))
+            .as_deref(),
+        Some(expected.as_str()),
+        "the raw diagnostic must be replaced by the localized message"
+    );
 }
 
 #[gpui::test]

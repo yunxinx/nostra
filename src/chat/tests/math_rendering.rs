@@ -43,6 +43,64 @@ fn heading_and_inline_display_math_use_distinct_formula_nodes(cx: &mut TestAppCo
     }
 }
 
+/// Inline formulas of different heights on one line must sit on one shared
+/// baseline (the RaTeX baseline reported through `InlineMetrics`), not be
+/// vertically centered independently of each other.
+#[gpui::test]
+fn inline_formulas_on_one_line_share_the_text_baseline(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "前 $x$ 中 $\\int_0^1 f$ 后";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let starts = [
+        markdown.find("$x$").expect("short formula"),
+        markdown.find("$\\int").expect("tall formula"),
+    ];
+    let [short, tall] = starts.map(|start| {
+        let selector: &'static str =
+            Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+        let bounds = cx.debug_bounds(selector).expect("rendered formula bounds");
+        let snapshot =
+            crate::ui::math::formula_cache_snapshot(owner_id, start).expect("formula cache probe");
+        let ascent = snapshot.ascent.expect("installed formula ascent");
+        let descent = snapshot.descent.expect("installed formula descent");
+        (bounds, ascent, descent)
+    });
+
+    assert!(
+        tall.1 + tall.2 > short.1 + short.2,
+        "the integral must be taller than the variable: {tall:?} vs {short:?}"
+    );
+    let short_baseline = short.0.top() + short.1;
+    let tall_baseline = tall.0.top() + tall.1;
+    assert!(
+        (short_baseline - tall_baseline).abs() < px(0.5),
+        "inline formulas must share one baseline: short {short_baseline:?} vs tall {tall_baseline:?}"
+    );
+}
+
 #[gpui::test]
 fn formula_rendering_inherits_native_marks_and_heading_weight(cx: &mut TestAppContext) {
     init_app(cx);

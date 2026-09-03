@@ -259,6 +259,11 @@ impl MarkdownBody {
         self.state.update(cx, |state, cx| state.select_all(cx));
         self.state.read(cx).selected_text()
     }
+
+    #[cfg(test)]
+    pub(crate) fn display_error(&self, cx: &App) -> Option<gpui::SharedString> {
+        self.state.read(cx).display_error()
+    }
 }
 
 #[cfg(test)]

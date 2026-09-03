@@ -104,6 +104,9 @@ pub(crate) struct FormulaCacheSnapshot {
     pub(crate) active: bool,
     pub(crate) release_count: usize,
     pub(crate) image_drop_count: usize,
+    /// Baseline metrics of the displayed image, once one is installed.
+    pub(crate) ascent: Option<Pixels>,
+    pub(crate) descent: Option<Pixels>,
 }
 
 #[cfg(test)]
@@ -124,6 +127,7 @@ fn record_formula_cache(
     fingerprint: &FormulaFingerprint,
     generation: u64,
     status: &FormulaStatus,
+    displayed: Option<&RenderedFormula>,
 ) {
     let mut probes = formula_cache_probes()
         .lock()
@@ -142,6 +146,8 @@ fn record_formula_cache(
             active: true,
             release_count,
             image_drop_count,
+            ascent: displayed.map(|rendered| rendered.ascent),
+            descent: displayed.map(|rendered| rendered.descent),
         },
     );
 }
@@ -325,6 +331,7 @@ pub(super) fn cached_formula(
                 &cached.fingerprint,
                 cached.generation,
                 &cached.status,
+                cached.displayed.as_ref(),
             );
         }
         let weak_cache = cache.downgrade();
@@ -376,6 +383,7 @@ pub(super) fn cached_formula(
                         &cache.fingerprint,
                         cache.generation,
                         &cache.status,
+                        cache.displayed.as_ref(),
                     );
                     cache_cx.notify();
                 });
