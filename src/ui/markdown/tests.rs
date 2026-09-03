@@ -1037,6 +1037,77 @@ fn parse_failures_display_the_localized_markdown_error(cx: &mut TestAppContext) 
     );
 }
 
+struct NarrowBodyTestRoot {
+    body: MarkdownBody,
+}
+
+impl Render for NarrowBodyTestRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(140.))
+            .debug_selector(|| "markdown-narrow-body".into())
+            .child(self.body.text_view(TextViewStyle::default()))
+    }
+}
+
+/// Drag-copying a paragraph keeps every CommonMark hard break the author
+/// wrote and never turns a visual soft wrap into a newline, even when the
+/// paragraph wraps several times in a narrow transcript.
+#[gpui::test]
+fn dragged_paragraph_copy_keeps_hard_breaks_but_not_soft_wraps(cx: &mut TestAppContext) {
+    // The inline formula makes this a mixed flow (text + atomic item), the
+    // layout path whose hard-break bookkeeping was lost.
+    const SOURCE: &str =
+        "第一行 $x$  \n第二行很长很长会在窄栏里软换行到下一行去继续显示  \n第三行结束";
+
+    init_markdown_test(cx);
+    let content = cx.update(|cx| {
+        cx.new(|cx| NarrowBodyTestRoot {
+            body: MarkdownBody::new(SOURCE, 17, cx),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+
+    let body = cx
+        .debug_bounds("markdown-narrow-body")
+        .expect("narrow body bounds");
+    assert!(
+        body.size.height > px(60.),
+        "the paragraph must wrap onto several visual lines: {body:?}"
+    );
+    let start = point(body.left() + px(1.), body.top() + px(4.));
+    let end = point(body.right() - px(1.), body.bottom() - px(4.));
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+    let copied = cx.update(TextSelection::selected_text);
+    let lines = copied.trim_end().split('\n').collect::<Vec<_>>();
+    assert_eq!(
+        lines,
+        vec![
+            "第一行 $x$",
+            "第二行很长很长会在窄栏里软换行到下一行去继续显示",
+            "第三行结束"
+        ],
+        "hard breaks must survive and soft wraps must not add newlines: {copied:?}"
+    );
+}
+
 /// A streamed fragment can be transiently unparseable (here a preparer that
 /// refuses a half-written token). The last stable document must stay visible
 /// without an error, and the next append that completes the token recovers.
