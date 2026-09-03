@@ -2435,7 +2435,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=b946979b3118c3ebd30ecd99adeec553ba8d6e41#b946979b3118c3ebd30ecd99adeec553ba8d6e41"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=30b937c80838db626aec5a03fc875c01bcbd3471#30b937c80838db626aec5a03fc875c01bcbd3471"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2473,7 +2473,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=b946979b3118c3ebd30ecd99adeec553ba8d6e41#b946979b3118c3ebd30ecd99adeec553ba8d6e41"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=30b937c80838db626aec5a03fc875c01bcbd3471#30b937c80838db626aec5a03fc875c01bcbd3471"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2550,7 +2550,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=b946979b3118c3ebd30ecd99adeec553ba8d6e41#b946979b3118c3ebd30ecd99adeec553ba8d6e41"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=30b937c80838db626aec5a03fc875c01bcbd3471#30b937c80838db626aec5a03fc875c01bcbd3471"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2564,7 +2564,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=b946979b3118c3ebd30ecd99adeec553ba8d6e41#b946979b3118c3ebd30ecd99adeec553ba8d6e41"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=30b937c80838db626aec5a03fc875c01bcbd3471#30b937c80838db626aec5a03fc875c01bcbd3471"
 dependencies = [
  "proc-macro2",
  "quote",
