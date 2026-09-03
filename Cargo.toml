@@ -67,10 +67,10 @@ reqwest_client = { git = "https://github.com/yunxinx/zed.git", rev = "cb3e774a23
 # The pinned gpui-component revision owns Nostra's authoritative streaming
 # TextView state, composable inline Markdown extensions, standard button/menu
 # interaction contract, title-bar geometry, and nested horizontal scrolling.
-gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "54491d13d6fe05a49cb405679e8b2fc79f3d7f05", features = [
+gpui-component = { git = "https://github.com/yunxinx/gpui-component.git", rev = "b946979b3118c3ebd30ecd99adeec553ba8d6e41", features = [
     "tree-sitter-languages",
 ] }
-gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "54491d13d6fe05a49cb405679e8b2fc79f3d7f05" }
+gpui-component-assets = { git = "https://github.com/yunxinx/gpui-component.git", rev = "b946979b3118c3ebd30ecd99adeec553ba8d6e41" }
 
 # Frozen RaTeX git rev for the formula path (parser, layout, SVG, and fonts),
 # not crates.io 0.1.14. The `embed-fonts` feature makes formula images
@@ -93,7 +93,7 @@ gpui_platform = { git = "https://github.com/yunxinx/zed.git", rev = "cb3e774a236
 
 [dev-dependencies]
 gpui = { git = "https://github.com/yunxinx/zed.git", rev = "cb3e774a23617f1710bfbf0d9be835b422e782fe", features = ["test-support"] }
-gpui-base = { git = "https://github.com/yunxinx/gpui-component.git", rev = "54491d13d6fe05a49cb405679e8b2fc79f3d7f05" }
+gpui-base = { git = "https://github.com/yunxinx/gpui-component.git", rev = "b946979b3118c3ebd30ecd99adeec553ba8d6e41" }
 
 # Build tweaks copied from the gpui-component workspace to keep dev builds
 # usable; without these the dev binary is very slow.
