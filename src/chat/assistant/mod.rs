@@ -443,7 +443,7 @@ pub(crate) fn apply_generation_events_for_test(
                 id,
                 replay,
             }) => {
-                chat.finish_stream_text(content_index, &id, replay);
+                chat.finish_stream_text(content_index, &id, replay, cx);
             }
             Some(ConversationStreamEvent::ReasoningStarted { content_index, id }) => {
                 chat.start_stream_reasoning(content_index, id);
@@ -460,7 +460,7 @@ pub(crate) fn apply_generation_events_for_test(
                 id,
                 replay,
             }) => {
-                chat.finish_stream_reasoning(content_index, &id, replay);
+                chat.finish_stream_reasoning(content_index, &id, replay, cx);
             }
             Some(ConversationStreamEvent::ReasoningSnapshotUpdated {
                 content_index,

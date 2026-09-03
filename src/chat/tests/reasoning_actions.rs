@@ -23,7 +23,7 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
             reasoning.toggle();
             assert!(reasoning.is_expanded());
 
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "answer", cx);
         });
     });
@@ -55,7 +55,7 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "a thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -102,7 +102,7 @@ fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
                 expected.push_str(&delta);
                 this.append_stream_reasoning(0, "reasoning-0".into(), &delta, cx);
             }
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -199,8 +199,8 @@ fn the_copy_button_appears_only_once_reasoning_has_ended(cx: &mut TestAppContext
 
     // The stream boundary is what earns the button.
     cx.update(|_, cx| {
-        chat.update(cx, |this, _| {
-            this.finish_stream_reasoning(0, "reasoning-0", None)
+        chat.update(cx, |this, cx| {
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx)
         });
     });
     draw(cx);
@@ -237,7 +237,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     // streaming, so a copy offered now would freeze a partial answer.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -249,7 +249,9 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
 
     // Ending the stream is what earns the button.
     cx.update(|_, cx| {
-        chat.update(cx, |this, _| this.finish_stream_text(1, "text-0", None));
+        chat.update(cx, |this, cx| {
+            this.finish_stream_text(1, "text-0", None, cx)
+        });
     });
     redraw(cx);
     assert!(
@@ -271,13 +273,13 @@ fn the_message_copy_button_copies_the_whole_answer(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "a private thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "First part.", cx);
             this.append_stream_text(2, "text-1".into(), "Second part.", cx);
             // End the stream so the turn becomes copyable: the copy gate
             // requires every streamed block to have finished.
-            this.finish_stream_text(1, "text-0", None);
-            this.finish_stream_text(2, "text-1", None);
+            this.finish_stream_text(1, "text-0", None, cx);
+            this.finish_stream_text(2, "text-1", None, cx);
         });
     });
     redraw(cx);
@@ -320,7 +322,7 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_text(0, "text-0".into(), "Partial answer before the failure.", cx);
-            this.finish_stream_text(0, "text-0", None);
+            this.finish_stream_text(0, "text-0", None, cx);
         });
     });
     redraw(cx);
@@ -361,9 +363,9 @@ fn hovering_a_reasoning_card_reveals_the_message_copy_button(cx: &mut TestAppCon
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "a private thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "The visible answer.", cx);
-            this.finish_stream_text(1, "text-0", None);
+            this.finish_stream_text(1, "text-0", None, cx);
         });
     });
     redraw(cx);
@@ -405,7 +407,7 @@ fn a_user_turn_gets_the_message_copy_button_too(cx: &mut TestAppContext) {
         chat.update(cx, |this, cx| {
             this.messages.push(Message::empty(Role::User));
             this.append_stream_text(0, "text-0".into(), "What is the capital of France?", cx);
-            this.finish_stream_text(0, "text-0", None);
+            this.finish_stream_text(0, "text-0", None, cx);
         });
     });
     redraw(cx);

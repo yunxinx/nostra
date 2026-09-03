@@ -655,7 +655,7 @@ impl ChatView {
                     content_index,
                     id,
                     replay,
-                } => self.finish_stream_text(*content_index, id, replay.clone()),
+                } => self.finish_stream_text(*content_index, id, replay.clone(), cx),
                 super::super::conversation_runtime::ConversationStreamEvent::ReasoningStarted {
                     content_index,
                     id,
@@ -669,7 +669,7 @@ impl ChatView {
                     content_index,
                     id,
                     replay,
-                } => self.finish_stream_reasoning(*content_index, id, replay.clone()),
+                } => self.finish_stream_reasoning(*content_index, id, replay.clone(), cx),
                 super::super::conversation_runtime::ConversationStreamEvent::ReasoningSnapshotUpdated {
                     content_index,
                     id,
@@ -826,7 +826,7 @@ impl ChatView {
                 );
             }
             last.error = turn_error;
-            last.finish_reasoning(None);
+            last.finish_reasoning(None, cx);
         }
         self.remeasure_latest_message();
     }

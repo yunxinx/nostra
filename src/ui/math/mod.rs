@@ -8,12 +8,14 @@
 mod parse;
 mod render;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, ElementId, FontStyle, FontWeight, HighlightStyle, InteractiveElement as _,
-    IntoElement as _, ObjectFit, ParentElement as _, ScrollHandle, SharedString, Styled as _,
-    StyledImage as _, TextStyle, Window, div, img, px, relative,
+    AnyElement, App, ElementId, FontStyle, FontWeight, InteractiveElement as _, IntoElement as _,
+    ObjectFit, ParentElement as _, ScrollHandle, SharedString, Styled as _, StyledImage as _,
+    TextStyle, Window, div, img, px, relative,
 };
 use gpui_component::{
+    ActiveTheme as _, h_flex,
     scroll::horizontal_scroll_area,
     text::{
         InlineFlow, InlineFlowItem, InlineFlowState, InlineMetrics, MarkdownExtensions,
@@ -33,15 +35,20 @@ use crate::{
 
 use self::{
     parse::RecognizedFormula,
-    render::{FormulaRequest, FormulaStyle, RenderedFormula, cached_formula},
+    render::{
+        FormulaRequest, FormulaStyle, RenderedFormula, cached_formula_snapshot,
+        estimate_display_placeholder_height,
+    },
 };
 
 #[cfg(test)]
 pub(crate) use self::render::{
-    formula_cache_snapshot, formula_cache_snapshot_for_owner, formula_cache_snapshots,
+    FORMULA_DEBOUNCE, formula_background_submits, formula_cache_snapshot,
+    formula_cache_snapshot_for_owner, formula_cache_snapshots, reset_formula_background_submits,
 };
 const NODE_NAME: &str = "nostra-math";
 const LITERAL_NODE_NAME: &str = "nostra-math-literal";
+const PENDING_NODE_NAME: &str = "nostra-math-pending";
 pub(crate) const MATH_EXTENSION_ID: ContributionId = ContributionId::new("nostra.markdown.math");
 const MATH_EXTENSION_ORDER: u32 = 20;
 const DISPLAY_FALLBACK_LINE_HEIGHT: f32 = 1.2;
@@ -71,6 +78,14 @@ impl MathFormula {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingMath {
+    prefix: String,
+    pending: String,
+    plain_text: String,
+    start: usize,
+}
+
 pub(crate) fn markdown_contribution() -> MarkdownExtensionDefinition {
     MarkdownExtensionDefinition::new(
         MATH_EXTENSION_ID,
@@ -81,6 +96,7 @@ pub(crate) fn markdown_contribution() -> MarkdownExtensionDefinition {
                 context.owner_id(),
                 context.source_offset(),
                 context.contribution_owner(),
+                context.streaming(),
             )
         }),
     )
@@ -91,8 +107,9 @@ pub(super) fn extend(
     owner_id: u64,
     source_offset: usize,
     contribution_owner: MarkdownContributionOwner,
+    streaming: bool,
 ) -> MarkdownExtensions {
-    extensions
+    let extensions = extensions
         .parse_options(|options| {
             options.constructs.math_text = true;
             options.constructs.math_flow = true;
@@ -119,7 +136,16 @@ pub(super) fn extend(
             // streamed source and avoids the native empty Math/CodeBlock
             // fallback dropping the delimiter from selection and copy.
             div().child(node.as_text().to_string()).into_any_element()
-        })
+        });
+    if streaming {
+        extensions
+            .inline_parser(move |node, cx| parse_pending_inline(node, cx, source_offset))
+            .inline_renderer(PENDING_NODE_NAME, move |node, context, window, cx| {
+                render_pending_inline(node, context, owner_id, window, cx)
+            })
+    } else {
+        extensions
+    }
 }
 
 fn parse_inline(
@@ -158,6 +184,33 @@ fn parse_inline(
         }
         _ => None,
     }
+}
+
+fn parse_pending_inline(
+    node: &markdown_ast::Node,
+    cx: &MarkdownParseContext<'_>,
+    source_offset: usize,
+) -> Option<MarkdownNode> {
+    let markdown_ast::Node::Text(_) = node else {
+        return None;
+    };
+    let range = cx.node_range(node)?;
+    if range.end != cx.source().len() {
+        return None;
+    }
+    let original = cx.node_source(node)?;
+    let (prefix, pending) = parse::split_pending_math(original)?;
+    let formula = PendingMath {
+        prefix: prefix.to_string(),
+        pending: pending.to_string(),
+        plain_text: original.to_string(),
+        start: source_offset + range.start + prefix.len(),
+    };
+    Some(
+        MarkdownNode::new(PENDING_NODE_NAME, formula.clone())
+            .text(formula.plain_text.clone())
+            .markdown(original.to_string()),
+    )
 }
 
 fn parse_inline_formula_node(
@@ -224,7 +277,7 @@ fn render_inline(
     let formula = node.data::<MathFormula>()?;
     let text_style = context.text_style();
     let font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
-    let rendered = cached_formula(
+    let snapshot = cached_formula_snapshot(
         FormulaRequest {
             source: &formula.source,
             inline: !formula.display,
@@ -237,12 +290,81 @@ fn render_inline(
         },
         window,
         cx,
-    )?;
+    );
     let selector = format!("markdown-math-{owner_id}-{}", formula.start);
+    if let Some(rendered) = snapshot.rendered {
+        return Some(MarkdownInline::new(
+            InlineMetrics::new(rendered.width, rendered.ascent, rendered.descent),
+            rendered_formula_element(&rendered, selector),
+        ));
+    }
+    if snapshot.failed {
+        return Some(failed_formula_inline(
+            &formula.plain_text,
+            font_size,
+            selector,
+            cx,
+        ));
+    }
+    None
+}
+
+fn render_pending_inline(
+    node: &MarkdownNode,
+    context: &MarkdownInlineRenderContext,
+    owner_id: u64,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<MarkdownInline> {
+    let pending = node.data::<PendingMath>()?;
+    let text_style = context.text_style();
+    let font_size = f32::from(text_style.font_size.to_pixels(window.rem_size()));
+    let selector = format!("markdown-math-pending-{owner_id}-{}", pending.start);
+    let width = px(font_size
+        * 0.55
+        * (pending.prefix.chars().count() + pending.pending.chars().count()).max(1) as f32);
+    let ascent = px(font_size * 0.8);
+    let descent = px(font_size * 0.25);
+    let muted = cx.theme().muted_foreground;
     Some(MarkdownInline::new(
-        InlineMetrics::new(rendered.width, rendered.ascent, rendered.descent),
-        rendered_formula_element(&rendered, selector),
+        InlineMetrics::new(width, ascent, descent),
+        h_flex()
+            .id(format!("{selector}-content"))
+            .debug_selector(move || selector.clone())
+            .when(!pending.prefix.is_empty(), |this| {
+                this.child(pending.prefix.clone())
+            })
+            .child(
+                div()
+                    .font_family("ui-monospace")
+                    .text_color(muted)
+                    .whitespace_nowrap()
+                    .child(pending.pending.clone()),
+            )
+            .into_any_element(),
     ))
+}
+
+fn failed_formula_inline(
+    plain_text: &str,
+    font_size: f32,
+    selector: String,
+    cx: &mut App,
+) -> MarkdownInline {
+    let width = px(font_size * 0.55 * plain_text.chars().count().max(1) as f32);
+    let ascent = px(font_size * 0.8);
+    let descent = px(font_size * 0.25);
+    MarkdownInline::new(
+        InlineMetrics::new(width, ascent, descent),
+        div()
+            .id(format!("{selector}-fallback"))
+            .debug_selector(move || selector.clone())
+            .font_family("ui-monospace")
+            .bg(cx.theme().muted)
+            .px_1()
+            .child(plain_text.to_string())
+            .into_any_element(),
+    )
 }
 
 fn render_display(
@@ -305,7 +427,7 @@ fn render_display_formula_row(
         .clone();
     let style = gpui::StyleRefinement::default();
     let color = window.text_style().color;
-    let rendered = cached_formula(
+    let snapshot = cached_formula_snapshot(
         FormulaRequest {
             source: &formula.source,
             inline: false,
@@ -319,7 +441,7 @@ fn render_display_formula_row(
         window,
         cx,
     );
-    let (item, formula_width) = if let Some(rendered) = rendered {
+    let (item, formula_width) = if let Some(rendered) = snapshot.rendered {
         let selector = format!("markdown-math-{owner_id}-{}", formula.start);
         (
             InlineFlowItem::custom(
@@ -329,16 +451,37 @@ fn render_display_formula_row(
             ),
             Some(rendered.width),
         )
-    } else {
+    } else if snapshot.failed {
+        let selector = format!("markdown-math-{owner_id}-{}", formula.start);
+        let fallback = failed_display_formula_element(&formula.plain_text, font_size, selector, cx);
         (
-            InlineFlowItem::text(formula.plain_text.clone()).highlights(vec![(
-                0..formula.plain_text.len(),
-                HighlightStyle {
-                    color: Some(color),
-                    font_style: Some(FontStyle::Italic),
-                    ..HighlightStyle::default()
-                },
-            )]),
+            InlineFlowItem::custom(
+                formula.plain_text.clone(),
+                InlineMetrics::new(
+                    px(font_size * 0.55 * formula.plain_text.chars().count().max(1) as f32),
+                    px(font_size * 0.8),
+                    px(font_size * 0.25),
+                ),
+                fallback,
+            ),
+            None,
+        )
+    } else {
+        let height = snapshot
+            .last_height
+            .unwrap_or_else(|| estimate_display_placeholder_height(&formula.source, font_size));
+        (
+            InlineFlowItem::custom(
+                formula.plain_text.clone(),
+                InlineMetrics::new(px(1.), height * 0.8, height * 0.2),
+                div()
+                    .w_full()
+                    .h(height)
+                    .debug_selector(move || {
+                        format!("markdown-math-placeholder-{owner_id}-{}", formula.start)
+                    })
+                    .into_any_element(),
+            ),
             None,
         )
     };
@@ -384,6 +527,23 @@ fn rendered_formula_element(rendered: &RenderedFormula, selector: String) -> Any
                 .w_full()
                 .h_full(),
         )
+        .into_any_element()
+}
+
+fn failed_display_formula_element(
+    plain_text: &str,
+    font_size: f32,
+    selector: String,
+    cx: &mut App,
+) -> AnyElement {
+    div()
+        .id(format!("{selector}-fallback"))
+        .debug_selector(move || selector.clone())
+        .font_family("ui-monospace")
+        .bg(cx.theme().muted)
+        .px_1()
+        .text_size(px(font_size.max(MIN_DISPLAY_FALLBACK_SIZE)))
+        .child(plain_text.to_string())
         .into_any_element()
 }
 

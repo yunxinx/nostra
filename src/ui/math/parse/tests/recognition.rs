@@ -79,8 +79,8 @@ fn inline_formula_recognition_keeps_closing_currency_context() {
 
     let node_range = source.find('$').unwrap()..source.rfind('$').unwrap() + 1;
     assert!(
-        inline_formula(&source[node_range.clone()]).is_some(),
-        "the isolated node demonstrates why the following digit must remain visible"
+        inline_formula(&source[node_range.clone()]).is_none(),
+        "an amount-then-prose body is currency even without a following digit"
     );
     assert!(
         inline_formula_in_context(source, node_range).is_none(),
@@ -134,4 +134,64 @@ fn preparation_leaves_code_html_and_destinations_unchanged() {
         assert!(prepared.contains("$path"), "source: {source:?}");
         assert!(prepared.ends_with("and `x`"), "source: {source:?}");
     }
+}
+
+#[test]
+fn spaced_dollars_are_formulas_and_currency_stays_text() {
+    for source in ["$ x $", "$x$", r"\(x\)"] {
+        let formula = inline_formula(source).expect("accepted formula");
+        assert_eq!(formula.plain_text, source, "{source}");
+        assert!(!formula.display, "{source}");
+    }
+
+    for source in ["$5 and $10", "$ 5 and $ 10", "$2000~$5000", "$...$"] {
+        assert!(
+            scan_math(source).tokens.is_empty(),
+            "currency/placeholder became a formula: {source:?} -> {:?}",
+            scan_math(source).tokens
+        );
+        let prepared = prepare_math_source(source);
+        let (_, formulas) = parse_inline_math(source, &prepared);
+        assert!(
+            formulas.is_empty(),
+            "prepared formulas for {source:?}: {formulas:?}"
+        );
+    }
+}
+
+#[test]
+fn later_formula_survives_a_rejected_currency_opener() {
+    let source = "$5; equation $x$";
+    let prepared = prepare_math_source(source);
+    let (_, formulas) = parse_inline_math(source, &prepared);
+    assert_eq!(formulas, ["$x$"]);
+}
+
+#[test]
+fn transport_splits_are_repaired_only_inside_math() {
+    let tabbed = "$\\text{\tlabel}$";
+    let formula = inline_formula(tabbed).expect("tabbed formula");
+    assert_eq!(formula.source, r"\text{\tlabel}");
+    assert_eq!(formula.plain_text, tabbed);
+
+    let split = "$a\neq b$";
+    let formula = inline_formula(split).expect("split neq");
+    assert_eq!(formula.source, r"a\neq b");
+    assert_eq!(formula.plain_text, split);
+
+    let prose = "line\neq remains prose $x$";
+    let prepared = prepare_math_source(prose);
+    assert!(prepared.contains("line\neq remains prose"));
+    let (_, formulas) = parse_inline_math(prose, &prepared);
+    assert_eq!(formulas, ["$x$"]);
+}
+
+#[test]
+fn unclosed_tex_tail_looks_like_pending_math() {
+    let (prefix, pending) = split_pending_math(r"intro $\frac{a}{b").expect("pending");
+    assert_eq!(prefix, "intro ");
+    assert_eq!(pending, r"$\frac{a}{b");
+    assert!(looks_like_math(r"\frac{a}{b"));
+    assert!(split_pending_math("$   ").is_none());
+    assert!(split_pending_math("just text").is_none());
 }

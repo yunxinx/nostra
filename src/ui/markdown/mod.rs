@@ -15,11 +15,11 @@ use gpui::{
     Styled as _, Task, Window, div, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, Rope, Sizable as _,
+    ActiveTheme as _, Icon, Rope, RopeExt as _, Sizable as _,
     button::Toggle,
     clipboard::Clipboard,
     h_flex,
-    highlighter::{HighlightTheme, SyntaxHighlighter},
+    highlighter::{HighlightTheme, LanguageRegistry, SyntaxHighlighter},
     scroll::{ScrollableMask, Scrollbar, ScrollbarMode},
     text::{
         MarkdownExtensions, MarkdownNode, SelectableText, SelectableTextState, TextView,
@@ -122,6 +122,8 @@ pub(crate) struct MarkdownPerfProbe {
     pub(crate) text_view_builds: usize,
     pub(crate) code_block_renders: usize,
     pub(crate) code_text_elements: usize,
+    pub(crate) highlighter_constructions: usize,
+    pub(crate) incremental_updates: usize,
 }
 
 #[cfg(test)]
@@ -181,10 +183,30 @@ impl MarkdownBody {
         presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
+        Self::new_with_presentation_and_streaming(source, owner_id, presentation, false, cx)
+    }
+
+    pub(crate) fn new_streaming_with_presentation(
+        source: &str,
+        owner_id: u64,
+        presentation: &MarkdownPresentation,
+        cx: &mut App,
+    ) -> Self {
+        Self::new_with_presentation_and_streaming(source, owner_id, presentation, true, cx)
+    }
+
+    fn new_with_presentation_and_streaming(
+        source: &str,
+        owner_id: u64,
+        presentation: &MarkdownPresentation,
+        streaming: bool,
+        cx: &mut App,
+    ) -> Self {
         let extension_context = MarkdownExtensionInstallContext::new(
             owner_id,
             0,
             presentation.preference_state.clone(),
+            streaming,
         );
         let mut body = Self {
             state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
@@ -199,6 +221,36 @@ impl MarkdownBody {
     #[cfg(test)]
     pub(crate) fn new(source: &str, owner_id: u64, cx: &mut App) -> Self {
         Self::new_with_presentation(source, owner_id, &MarkdownPresentation::for_test(cx), cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_streaming(source: &str, owner_id: u64, cx: &mut App) -> Self {
+        Self::new_streaming_with_presentation(
+            source,
+            owner_id,
+            &MarkdownPresentation::for_test(cx),
+            cx,
+        )
+    }
+
+    /// Switch this body from the streaming math parser (pending unclosed
+    /// openers) to the terminal parser. Unclosed `$` / `\(` tails become
+    /// ordinary text. Idempotent after the first call.
+    ///
+    /// The fork applies `MarkdownExtensions` from `TextView::markdown_extensions`
+    /// during the next paint (`TextViewState::set_markdown_extensions` is not
+    /// public). Reinstall here so that paint sees a different parser/renderer
+    /// shape and reparses. `cx.notify()` on the `TextViewState` invalidates the
+    /// window so the paint is not deferred until an unrelated ChatView update.
+    pub(crate) fn finish(&mut self, cx: &mut App) {
+        if !self.extension_context.set_streaming(false) {
+            return;
+        }
+        if self.extension_snapshot.revision() == 0 {
+            return;
+        }
+        self.extensions = self.extension_snapshot.install(&self.extension_context);
+        self.state.update(cx, |_, cx| cx.notify());
     }
 
     pub(crate) fn push_str(&mut self, delta: &str, cx: &mut App) {

@@ -42,6 +42,60 @@ impl Render for CodeSelectionTestRoot {
     }
 }
 
+struct DualSurfaceTestRoot {
+    highlighted: MarkdownBody,
+    fallback: MarkdownBody,
+}
+
+impl Render for DualSurfaceTestRoot {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(480.))
+            .child(self.highlighted.text_view(TextViewStyle::default()))
+            .child(self.fallback.text_view(TextViewStyle::default()))
+    }
+}
+
+struct StyleSurfaceTestRoot {
+    text: SharedString,
+    highlighted: CodeStyles,
+    fallback: CodeStyles,
+    state: SelectableTextState,
+}
+
+impl Render for StyleSurfaceTestRoot {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w(px(480.))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(cx.theme().mono_font_size)
+            .child(
+                div()
+                    .debug_selector(|| "code-surface-highlighted".into())
+                    .child(code_text_element(
+                        1,
+                        0,
+                        self.state.clone(),
+                        self.text.clone(),
+                        self.highlighted.clone(),
+                        None,
+                    )),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "code-surface-fallback".into())
+                    .child(code_text_element(
+                        2,
+                        0,
+                        self.state.clone(),
+                        self.text.clone(),
+                        self.fallback.clone(),
+                        None,
+                    )),
+            )
+    }
+}
+
 struct RootedBodyTestRoot {
     body: MarkdownBody,
 }
@@ -129,6 +183,7 @@ fn markdown_contribution_installation_uses_snapshot_order_and_body_context() {
         42,
         17,
         Arc::new(Mutex::new(preferences::Preferences::default())),
+        false,
     );
 
     let _ = snapshot.install(&context);
@@ -669,6 +724,9 @@ fn replacing_and_removing_math_releases_generation_owned_formula_cache(cx: &mut 
     assert!(successor_cache.active);
 
     cx.run_until_parked();
+    cx.executor()
+        .advance_clock(crate::ui::math::FORMULA_DEBOUNCE);
+    cx.run_until_parked();
     cx.update(|window, cx| {
         let _ = window.draw(cx);
     });
@@ -984,6 +1042,249 @@ fn highlight_cache_matches_language_identifiers_case_insensitively(cx: &mut Test
     });
 
     assert!(cx.update(|cx| cache.matches(&casing_changed, cx)));
+}
+
+#[test]
+fn language_aliases_select_registered_grammars() {
+    let registry = gpui_component::highlighter::LanguageRegistry::singleton();
+    for (alias, target) in [
+        ("shell", "bash"),
+        ("zsh", "bash"),
+        ("console", "bash"),
+        ("jsx", "javascript"),
+        ("dockerfile", "bash"),
+        ("xml", "html"),
+        ("ini", "toml"),
+        ("json5", "json"),
+        ("plaintext", "text"),
+    ] {
+        assert_eq!(normalized_language_id(Some(alias)), target);
+        if target != "text" {
+            assert!(
+                registry.language(target).is_some(),
+                "{alias} must alias to a registered {target} grammar"
+            );
+        }
+    }
+
+    let theme = HighlightTheme::default_dark();
+    for (language, code) in [
+        ("shell", "echo hello"),
+        ("jsx", "const node = <div />;\n"),
+        ("dockerfile", "RUN echo hello\n"),
+        ("xml", "<root attr=\"value\"></root>\n"),
+        ("ini", "key = \"value\"\n"),
+        ("console", "echo hello"),
+    ] {
+        let styles = compute_code_styles(code, &normalized_language_id(Some(language)), &theme);
+        assert!(
+            !styles.is_empty(),
+            "{language} fences must produce token styles, got {}",
+            styles.len()
+        );
+    }
+}
+
+#[gpui::test]
+fn unknown_language_warns_once_and_renders_plain(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    reset_unknown_language_warns();
+    let owner = MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1);
+    let unknown = FencedCode {
+        code: "not a grammar".into(),
+        language: Some("not-a-real-language-p0".into()),
+        start: 0,
+    };
+    let first = cx.update(|cx| HighlightCache::new(&unknown, owner, cx));
+    let second = cx.update(|cx| HighlightCache::new(&unknown, owner, cx));
+    assert_eq!(unknown_language_warns(), 1);
+    assert_eq!(first.language, "not-a-real-language-p0");
+    assert_eq!(second.language, first.language);
+}
+
+#[gpui::test]
+fn fenced_language_label_keeps_original_spelling(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    const OWNER_ID: u64 = 7;
+    let source = "```SHELL\necho hello\n```";
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let content = cx.new(|cx| CodeSelectionTestRoot {
+            body: MarkdownBody::new(source, OWNER_ID, cx),
+        });
+        Root::new(content, window, cx)
+    });
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let start = source.find("```").expect("fence");
+    let label: &'static str =
+        Box::leak(format!("markdown-code-language-{OWNER_ID}-{start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(label).is_some(),
+        "original SHELL label must remain visible"
+    );
+}
+
+#[gpui::test]
+fn aliased_language_still_hits_the_highlight_cache(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    let original = FencedCode {
+        code: "echo hello".into(),
+        language: Some("shell".into()),
+        start: 0,
+    };
+    let recased = FencedCode {
+        language: Some("SHELL".into()),
+        ..original.clone()
+    };
+    let cache = cx.update(|cx| {
+        HighlightCache::new(
+            &original,
+            MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1),
+            cx,
+        )
+    });
+    assert_eq!(cache.language, "bash");
+    assert!(cx.update(|cx| cache.matches(&recased, cx)));
+}
+
+#[gpui::test]
+fn streamed_appends_reuse_one_highlighter(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    reset_perf_probe();
+    let owner = MarkdownContributionOwner::new(FENCED_CODE_EXTENSION_ID, 1);
+    let line = "fn step() { let value: usize = 1; }\n";
+    let mut source = line.repeat(150);
+    let mut code = FencedCode {
+        code: source.clone().into(),
+        language: Some("rust".into()),
+        start: 0,
+    };
+    let mut cache = cx.update(|cx| HighlightCache::new(&code, owner, cx));
+    assert_eq!(perf_probe().highlighter_constructions, 1);
+    let one_shot = cache.styles.clone().expect("sync styles");
+
+    for flush in 0..50 {
+        source.push_str(line);
+        code.code = source.clone().into();
+        cx.update(|cx| cache.apply_code_change(&code, cx));
+        assert_eq!(
+            perf_probe().highlighter_constructions,
+            1,
+            "flush {flush} must not rebuild the highlighter"
+        );
+    }
+    assert_eq!(perf_probe().incremental_updates, 50);
+    let incremental = cache.styles.clone().expect("incremental styles");
+    let rebuilt = compute_code_styles(source.as_str(), "rust", cache.theme.as_ref());
+    assert_eq!(incremental.as_ref(), rebuilt.as_ref());
+    assert_ne!(one_shot.len(), incremental.len());
+}
+
+#[gpui::test]
+fn fallback_and_highlighted_code_share_height(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    const OWNER_ID: u64 = 7;
+    let body = "fn main() {\n    let value = 1;\n    println!(\"{value}\");\n}";
+    let content = cx.update(|cx| {
+        cx.new(|cx| DualSurfaceTestRoot {
+            highlighted: MarkdownBody::new(&format!("```rust\n{body}\n```"), OWNER_ID, cx),
+            fallback: MarkdownBody::new(
+                &format!("```not-a-real-language\n{body}\n```"),
+                OWNER_ID + 1,
+                cx,
+            ),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content, window, cx));
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let highlighted_selector: &'static str =
+        Box::leak(format!("markdown-code-line-{OWNER_ID}-0-0").into_boxed_str());
+    let fallback_selector: &'static str =
+        Box::leak(format!("markdown-code-line-{}-0-0", OWNER_ID + 1).into_boxed_str());
+    let highlighted = cx
+        .debug_bounds(highlighted_selector)
+        .expect("highlighted code");
+    let fallback = cx.debug_bounds(fallback_selector).expect("fallback code");
+    assert_eq!(highlighted.size.height, fallback.size.height);
+    let line_height = cx.update(|window, _| window.line_height());
+    let highlighted_lines = (f32::from(highlighted.size.height) / f32::from(line_height)).round();
+    let fallback_lines = (f32::from(fallback.size.height) / f32::from(line_height)).round();
+    assert_eq!(highlighted_lines, fallback_lines);
+}
+
+#[gpui::test]
+fn empty_and_full_styles_share_code_text_height(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    let code = "fn main() {\n    let value: usize = 1;\n}\n";
+    let theme = cx.update(|cx| cx.theme().highlight_theme.clone());
+    let styles = compute_code_styles(code, "rust", theme.as_ref());
+    let empty: CodeStyles = CodeStyles::default();
+    let content = cx.update(|cx| {
+        cx.new(|_cx| StyleSurfaceTestRoot {
+            text: code.into(),
+            highlighted: styles,
+            fallback: empty,
+            state: SelectableTextState::new(code),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content, window, cx));
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let highlighted = cx
+        .debug_bounds("code-surface-highlighted")
+        .expect("highlighted");
+    let fallback = cx.debug_bounds("code-surface-fallback").expect("fallback");
+    assert_eq!(highlighted.size.height, fallback.size.height);
+    let line_height = cx.update(|window, _| window.line_height());
+    let highlighted_lines = (f32::from(highlighted.size.height) / f32::from(line_height)).round();
+    let fallback_lines = (f32::from(fallback.size.height) / f32::from(line_height)).round();
+    assert_eq!(highlighted_lines, fallback_lines);
+    assert_eq!(highlighted_lines as usize, code.lines().count());
+}
+
+#[gpui::test]
+fn streaming_markdown_body_finish_drops_pending_parser(cx: &mut TestAppContext) {
+    init_markdown_test(cx);
+    const OWNER_ID: u64 = 21;
+    let content = cx.update(|cx| {
+        cx.new(|cx| RootedBodyTestRoot {
+            body: MarkdownBody::new_streaming(r"$\frac{a}{b", OWNER_ID, cx),
+        })
+    });
+    let (_, cx) = cx.add_window_view(|window, cx| Root::new(content.clone(), window, cx));
+    let cx: &mut VisualTestContext = cx;
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let pending: &'static str =
+        Box::leak(format!("markdown-math-pending-{OWNER_ID}-0").into_boxed_str());
+    assert!(
+        cx.debug_bounds(pending).is_some(),
+        "unclosed TeX must render as a pending formula node"
+    );
+
+    cx.update(|_, cx| {
+        content.update(cx, |root, cx| {
+            root.body.finish(cx);
+            root.body.finish(cx);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    assert!(
+        cx.debug_bounds(pending).is_none(),
+        "finish must reparse the unclosed opener as ordinary text"
+    );
 }
 
 #[test]

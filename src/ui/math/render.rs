@@ -1,6 +1,6 @@
 //! Asynchronous RaTeX rendering and explicit GPUI image-cache ownership.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 #[cfg(test)]
 use std::{
@@ -22,6 +22,8 @@ use crate::ui::markdown::MarkdownContributionOwner;
 const INLINE_SVG_PADDING: f64 = 1.0;
 const DISPLAY_SVG_PADDING: f64 = 4.0;
 const SVG_STROKE_WIDTH: f64 = 1.5;
+pub(crate) const FORMULA_DEBOUNCE: Duration = Duration::from_millis(120);
+const GLYPH_NORMALIZATIONS: &[(char, &str)] = &[('·', "⋅"), ('℃', "°C")];
 #[derive(Clone)]
 pub(super) struct RenderedFormula {
     pub(super) image: Arc<RenderImage>,
@@ -40,7 +42,10 @@ pub(super) struct FormulaStyle {
 }
 
 impl FormulaStyle {
-    fn apply(self, source: &str) -> String {
+    pub(super) fn apply(self, source: &str, display: bool) -> String {
+        if display || source.contains("\\begin{") {
+            return source.to_string();
+        }
         let mut styled = if self.bold {
             // `\boldsymbol` retains mathematical classes and the conventional
             // italic form of variables while applying Markdown's bold weight.
@@ -85,11 +90,24 @@ enum FormulaStatus {
     Failed,
 }
 
+pub(super) struct FormulaSnapshot {
+    pub(super) rendered: Option<RenderedFormula>,
+    pub(super) failed: bool,
+    pub(super) last_height: Option<Pixels>,
+}
+
 struct FormulaCache {
     fingerprint: FormulaFingerprint,
     generation: u64,
     status: FormulaStatus,
     displayed: Option<RenderedFormula>,
+    last_height: Option<Pixels>,
+    /// True while a fingerprint change happened inside the 120ms coalesce
+    /// window. False means the next change is a first appearance or a gap
+    /// long enough to render immediately.
+    coalesce_open: bool,
+    recent_change: Option<Task<()>>,
+    debounce: Option<Task<()>>,
     _task: Option<Task<()>>,
 }
 
@@ -107,10 +125,46 @@ pub(crate) struct FormulaCacheSnapshot {
     /// Baseline metrics of the displayed image, once one is installed.
     pub(crate) ascent: Option<Pixels>,
     pub(crate) descent: Option<Pixels>,
+    /// True while a raster is on screen, including re-render Pending.
+    pub(crate) has_displayed: bool,
 }
 
 #[cfg(test)]
 type FormulaProbeKey = (MarkdownContributionOwner, u64, usize);
+
+#[cfg(test)]
+std::thread_local! {
+    static FORMULA_RENDER_SUBMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORMULA_LAST_FAILURE: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn record_formula_render_submit() {
+    FORMULA_RENDER_SUBMITS.with(|submits| submits.set(submits.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+fn record_formula_failure(stage: &str, summary: &str) {
+    FORMULA_LAST_FAILURE.with(|failure| {
+        *failure.borrow_mut() = Some((stage.to_string(), summary.to_string()));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn formula_background_submits() -> usize {
+    FORMULA_RENDER_SUBMITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_formula_background_submits() {
+    FORMULA_RENDER_SUBMITS.with(|submits| submits.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn last_formula_failure() -> Option<(String, String)> {
+    FORMULA_LAST_FAILURE.with(|failure| failure.borrow().clone())
+}
 
 #[cfg(test)]
 fn formula_cache_probes() -> &'static Mutex<HashMap<FormulaProbeKey, FormulaCacheSnapshot>> {
@@ -148,6 +202,7 @@ fn record_formula_cache(
             image_drop_count,
             ascent: displayed.map(|rendered| rendered.ascent),
             descent: displayed.map(|rendered| rendered.descent),
+            has_displayed: displayed.is_some(),
         },
     );
 }
@@ -249,12 +304,12 @@ impl FormulaCache {
             generation: 0,
             status: FormulaStatus::Idle,
             displayed: None,
+            last_height: None,
+            coalesce_open: false,
+            recent_change: None,
+            debounce: None,
             _task: None,
         }
-    }
-
-    fn rendered(&self) -> Option<RenderedFormula> {
-        self.displayed.clone()
     }
 
     fn take_image(&mut self) -> Option<Arc<RenderImage>> {
@@ -262,11 +317,11 @@ impl FormulaCache {
     }
 }
 
-pub(super) fn cached_formula(
+pub(super) fn cached_formula_snapshot(
     request: FormulaRequest<'_>,
     window: &mut Window,
     cx: &mut App,
-) -> Option<RenderedFormula> {
+) -> FormulaSnapshot {
     #[cfg(test)]
     let probe_key = (request.contribution_owner, request.owner_id, request.start);
     let fingerprint = FormulaFingerprint {
@@ -312,96 +367,180 @@ pub(super) fn cached_formula(
         cached.fingerprint != fingerprint || matches!(cached.status, FormulaStatus::Idle)
     };
     if needs_render {
-        cache.update(cx, |cache, _| {
-            cache.generation = cache.generation.wrapping_add(1);
-            cache.fingerprint = fingerprint.clone();
-            cache.status = FormulaStatus::Pending;
-            // Dropping the previous task cancels work that can no longer win.
-            cache._task = None;
-        });
+        schedule_formula_render(
+            &cache,
+            fingerprint.clone(),
+            #[cfg(test)]
+            probe_key,
+            window,
+            cx,
+        );
+    }
 
-        let generation = cache.read(cx).generation;
-        #[cfg(test)]
-        {
-            let cached = cache.read(cx);
-            record_formula_cache(
-                probe_key.0,
-                probe_key.1,
-                probe_key.2,
-                &cached.fingerprint,
-                cached.generation,
-                &cached.status,
-                cached.displayed.as_ref(),
-            );
-        }
+    let cached = cache.read(cx);
+    FormulaSnapshot {
+        rendered: cached.displayed.clone(),
+        failed: matches!(cached.status, FormulaStatus::Failed),
+        last_height: cached.last_height,
+    }
+}
+
+fn schedule_formula_render(
+    cache: &gpui::Entity<FormulaCache>,
+    fingerprint: FormulaFingerprint,
+    #[cfg(test)] probe_key: FormulaProbeKey,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (generation, within_window) = cache.update(cx, |cache, _| {
+        let within_window = cache.coalesce_open;
+        cache.coalesce_open = true;
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.fingerprint = fingerprint.clone();
+        cache.status = FormulaStatus::Pending;
+        cache.debounce = None;
+        cache._task = None;
+        (cache.generation, within_window)
+    });
+
+    #[cfg(test)]
+    {
+        let cached = cache.read(cx);
+        record_formula_cache(
+            probe_key.0,
+            probe_key.1,
+            probe_key.2,
+            &cached.fingerprint,
+            cached.generation,
+            &cached.status,
+            cached.displayed.as_ref(),
+        );
+    }
+
+    arm_recent_change_window(cache, window, cx);
+
+    if within_window {
         let weak_cache = cache.downgrade();
-        let svg_renderer = cx.svg_renderer();
         let render_fingerprint = fingerprint.clone();
-        // Parse, layout, SVG serialization, and rasterization are all CPU-heavy
-        // and must remain off the UI thread. The foreground continuation only
-        // installs the completed immutable image and requests one redraw.
-        let background =
-            cx.background_spawn(
-                async move { render_formula_image(&render_fingerprint, &svg_renderer) },
-            );
-        let task = window.spawn(cx, async move |async_cx| {
-            let rendered = background.await;
-            let mut discarded_image = None;
-            let mut replaced_image = None;
+        let debounce = window.spawn(cx, async move |async_cx| {
+            async_cx.background_executor().timer(FORMULA_DEBOUNCE).await;
+            let Some(cache) = weak_cache.upgrade() else {
+                return;
+            };
             let _ = async_cx.update(|window, cx| {
-                let _ = weak_cache.update(cx, |cache, cache_cx| {
-                    // A streamed formula or theme/style change can supersede a
-                    // background render. Never install stale pixels; explicitly
-                    // release them because they may already have entered the
-                    // current window's sprite atlas during an earlier frame.
-                    if cache.generation != generation || cache.fingerprint != fingerprint {
-                        discarded_image = rendered.map(|rendered| rendered.image);
-                        return;
-                    }
-                    match rendered {
-                        Some(rendered) => {
-                            replaced_image = cache
-                                .displayed
-                                .replace(rendered)
-                                .map(|rendered| rendered.image);
-                            cache.status = FormulaStatus::Ready;
-                        }
-                        None => {
-                            // A genuinely unsupported final formula must fall
-                            // back to its selectable source instead of showing
-                            // stale pixels indefinitely. Pending replacements,
-                            // by contrast, keep the last-good frame above.
-                            replaced_image = cache.take_image();
-                            cache.status = FormulaStatus::Failed;
-                        }
-                    }
+                start_formula_render(
+                    cache,
+                    generation,
+                    render_fingerprint,
                     #[cfg(test)]
-                    record_formula_cache(
-                        probe_key.0,
-                        probe_key.1,
-                        probe_key.2,
-                        &cache.fingerprint,
-                        cache.generation,
-                        &cache.status,
-                        cache.displayed.as_ref(),
-                    );
-                    cache_cx.notify();
-                });
-                if let Some(image) = discarded_image.take() {
-                    #[cfg(test)]
-                    record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
-                    cx.drop_image(image, Some(window));
-                }
-                if let Some(image) = replaced_image.take() {
-                    #[cfg(test)]
-                    record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
-                    cx.drop_image(image, Some(window));
-                }
+                    probe_key,
+                    window,
+                    cx,
+                );
             });
         });
-        cache.update(cx, |cache, _| cache._task = Some(task));
+        cache.update(cx, |cache, _| cache.debounce = Some(debounce));
+        return;
     }
-    cache.read(cx).rendered()
+
+    start_formula_render(
+        cache.clone(),
+        generation,
+        fingerprint,
+        #[cfg(test)]
+        probe_key,
+        window,
+        cx,
+    );
+}
+
+fn arm_recent_change_window(cache: &gpui::Entity<FormulaCache>, window: &mut Window, cx: &mut App) {
+    let weak_cache = cache.downgrade();
+    let recent = window.spawn(cx, async move |async_cx| {
+        async_cx.background_executor().timer(FORMULA_DEBOUNCE).await;
+        let Some(cache) = weak_cache.upgrade() else {
+            return;
+        };
+        let _ = async_cx.update(|_, cx| {
+            cache.update(cx, |cache, _| cache.coalesce_open = false);
+        });
+    });
+    cache.update(cx, |cache, _| cache.recent_change = Some(recent));
+}
+
+fn start_formula_render(
+    cache: gpui::Entity<FormulaCache>,
+    generation: u64,
+    fingerprint: FormulaFingerprint,
+    #[cfg(test)] probe_key: FormulaProbeKey,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let stale = {
+        let current = cache.read(cx);
+        current.generation != generation || current.fingerprint != fingerprint
+    };
+    if stale {
+        return;
+    }
+
+    #[cfg(test)]
+    record_formula_render_submit();
+
+    let weak_cache = cache.downgrade();
+    let svg_renderer = cx.svg_renderer();
+    let render_fingerprint = fingerprint.clone();
+    let background = cx
+        .background_spawn(async move { render_formula_image(&render_fingerprint, &svg_renderer) });
+    let task = window.spawn(cx, async move |async_cx| {
+        let rendered = background.await;
+        let mut discarded_image = None;
+        let mut replaced_image = None;
+        let _ = async_cx.update(|window, cx| {
+            let _ = weak_cache.update(cx, |cache, cache_cx| {
+                if cache.generation != generation || cache.fingerprint != fingerprint {
+                    discarded_image = rendered.map(|rendered| rendered.image);
+                    return;
+                }
+                match rendered {
+                    Some(rendered) => {
+                        cache.last_height = Some(rendered.height);
+                        replaced_image = cache
+                            .displayed
+                            .replace(rendered)
+                            .map(|rendered| rendered.image);
+                        cache.status = FormulaStatus::Ready;
+                    }
+                    None => {
+                        replaced_image = cache.take_image();
+                        cache.status = FormulaStatus::Failed;
+                    }
+                }
+                #[cfg(test)]
+                record_formula_cache(
+                    probe_key.0,
+                    probe_key.1,
+                    probe_key.2,
+                    &cache.fingerprint,
+                    cache.generation,
+                    &cache.status,
+                    cache.displayed.as_ref(),
+                );
+                cache_cx.notify();
+            });
+            if let Some(image) = discarded_image.take() {
+                #[cfg(test)]
+                record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
+                cx.drop_image(image, Some(window));
+            }
+            if let Some(image) = replaced_image.take() {
+                #[cfg(test)]
+                record_formula_image_drop(probe_key.0, probe_key.1, probe_key.2);
+                cx.drop_image(image, Some(window));
+            }
+        });
+    });
+    cache.update(cx, |cache, _| cache._task = Some(task));
 }
 
 fn render_formula_image(
@@ -415,16 +554,19 @@ fn render_formula_image(
         fingerprint.font_size,
         fingerprint.color,
     )?;
-    let image = svg_renderer
-        .render_single_frame(svg.as_bytes(), fingerprint.raster_scale)
-        .ok()?;
-    Some(RenderedFormula {
-        image,
-        width: px(width),
-        height: px(height),
-        ascent: px(ascent),
-        descent: px(descent),
-    })
+    match svg_renderer.render_single_frame(svg.as_bytes(), fingerprint.raster_scale) {
+        Ok(image) => Some(RenderedFormula {
+            image,
+            width: px(width),
+            height: px(height),
+            ascent: px(ascent),
+            descent: px(descent),
+        }),
+        Err(error) => {
+            log_formula_failure("raster", error);
+            None
+        }
+    }
 }
 
 fn render_formula_svg(
@@ -438,11 +580,18 @@ fn render_formula_svg(
         return None;
     }
 
-    let source = style.apply(source);
-    let nodes = parse(&source).ok()?;
-    if nodes.is_empty() {
-        return None;
-    }
+    let source = style.apply(&normalize_glyphs(source), !inline);
+    let nodes = match parse(&source) {
+        Ok(nodes) if !nodes.is_empty() => nodes,
+        Ok(_) => {
+            log_formula_failure("parse", "empty node list");
+            return None;
+        }
+        Err(error) => {
+            log_formula_failure("parse", error);
+            return None;
+        }
+    };
 
     let style = if inline {
         MathStyle::Text
@@ -457,6 +606,7 @@ fn render_formula_svg(
     );
     let display_list = to_display_list(&layout);
     if display_list.width <= 0.0 || display_list.total_height() <= 0.0 {
+        log_formula_failure("layout", "non-positive metrics");
         return None;
     }
 
@@ -497,6 +647,48 @@ fn render_display_list_svg(display_list: &DisplayList, font_size: f32, inline: b
 fn ratex_color(color: Hsla) -> Color {
     let rgba: Rgba = color.into();
     Color::new(rgba.r, rgba.g, rgba.b, rgba.a)
+}
+
+pub(super) fn normalize_glyphs(source: &str) -> Cow<'_, str> {
+    if !source.chars().any(|character| {
+        GLYPH_NORMALIZATIONS
+            .iter()
+            .any(|(from, _)| character == *from)
+    }) {
+        return Cow::Borrowed(source);
+    }
+    let mut normalized = String::with_capacity(source.len());
+    for character in source.chars() {
+        if let Some((_, replacement)) = GLYPH_NORMALIZATIONS
+            .iter()
+            .find(|(from, _)| character == *from)
+        {
+            normalized.push_str(replacement);
+        } else {
+            normalized.push(character);
+        }
+    }
+    Cow::Owned(normalized)
+}
+
+fn log_formula_failure(stage: &str, summary: impl std::fmt::Display) {
+    let message = format!("{stage}: {summary}");
+    crate::logging::warn("ui.math", &message);
+    #[cfg(test)]
+    record_formula_failure(stage, &message);
+}
+
+pub(super) fn estimate_display_placeholder_height(source: &str, font_size: f32) -> Pixels {
+    // Display rows use a 1.18 scale and 1.2 line-height. Large operators such
+    // as `\sum` with limits are taller than one source line of prose, so keep
+    // a two-line floor plus SVG padding. AC10 allows at most one line-height
+    // of jump once the raster arrives.
+    const DISPLAY_PLACEHOLDER_SCALE: f32 = 1.18;
+    const DISPLAY_PLACEHOLDER_LINE_HEIGHT: f32 = 1.2;
+    const MIN_DISPLAY_PLACEHOLDER_SIZE: f32 = 12.0;
+    let lines = source.lines().count().max(2) as f32;
+    let scaled = (font_size * DISPLAY_PLACEHOLDER_SCALE).max(MIN_DISPLAY_PLACEHOLDER_SIZE);
+    px(scaled * DISPLAY_PLACEHOLDER_LINE_HEIGHT * lines + DISPLAY_SVG_PADDING as f32 * 2.0)
 }
 
 #[cfg(test)]
@@ -593,8 +785,57 @@ mod tests {
             italic: true,
             strikethrough: true,
         };
-        assert_eq!(style.apply("x^2"), r"\sout{\boldsymbol{x^2}}");
+        assert_eq!(style.apply("x^2", false), r"\sout{\boldsymbol{x^2}}");
+        assert_eq!(
+            style.apply(r"\begin{aligned}a\\b\end{aligned}", false),
+            r"\begin{aligned}a\\b\end{aligned}"
+        );
+        assert_eq!(style.apply("x^2", true), "x^2");
         assert!(render_formula_svg("x^2", true, style, 16.0, Hsla::black()).is_some());
+    }
+
+    #[test]
+    fn glyph_normalization_rewrites_missing_ratex_symbols() {
+        assert_eq!(normalize_glyphs("a·b℃").as_ref(), "a⋅b°C");
+        assert!(
+            render_formula_svg("a·b", true, FormulaStyle::default(), 16.0, Hsla::black()).is_some()
+        );
+    }
+
+    #[test]
+    fn display_sum_placeholder_stays_within_one_em_of_raster_height() {
+        let source = r"\sum_{n=1}^{N} n";
+        let font_size = 16.0;
+        let (_, _, height, _, _) = render_formula_svg(
+            source,
+            false,
+            FormulaStyle::default(),
+            font_size,
+            Hsla::black(),
+        )
+        .expect("sum should render");
+        let estimate = f32::from(estimate_display_placeholder_height(source, font_size));
+        assert!(
+            (estimate - height).abs() <= font_size * 1.2,
+            "placeholder {estimate} vs raster {height} (em {font_size})"
+        );
+    }
+
+    #[test]
+    fn failed_formulas_record_a_stage_and_summary() {
+        assert!(
+            render_formula_svg(
+                r"\includegraphics{missing.png}",
+                true,
+                FormulaStyle::default(),
+                16.0,
+                Hsla::black(),
+            )
+            .is_none()
+        );
+        let (stage, summary) = last_formula_failure().expect("failure log");
+        assert_eq!(stage, "parse");
+        assert!(summary.contains("parse"), "{summary}");
     }
 
     #[test]

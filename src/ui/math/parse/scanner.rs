@@ -165,6 +165,16 @@ pub(super) fn scan_math_with_context(source: &str, exclude_indented_code: bool) 
                 let trimmed = source[body.clone()].trim();
                 let end = closing_start + delimiter.closing_len();
                 if !trimmed.is_empty() && !is_ellipsis_placeholder(trimmed) {
+                    let after_close = source[end..].chars().next();
+                    if delimiter == MathDelimiter::Dollar
+                        && body_is_currency_like(&source[body.clone()], after_close)
+                    {
+                        // Reject the pair without consuming the closer so a
+                        // later `$x$` after `$5; equation $x$` can still match.
+                        scan.escapable_dollars.push(ix);
+                        ix += delimiter.opening_len();
+                        continue;
+                    }
                     scan.tokens.push(MathToken {
                         delimiter,
                         start: ix,
@@ -277,15 +287,11 @@ pub(super) fn find_math_close(
                         && source.as_bytes().get(ix.wrapping_sub(1)) != Some(&b'$')
                         && source.as_bytes().get(ix + 1) != Some(&b'$') =>
                 {
-                    let preceded_by_non_whitespace = source[..ix]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|previous| !previous.is_whitespace());
                     let followed_by_digit = source[ix + 1..]
                         .chars()
                         .next()
                         .is_some_and(|next| next.is_ascii_digit());
-                    if preceded_by_non_whitespace && !followed_by_digit {
+                    if !followed_by_digit {
                         return Some(ix);
                     }
                     return None;
@@ -359,10 +365,86 @@ pub(super) fn is_valid_dollar_opener(source: &str, ix: usize) -> bool {
         return false;
     }
 
-    let Some(next) = source[ix + 1..].chars().next() else {
+    // Inner whitespace is allowed (`$ x $`). EOF after `$` cannot open a pair.
+    !source[ix + 1..].is_empty()
+}
+
+/// Currency, range, and placeholder bodies must stay prose.
+///
+/// `after_close` is the first character after the candidate closing `$`.
+pub(super) fn body_is_currency_like(body: &str, after_close: Option<char>) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if is_ellipsis_placeholder(trimmed) {
+        return true;
+    }
+    if after_close.is_some_and(|character| character.is_ascii_digit()) && is_range_amount(trimmed) {
+        return true;
+    }
+    is_amount_prose(trimmed)
+}
+
+fn is_range_amount(trimmed: &str) -> bool {
+    let Some(last) = trimmed
+        .chars()
+        .last()
+        .filter(|character| matches!(character, '~' | '～' | '-'))
+    else {
         return false;
     };
-    !next.is_whitespace()
+    let number = &trimmed[..trimmed.len() - last.len_utf8()];
+    is_plain_amount(number)
+}
+
+fn is_amount_prose(trimmed: &str) -> bool {
+    let Some(amount_len) = leading_amount_len(trimmed) else {
+        return false;
+    };
+    let rest = &trimmed[amount_len..];
+    rest.is_empty()
+        || rest.chars().next().is_some_and(|character| {
+            character.is_whitespace() || is_currency_punctuation(character)
+        })
+}
+
+fn is_currency_punctuation(character: char) -> bool {
+    matches!(
+        character,
+        ',' | ';' | ':' | '!' | '?' | '.' | '"' | '\'' | ')' | ']' | '/'
+    )
+}
+
+fn is_plain_amount(value: &str) -> bool {
+    leading_amount_len(value).is_some_and(|len| len == value.len())
+}
+
+fn leading_amount_len(value: &str) -> Option<usize> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() {
+        return None;
+    }
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    while index + 4 <= bytes.len()
+        && bytes[index] == b','
+        && bytes[index + 1..index + 4].iter().all(u8::is_ascii_digit)
+    {
+        index += 4;
+    }
+    if index < bytes.len() && bytes[index] == b'.' {
+        let decimal_start = index + 1;
+        if decimal_start < bytes.len() && bytes[decimal_start].is_ascii_digit() {
+            index = decimal_start;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+        }
+    }
+    Some(index)
 }
 
 pub(super) fn count_run(source: &str, ix: usize, needle: u8) -> Option<usize> {

@@ -161,6 +161,7 @@ pub(crate) struct MarkdownExtensionInstallContext {
     owner_id: u64,
     source_offset: usize,
     preference_state: PreferenceState,
+    streaming: bool,
 }
 
 impl MarkdownExtensionInstallContext {
@@ -168,12 +169,23 @@ impl MarkdownExtensionInstallContext {
         owner_id: u64,
         source_offset: usize,
         preference_state: PreferenceState,
+        streaming: bool,
     ) -> Self {
         Self {
             owner_id,
             source_offset,
             preference_state,
+            streaming,
         }
+    }
+
+    /// Returns whether the streaming flag changed.
+    pub(super) fn set_streaming(&mut self, streaming: bool) -> bool {
+        if self.streaming == streaming {
+            return false;
+        }
+        self.streaming = streaming;
+        true
     }
 
     fn for_contribution(
@@ -185,6 +197,7 @@ impl MarkdownExtensionInstallContext {
             source_offset: self.source_offset,
             preference_state: self.preference_state.clone(),
             contribution_owner,
+            streaming: self.streaming,
         }
     }
 }
@@ -195,6 +208,7 @@ pub(crate) struct MarkdownExtensionContext {
     source_offset: usize,
     preference_state: PreferenceState,
     contribution_owner: MarkdownContributionOwner,
+    streaming: bool,
 }
 
 impl MarkdownExtensionContext {
@@ -212,6 +226,10 @@ impl MarkdownExtensionContext {
 
     pub(crate) const fn contribution_owner(&self) -> MarkdownContributionOwner {
         self.contribution_owner
+    }
+
+    pub(crate) const fn streaming(&self) -> bool {
+        self.streaming
     }
 }
 

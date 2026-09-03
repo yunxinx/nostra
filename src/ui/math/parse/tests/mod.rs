@@ -49,6 +49,7 @@ fn count_nodes(node: &markdown_ast::Node, predicate: fn(&markdown_ast::Node) -> 
         })
 }
 
+mod fixtures;
 mod recognition;
 mod semantics;
 mod source_context;

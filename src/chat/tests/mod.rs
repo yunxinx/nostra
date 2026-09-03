@@ -416,9 +416,10 @@ fn redraw(cx: &mut gpui::VisualTestContext) {
 
 fn redraw_settled_math(cx: &mut gpui::VisualTestContext) {
     redraw(cx);
-    // Formula generation and SVG rasterization are deliberately performed on
-    // the background executor. Drain that work and draw once more so visual
-    // assertions observe the settled image rather than the text fallback.
+    // First appearance renders immediately; later fingerprint changes inside
+    // 120ms still wait for the coalesce timer. Advance it so both paths settle.
+    cx.executor()
+        .advance_clock(crate::ui::math::FORMULA_DEBOUNCE);
     redraw(cx);
 }
 

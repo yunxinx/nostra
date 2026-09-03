@@ -464,7 +464,12 @@ impl ChatView {
             text: String::new(),
             replay: ProviderMetadata::default(),
             finished: false,
-            body: MarkdownBody::new_with_presentation("", ui_id, &self.markdown_presentation, cx),
+            body: MarkdownBody::new_streaming_with_presentation(
+                "",
+                ui_id,
+                &self.markdown_presentation,
+                cx,
+            ),
         });
         last.parts.sort_by_key(MessagePart::content_index);
     }
@@ -512,10 +517,12 @@ impl ChatView {
         content_index: usize,
         id: &str,
         replay: Option<ProviderMetadata>,
+        cx: &mut App,
     ) {
         let Some(MessagePart::Text {
             replay: current,
             finished,
+            body,
             ..
         }) = self.messages.last_mut().and_then(|message| {
             message
@@ -530,6 +537,7 @@ impl ChatView {
             *current = replay;
         }
         *finished = true;
+        body.finish(cx);
     }
 
     /// Start the reasoning content block identified by the gateway stream.
@@ -610,6 +618,7 @@ impl ChatView {
         content_index: usize,
         id: &str,
         replay: Option<ProviderMetadata>,
+        cx: &mut App,
     ) {
         let Some(MessagePart::Reasoning {
             reasoning,
@@ -629,7 +638,7 @@ impl ChatView {
         }
         *finished = true;
         if let Some(trace) = trace {
-            trace.finish();
+            trace.finish(cx);
         }
     }
 

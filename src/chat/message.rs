@@ -129,7 +129,7 @@ impl Message {
         self.provider_metadata = message.provider_metadata;
     }
 
-    pub(super) fn finish_reasoning(&mut self, id: Option<&str>) {
+    pub(super) fn finish_reasoning(&mut self, id: Option<&str>, cx: &mut App) {
         for part in &mut self.parts {
             let MessagePart::Reasoning {
                 id: part_id,
@@ -143,7 +143,7 @@ impl Message {
             if id.is_none_or(|id| id == part_id) {
                 *finished = true;
                 if let Some(trace) = trace {
-                    trace.finish();
+                    trace.finish(cx);
                 }
             }
         }
@@ -281,7 +281,7 @@ impl MessagePart {
                 ContentBlock::Reasoning { reasoning },
             ) if !reasoning.display.is_empty() => {
                 trace.set_source(&reasoning.display, cx);
-                trace.finish();
+                trace.finish(cx);
                 Self::Reasoning {
                     content_index: index,
                     ui_id,

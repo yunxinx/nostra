@@ -12,6 +12,7 @@ mod source;
 use self::{rewrite::*, scanner::*, semantics::*, source::*};
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
 };
@@ -572,7 +573,7 @@ pub(super) fn display_formula_from_ast(source: &str, ast_value: &str) -> Option<
         return None;
     }
 
-    formula.source = formula_source.to_string();
+    formula.source = repair_transport_splits(formula_source).into_owned();
     formula.plain_text = if raw_body.contains('\n') {
         let line_ending = if raw_body.starts_with("\r\n") {
             "\r\n"
@@ -624,11 +625,129 @@ fn recognized_formula_with_token(
 
 fn recognized_formula_from_token(source: &str, token: &MathToken) -> RecognizedFormula {
     RecognizedFormula {
-        source: source[token.body.clone()].trim().to_string(),
+        source: repair_transport_splits(source[token.body.clone()].trim()).into_owned(),
         plain_text: source[token.start..token.end].to_string(),
         relative_start: token.start,
         display: token.delimiter.is_display(),
     }
+}
+
+/// Repair transport artifacts inside an already-recognized math body.
+///
+/// The parse view stays equal-length UTF-8; this rewrite only feeds RaTeX.
+pub(super) fn repair_transport_splits(body: &str) -> Cow<'_, str> {
+    const CONTROLS: &[(u8, &str)] = &[
+        (b'\t', r"\t"),
+        (b'\r', r"\r"),
+        (0x08, r"\b"),
+        (0x0c, r"\f"),
+        (0x0b, r"\v"),
+    ];
+    const SPLITS: &[(&str, &str)] = &[
+        ("exists", r"\nexists"),
+        ("abla", r"\nabla"),
+        ("eq", r"\neq"),
+        ("ot", r"\not"),
+    ];
+
+    let bytes = body.as_bytes();
+    let needs_repair = bytes
+        .iter()
+        .any(|byte| CONTROLS.iter().any(|(control, _)| byte == control) || *byte == b'\n');
+    if !needs_repair {
+        return Cow::Borrowed(body);
+    }
+
+    let mut repaired = String::with_capacity(body.len());
+    let mut index = 0;
+    let mut changed = false;
+    while index < body.len() {
+        let byte = bytes[index];
+        if let Some((_, escape)) = CONTROLS.iter().find(|(control, _)| *control == byte) {
+            repaired.push_str(escape);
+            changed = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\n'
+            && let Some((tex, consumed)) = split_command_at(&body[index + 1..], SPLITS)
+        {
+            repaired.push_str(tex);
+            changed = true;
+            index += 1 + consumed;
+            continue;
+        }
+        let character = body[index..].chars().next();
+        let len = character.map_or(1, char::len_utf8);
+        repaired.push_str(&body[index..index + len]);
+        index += len;
+    }
+    if changed {
+        Cow::Owned(repaired)
+    } else {
+        Cow::Borrowed(body)
+    }
+}
+
+fn split_command_at<'a>(rest: &str, splits: &'a [(&str, &str)]) -> Option<(&'a str, usize)> {
+    for (bare, tex) in splits {
+        if rest.starts_with(bare) {
+            let after = rest.as_bytes().get(bare.len());
+            if after.is_none_or(|byte| !byte.is_ascii_alphabetic()) {
+                return Some((tex, bare.len()));
+            }
+        }
+    }
+    None
+}
+
+/// Split a trailing text leaf into ordinary prefix + unclosed math opener.
+pub(super) fn split_pending_math(text: &str) -> Option<(&str, &str)> {
+    let opener = last_unclosed_math_opener(text)?;
+    let pending = &text[opener..];
+    let body = pending
+        .strip_prefix(r"\(")
+        .or_else(|| pending.strip_prefix('$'))?;
+    looks_like_math(body).then_some((&text[..opener], pending))
+}
+
+pub(super) fn looks_like_math(body: &str) -> bool {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().count() == 1
+        && trimmed
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+    {
+        return true;
+    }
+    trimmed.contains('\\')
+        || trimmed.contains('^')
+        || trimmed.contains('_')
+        || trimmed.contains('{')
+        || trimmed.contains(r"\frac")
+}
+
+fn last_unclosed_math_opener(text: &str) -> Option<usize> {
+    let mut index = 0;
+    while index < text.len() {
+        if let Some(delimiter) = math_delimiter_at(text, index) {
+            if delimiter.is_display() {
+                index += delimiter.opening_len();
+                continue;
+            }
+            if let Some(close) = find_math_close(text, index + delimiter.opening_len(), delimiter) {
+                index = close + delimiter.closing_len();
+                continue;
+            }
+            return Some(index);
+        }
+        index += text[index..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
 }
 
 #[cfg(test)]

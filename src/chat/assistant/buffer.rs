@@ -2,7 +2,7 @@
 
 use super::*;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use unicode_segmentation::UnicodeSegmentation as _;
 
 pub(super) const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
@@ -234,6 +234,29 @@ impl QueuedDelta {
     }
 }
 
+impl QueuedDelta {
+    fn remaining_text(&self) -> Option<&str> {
+        match &self.delta {
+            StreamDelta::TextDelta { delta, .. } | StreamDelta::ReasoningDelta { delta, .. } => {
+                Some(&delta[self.cursor..])
+            }
+            _ => None,
+        }
+    }
+
+    fn block_key(&self) -> Option<(usize, String)> {
+        match &self.delta {
+            StreamDelta::TextDelta {
+                content_index, id, ..
+            }
+            | StreamDelta::ReasoningDelta {
+                content_index, id, ..
+            } => Some((*content_index, id.clone())),
+            _ => None,
+        }
+    }
+}
+
 pub(super) fn grapheme_summary(text: &str) -> GraphemeSummary {
     let mut count = 0;
     let mut last_start = None;
@@ -244,6 +267,220 @@ pub(super) fn grapheme_summary(text: &str) -> GraphemeSummary {
     GraphemeSummary { count, last_start }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FenceState {
+    marker: u8,
+    length: usize,
+}
+
+#[derive(Clone, Default)]
+struct RevealBoundary {
+    line_prefix: String,
+    fence: Option<FenceState>,
+}
+
+impl RevealBoundary {
+    fn safe_cut(&self, pending: &str, budget_end: usize, terminal: bool) -> usize {
+        if terminal {
+            return budget_end;
+        }
+        let budget_end = budget_end.min(pending.len());
+        let mut cut = if pending.is_char_boundary(budget_end) {
+            budget_end
+        } else {
+            pending
+                .char_indices()
+                .rev()
+                .find(|(offset, _)| *offset < budget_end)
+                .map(|(offset, _)| offset)
+                .unwrap_or(0)
+        };
+        while cut > 0 {
+            let mut candidate = String::with_capacity(self.line_prefix.len() + cut);
+            candidate.push_str(&self.line_prefix);
+            candidate.push_str(&pending[..cut]);
+            let last_line = candidate.rsplit('\n').next().unwrap_or(&candidate);
+            if !tail_is_ambiguous(last_line, self.fence.as_ref()) {
+                return cut;
+            }
+            cut = pending[..cut]
+                .grapheme_indices(true)
+                .next_back()
+                .map(|(offset, _)| offset)
+                .unwrap_or(0);
+        }
+        0
+    }
+
+    fn advance(&mut self, revealed: &str) {
+        self.line_prefix.push_str(revealed);
+        while let Some(newline) = self.line_prefix.find('\n') {
+            let mut line = self.line_prefix.clone();
+            line.truncate(newline);
+            update_stream_fence(&line, &mut self.fence);
+            self.line_prefix = self.line_prefix[newline + 1..].to_string();
+        }
+    }
+}
+
+fn update_stream_fence(line: &str, state: &mut Option<FenceState>) {
+    let line = line.trim_end_matches('\r');
+    let indentation = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count();
+    if indentation > 3 {
+        return;
+    }
+    let rest = &line.as_bytes()[indentation..];
+    let Some(&marker) = rest.first().filter(|marker| matches!(marker, b'`' | b'~')) else {
+        return;
+    };
+    let length = rest.iter().take_while(|byte| **byte == marker).count();
+    if length < 3 {
+        return;
+    }
+    match *state {
+        None => {
+            if marker == b'`' && rest[length..].contains(&b'`') {
+                return;
+            }
+            *state = Some(FenceState { marker, length });
+        }
+        Some(open) if open.marker == marker && length >= open.length => {
+            if rest[length..].iter().all(|byte| byte.is_ascii_whitespace()) {
+                *state = None;
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+fn trim_at_most_3_spaces(line: &str) -> &str {
+    let spaces = line
+        .as_bytes()
+        .iter()
+        .take_while(|byte| **byte == b' ')
+        .count()
+        .min(3);
+    &line[spaces..]
+}
+
+#[cfg(test)]
+pub(super) fn revealed_tail_is_ambiguous(revealed: &str) -> bool {
+    if revealed.is_empty() {
+        return false;
+    }
+    let mut boundary = RevealBoundary::default();
+    boundary.advance(revealed);
+    tail_is_ambiguous(&boundary.line_prefix, boundary.fence.as_ref())
+}
+
+fn tail_is_ambiguous(last_line: &str, fence: Option<&FenceState>) -> bool {
+    if let Some(fence) = fence {
+        return is_closing_fence_line(last_line, fence);
+    }
+    if last_line.ends_with('[') || last_line.ends_with('(') {
+        return true;
+    }
+    if is_fence_opener_line(last_line) {
+        return true;
+    }
+    let rest = trim_at_most_3_spaces(last_line);
+    is_list_or_quote_marker(rest) || is_ordered_marker(rest) || is_ordered_star_marker(rest)
+}
+
+fn is_fence_opener_line(last_line: &str) -> bool {
+    let rest = trim_at_most_3_spaces(last_line);
+    let bytes = rest.as_bytes();
+    let Some(&marker) = bytes.first().filter(|marker| matches!(marker, b'`' | b'~')) else {
+        return false;
+    };
+    bytes.iter().take_while(|byte| **byte == marker).count() >= 3
+}
+
+fn is_closing_fence_line(last_line: &str, fence: &FenceState) -> bool {
+    let rest = trim_at_most_3_spaces(last_line);
+    let bytes = rest.as_bytes();
+    let length = bytes
+        .iter()
+        .take_while(|byte| **byte == fence.marker)
+        .count();
+    length >= fence.length
+        && bytes
+            .get(length..)
+            .is_some_and(|tail| tail.iter().all(u8::is_ascii_whitespace))
+}
+
+fn is_list_or_quote_marker(rest: &str) -> bool {
+    matches!(rest.trim_end(), "-" | "--" | "*" | "+" | ">")
+}
+
+fn is_ordered_marker(rest: &str) -> bool {
+    let rest = rest.trim_end();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let after = &rest[digits..];
+    after.is_empty()
+        || after == "."
+        || after == ")"
+        || ((after.starts_with('.') || after.starts_with(')'))
+            && after.len() > 1
+            && after[1..].bytes().all(|byte| byte.is_ascii_whitespace()))
+}
+
+fn is_ordered_star_marker(rest: &str) -> bool {
+    let rest = rest.trim_end();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 {
+        return false;
+    }
+    let after = &rest[digits..];
+    let Some(punct_len) = after
+        .as_bytes()
+        .first()
+        .copied()
+        .filter(|byte| *byte == b'.' || *byte == b')')
+        .map(|_| 1)
+    else {
+        return false;
+    };
+    let after_punct = &after[punct_len..];
+    if after_punct
+        .as_bytes()
+        .first()
+        .is_none_or(|byte| !byte.is_ascii_whitespace())
+    {
+        return false;
+    }
+    matches!(after_punct.trim(), "*" | "**" | "***")
+}
+
+fn nth_grapheme_end(text: &str, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    text.grapheme_indices(true)
+        .nth(count)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
+fn grapheme_count(text: &str) -> usize {
+    text.graphemes(true).count()
+}
+
+fn revealed_delta_text(delta: Option<&StreamDelta>) -> Option<&str> {
+    match delta {
+        Some(StreamDelta::TextDelta { delta, .. } | StreamDelta::ReasoningDelta { delta, .. }) => {
+            Some(delta.as_str())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PendingDeltas {
     pub(super) deltas: VecDeque<QueuedDelta>,
@@ -251,6 +488,7 @@ pub(super) struct PendingDeltas {
     pub(super) flush_scheduled: bool,
     paced: bool,
     held_tail_once: bool,
+    reveal_boundaries: HashMap<(usize, String), RevealBoundary>,
 }
 
 impl PendingDeltas {
@@ -297,6 +535,7 @@ impl PendingDeltas {
         self.pending_graphemes = 0;
         self.paced = false;
         self.held_tail_once = false;
+        self.reveal_boundaries.clear();
         std::mem::take(&mut self.deltas)
             .into_iter()
             .map(QueuedDelta::into_remaining_delta)
@@ -324,12 +563,21 @@ impl PendingDeltas {
 
         while let Some(front) = self.deltas.front() {
             let Some(total) = front.graphemes else {
-                visible.push(
-                    self.deltas
-                        .pop_front()
-                        .expect("front delta exists")
-                        .into_remaining_delta(),
-                );
+                let delta = self
+                    .deltas
+                    .pop_front()
+                    .expect("front delta exists")
+                    .into_remaining_delta();
+                if let StreamDelta::TextFinished {
+                    content_index, id, ..
+                }
+                | StreamDelta::ReasoningFinished {
+                    content_index, id, ..
+                } = &delta
+                {
+                    self.reveal_boundaries.remove(&(*content_index, id.clone()));
+                }
+                visible.push(delta);
                 continue;
             };
             if total == 0 {
@@ -347,7 +595,11 @@ impl PendingDeltas {
                 break;
             }
 
-            let count = available.min(budget);
+            let count = self.clamp_markdown_tail(terminal, available.min(budget));
+            if count == 0 {
+                break;
+            }
+            let key = self.deltas.front().and_then(QueuedDelta::block_key);
             if count == total {
                 visible.push(
                     self.deltas
@@ -363,6 +615,11 @@ impl PendingDeltas {
                     .expect("front text delta contains a visible prefix");
                 visible.push(prefix);
             }
+            if let Some(key) = key
+                && let Some(text) = revealed_delta_text(visible.last())
+            {
+                self.reveal_boundaries.entry(key).or_default().advance(text);
+            }
             self.pending_graphemes = self.pending_graphemes.saturating_sub(count);
             budget = budget.saturating_sub(count);
 
@@ -376,8 +633,32 @@ impl PendingDeltas {
             self.flush_scheduled = false;
             self.paced = false;
             self.held_tail_once = false;
+            self.reveal_boundaries.clear();
         }
         visible
+    }
+
+    fn clamp_markdown_tail(&self, terminal: bool, count: usize) -> usize {
+        if terminal || count == 0 {
+            return count;
+        }
+        let Some(front) = self.deltas.front() else {
+            return count;
+        };
+        let Some(remaining) = front.remaining_text() else {
+            return count;
+        };
+        let Some(key) = front.block_key() else {
+            return count;
+        };
+        let budget_end = nth_grapheme_end(remaining, count);
+        let cut = self
+            .reveal_boundaries
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .safe_cut(remaining, budget_end, false);
+        grapheme_count(&remaining[..cut.min(remaining.len())])
     }
 
     pub(super) fn next_interval(&self) -> Duration {

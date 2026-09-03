@@ -142,7 +142,7 @@ pub(super) struct HighlightCache {
     owner: MarkdownContributionOwner,
     code: SharedString,
     /// Normalized syntax language ID used for cache matching and highlighting.
-    language: String,
+    pub(super) language: String,
     pub(super) theme: Arc<HighlightTheme>,
     /// Syntax highlight ranges. `None` while a long block is being highlighted
     /// on a background thread; the render path shows a plain-text placeholder
@@ -162,6 +162,24 @@ pub(super) struct HighlightCache {
     /// Generation owned by `highlight_task`; prevents a stale callback from
     /// clearing a task that was started for a newer cache generation.
     pub(super) highlight_task_generation: Option<u64>,
+    /// Retained only on the synchronous path (`<= BG_HIGHLIGHT_BYTES`) so
+    /// streamed appends can apply `InputEdit` instead of rebuilding.
+    highlighter: Option<SyntaxHighlighter>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static UNKNOWN_LANGUAGE_WARNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn unknown_language_warns() -> usize {
+    UNKNOWN_LANGUAGE_WARNS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn reset_unknown_language_warns() {
+    UNKNOWN_LANGUAGE_WARNS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
@@ -188,38 +206,32 @@ impl HighlightCache {
         });
         let theme = cx.theme().highlight_theme.clone();
         let language = normalized_language_id(code.language.as_deref());
+        if LanguageRegistry::singleton().language(&language).is_none() {
+            note_unknown_language(&language);
+        }
         // Short blocks are highlighted synchronously so the first paint is
         // complete (no flash); long blocks render a placeholder and defer the
         // work to the background worker started in `render`.
-        let styles = if code.code.len() <= BG_HIGHLIGHT_BYTES {
-            Some(compute_code_styles(
-                code.code.as_ref(),
-                &language,
-                theme.as_ref(),
-            ))
+        let (styles, highlighter) = if code.code.len() <= BG_HIGHLIGHT_BYTES {
+            highlight_sync(code.code.as_ref(), &language, theme.as_ref())
         } else {
-            None
+            (None, None)
         };
-        let line_count = code.code.split('\n').count();
-        let number_width = line_count.max(1).to_string().len();
-        let line_numbers = (1..=line_count)
-            .map(|number| format!("{number:>number_width$}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into();
-
-        Self {
+        let mut cache = Self {
             owner,
             code: code.code.clone(),
             language,
             theme,
             styles,
-            line_count,
-            line_numbers,
+            line_count: 0,
+            line_numbers: SharedString::default(),
             generation: 0,
             highlight_task: None,
             highlight_task_generation: None,
-        }
+            highlighter,
+        };
+        cache.refresh_line_metrics();
+        cache
     }
 
     pub(super) fn replace(&mut self, code: &FencedCode, cx: &App) {
@@ -235,6 +247,81 @@ impl HighlightCache {
         self.generation = generation;
     }
 
+    fn refresh_line_metrics(&mut self) {
+        self.line_count = self.code.split('\n').count();
+        let number_width = self.line_count.max(1).to_string().len();
+        self.line_numbers = (1..=self.line_count)
+            .map(|number| format!("{number:>number_width$}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into();
+    }
+
+    fn extend(&mut self, code: &FencedCode, old_len: usize) {
+        let new_text = code.code.as_ref();
+        let Some(mut highlighter) = self.highlighter.take() else {
+            return;
+        };
+        if new_text.len() > BG_HIGHLIGHT_BYTES {
+            self.highlighter = Some(highlighter);
+            return;
+        }
+
+        let theme = self.theme.clone();
+        let styles_and_highlighter =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let rope = Rope::from(new_text);
+                let start = rope.offset_to_point(old_len);
+                let end = rope.offset_to_point(new_text.len());
+                let edit = tree_sitter::InputEdit {
+                    start_byte: old_len,
+                    old_end_byte: old_len,
+                    new_end_byte: new_text.len(),
+                    start_position: tree_sitter::Point::new(start.row, start.column),
+                    old_end_position: tree_sitter::Point::new(start.row, start.column),
+                    new_end_position: tree_sitter::Point::new(end.row, end.column),
+                };
+                highlighter.update(Some(edit), &rope, None);
+                let styles: CodeStyles = highlighter
+                    .styles(&(0..new_text.len()), theme.as_ref())
+                    .into();
+                (styles, highlighter)
+            }));
+
+        match styles_and_highlighter {
+            Ok((styles, highlighter)) => {
+                #[cfg(test)]
+                update_perf_probe(|probe| probe.incremental_updates += 1);
+                self.styles = Some(styles);
+                self.highlighter = Some(highlighter);
+            }
+            Err(_) => {
+                self.styles = Some(CodeStyles::default());
+                self.highlighter = None;
+            }
+        }
+        self.code = code.code.clone();
+        self.refresh_line_metrics();
+    }
+
+    pub(super) fn apply_code_change(&mut self, code: &FencedCode, cx: &App) {
+        let language = normalized_language_id(code.language.as_deref());
+        let same_language = self.language == language;
+        let same_theme = self.theme == cx.theme().highlight_theme;
+        match classify_change(self.code.as_ref(), code.code.as_ref()) {
+            CodeChange::Unchanged if same_language && same_theme => {}
+            CodeChange::Appended { old_len }
+                if same_language
+                    && same_theme
+                    && code.code.len() <= BG_HIGHLIGHT_BYTES
+                    && self.highlighter.is_some() =>
+            {
+                self.extend(code, old_len);
+            }
+            _ => self.replace(code, cx),
+        }
+    }
+
     /// Install `styles`, but only if they belong to the current generation.
     /// Returns `false` when `generation` is stale (the result is discarded),
     /// so callers can skip the repaint that would otherwise be a no-op.
@@ -247,12 +334,8 @@ impl HighlightCache {
     }
 
     pub(super) fn matches(&self, code: &FencedCode, cx: &App) -> bool {
-        // `language` is already normalized; compare the raw input case-insensitively
-        // to avoid allocating another normalized string on every render.
         self.code == code.code
-            && self
-                .language
-                .eq_ignore_ascii_case(code.language.as_deref().unwrap_or("text"))
+            && self.language == normalized_language_id(code.language.as_deref())
             && self.theme == cx.theme().highlight_theme
     }
 }
@@ -273,7 +356,100 @@ impl Drop for HighlightCache {
 }
 
 pub(super) fn normalized_language_id(language: Option<&str>) -> String {
-    language.unwrap_or("text").to_ascii_lowercase()
+    let lowered = language.unwrap_or("text").to_ascii_lowercase();
+    LANGUAGE_ALIASES
+        .iter()
+        .find_map(|(alias, target)| (*alias == lowered).then_some(*target))
+        .unwrap_or(&lowered)
+        .to_string()
+}
+
+const LANGUAGE_ALIASES: &[(&str, &str)] = &[
+    ("shell", "bash"),
+    ("zsh", "bash"),
+    ("shellscript", "bash"),
+    ("console", "bash"),
+    ("jsx", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("dockerfile", "bash"),
+    ("docker", "bash"),
+    ("xml", "html"),
+    ("svg", "html"),
+    ("xhtml", "html"),
+    ("ini", "toml"),
+    ("cfg", "toml"),
+    ("conf", "toml"),
+    ("properties", "toml"),
+    ("json5", "json"),
+    ("plaintext", "text"),
+    ("txt", "text"),
+    ("log", "text"),
+    ("output", "text"),
+];
+
+fn note_unknown_language(id: &str) {
+    if id == "text" {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.insert(id.to_string()) {
+        return;
+    }
+    drop(seen);
+    crate::logging::warn(
+        "ui.markdown",
+        format!("unknown fenced-code language '{id}'"),
+    );
+    #[cfg(test)]
+    UNKNOWN_LANGUAGE_WARNS.with(|count| count.set(count.get() + 1));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CodeChange {
+    Unchanged,
+    Appended { old_len: usize },
+    Replaced,
+}
+
+pub(super) fn classify_change(previous: &str, next: &str) -> CodeChange {
+    if previous == next {
+        CodeChange::Unchanged
+    } else if next.len() >= previous.len() && next.starts_with(previous) {
+        CodeChange::Appended {
+            old_len: previous.len(),
+        }
+    } else {
+        CodeChange::Replaced
+    }
+}
+
+fn highlight_sync(
+    code: &str,
+    language: &str,
+    theme: &HighlightTheme,
+) -> (Option<CodeStyles>, Option<SyntaxHighlighter>) {
+    #[cfg(test)]
+    update_perf_probe(|probe| probe.highlighter_constructions += 1);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut highlighter = SyntaxHighlighter::new(language);
+        let rope = Rope::from(code);
+        highlighter.update(None, &rope, None);
+        let styles: CodeStyles = highlighter.styles(&(0..code.len()), theme).into();
+        (Some(styles), Some(highlighter))
+    }))
+    .unwrap_or((Some(CodeStyles::default()), None))
+}
+
+fn gutter_width(line_count: usize, cx: &App) -> gpui::Pixels {
+    let number_width = line_count.max(1).to_string().len() as f32;
+    let gutter_character_width = cx.theme().mono_font_size * 0.62;
+    gutter_character_width * number_width + px(12.)
 }
 
 /// Run tree-sitter syntax highlighting for a complete code block. Invoked
@@ -411,7 +587,7 @@ pub(super) fn render(
         HighlightCache::new(code, contribution_owner, cx)
     });
     if !cache.read(cx).matches(code, cx) {
-        cache.update(cx, |cache, cx| cache.replace(code, cx));
+        cache.update(cx, |cache, cx| cache.apply_code_change(code, cx));
     }
     spawn_background_highlight(&cache, code, window, cx);
     let (styles, line_count, line_numbers) = cache.read_with(cx, |cache, _| {
@@ -445,7 +621,6 @@ pub(super) fn render(
     } else {
         global_wrap
     };
-    let number_width = line_count.max(1).to_string().len();
     let text_state = attached_text_state
         .cloned()
         .unwrap_or_else(|| SelectableTextState::new(code.code.clone()));
@@ -455,9 +630,8 @@ pub(super) fn render(
         .style
         .editor_line_number
         .unwrap_or(cx.theme().muted_foreground);
-    let gutter_character_width = cx.theme().mono_font_size * 0.62;
     let gutter_margin = px(12.);
-    let gutter_width = gutter_character_width * number_width + gutter_margin;
+    let gutter_width = gutter_width(line_count, cx);
 
     let mut has_horizontal_overflow = false;
     let code_content = if wrap && show_line_numbers {

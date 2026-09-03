@@ -103,7 +103,7 @@ fn label_reports_thinking_while_streaming_then_the_banked_duration(cx: &mut gpui
         t!("chat.reasoning.streaming").to_string()
     );
 
-    trace.finish();
+    window.update(|_, cx| trace.finish(cx));
     let finished = trace.label(true);
     assert_ne!(finished, t!("chat.reasoning.streaming").to_string());
     assert!(
@@ -118,14 +118,14 @@ fn finish_is_idempotent_and_preserves_user_disclosure(cx: &mut gpui::TestAppCont
     let window = cx.add_empty_window();
     let mut trace = window.update(|_, cx| ReasoningTrace::new(1, cx));
 
-    trace.finish();
+    window.update(|_, cx| trace.finish(cx));
     let elapsed = trace.elapsed;
     assert!(trace.started_at.is_none(), "the clock was stopped");
 
     // Closing an already-closed trace must not bank more time, and must not
     // re-collapse a card the user has since opened.
     trace.toggle();
-    trace.finish();
+    window.update(|_, cx| trace.finish(cx));
     assert_eq!(trace.elapsed, elapsed);
     assert!(trace.is_expanded(), "user intent is preserved");
 }
@@ -147,7 +147,7 @@ fn empty_deltas_do_not_start_or_change_timing(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let window = cx.add_empty_window();
     let mut trace = window.update(|_, cx| ReasoningTrace::new(1, cx));
-    trace.finish();
+    window.update(|_, cx| trace.finish(cx));
     let elapsed = trace.elapsed;
 
     window.update(|_, cx| trace.push("", cx));

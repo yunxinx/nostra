@@ -4138,6 +4138,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
+ "tree-sitter",
  "unicode-segmentation",
  "url",
  "uuid",

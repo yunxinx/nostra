@@ -165,7 +165,8 @@ fn currency_and_delimiter_examples_remain_native() {
     ] {
         assert!(!contains_math_syntax(source), "unexpected math: {source:?}");
     }
-    assert!(contains_math_syntax("The value is $5$ exactly"));
+    assert!(!contains_math_syntax("The value is $5$ exactly"));
+    assert!(contains_math_syntax("The value is $x$ exactly"));
     assert!(contains_math_syntax("placeholder $...$, formula $x$"));
 }
 

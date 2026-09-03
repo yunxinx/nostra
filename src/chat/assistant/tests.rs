@@ -186,6 +186,72 @@ fn paced_frames_are_grapheme_safe_and_gate_lifecycle_events() {
 }
 
 #[test]
+fn markdown_tail_hold_keeps_ambiguous_prefixes_unrevealed() {
+    for source in [
+        "- item",
+        "---",
+        "> quote",
+        "1. first",
+        "1. **bold**",
+        "```rust\ncode",
+        "[link](u)",
+    ] {
+        let frames = stream_revealed_prefixes(source);
+        for (index, revealed) in frames.iter().enumerate() {
+            assert!(
+                !revealed_tail_is_ambiguous(revealed),
+                "unsafe prefix at frame {index} of {source:?}: {revealed:?}"
+            );
+        }
+        assert_eq!(frames.last().map(String::as_str), Some(source));
+    }
+}
+
+#[test]
+fn fence_interior_does_not_hold_list_markers() {
+    let source = "```\n- item\n```";
+    let frames = stream_revealed_prefixes(source);
+    assert!(
+        frames
+            .iter()
+            .any(|revealed| revealed.contains("- i") || revealed.contains("- item")),
+        "list-like text inside a fence must not be held: {frames:?}"
+    );
+    assert_eq!(frames.last().map(String::as_str), Some(source));
+}
+
+fn stream_revealed_prefixes(source: &str) -> Vec<String> {
+    let mut pending = PendingDeltas::default();
+    let mut revealed = String::new();
+    let mut frames = Vec::new();
+    for character in source.chars() {
+        pending.push(StreamDelta::TextDelta {
+            content_index: 0,
+            id: "text-0".into(),
+            delta: character.to_string(),
+        });
+        for delta in pending.take_frame(false) {
+            if let StreamDelta::TextDelta { delta, .. } = delta {
+                revealed.push_str(&delta);
+            }
+        }
+        frames.push(revealed.clone());
+    }
+    pending.push(StreamDelta::TextFinished {
+        content_index: 0,
+        id: "text-0".into(),
+        replay: None,
+    });
+    for delta in pending.take_frame(true) {
+        if let StreamDelta::TextDelta { delta, .. } = delta {
+            revealed.push_str(&delta);
+        }
+    }
+    frames.push(revealed.clone());
+    frames
+}
+
+#[test]
 fn failed_terminal_always_carries_the_outcome_request_id() {
     let fallback =
         terminal_failure(OutcomeStatus::Failed, None, "request-1".into()).expect("failed outcome");

@@ -207,6 +207,16 @@ fn theme_switch_keeps_markdown_state_and_regenerates_formula_color(cx: &mut Test
     cx.update(|_, cx| {
         gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
     });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let mid = crate::ui::math::formula_cache_snapshot(owner_id, formula_start)
+        .expect("theme-switch in-flight formula cache");
+    assert!(
+        mid.has_displayed,
+        "theme switch must keep the previous formula image instead of a blank frame: {mid:?}"
+    );
+
     redraw_settled_math(cx);
 
     let after = crate::ui::math::formula_cache_snapshot(owner_id, formula_start)
@@ -273,8 +283,8 @@ fn failed_inline_and_display_formulas_remain_selectable_fallbacks(cx: &mut TestA
         let selector: &'static str =
             Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
         assert!(
-            cx.debug_bounds(selector).is_none(),
-            "an unsupported formula must stay on its selectable text fallback"
+            cx.debug_bounds(selector).is_some(),
+            "an unsupported formula must keep a visible monospace fallback"
         );
     }
     let selected_all = cx.update(|_, cx| {
@@ -461,4 +471,243 @@ fn display_formula_drag_preserves_interleaved_markdown_order(cx: &mut TestAppCon
         })
     });
     assert_eq!(selected_all.trim(), markdown);
+}
+
+#[gpui::test]
+fn italic_aligned_environment_renders_without_mathit_wrap(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = r"*$\begin{aligned}a\\b\end{aligned}$*";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw_settled_math(cx);
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let start = markdown.find('$').expect("formula");
+    let selector: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{start}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(selector).is_some(),
+        "aligned environment in italic must render as a formula"
+    );
+}
+
+#[gpui::test]
+fn streaming_unclosed_tex_is_pending_until_close_or_finish(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+    let id = "pending-frac".to_string();
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| this.start_stream_text(0, id.clone(), cx));
+    });
+    for character in r"$\frac{a}{b".chars() {
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                this.append_stream_text(0, id.clone(), &character.to_string(), cx);
+            });
+        });
+        redraw(cx);
+    }
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
+            panic!("streamed assistant text")
+        };
+        *ui_id
+    });
+    let pending: &'static str =
+        Box::leak(format!("markdown-math-pending-{owner_id}-0").into_boxed_str());
+    assert!(
+        cx.debug_bounds(pending).is_some(),
+        "unclosed TeX must render as a pending formula node"
+    );
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.append_stream_text(0, id.clone(), "}$", cx);
+        });
+    });
+    redraw_settled_math(cx);
+    let ready: &'static str = Box::leak(format!("markdown-math-{owner_id}-0").into_boxed_str());
+    assert!(
+        cx.debug_bounds(ready).is_some(),
+        "closing the formula must promote the pending node"
+    );
+
+    let unfinished_id = "unclosed-until-finish".to_string();
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.start_stream_text(1, unfinished_id.clone(), cx);
+            this.append_stream_text(1, unfinished_id.clone(), r"$\frac{a}{b", cx);
+            this.finish_stream_text(1, &unfinished_id, None, cx);
+        });
+    });
+    redraw(cx);
+    let unfinished_owner = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[1] else {
+            panic!("second streamed text")
+        };
+        *ui_id
+    });
+    let unfinished_pending: &'static str =
+        Box::leak(format!("markdown-math-pending-{unfinished_owner}-0").into_boxed_str());
+    assert!(
+        cx.debug_bounds(unfinished_pending).is_none(),
+        "finishing an unclosed opener must fall back to ordinary text"
+    );
+}
+
+#[gpui::test]
+fn formula_render_debounce_coalesces_bursts(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    crate::ui::math::reset_formula_background_submits();
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "$$a$$".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    redraw(cx);
+    assert_eq!(
+        crate::ui::math::formula_background_submits(),
+        1,
+        "a formula that appears once must render immediately"
+    );
+
+    cx.executor().advance_clock(Duration::from_millis(200));
+    cx.run_until_parked();
+    crate::ui::math::reset_formula_background_submits();
+    for body in ["a", "ab", "abc", "abcd", "abcde"] {
+        let markdown = format!("$${body}$$");
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                let MessagePart::Text {
+                    body: markdown_body,
+                    ..
+                } = &mut this.messages[0].parts[0]
+                else {
+                    panic!("assistant text");
+                };
+                markdown_body.set_text(&markdown, cx);
+            });
+        });
+        redraw(cx);
+    }
+    assert_eq!(
+        crate::ui::math::formula_background_submits(),
+        1,
+        "the first change after a quiet gap submits immediately; later burst changes wait"
+    );
+    cx.executor()
+        .advance_clock(crate::ui::math::FORMULA_DEBOUNCE);
+    cx.run_until_parked();
+    assert_eq!(
+        crate::ui::math::formula_background_submits(),
+        2,
+        "five changes inside the debounce window coalesce to one extra submit"
+    );
+
+    crate::ui::math::reset_formula_background_submits();
+    for body in ["x", "xy"] {
+        let markdown = format!("$${body}$$");
+        cx.update(|_, cx| {
+            chat.update(cx, |this, cx| {
+                let MessagePart::Text {
+                    body: markdown_body,
+                    ..
+                } = &mut this.messages[0].parts[0]
+                else {
+                    panic!("assistant text");
+                };
+                markdown_body.set_text(&markdown, cx);
+            });
+        });
+        redraw(cx);
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        crate::ui::math::formula_background_submits(),
+        2,
+        "changes spaced by 200ms each submit"
+    );
+}
+
+#[gpui::test]
+fn display_formula_placeholder_height_stays_within_one_line(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    let markdown = "$$\n\\sum_{n=1}^{N} n\n$$";
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.messages.push(Message::from_canonical(
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: markdown.into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            ));
+        });
+    });
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let owner_id = cx.update(|_, cx| {
+        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
+            panic!("assistant text part")
+        };
+        *ui_id
+    });
+    let row: &'static str =
+        Box::leak(format!("markdown-math-block-row-{owner_id}-0").into_boxed_str());
+    let pending_height = cx
+        .debug_bounds(row)
+        .expect("placeholder display row")
+        .size
+        .height;
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let _ = window.draw(cx);
+    });
+    let ready_height = cx
+        .debug_bounds(row)
+        .expect("settled display row")
+        .size
+        .height;
+    let line_height = cx.update(|window, _| window.line_height());
+    assert!(
+        (ready_height - pending_height).abs() <= line_height,
+        "display height jumped from {pending_height:?} to {ready_height:?} (line {line_height:?})"
+    );
 }

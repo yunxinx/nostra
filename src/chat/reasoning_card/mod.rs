@@ -148,7 +148,7 @@ impl ReasoningTrace {
         presentation: &MarkdownPresentation,
         cx: &mut App,
     ) -> Self {
-        let body = MarkdownBody::new_with_presentation("", owner_id, presentation, cx);
+        let body = MarkdownBody::new_streaming_with_presentation("", owner_id, presentation, cx);
         Self {
             body,
             expanded: true,
@@ -219,13 +219,14 @@ impl ReasoningTrace {
     ///
     /// Idempotent: called on the explicit reasoning-block boundary and again as
     /// a terminal fallback for cancellation or malformed/incomplete streams.
-    pub(crate) fn finish(&mut self) {
+    pub(crate) fn finish(&mut self, cx: &mut App) {
         if let Some(started_at) = self.started_at.take() {
             self.elapsed = Some(started_at.elapsed());
         }
         if !self.user_controlled {
             self.expanded = false;
         }
+        self.body.finish(cx);
     }
 
     /// Toggle the body, and hand control of it to the user for good.

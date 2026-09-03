@@ -40,6 +40,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
 markdown = "1.0.0"
 unicode-segmentation = "1.12"
+# Same 0.26 line as gpui-component so incremental `SyntaxHighlighter::update`
+# can construct `tree_sitter::InputEdit` without a second parser identity.
+tree-sitter = "0.26"
 
 # Zed/GPUI and gpui-component are maintained as one verified fork set. Checked-in
 # dependencies pin exact commits: every GPUI crate shares one Zed revision and

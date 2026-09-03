@@ -10,10 +10,10 @@ fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "answer", cx);
             this.append_stream_reasoning(2, "reasoning-1".into(), "second", cx);
-            this.finish_stream_reasoning(2, "reasoning-1", None);
+            this.finish_stream_reasoning(2, "reasoning-1", None, cx);
 
             let turn = this.messages.last_mut().expect("assistant turn");
             assert_eq!(
@@ -65,10 +65,10 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "answer", cx);
             this.append_stream_reasoning(2, "reasoning-1".into(), "second", cx);
-            this.finish_stream_reasoning(2, "reasoning-1", None);
+            this.finish_stream_reasoning(2, "reasoning-1", None, cx);
         });
     });
 
@@ -135,7 +135,7 @@ fn a_finished_reasoning_id_cannot_be_reused(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_reasoning(0, "reasoning-0".into(), "late", cx);
         });
     });
@@ -168,7 +168,7 @@ fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppCon
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.start_stream_reasoning(0, "reasoning-0".into());
-            this.finish_stream_reasoning(0, "reasoning-0", Some(replay.clone()));
+            this.finish_stream_reasoning(0, "reasoning-0", Some(replay.clone()), cx);
             this.append_stream_reasoning(0, "reasoning-0".into(), "late", cx);
         });
     });
@@ -197,7 +197,7 @@ fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext)
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "partial first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "partial answer", cx);
             this.append_stream_reasoning(2, "reasoning-1".into(), "partial second", cx);
             let first = this
@@ -268,7 +268,7 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
         chat.update(cx, |this, cx| {
             this.start_stream_tool_call(0, 0, "call-0".into(), "lookup".into());
             this.append_stream_reasoning(1, "reasoning-0".into(), "partial", cx);
-            this.finish_stream_reasoning(1, "reasoning-0", None);
+            this.finish_stream_reasoning(1, "reasoning-0", None, cx);
             let turn = this.messages.last_mut().expect("assistant turn");
             let MessagePart::Reasoning {
                 ui_id,

@@ -59,7 +59,7 @@ fn reasoning_finished_collapses_the_card(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             this.append_stream_reasoning(0, "reasoning-0".into(), "thinking", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None);
+            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
             this.append_stream_text(1, "text-0".into(), "Here is the answer.", cx);
         });
     });
