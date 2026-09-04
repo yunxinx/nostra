@@ -949,7 +949,7 @@ impl ChatApp {
         let target = self
             .project_snapshot()
             .draft_for_project(&project_id)
-            .map(|conversation| ProjectTarget::View(conversation.target()));
+            .map(|conversation| ProjectTarget::Conversation(conversation.id()));
         self.render_indented_session_row(
             format!("agent-draft-{project_id}"),
             title,
@@ -1031,9 +1031,9 @@ impl ChatApp {
         _cx: &mut Context<Self>,
     ) -> AnyElement {
         let ids = match &target {
-            ProjectTarget::View(entity) => SidebarActionIds {
-                trigger_id: ("agent-conversation-actions", *entity).into(),
-                confirm_id: ("agent-conversation-delete-confirm", *entity).into(),
+            ProjectTarget::Conversation(entity) => SidebarActionIds {
+                trigger_id: ("agent-conversation-actions", entity.as_u64()).into(),
+                confirm_id: ("agent-conversation-delete-confirm", entity.as_u64()).into(),
                 trigger_debug_selector: format!("agent-conversation-actions-{}", entity.as_u64()),
                 delete_label: t!("agent.delete_session").to_string(),
                 confirm_title: t!("agent.delete_session_title").to_string(),

@@ -9,7 +9,8 @@ fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestApp
         preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
         chat.update(cx, |chat, cx| {
             for index in 0..20 {
-                chat.messages.push(Message::from_canonical(
+                test_support::push_canonical(
+                    chat,
                     LlmMessage {
                         role: crate::llm::Role::Assistant,
                         content: vec![ContentBlock::Text {
@@ -19,7 +20,7 @@ fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestApp
                         provider_metadata: ProviderMetadata::default(),
                     },
                     cx,
-                ));
+                );
             }
             chat.sync_message_list_count();
             chat.list_state.scroll_to(ListOffset::default());
@@ -64,7 +65,8 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
         preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
         chat.update(cx, |chat, cx| {
             for index in 0..20 {
-                chat.messages.push(Message::from_canonical(
+                test_support::push_canonical(
+                    chat,
                     LlmMessage {
                         role: crate::llm::Role::Assistant,
                         content: vec![ContentBlock::Text {
@@ -74,7 +76,7 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
                         provider_metadata: ProviderMetadata::default(),
                     },
                     cx,
-                ));
+                );
             }
             chat.sync_message_list_count();
             chat.list_state.scroll_to(ListOffset::default());
@@ -133,7 +135,8 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
         preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
         chat.update(cx, |this, cx| {
             for line in 0..60 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(
+                    this,
                     0,
                     "inactive-reasoning".into(),
                     &format!("Reasoning line {line}.\n\n"),
@@ -155,7 +158,7 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
     });
     assert!(
         cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            let turn = chat.read(cx);
             reasoning_part(turn)
                 .expect("reasoning trace")
                 .smooth_scroll_remaining()
@@ -170,7 +173,7 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
     });
     assert_eq!(
         cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            let turn = chat.read(cx);
             reasoning_part(turn)
                 .expect("reasoning trace")
                 .smooth_scroll_remaining()
@@ -180,7 +183,7 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
     );
 
     let before_inactive = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         reasoning_part(turn)
             .expect("reasoning trace")
             .scroll_offset()
@@ -193,7 +196,7 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
     });
 
     let after_inactive = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         reasoning_part(turn)
             .expect("reasoning trace")
             .scroll_offset()
@@ -206,7 +209,7 @@ fn inactive_reasoning_window_does_not_queue_card_smooth_scroll(cx: &mut TestAppC
 
     assert_eq!(
         cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            let turn = chat.read(cx);
             reasoning_part(turn)
                 .expect("reasoning trace")
                 .smooth_scroll_remaining()

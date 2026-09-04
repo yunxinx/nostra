@@ -7,9 +7,7 @@ use super::super::*;
 fn streamed_body_text(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestContext) -> String {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[1].parts[0] else {
-                panic!("streamed assistant text")
-            };
+            let (_, _, body) = prose_at(this, 1, 0);
             body.select_all_text(cx)
         })
     })
@@ -18,7 +16,7 @@ fn streamed_body_text(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestCo
 fn stream(chat: &gpui::Entity<ChatView>, id: &str, delta: &str, cx: &mut gpui::VisualTestContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id.to_string(), delta, cx);
+            test_support::append_text(this, 0, id.to_string(), delta, cx);
         });
     });
     redraw(cx);
@@ -35,7 +33,9 @@ fn streamed_reference_definitions_resolve_earlier_and_later_references(cx: &mut 
     seed_turn(&chat, cx);
     let id = "streamed-definitions";
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.start_stream_text(0, id.to_string(), cx));
+        chat.update(cx, |this, cx| {
+            test_support::start_text(this, 0, id.to_string(), cx)
+        });
     });
 
     stream(&chat, id, "看 [文档][d] 与 ![图][i]\n\n", cx);
@@ -82,7 +82,9 @@ fn streamed_footnote_definition_resolves_earlier_reference(cx: &mut TestAppConte
     seed_turn(&chat, cx);
     let id = "streamed-footnotes";
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.start_stream_text(0, id.to_string(), cx));
+        chat.update(cx, |this, cx| {
+            test_support::start_text(this, 0, id.to_string(), cx)
+        });
     });
 
     stream(&chat, id, "正文[^1] 继续\n\n", cx);

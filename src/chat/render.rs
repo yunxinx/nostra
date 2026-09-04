@@ -1,7 +1,25 @@
 //! Rendering and scroll behavior for the conversation transcript.
 
+use gpui::{
+    AnyElement, App, Context, ElementId, InteractiveElement as _, IntoElement, ListOffset,
+    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Window, div,
+    list, prelude::FluentBuilder as _, px,
+};
+use gpui_component::{
+    ActiveTheme as _, ElementExt as _, StyledExt as _, h_flex,
+    scroll::ScrollableElement as _,
+    shimmer::ShimmerText,
+    text::{TextView, TextViewStyle},
+    v_flex,
+};
+use rust_i18n::t;
+
 use crate::appearance::contrast;
 
+use super::hover_reveal::hover_reveal_copy;
+#[cfg(test)]
+use super::scrolling::record_reasoning_smooth_invalidation;
+use super::scrolling::smooth_scroll_animation_enabled;
 use super::*;
 
 impl Render for ChatView {
@@ -21,7 +39,7 @@ impl Render for ChatView {
             });
         }
 
-        let has_messages = !self.messages.is_empty();
+        let has_messages = !self.mirrors.is_empty();
         let send_disabled = self.runtime_snapshot.is_generating()
             || self.runtime_snapshot.persistence_pending()
             || self.runtime_snapshot.deletion_pending()
@@ -99,19 +117,20 @@ impl ChatView {
         self.sync_message_list_count();
         #[cfg(test)]
         self.materialized_message_indices.clear();
-        let message_count = self.messages.len();
+        let message_count = self.mirrors.len();
+        let is_generating = self.runtime_snapshot.is_generating();
         let wheel_scroll_anchor = self.list_state.logical_scroll_top();
         let render_item = cx.processor(move |this, index, window, cx| {
             #[cfg(test)]
             this.materialized_message_indices.insert(index);
-            let Some(message) = this.messages.get(index) else {
+            let Some(mirror) = this.mirrors.get(index) else {
                 return div().into_any_element();
             };
-            let row = render_message(
-                message,
+            let row = render_turn(
+                mirror,
                 index,
                 this.preference_snapshot.user_message_markdown,
-                this.runtime_snapshot.is_generating() && index + 1 == this.messages.len(),
+                is_generating && index + 1 == message_count,
                 window,
                 cx,
             );
@@ -218,26 +237,26 @@ impl ChatView {
 
     fn schedule_reasoning_scroll_frame(
         &mut self,
-        message_ui_id: u64,
-        part_ui_id: u64,
+        turn_id: TurnId,
+        part_id: PartId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) else {
+        let Some(trace) = self.reasoning_trace_mut(turn_id, part_id) else {
             return;
         };
         if !trace.mark_smooth_frame_scheduled() {
             return;
         }
         cx.on_next_frame(window, move |this, window, cx| {
-            this.advance_reasoning_scroll(message_ui_id, part_ui_id, window, cx);
+            this.advance_reasoning_scroll(turn_id, part_id, window, cx);
         });
     }
 
     fn advance_reasoning_scroll(
         &mut self,
-        message_ui_id: u64,
-        part_ui_id: u64,
+        turn_id: TurnId,
+        part_id: PartId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -246,12 +265,12 @@ impl ChatView {
         // different window.
         if !smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
         {
-            if let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) {
+            if let Some(trace) = self.reasoning_trace_mut(turn_id, part_id) {
                 trace.cancel_smooth_scroll_frame();
             }
             return;
         }
-        let Some(trace) = self.reasoning_trace_mut(message_ui_id, part_ui_id) else {
+        let Some(trace) = self.reasoning_trace_mut(turn_id, part_id) else {
             return;
         };
         let Some(has_remaining) = trace.advance_smooth_scroll() else {
@@ -261,25 +280,25 @@ impl ChatView {
         record_reasoning_smooth_invalidation();
         cx.notify();
         if has_remaining {
-            self.schedule_reasoning_scroll_frame(message_ui_id, part_ui_id, window, cx);
+            self.schedule_reasoning_scroll_frame(turn_id, part_id, window, cx);
         }
     }
 
     pub(super) fn reasoning_trace_mut(
         &mut self,
-        message_ui_id: u64,
-        part_ui_id: u64,
+        turn_id: TurnId,
+        part_id: PartId,
     ) -> Option<&mut ReasoningTrace> {
-        self.messages
+        self.mirrors
             .iter_mut()
-            .find(|message| message.ui_id == message_ui_id)
-            .and_then(|message| {
-                message.parts.iter_mut().find_map(|part| match part {
-                    MessagePart::Reasoning {
-                        ui_id,
+            .find(|mirror| mirror.turn_id == turn_id)
+            .and_then(|mirror| {
+                mirror.parts.iter_mut().find_map(|part| match part {
+                    PartMirror::Reasoning {
+                        part_id: current,
                         trace: Some(trace),
                         ..
-                    } if *ui_id == part_ui_id => Some(trace),
+                    } if *current == part_id => Some(trace),
                     _ => None,
                 })
             })
@@ -287,209 +306,200 @@ impl ChatView {
 
     pub(super) fn sync_message_list_count(&self) {
         let current = self.list_state.item_count();
-        let target = self.messages.len();
+        let target = self.mirrors.len();
         if current == 0 && target > 0 {
             self.list_state
                 .reset_with_uniform_height(target, MESSAGE_HEIGHT_HINT);
         } else if current < target {
-            self.list_state.splice(current..current, target - current);
+            self.list_state.splice_with_uniform_height(
+                current..current,
+                target - current,
+                MESSAGE_HEIGHT_HINT,
+            );
         } else if current > target {
             self.list_state.splice(target..current, 0);
         }
     }
 
     pub(super) fn remeasure_latest_message(&self) {
-        if let Some(index) = self.messages.len().checked_sub(1) {
+        if let Some(index) = self.mirrors.len().checked_sub(1) {
             self.list_state.remeasure_items(index..index + 1);
         }
     }
 }
 
-fn render_message(
-    msg: &Message,
+fn render_turn(
+    mirror: &TurnMirror,
     message_index: usize,
     render_user_markdown: bool,
     in_flight: bool,
     window: &mut Window,
     cx: &mut Context<ChatView>,
 ) -> impl IntoElement {
-    let message_ui_id = msg.ui_id;
-    let (radius_lg, secondary, secondary_foreground, foreground, muted_foreground) = {
+    let turn_id = mirror.turn_id;
+    let message_ui_id = turn_id.as_u64();
+    let (radius_lg, secondary, secondary_foreground, foreground, muted, muted_foreground) = {
         let theme = cx.theme();
         (
             theme.radius_lg,
             theme.secondary,
             theme.secondary_foreground,
             theme.foreground,
+            theme.muted,
             theme.muted_foreground,
         )
     };
-    let is_user = msg.role == Role::User;
-    let parts = msg.parts.iter().filter_map(|part| {
-            match part {
-                MessagePart::Text {
-                    ui_id, text, body, ..
-                } if !text.is_empty() => {
-                    Some(if is_user && !render_user_markdown {
-                        TextView::plain(("user-message-plain", *ui_id), text.clone())
-                            .selectable(true)
-                            .style(TextViewStyle::default())
-                            .into_any_element()
-                    } else {
-                        body.text_view(TextViewStyle::default()).into_any_element()
-                    })
-                }
-                MessagePart::Reasoning {
-                    ui_id,
-                    reasoning,
-                    finished,
-                    trace: Some(trace),
-                    ..
-                } => {
-                    // Each content block owns independent disclosure and copy
-                    // state. `ui_id` survives terminal reconciliation and vector
-                    // reordering, so keyed GPUI/Clipboard state remains stable.
-                    let ui_id = *ui_id;
-                    let content_index = part.content_index();
-                    let native_scroll_anchor = trace.current_scroll_offset();
-                    let on_toggle = cx.listener(move |this: &mut ChatView, _, window, cx| {
-                        if let Some(MessagePart::Reasoning {
-                            trace: Some(trace), ..
-                        }) = this
-                            .messages
-                            .iter_mut()
-                            .find(|message| message.ui_id == message_ui_id)
-                            .and_then(|message| {
-                                message.parts.iter_mut().find(|part| {
-                                    matches!(part, MessagePart::Reasoning { ui_id: current, .. } if *current == ui_id)
-                                })
-                            })
-                        {
-                            if let Some(position) = trace.toggle_with_cx(cx) {
-                                // The first frame gives the retained TextView a
-                                // definite viewport and block-height estimates.
-                                // Restore the reader's relative position on the
-                                // following frame, once its scroll range is real.
-                                cx.on_next_frame(window, move |_, window, cx| {
-                                    cx.on_next_frame(window, move |this, _, cx| {
-                                        if let Some(trace) =
-                                            this.reasoning_trace_mut(message_ui_id, ui_id)
-                                        {
-                                            trace.apply_virtualized_position(position);
-                                            cx.notify();
-                                        }
-                                    });
-                                    cx.notify();
-                                });
-                            }
-                            cx.notify();
-                        }
-                    });
-                    let on_scroll = cx.listener(
-                        move |this: &mut ChatView,
-                              event: &ScrollWheelEvent,
-                              window,
-                              cx| {
-                            // A gesture over a nested reasoning viewport takes
-                            // ownership of the pointer; do not let a previously
-                            // queued transcript animation keep moving underneath it.
-                            this.smooth_scroll.cancel_motion();
-                            // Do not start card easing from an inactive window:
-                            // AppKit throttles its animation frames.
-                            let smooth = smooth_scroll_animation_enabled(
-                                window,
-                                this.preference_snapshot.smooth_chat_scrolling,
-                            )
-                                && !event.delta.precise();
-                            let Some(trace) = this.reasoning_trace_mut(message_ui_id, ui_id) else {
-                                return;
-                            };
-                            trace.handle_scroll(event, window, cx);
-                            if !smooth {
-                                trace.cancel_smooth_scroll();
-                                return;
-                            }
-
-                            // The card's native scroll listener runs before this
-                            // callback. Restore its painted-frame anchor, then
-                            // replay the same distance through eased frames.
-                            let distance = event.delta.pixel_delta(window.line_height()).y;
-                            if distance == Pixels::ZERO {
-                                return;
-                            }
-                            trace.enqueue_smooth_scroll(native_scroll_anchor, distance);
-                            this.schedule_reasoning_scroll_frame(
-                                message_ui_id,
-                                ui_id,
-                                window,
-                                cx,
-                            );
-                        },
-                    );
-                    let view = cx.entity().downgrade();
-                    let copy_value = move |_: &mut Window, cx: &mut App| {
-                        view.upgrade()
-                            .and_then(|view| {
-                                view.read(cx).reasoning_copy_source(message_ui_id, ui_id)
-                            })
-                            .unwrap_or_default()
-                    };
-                    Some(reasoning_card::render(
-                        trace,
-                        &reasoning.display,
-                        *finished,
-                        reasoning_card::ReasoningCardId {
-                            ui_id,
-                            content_index,
-                        },
-                        reasoning_card::ReasoningCardActions {
-                            on_toggle: std::rc::Rc::new(on_toggle),
-                            copy_value: std::rc::Rc::new(copy_value),
-                            on_scroll: std::rc::Rc::new(on_scroll),
-                        },
-                        window,
-                        cx,
-                    ))
-                }
-                MessagePart::ToolCall { name, .. } if !name.is_empty() => Some(
-                    div()
-                        .text_color(muted_foreground)
-                        .child(t!("chat.tool_requested", name = name.clone()).to_string())
+    let is_user = mirror.role == Role::User;
+    let is_tool = mirror.role == Role::Tool;
+    let parts = mirror
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            PartMirror::Prose {
+                text,
+                body,
+                part_id,
+                ..
+            } if !text.is_empty() => {
+                if is_user && !render_user_markdown {
+                    Some(
+                        TextView::plain(
+                            ("user-message-plain", part_id.as_u64()),
+                            SharedString::from(text.as_str()),
+                        )
+                        .selectable(true)
+                        .style(TextViewStyle::default())
                         .into_any_element(),
-                ),
-                MessagePart::ToolResult { body, .. } => {
+                    )
+                } else {
                     Some(body.text_view(TextViewStyle::default()).into_any_element())
                 }
-                _ => None,
             }
+            PartMirror::Reasoning {
+                part_id,
+                content_index,
+                display,
+                finished,
+                trace: Some(trace),
+            } => {
+                let part_id = *part_id;
+                let ui_id = part_id.as_u64();
+                let content_index = *content_index;
+                let native_scroll_anchor = trace.current_scroll_offset();
+                let on_toggle = cx.listener(move |this: &mut ChatView, _, window, cx| {
+                    if let Some(trace) = this.reasoning_trace_mut(turn_id, part_id) {
+                        if let Some(position) = trace.toggle_with_cx(cx) {
+                            cx.on_next_frame(window, move |_, window, cx| {
+                                cx.on_next_frame(window, move |this, _, cx| {
+                                    if let Some(trace) = this.reasoning_trace_mut(turn_id, part_id)
+                                    {
+                                        trace.apply_virtualized_position(position);
+                                        cx.notify();
+                                    }
+                                });
+                                cx.notify();
+                            });
+                        }
+                        cx.notify();
+                    }
+                });
+                let on_scroll = cx.listener(
+                    move |this: &mut ChatView, event: &ScrollWheelEvent, window, cx| {
+                        this.smooth_scroll.cancel_motion();
+                        let smooth = smooth_scroll_animation_enabled(
+                            window,
+                            this.preference_snapshot.smooth_chat_scrolling,
+                        ) && !event.delta.precise();
+                        let Some(trace) = this.reasoning_trace_mut(turn_id, part_id) else {
+                            return;
+                        };
+                        trace.handle_scroll(event, window, cx);
+                        if !smooth {
+                            trace.cancel_smooth_scroll();
+                            return;
+                        }
+
+                        let distance = event.delta.pixel_delta(window.line_height()).y;
+                        if distance == Pixels::ZERO {
+                            return;
+                        }
+                        trace.enqueue_smooth_scroll(native_scroll_anchor, distance);
+                        this.schedule_reasoning_scroll_frame(turn_id, part_id, window, cx);
+                    },
+                );
+                let view = cx.entity().downgrade();
+                let copy_value = move |_: &mut Window, cx: &mut App| {
+                    view.upgrade()
+                        .and_then(|view| view.read(cx).reasoning_copy_source(turn_id, part_id, cx))
+                        .unwrap_or_default()
+                };
+                Some(reasoning_card::render(
+                    trace,
+                    display,
+                    *finished,
+                    reasoning_card::ReasoningCardId {
+                        ui_id,
+                        content_index,
+                    },
+                    reasoning_card::ReasoningCardActions {
+                        on_toggle: std::rc::Rc::new(on_toggle),
+                        copy_value: std::rc::Rc::new(copy_value),
+                        on_scroll: std::rc::Rc::new(on_scroll),
+                    },
+                    window,
+                    cx,
+                ))
+            }
+            PartMirror::ToolCall { name, .. } if !name.is_empty() => Some(
+                div()
+                    .text_color(muted_foreground)
+                    .child(t!("chat.tool_requested", name = name.clone()).to_string())
+                    .into_any_element(),
+            ),
+            PartMirror::ToolResult { body, .. } => {
+                Some(body.text_view(TextViewStyle::default()).into_any_element())
+            }
+            _ => None,
         })
         .collect::<Vec<_>>();
 
-    let waiting = !is_user && in_flight && msg.error.is_none() && parts.is_empty();
+    let waiting = mirror.role == Role::Assistant
+        && in_flight
+        && mirror.error.is_none()
+        && !has_wait_ending_content(mirror);
     let inner: AnyElement = if is_user {
-        // A user turn is a borderless block on the transcript: it has to hold
-        // its own against the pane, and its text against it.
         let bubble = contrast::pane_block(secondary, cx);
         let bubble_text = contrast::text_on(secondary_foreground, bubble, cx);
-        // Right-aligned bubble for user turns.
         h_flex()
             .w_full()
             .justify_end()
             .child(
                 div()
                     .debug_selector(move || format!("user-message-bubble-{message_index}"))
-                    // Markdown contributes an intrinsic min-content width. As a
-                    // horizontal flex item the bubble must be allowed to shrink
-                    // below it when the conversation column narrows.
                     .min_w_0()
                     .max_w(px(560.))
                     .rounded(radius_lg)
                     .bg(bubble)
                     .text_color(bubble_text)
-                    // Kept tight on purpose: the body inherits the window's
-                    // 16px base size, so its line box is already ~24px tall and
-                    // generous padding on top of that makes a one-word turn
-                    // read as a block.
+                    .px_3()
+                    .py_1p5()
+                    .children(parts),
+            )
+            .into_any_element()
+    } else if is_tool {
+        let card = contrast::pane_block(muted, cx);
+        let card_text = contrast::text_on(muted_foreground, card, cx);
+        h_flex()
+            .w_full()
+            .justify_start()
+            .child(
+                div()
+                    .debug_selector(move || format!("tool-result-{message_index}"))
+                    .min_w_0()
+                    .max_w(px(560.))
+                    .rounded(radius_lg)
+                    .bg(card)
+                    .text_color(card_text)
                     .px_3()
                     .py_1p5()
                     .children(parts),
@@ -506,43 +516,22 @@ fn render_message(
             )
             .into_any_element()
     } else {
-        // Assistant content is rendered in canonical block order. Reasoning
-        // cards are normal flex children, so text/tool interleaving is preserved
-        // without overlays or a second presentation ordering model.
         v_flex()
             .w_full()
             .gap_3()
             .text_color(foreground)
             .children(parts)
-            .when_some(msg.error.as_ref(), |this, error| {
+            .when_some(mirror.error.as_ref(), |this, error| {
                 this.child(error_card::render(error, message_ui_id, window, cx))
             })
             .into_any_element()
     };
 
-    // A hover-revealed action row beneath the message: a single copy button
-    // right-aligned under user bubbles, left-aligned under assistant content.
-    // `hover_reveal_copy` owns the invisible-until-group-hover wrapper, so
-    // revealing it spends no layout and the bubble's bounds never shift when
-    // the pointer enters.
-    //
-    // Suppressed on assistant turns that failed: the error card already carries
-    // its own "copy raw response" button, and a second message-level copy would
-    // either duplicate it or copy the partial prose above — neither of which is
-    // what a failed turn should offer. Also suppressed while the turn is still
-    // streaming and until it actually has prose: a copy must never freeze a
-    // partial answer mid-stream, and a reasoning- or tool-only stream must not
-    // offer to copy an empty string onto the clipboard.
     let hover_group: SharedString = format!("turn-message-{message_ui_id}").into();
-    let body_with_actions = if msg.error.is_none() && stream_ended(msg) && has_copyable_text(msg) {
-        // Read the live message at click time rather than capturing a snapshot
-        // from render, so the clipboard always reflects the message's current
-        // state.
+    let body_with_actions = if mirror.error.is_none() && mirror.copyable {
         let view = cx.entity().downgrade();
         let actions = h_flex()
             .w_full()
-            // Same side the bubble/heading sits on, so the button reads as
-            // belonging to that message rather than floating in the column.
             .when(is_user, |this| this.justify_end())
             .mt_1()
             .child(hover_reveal_copy(
@@ -551,15 +540,12 @@ fn render_message(
                 t!("chat.copy_message").to_string(),
                 move |_: &mut Window, cx: &mut App| {
                     view.upgrade()
-                        .and_then(|view| view.read(cx).copyable_message_text(message_ui_id))
+                        .and_then(|view| view.read(cx).copyable_message_text(turn_id, cx))
                         .unwrap_or_default()
                 },
                 move || format!("message-copy-{message_index}"),
             ));
 
-        // Wrap body + actions so both share one hover group: hovering anywhere
-        // over the message — including a nested reasoning card — reveals the
-        // row.
         v_flex()
             .w_full()
             .gap_0()
@@ -581,50 +567,18 @@ fn render_message(
     )
 }
 
-/// Iterates the non-whitespace text parts of `message` in canonical order. Both
-/// `has_copyable_text` and [`copyable_text`] consume this same iterator, so the
-/// "should the button appear" and "what lands on the clipboard" rules cannot
-/// drift apart.
-fn text_parts(message: &Message) -> impl Iterator<Item = &str> {
-    message.parts.iter().filter_map(|part| match part {
-        MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
-        _ => None,
+fn has_wait_ending_content(mirror: &TurnMirror) -> bool {
+    mirror.parts.iter().any(|part| match part {
+        PartMirror::Prose { text, .. } => !text.is_empty(),
+        PartMirror::Reasoning {
+            display,
+            trace: Some(_),
+            ..
+        } => !display.is_empty(),
+        PartMirror::ToolCall { name, .. } => !name.is_empty(),
+        PartMirror::ToolResult { .. } => false,
+        _ => false,
     })
-}
-
-/// Whether every streamed block of `message` has ended. User turns, tool
-/// calls, and tool results have no streaming lifecycle and read as ended. The
-/// message-level copy gate uses this so a copy is never offered for a
-/// still-streaming turn.
-fn stream_ended(message: &Message) -> bool {
-    message.parts.iter().all(|part| match part {
-        MessagePart::Text { finished, .. } | MessagePart::Reasoning { finished, .. } => *finished,
-        MessagePart::ToolCall { .. } | MessagePart::ToolResult { .. } => true,
-    })
-}
-
-/// Whether `message` has any prose worth offering a copy of.
-fn has_copyable_text(message: &Message) -> bool {
-    text_parts(message).next().is_some()
-}
-
-/// Plain text a reader would expect on the clipboard for `message`: the
-/// concatenated source of every visible-text part, in canonical order.
-///
-/// The parts carry the raw Markdown the model produced, so the clipboard holds
-/// that source verbatim rather than the rendered prose. Reasoning and tool
-/// blocks are deliberately excluded — reasoning has its own per-card copy
-/// affordance, and tool calls are structured data rather than prose.
-pub(super) fn copyable_text(message: &Message) -> SharedString {
-    text_parts(message)
-        .fold(String::new(), |mut text, part| {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(part);
-            text
-        })
-        .into()
 }
 
 /// Greeting shown before the first turn.  Takes the composer's *resting*

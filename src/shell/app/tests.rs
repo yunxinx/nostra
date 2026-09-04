@@ -13,6 +13,10 @@ use gpui::{Global, TestAppContext};
 use gpui_component::WindowExt as _;
 use reqwest_client::ReqwestClient;
 
+use crate::chat::ChatView;
+use crate::chat::conversation_runtime::ConversationRuntime;
+use crate::chat::test_support;
+use crate::chat::transcript::Transcript;
 use crate::llm::{
     GatewayGenerationService, GenerationService, HttpTransport, ProviderCatalogSnapshot,
 };
@@ -26,6 +30,7 @@ use crate::session::{
     SessionStores, TurnStatus,
 };
 use crate::shell::app::chat_workspace::ChatTarget;
+use crate::ui::reference_picker::ChatReferenceComposer;
 
 use super::history_sidebar::is_pending_history_conversation;
 use super::*;
@@ -329,7 +334,7 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
                 .view
                 .clone();
             assert!(view.update(cx, |chat, cx| {
-                chat.start_durable_pending_reply_for_test(Rc::clone(&dropped), window, cx)
+                test_support::start_durable_pending_reply(chat, Rc::clone(&dropped), window, cx)
             }));
         });
     });
@@ -373,8 +378,8 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
             let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
                 .clone();
-            let session_id = view.update(cx, |chat, cx| chat.persist_session_for_test(cx));
-            (view.entity_id(), session_id)
+            let session_id = view.update(cx, test_support::persist_session);
+            (this.chat_snapshot().conversations()[0].id(), session_id)
         })
     });
     assert!(
@@ -401,7 +406,7 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
             this.chat_snapshot()
                 .conversations()
                 .iter()
-                .all(|conversation| conversation.view().entity_id() != target)
+                .all(|conversation| conversation.id() != target)
         );
     });
 }
@@ -445,6 +450,42 @@ fn hover(cx: &mut gpui::VisualTestContext, selector: &'static str) {
     redraw(cx);
 }
 
+struct ReleasedConversation {
+    view: gpui::WeakEntity<ChatView>,
+    runtime: gpui::WeakEntity<ConversationRuntime>,
+    transcript: gpui::WeakEntity<Transcript>,
+    composer: gpui::WeakEntity<ChatReferenceComposer>,
+}
+
+fn release_first_conversation(
+    this: &mut ChatApp,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<ChatApp>,
+) -> ReleasedConversation {
+    let (target, released) = {
+        let host = this.chat_workspace().read(cx);
+        let conversation = &host.conversations.conversations()[0];
+        (
+            conversation.id,
+            ReleasedConversation {
+                view: conversation.view.downgrade(),
+                runtime: conversation.runtime.downgrade(),
+                transcript: conversation.transcript.downgrade(),
+                composer: conversation.composer.downgrade(),
+            },
+        )
+    };
+    this.delete_conversation(target, window, cx);
+    released
+}
+
+fn conversation_entities_dropped(released: &ReleasedConversation) -> bool {
+    released.view.upgrade().is_none()
+        && released.runtime.upgrade().is_none()
+        && released.transcript.upgrade().is_none()
+        && released.composer.upgrade().is_none()
+}
+
 #[gpui::test]
 fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAppContext) {
     let (app, cx) = add_app_window(cx);
@@ -459,11 +500,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
 
             let mut removed = Vec::new();
             while this.chat_snapshot().conversations().len() > 1 {
-                let view = this.chat_snapshot().conversations()[0].view();
-                let view = view.downgrade();
-                let target = this.chat_snapshot().conversations()[0].target();
-                removed.push(view);
-                this.delete_conversation(target, window, cx);
+                removed.push(release_first_conversation(this, window, cx));
             }
             assert_eq!(this.chat_snapshot().conversations().len(), 1);
             assert!(this.chat_snapshot().active().is_some());
@@ -479,7 +516,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
         })
     });
     cx.run_until_parked();
-    assert!(first_removed.iter().all(|view| view.upgrade().is_none()));
+    assert!(first_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
@@ -499,10 +536,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
             }
             let mut removed = Vec::new();
             while this.chat_snapshot().conversations().len() > 1 {
-                let view = this.chat_snapshot().conversations()[0].view().downgrade();
-                let target = this.chat_snapshot().conversations()[0].target();
-                removed.push(view);
-                this.delete_conversation(target, window, cx);
+                removed.push(release_first_conversation(this, window, cx));
             }
             assert_eq!(this.chat_snapshot().conversations().len(), 1);
             assert!(this.chat_snapshot().active().is_some());
@@ -510,7 +544,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
         })
     });
     cx.run_until_parked();
-    assert!(second_removed.iter().all(|view| view.upgrade().is_none()));
+    assert!(second_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
@@ -530,10 +564,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
             }
             let mut removed = Vec::new();
             while this.chat_snapshot().conversations().len() > 1 {
-                let view = this.chat_snapshot().conversations()[0].view().downgrade();
-                let target = this.chat_snapshot().conversations()[0].target();
-                removed.push(view);
-                this.delete_conversation(target, window, cx);
+                removed.push(release_first_conversation(this, window, cx));
             }
             assert_eq!(this.chat_snapshot().conversations().len(), 1);
             assert!(this.chat_snapshot().active().is_some());
@@ -541,7 +572,7 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
         })
     });
     cx.run_until_parked();
-    assert!(third_removed.iter().all(|view| view.upgrade().is_none()));
+    assert!(third_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
             assert_eq!(
@@ -563,46 +594,24 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let middle = this.chat_snapshot().conversations()[1].target();
-            let next = this.chat_snapshot().conversations()[2].target();
+            let middle = this.chat_snapshot().conversations()[1].id();
+            let next = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(middle, cx));
             this.delete_conversation(middle, window, cx);
             assert_eq!(this.chat_snapshot().active(), Some(next));
-            assert_eq!(
-                this.chat_snapshot()
-                    .active_view()
-                    .expect("active view")
-                    .entity_id(),
-                next
-            );
 
-            let before = this
-                .chat_snapshot()
-                .active_view()
-                .expect("active view")
-                .entity_id();
-            let non_active = this.chat_snapshot().conversations()[0].target();
+            let before = this.chat_snapshot().active().expect("active conversation");
+            let non_active = this.chat_snapshot().conversations()[0].id();
             this.delete_conversation(non_active, window, cx);
             assert_eq!(this.chat_snapshot().active(), Some(before));
-            assert_eq!(
-                this.chat_snapshot()
-                    .active_view()
-                    .expect("active view")
-                    .entity_id(),
-                before
-            );
 
             let only = this
                 .chat_snapshot()
                 .active_view()
                 .expect("active view")
                 .downgrade();
-            let only_id = this
-                .chat_snapshot()
-                .active_view()
-                .expect("active view")
-                .entity_id();
+            let only_id = this.chat_snapshot().active().expect("active conversation");
             this.delete_conversation(only_id, window, cx);
             assert!(this.chat_snapshot().conversations().is_empty());
             assert!(this.chat_snapshot().active().is_none());
@@ -624,9 +633,12 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
                 .view
                 .clone();
             view.update(cx, |chat, cx| {
-                chat.start_pending_reply_for_test(dropped.clone(), cx)
+                test_support::start_pending_reply(chat, dropped.clone(), cx)
             });
-            (view.entity_id(), view.downgrade())
+            (
+                this.chat_snapshot().conversations()[0].id(),
+                view.downgrade(),
+            )
         })
     });
     cx.run_until_parked();
@@ -653,11 +665,11 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let target = this.chat_snapshot().conversations()[0].target();
-            let selected = this.chat_snapshot().conversations()[2].target();
+            let target = this.chat_snapshot().conversations()[0].id();
+            let selected = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(target, cx);
-                workspace.begin_delete_confirmation(ChatTarget::View(target), window, cx);
+                workspace.begin_delete_confirmation(ChatTarget::Conversation(target), window, cx);
             });
             this.select(2, window, cx);
             (target, selected)
@@ -684,7 +696,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             this.chat_snapshot()
                 .conversations()
                 .iter()
-                .all(|conversation| conversation.view().entity_id() != target)
+                .all(|conversation| conversation.id() != target)
         );
         assert_eq!(this.chat_snapshot().active(), Some(selected));
     });
@@ -698,8 +710,8 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let target = this.chat_snapshot().conversations()[0].target();
-            let selected = this.chat_snapshot().conversations()[2].target();
+            let target = this.chat_snapshot().conversations()[0].id();
+            let selected = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(target, cx));
             (target, selected)
@@ -713,7 +725,7 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
     redraw(cx);
     assert_eq!(
         app.read_with(cx, |this, _| { this.chat_snapshot().confirming().cloned() }),
-        Some(ChatTarget::View(target))
+        Some(ChatTarget::Conversation(target))
     );
 
     cx.update(|window, cx| {
@@ -734,7 +746,7 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
             this.chat_snapshot()
                 .conversations()
                 .iter()
-                .all(|conversation| conversation.view().entity_id() != target)
+                .all(|conversation| conversation.id() != target)
         );
         assert_eq!(this.chat_snapshot().active(), Some(selected));
         assert_eq!(this.chat_snapshot().confirming(), None);
@@ -748,8 +760,8 @@ fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppC
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             let view = this.chat_snapshot().conversations()[0].view();
-            let target = view.entity_id();
-            view.update(cx, |chat, cx| chat.mark_generating_for_test(cx));
+            let target = this.chat_snapshot().conversations()[0].id();
+            view.update(cx, test_support::mark_generating);
             this.chat_workspace()
                 .update(cx, |workspace, cx| workspace.select_target(target, cx));
             target
@@ -784,7 +796,7 @@ fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppC
     click(cx, actions);
     assert_eq!(
         app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
-        Some(ChatTarget::View(target))
+        Some(ChatTarget::Conversation(target))
     );
     assert!(
         cx.debug_bounds(actions).is_some(),
@@ -831,7 +843,7 @@ fn agent_draft_uses_the_shared_inline_delete_interaction(cx: &mut TestAppContext
         app.read_with(cx, |this, _| {
             this.project_snapshot().confirming().cloned()
         }),
-        Some(ProjectTarget::View(target))
+        Some(ProjectTarget::Conversation(target))
     );
 
     let confirm = Box::leak(
@@ -892,7 +904,7 @@ fn deleting_the_active_agent_reveals_its_inline_confirmation_anchor(cx: &mut Tes
         );
         assert_eq!(
             this.project_snapshot().confirming(),
-            Some(&ProjectTarget::View(target))
+            Some(&ProjectTarget::Conversation(target))
         );
     });
     let confirm = Box::leak(
@@ -1206,7 +1218,7 @@ fn deleting_an_agent_draft_discards_only_the_unpersisted_view(cx: &mut TestAppCo
             this.project_workspace().update(cx, |workspace, cx| {
                 workspace.open_draft(project.project_id.clone(), window, cx);
                 let target = workspace.snapshot().active().expect("active Agent draft");
-                workspace.confirm_delete_target(ProjectTarget::View(target), window, cx);
+                workspace.confirm_delete_target(ProjectTarget::Conversation(target), window, cx);
             });
         });
     });
@@ -1383,7 +1395,7 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             let view = this.chat_snapshot().conversations()[0].view();
-            view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
+            view.update(cx, test_support::persist_session)
         })
     });
     cx.run_until_parked();
@@ -1398,7 +1410,7 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
                 .find(|conversation| conversation.session_id().is_none())
                 .expect("fresh draft")
                 .view();
-            view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
+            view.update(cx, test_support::persist_session)
         })
     });
 
@@ -1488,7 +1500,7 @@ fn row_actions_stay_centered_and_never_reflow_the_title(cx: &mut TestAppContext)
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].target()
+            this.chat_snapshot().conversations()[0].id()
         })
     });
     redraw(cx);
@@ -1685,7 +1697,7 @@ fn arming_a_delete_does_not_resize_its_trigger(cx: &mut TestAppContext) {
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].target()
+            this.chat_snapshot().conversations()[0].id()
         })
     });
     redraw(cx);
@@ -1710,7 +1722,7 @@ fn history_section_header_collapses_pending_rows(cx: &mut TestAppContext) {
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].target()
+            this.chat_snapshot().conversations()[0].id()
         })
     });
     redraw(cx);
@@ -1738,14 +1750,14 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
             let first = this.chat_snapshot().conversations()[0].view();
-            let second = this.chat_snapshot().conversations()[1].view();
+            let first_id = this.chat_snapshot().conversations()[0].id();
+            let second_id = this.chat_snapshot().conversations()[1].id();
             first.update(cx, |chat, cx| {
-                chat.start_pending_reply_for_test(Rc::clone(&dropped), cx)
+                test_support::start_pending_reply(chat, Rc::clone(&dropped), cx)
             });
-            this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.select_target(second.entity_id(), cx)
-            });
-            (first.entity_id(), second.entity_id())
+            this.chat_workspace()
+                .update(cx, |workspace, cx| workspace.select_target(second_id, cx));
+            (first_id, second_id)
         })
     });
     cx.run_until_parked();
@@ -1774,7 +1786,7 @@ fn deleting_the_last_conversation_returnss_to_empty_workspace(cx: &mut TestAppCo
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let target = this.chat_snapshot().conversations()[0].target();
+            let target = this.chat_snapshot().conversations()[0].id();
             this.delete_conversation(target, window, cx);
         });
     });
@@ -1794,7 +1806,7 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
             this.spawn_draft(window, cx);
             {
                 let view = this.chat_snapshot().conversations()[0].view();
-                view.update(cx, |chat, cx| chat.persist_session_for_test(cx))
+                view.update(cx, test_support::persist_session)
             }
         })
     });

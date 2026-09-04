@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     future::Future,
     pin::Pin,
     rc::Rc,
@@ -9,7 +8,7 @@ use std::{
 };
 
 use gpui::{
-    AppContext as _, IntoElement as _, ListOffset, Modifiers, MouseButton, ParentElement as _,
+    App, AppContext as _, IntoElement as _, ListOffset, Modifiers, MouseButton, ParentElement as _,
     ScrollDelta, ScrollWheelEvent, TestAppContext, point, px,
 };
 use gpui_component::input::InputEvent;
@@ -28,10 +27,11 @@ use crate::session::{
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
+pub(crate) use super::test_support;
 use super::{
-    CONTENT_MAX_WIDTH, ChatDeleteRequest, ChatEvent, ChatView, Message, MessagePart,
-    ReasoningTrace, Role, SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION,
-    STICK_THRESHOLD, SmoothScrollState, is_replayable, reasoning_smooth_invalidations,
+    CONTENT_MAX_WIDTH, ChatDeleteRequest, ChatView, PartMirror, PartSource, ReasoningTrace, Role,
+    SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD,
+    SmoothScrollState, Turn, is_replayable, reasoning_smooth_invalidations,
     reset_reasoning_smooth_invalidations,
 };
 
@@ -114,38 +114,111 @@ fn delayed_runtime_snapshots_cannot_revert_the_chat_view_projection(cx: &mut Tes
 /// configured provider that a unit test has no reason to stand up.
 fn seed_turn(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestContext) {
     cx.update(|_, cx| {
-        chat.update(cx, |this, _cx| {
+        chat.update(cx, |this, cx| {
             for role in [Role::User, Role::Assistant] {
-                this.messages.push(Message::empty(role));
+                test_support::push_empty(this, role, cx);
             }
         });
     });
 }
 
-fn reasoning_part(message: &Message) -> Option<&ReasoningTrace> {
-    message.parts.iter().find_map(|part| match part {
-        MessagePart::Reasoning {
-            trace: Some(trace), ..
-        } => Some(trace),
-        _ => None,
+fn last_assistant_mirror_mut(chat: &mut ChatView) -> &mut super::TurnMirror {
+    chat.mirrors
+        .iter_mut()
+        .rev()
+        .find(|mirror| mirror.role == Role::Assistant)
+        .expect("assistant mirror")
+}
+
+fn last_llm(chat: &ChatView, cx: &App) -> LlmMessage {
+    last_turn(chat, cx).to_llm()
+}
+
+fn last_reasoning_id(chat: &ChatView) -> u64 {
+    reasoning_part(chat)
+        .map(ReasoningTrace::owner_id)
+        .expect("reasoning part")
+}
+
+fn last_prose_id(chat: &ChatView) -> u64 {
+    chat.mirrors
+        .last()
+        .and_then(|mirror| {
+            mirror.parts.iter().find_map(|part| match part {
+                PartMirror::Prose { body, .. } => Some(body.owner_id()),
+                _ => None,
+            })
+        })
+        .expect("prose part")
+}
+
+fn last_turn<'a>(chat: &'a ChatView, cx: &'a App) -> &'a Turn {
+    chat.transcript
+        .read(cx)
+        .turns()
+        .last()
+        .expect("seeded turn")
+}
+
+fn prose_at(
+    chat: &ChatView,
+    turn_index: usize,
+    part_index: usize,
+) -> (u64, &str, &crate::ui::markdown::MarkdownBody) {
+    match &chat.mirrors[turn_index].parts[part_index] {
+        PartMirror::Prose { text, body, .. } => (body.owner_id(), text.as_str(), body),
+        _ => panic!("part at ({turn_index}, {part_index}) is not prose"),
+    }
+}
+
+fn prose_body_mut(
+    chat: &mut ChatView,
+    turn_index: usize,
+    part_index: usize,
+) -> &mut crate::ui::markdown::MarkdownBody {
+    match &mut chat.mirrors[turn_index].parts[part_index] {
+        PartMirror::Prose { body, .. } => body,
+        _ => panic!("part at ({turn_index}, {part_index}) is not prose"),
+    }
+}
+
+fn last_assistant_mirror(chat: &ChatView) -> &super::TurnMirror {
+    chat.mirrors
+        .iter()
+        .rev()
+        .find(|mirror| mirror.role == Role::Assistant)
+        .expect("assistant mirror")
+}
+
+fn reasoning_part(chat: &ChatView) -> Option<&ReasoningTrace> {
+    last_assistant_mirror(chat)
+        .parts
+        .iter()
+        .find_map(|part| match part {
+            PartMirror::Reasoning {
+                trace: Some(trace), ..
+            } => Some(trace),
+            _ => None,
+        })
+}
+
+fn reasoning_part_mut(chat: &mut ChatView) -> Option<&mut ReasoningTrace> {
+    chat.mirrors.iter_mut().rev().find_map(|mirror| {
+        mirror.parts.iter_mut().find_map(|part| match part {
+            PartMirror::Reasoning {
+                trace: Some(trace), ..
+            } => Some(trace),
+            _ => None,
+        })
     })
 }
 
-fn reasoning_part_mut(message: &mut Message) -> Option<&mut ReasoningTrace> {
-    message.parts.iter_mut().find_map(|part| match part {
-        MessagePart::Reasoning {
-            trace: Some(trace), ..
-        } => Some(trace),
-        _ => None,
-    })
-}
-
-fn reasoning_parts(message: &Message) -> Vec<&ReasoningTrace> {
-    message
+fn reasoning_parts(chat: &ChatView) -> Vec<&ReasoningTrace> {
+    last_assistant_mirror(chat)
         .parts
         .iter()
         .filter_map(|part| match part {
-            MessagePart::Reasoning {
+            PartMirror::Reasoning {
                 trace: Some(trace), ..
             } => Some(trace),
             _ => None,
@@ -153,16 +226,14 @@ fn reasoning_parts(message: &Message) -> Vec<&ReasoningTrace> {
         .collect()
 }
 
-fn reasoning_states(message: &Message) -> Vec<(&str, bool)> {
-    message
-        .parts
+fn reasoning_states<'a>(chat: &'a ChatView, cx: &'a App) -> Vec<(&'a str, bool)> {
+    let turn = last_turn(chat, cx);
+    turn.parts
         .iter()
-        .filter_map(|part| match part {
-            MessagePart::Reasoning {
-                reasoning,
-                finished,
-                ..
-            } => Some((reasoning.display.as_str(), *finished)),
+        .filter_map(|part| match &part.source {
+            PartSource::Reasoning { reasoning, .. } => {
+                Some((reasoning.display.as_str(), part.finished))
+            }
             _ => None,
         })
         .collect()
@@ -222,10 +293,17 @@ fn add_chat_window_with_generation_service(
     let preference_handle = cx.update(|cx| preferences::handle(cx));
     let scope = crate::runtime::ConversationScopeHandle::for_test();
     let (root, cx) = cx.add_window_view(move |window, cx| {
-        let runtime =
-            super::create_conversation_runtime(scope, conversation, generation_service, cx);
+        let transcript = cx.new(crate::chat::transcript::Transcript::new);
+        let runtime = super::create_conversation_runtime(
+            scope,
+            conversation,
+            generation_service,
+            transcript.clone(),
+            cx,
+        );
         let chat = ChatView::view_with_generation_service_and_preferences(
             runtime,
+            transcript,
             preference_handle,
             window,
             cx,

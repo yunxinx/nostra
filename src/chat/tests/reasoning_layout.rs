@@ -27,7 +27,8 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for line in 0..40 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(
+                    this,
                     0,
                     "reasoning-0".into(),
                     &format!("Reasoning line {line}.\n\n"),
@@ -42,10 +43,7 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
     draw(cx);
 
     let saturated = cx.update(|_, cx| {
-        chat.read(cx)
-            .messages
-            .last()
-            .and_then(|turn| reasoning_part(turn))
+        reasoning_part(chat.read(cx))
             .expect("trace")
             .scroll_max_offset()
     });
@@ -59,7 +57,8 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for line in 40..80 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(
+                    this,
                     0,
                     "reasoning-0".into(),
                     &format!("Reasoning line {line}.\n\n"),
@@ -94,7 +93,8 @@ fn completed_long_reasoning_opens_at_the_top(cx: &mut TestAppContext) {
         .join("\n\n");
     cx.update(|_, cx| {
         chat.update(cx, |chat, cx| {
-            chat.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                chat,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -106,7 +106,7 @@ fn completed_long_reasoning_opens_at_the_top(cx: &mut TestAppContext) {
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
@@ -119,7 +119,7 @@ fn completed_long_reasoning_opens_at_the_top(cx: &mut TestAppContext) {
     redraw(cx);
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("completed reasoning trace");
         assert!(
             trace.uses_virtualized_scroll(),
@@ -144,7 +144,8 @@ fn short_reasoning_keeps_its_natural_height(cx: &mut TestAppContext) {
     let source = "Check the relevant constraints.\n\nChoose the smallest valid change.";
     cx.update(|_, cx| {
         chat.update(cx, |chat, cx| {
-            chat.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                chat,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -156,7 +157,7 @@ fn short_reasoning_keeps_its_natural_height(cx: &mut TestAppContext) {
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
@@ -177,7 +178,7 @@ fn short_reasoning_keeps_its_natural_height(cx: &mut TestAppContext) {
         height_budget
     );
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("short reasoning trace");
         assert!(!trace.uses_virtualized_scroll());
         assert_eq!(trace.scroll_max_offset(), px(0.));
@@ -200,7 +201,8 @@ fn virtualized_reasoning_scrollbar_host_reaches_card_edge(cx: &mut TestAppContex
         .join("\n\n");
     cx.update(|_, cx| {
         chat.update(cx, |chat, cx| {
-            chat.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                chat,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -212,7 +214,7 @@ fn virtualized_reasoning_scrollbar_host_reaches_card_edge(cx: &mut TestAppContex
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
@@ -258,7 +260,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
     );
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &initial, cx);
         });
     });
     redraw(cx);
@@ -268,7 +270,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
         .debug_bounds("reasoning-body-0")
         .expect("the expanded reasoning body was drawn");
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(!trace.uses_virtualized_scroll());
         assert!(trace.scroll_max().y > px(80.));
@@ -282,7 +284,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
     redraw(cx);
 
     let paused_offset = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(!trace.is_following());
         trace.scroll_offset()
@@ -295,14 +297,14 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
     );
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &threshold_crossing, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &threshold_crossing, cx);
         });
     });
     redraw(cx);
     redraw(cx);
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             !trace.uses_virtualized_scroll(),
@@ -325,7 +327,7 @@ fn streaming_reasoning_defers_virtualization_while_the_reader_is_scrolled_up(
     });
     redraw(cx);
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             trace.is_following(),
@@ -355,7 +357,7 @@ fn finished_scrolled_reasoning_reopens_on_the_virtualized_path(cx: &mut TestAppC
     let threshold_crossing = "Additional retained paragraph content.\n\n".repeat(80);
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &initial, cx);
         });
     });
     redraw(cx);
@@ -371,7 +373,7 @@ fn finished_scrolled_reasoning_reopens_on_the_virtualized_path(cx: &mut TestAppC
     });
     redraw(cx);
     let paused_offset = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         reasoning_part(turn)
             .expect("reasoning trace")
             .scroll_offset()
@@ -379,19 +381,21 @@ fn finished_scrolled_reasoning_reopens_on_the_virtualized_path(cx: &mut TestAppC
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &threshold_crossing, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &threshold_crossing, cx);
         });
     });
     redraw(cx);
     redraw(cx);
     assert!(cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         !trace.is_following() && !trace.uses_virtualized_scroll()
     }));
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.finish_reply(None, None, cx));
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(this, None, None, cx)
+        });
     });
     redraw(cx);
 
@@ -409,7 +413,7 @@ fn finished_scrolled_reasoning_reopens_on_the_virtualized_path(cx: &mut TestAppC
     redraw(cx);
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             trace.uses_virtualized_scroll(),
@@ -444,20 +448,21 @@ fn authoritative_short_reasoning_returns_to_natural_height(cx: &mut TestAppConte
     let short_source = "The authoritative summary is short.";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &long_source, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &long_source, cx);
         });
     });
     redraw(cx);
     redraw(cx);
     assert!(cx.update(|_, cx| {
-        reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+        reasoning_part(chat.read(cx))
             .expect("reasoning trace")
             .uses_virtualized_scroll()
     }));
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_reply(
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage::from_message(LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -487,7 +492,7 @@ fn authoritative_short_reasoning_returns_to_natural_height(cx: &mut TestAppConte
     let height_budget = cx.update(|window, _| window.line_height() * 7.);
     assert!(body.size.height < height_budget);
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             !trace.uses_virtualized_scroll(),
@@ -515,7 +520,7 @@ fn authoritative_long_reasoning_promotes_even_when_the_reader_is_not_following(
         .join("\n\n");
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), &initial, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), &initial, cx);
         });
     });
     redraw(cx);
@@ -532,8 +537,7 @@ fn authoritative_long_reasoning_promotes_even_when_the_reader_is_not_following(
     redraw(cx);
     cx.update(|_, cx| {
         chat.update(cx, |this, _| {
-            let trace = reasoning_part_mut(this.messages.last_mut().expect("assistant turn"))
-                .expect("reasoning trace");
+            let trace = reasoning_part_mut(this).expect("reasoning trace");
             assert!(!trace.is_following());
             // Preserve expansion across the terminal boundary without changing
             // the final disclosure state.
@@ -544,7 +548,8 @@ fn authoritative_long_reasoning_promotes_even_when_the_reader_is_not_following(
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_reply(
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage::from_message(LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -563,7 +568,7 @@ fn authoritative_long_reasoning_promotes_even_when_the_reader_is_not_following(
     redraw(cx);
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(trace.is_expanded());
         assert!(

@@ -179,6 +179,11 @@ impl MarkdownExtensionInstallContext {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn owner_id(&self) -> u64 {
+        self.owner_id
+    }
+
     /// Returns whether the streaming flag changed.
     pub(super) fn set_streaming(&mut self, streaming: bool) -> bool {
         if self.streaming == streaming {

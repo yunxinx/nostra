@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::channel::oneshot;
-use gpui::{Context, EventEmitter, Task};
+use gpui::{Context, Entity, EventEmitter, Task};
 
 use crate::{
     llm::{GenerationService, Message as LlmMessage, ModelSelection},
@@ -16,9 +16,8 @@ use crate::{
 
 use super::assistant::ReplyTask;
 use super::persistence::TurnPersistenceCoordinator;
-use crate::llm::{
-    GatewayError, GenerationOutcome, IndexedMessage, ReasoningContent, ReplayMetadata, ToolCall,
-};
+use super::transcript::Transcript;
+use crate::llm::{GatewayError, GenerationOutcome, ReasoningContent, ReplayMetadata, ToolCall};
 
 pub(super) type ChatSessionControllerHandle = Arc<Mutex<ChatSessionController<SharedSessionStore>>>;
 
@@ -88,7 +87,7 @@ impl Drop for ConversationWorkLease {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct ConversationRequestGeneration(u64);
+pub(crate) struct ConversationRequestGeneration(u64);
 
 impl ConversationRequestGeneration {
     #[must_use]
@@ -114,7 +113,7 @@ pub(super) enum BeginTurnAdmissionError {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ConversationRuntimeSnapshot {
+pub(crate) struct ConversationRuntimeSnapshot {
     revision: u64,
     scope: crate::runtime::ScopeId,
     session_id: Option<SessionId>,
@@ -130,23 +129,22 @@ pub(super) struct ConversationRuntimeSnapshot {
 
 impl ConversationRuntimeSnapshot {
     #[must_use]
-    pub(super) const fn revision(&self) -> u64 {
+    pub(crate) const fn revision(&self) -> u64 {
         self.revision
     }
 
-    #[cfg(test)]
     #[must_use]
-    pub fn session_id(&self) -> Option<&SessionId> {
+    pub(crate) fn session_id(&self) -> Option<&SessionId> {
         self.session_id.as_ref()
     }
 
     #[must_use]
-    pub const fn request_generation(&self) -> ConversationRequestGeneration {
+    pub(crate) const fn request_generation(&self) -> ConversationRequestGeneration {
         self.request_generation
     }
 
     #[must_use]
-    pub const fn is_generating(&self) -> bool {
+    pub(crate) const fn is_generating(&self) -> bool {
         self.generating
     }
 
@@ -163,22 +161,22 @@ impl ConversationRuntimeSnapshot {
     }
 
     #[must_use]
-    pub const fn persistence_pending(&self) -> bool {
+    pub(crate) const fn persistence_pending(&self) -> bool {
         self.persistence_pending
     }
 
     #[must_use]
-    pub const fn deletion_pending(&self) -> bool {
+    pub(crate) const fn deletion_pending(&self) -> bool {
         self.deletion_pending
     }
 
     #[must_use]
-    pub const fn shutdown_requested(&self) -> bool {
+    pub(crate) const fn shutdown_requested(&self) -> bool {
         self.shutdown_requested
     }
 
     #[must_use]
-    pub const fn has_in_flight_work(&self) -> bool {
+    pub(crate) const fn has_in_flight_work(&self) -> bool {
         self.generating
             || self.persistence_pending
             || self.deletion_requested
@@ -189,8 +187,7 @@ impl ConversationRuntimeSnapshot {
 }
 
 #[derive(Clone)]
-pub(super) struct PendingBeginRequest {
-    pub text: String,
+pub(crate) struct PendingBeginRequest {
     pub user_message: LlmMessage,
     pub selection: ModelSelection,
     pub turn_id: String,
@@ -199,20 +196,13 @@ pub(super) struct PendingBeginRequest {
 }
 
 #[derive(Clone)]
-pub(super) struct StartedConversationTurn {
+pub(crate) struct StartedConversationTurn {
     pub request: PendingBeginRequest,
     pub session_id: SessionId,
 }
 
-#[derive(Clone)]
-pub(super) struct FinishedConversationTurn {
-    pub generation: ConversationRequestGeneration,
-    pub message: Option<IndexedMessage>,
-    pub error: Option<GatewayError>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ConversationRuntimeFailure {
+pub(crate) enum ConversationRuntimeFailure {
     Begin,
     TerminalRetry,
     Terminal,
@@ -220,7 +210,7 @@ pub(super) enum ConversationRuntimeFailure {
 }
 
 #[derive(Clone)]
-pub(super) enum ConversationRuntimeEvent {
+pub(crate) enum ConversationRuntimeEvent {
     StateChanged,
     TurnStarted(Box<StartedConversationTurn>),
     StreamBatch {
@@ -229,9 +219,8 @@ pub(super) enum ConversationRuntimeEvent {
     },
     GenerationRequestFailed {
         generation: ConversationRequestGeneration,
-        error: GatewayError,
     },
-    GenerationFinished(Box<FinishedConversationTurn>),
+    GenerationFinished(ConversationRequestGeneration),
     Failure(ConversationRuntimeFailure),
     DeleteCompleted,
 }
@@ -240,25 +229,25 @@ pub(super) enum ConversationRuntimeEvent {
 /// publication point. Consumers can project this data into their own state
 /// without reading the runtime entity while it is emitting.
 #[derive(Clone)]
-pub(super) struct ConversationRuntimeUpdate {
+pub(crate) struct ConversationRuntimeUpdate {
     snapshot: ConversationRuntimeSnapshot,
     event: ConversationRuntimeEvent,
 }
 
 impl ConversationRuntimeUpdate {
     #[must_use]
-    pub(super) fn snapshot(&self) -> &ConversationRuntimeSnapshot {
+    pub(crate) fn snapshot(&self) -> &ConversationRuntimeSnapshot {
         &self.snapshot
     }
 
     #[must_use]
-    pub(super) fn event(&self) -> &ConversationRuntimeEvent {
+    pub(crate) fn event(&self) -> &ConversationRuntimeEvent {
         &self.event
     }
 }
 
 #[derive(Clone)]
-pub(super) enum ConversationStreamEvent {
+pub(crate) enum ConversationStreamEvent {
     TextStarted {
         content_index: usize,
         id: String,
@@ -329,6 +318,9 @@ pub(crate) struct ConversationRuntime {
     pub(super) generating: bool,
     pub(super) reply_task: Option<ReplyTask>,
     pub(super) quiescence: ConversationQuiescence,
+    pub(super) transcript: Entity<Transcript>,
+    #[cfg(test)]
+    pub(super) next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
 
 impl ConversationRuntime {
@@ -336,6 +328,7 @@ impl ConversationRuntime {
         scope: ConversationScopeHandle,
         conversation: ConversationContext,
         generation_service: Arc<dyn GenerationService>,
+        transcript: Entity<Transcript>,
     ) -> Self {
         let (session_controller, session_store, session_unavailable) =
             match conversation.lifecycle() {
@@ -372,11 +365,14 @@ impl ConversationRuntime {
             generating: false,
             reply_task: None,
             quiescence: ConversationQuiescence::default(),
+            transcript,
+            #[cfg(test)]
+            next_reply_drop_flag: None,
         }
     }
 
     #[must_use]
-    pub(super) fn snapshot(&self) -> ConversationRuntimeSnapshot {
+    pub(crate) fn snapshot(&self) -> ConversationRuntimeSnapshot {
         ConversationRuntimeSnapshot {
             revision: self.snapshot_revision,
             scope: self.scope.scope(),
@@ -536,6 +532,24 @@ impl ConversationRuntime {
         }
     }
 
+    pub(super) fn publish_stream_batch(
+        &mut self,
+        generation: ConversationRequestGeneration,
+        events: Vec<ConversationStreamEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.request_generation || !self.generating {
+            return;
+        }
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.apply_stream_batch(&events, cx);
+        });
+        self.publish_event(
+            ConversationRuntimeEvent::StreamBatch { generation, events },
+            cx,
+        );
+    }
+
     pub(super) fn request_stop(&mut self) {
         if let Some(reply_task) = &self.reply_task {
             reply_task.cancel();
@@ -558,8 +572,11 @@ impl ConversationRuntime {
             return;
         }
         let terminal = ChatTurnTerminal::request_failed(&error);
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.finish_turn(None, Some(error), cx);
+        });
         self.publish_event(
-            ConversationRuntimeEvent::GenerationRequestFailed { generation, error },
+            ConversationRuntimeEvent::GenerationRequestFailed { generation },
             cx,
         );
         self.reply_task = None;
@@ -581,14 +598,10 @@ impl ConversationRuntime {
             outcome.error.clone(),
             outcome.request_id.clone(),
         );
-        self.publish_event(
-            ConversationRuntimeEvent::GenerationFinished(Box::new(FinishedConversationTurn {
-                generation,
-                message: outcome.message.clone(),
-                error: error.clone(),
-            })),
-            cx,
-        );
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.finish_turn(outcome.message.clone(), error, cx);
+        });
+        self.publish_event(ConversationRuntimeEvent::GenerationFinished(generation), cx);
         self.reply_task = None;
         self.finish_terminal(generation, terminal, cx);
     }

@@ -2,24 +2,72 @@
 
 use std::collections::HashMap;
 
-use gpui::{Entity, EntityId, SharedString, Subscription};
+use gpui::{App, Entity, SharedString, Subscription};
 
 use crate::chat::ChatView;
+use crate::chat::conversation_runtime::ConversationRuntime;
+use crate::chat::transcript::Transcript;
 use crate::llm::ModelSelection;
+use crate::providers;
 use crate::session::SessionId;
+use crate::ui::reference_picker::ChatReferenceComposer;
+
+/// Stable identity for one hosted conversation. Independent of the view
+/// entity, so workspace routing survives a later optional view.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ConversationId(u64);
+
+impl ConversationId {
+    #[must_use]
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+/// Catalog last-model, or a restored session model. `Conversation` owns this
+/// value and syncs it to the view; do not seed from `ChatView::selection`.
+pub(super) fn seed_conversation_selection(
+    restored: Option<ModelSelection>,
+    cx: &mut App,
+) -> Option<ModelSelection> {
+    restored.or_else(|| providers::last_selection_from(&providers::ensure_global(cx).snapshot()))
+}
+
+pub(super) fn conversation_generating(runtime: &Entity<ConversationRuntime>, cx: &App) -> bool {
+    runtime.read(cx).snapshot().is_generating()
+}
 
 pub(super) struct Conversation<M> {
+    pub(super) id: ConversationId,
+    pub(super) runtime: Entity<ConversationRuntime>,
+    pub(super) transcript: Entity<Transcript>,
+    pub(super) composer: Entity<ChatReferenceComposer>,
     pub(super) view: Entity<ChatView>,
     pub(super) metadata: M,
     pub(super) title: SharedString,
     pub(super) selection: Option<ModelSelection>,
     pub(super) session_id: Option<SessionId>,
     pub(super) is_generating: bool,
-    pub(super) _subscription: Subscription,
+    pub(super) _subscriptions: [Subscription; 2],
+}
+
+impl<M> Conversation<M> {
+    /// Update the sidebar title from the transcript. Returns whether it changed.
+    pub(super) fn refresh_title(&mut self, cx: &App) -> bool {
+        let Some(title) = self.transcript.read(cx).title() else {
+            return false;
+        };
+        if self.title == title {
+            return false;
+        }
+        self.title = title;
+        true
+    }
 }
 
 #[derive(Clone)]
 pub(super) struct ConversationSnapshot<M> {
+    id: ConversationId,
     view: Entity<ChatView>,
     metadata: M,
     title: SharedString,
@@ -53,16 +101,16 @@ impl<M> ConversationSnapshot<M> {
         self.is_generating
     }
 
-    pub(super) fn target(&self) -> EntityId {
-        self.view.entity_id()
+    pub(super) fn id(&self) -> ConversationId {
+        self.id
     }
 }
 
 #[derive(Clone)]
 pub(super) struct ConversationHostSnapshot<M> {
     conversations: Vec<ConversationSnapshot<M>>,
-    opened_session_index: HashMap<SessionId, EntityId>,
-    active: Option<EntityId>,
+    opened_session_index: HashMap<SessionId, ConversationId>,
+    active: Option<ConversationId>,
 }
 
 impl<M> ConversationHostSnapshot<M> {
@@ -78,7 +126,7 @@ impl<M> ConversationHostSnapshot<M> {
         &self.conversations
     }
 
-    pub(super) fn active(&self) -> Option<EntityId> {
+    pub(super) fn active(&self) -> Option<ConversationId> {
         self.active
     }
 
@@ -93,18 +141,18 @@ impl<M> ConversationHostSnapshot<M> {
             .and_then(ConversationSnapshot::session_id)
     }
 
-    pub(super) fn conversation(&self, target: EntityId) -> Option<&ConversationSnapshot<M>> {
+    pub(super) fn conversation(&self, target: ConversationId) -> Option<&ConversationSnapshot<M>> {
         self.conversations
             .iter()
-            .find(|conversation| conversation.target() == target)
+            .find(|conversation| conversation.id == target)
     }
 
-    pub(super) fn opened_target(&self, session_id: &SessionId) -> Option<EntityId> {
+    pub(super) fn opened_target(&self, session_id: &SessionId) -> Option<ConversationId> {
         self.opened_session_index.get(session_id).copied()
     }
 
     #[cfg(test)]
-    pub(super) fn opened_session_index(&self) -> &HashMap<SessionId, EntityId> {
+    pub(super) fn opened_session_index(&self) -> &HashMap<SessionId, ConversationId> {
         &self.opened_session_index
     }
 }
@@ -117,8 +165,9 @@ pub(super) struct RemovedConversation<M> {
 
 pub(super) struct ConversationHost<M> {
     conversations: Vec<Conversation<M>>,
-    opened_session_index: HashMap<SessionId, EntityId>,
-    active: Option<EntityId>,
+    opened_session_index: HashMap<SessionId, ConversationId>,
+    active: Option<ConversationId>,
+    next_id: u64,
 }
 
 impl<M> ConversationHost<M> {
@@ -127,7 +176,14 @@ impl<M> ConversationHost<M> {
             conversations: Vec::new(),
             opened_session_index: HashMap::new(),
             active: None,
+            next_id: 1,
         }
+    }
+
+    pub(super) fn allocate_id(&mut self) -> ConversationId {
+        let id = ConversationId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        id
     }
 
     pub(super) fn conversations(&self) -> &[Conversation<M>] {
@@ -138,34 +194,37 @@ impl<M> ConversationHost<M> {
         &mut self.conversations
     }
 
-    pub(super) fn conversation(&self, target: EntityId) -> Option<&Conversation<M>> {
+    pub(super) fn conversation(&self, target: ConversationId) -> Option<&Conversation<M>> {
         self.conversations
             .iter()
-            .find(|conversation| conversation.view.entity_id() == target)
+            .find(|conversation| conversation.id == target)
     }
 
-    pub(super) fn conversation_mut(&mut self, target: EntityId) -> Option<&mut Conversation<M>> {
+    pub(super) fn conversation_mut(
+        &mut self,
+        target: ConversationId,
+    ) -> Option<&mut Conversation<M>> {
         self.conversations
             .iter_mut()
-            .find(|conversation| conversation.view.entity_id() == target)
+            .find(|conversation| conversation.id == target)
     }
 
-    pub(super) fn conversation_index(&self, target: EntityId) -> Option<usize> {
+    pub(super) fn conversation_index(&self, target: ConversationId) -> Option<usize> {
         self.conversations
             .iter()
-            .position(|conversation| conversation.view.entity_id() == target)
+            .position(|conversation| conversation.id == target)
     }
 
-    pub(super) fn active(&self) -> Option<EntityId> {
+    pub(super) fn active(&self) -> Option<ConversationId> {
         self.active
     }
 
-    pub(super) fn opened_target(&self, session_id: &SessionId) -> Option<EntityId> {
+    pub(super) fn opened_target(&self, session_id: &SessionId) -> Option<ConversationId> {
         self.opened_session_index.get(session_id).copied()
     }
 
-    pub(super) fn push_and_activate(&mut self, conversation: Conversation<M>) -> EntityId {
-        let target = conversation.view.entity_id();
+    pub(super) fn push_and_activate(&mut self, conversation: Conversation<M>) -> ConversationId {
+        let target = conversation.id;
         if let Some(session_id) = &conversation.session_id {
             self.opened_session_index.insert(session_id.clone(), target);
         }
@@ -174,7 +233,7 @@ impl<M> ConversationHost<M> {
         target
     }
 
-    pub(super) fn bind_session(&mut self, target: EntityId, session_id: SessionId) -> bool {
+    pub(super) fn bind_session(&mut self, target: ConversationId, session_id: SessionId) -> bool {
         let Some(conversation) = self.conversation_mut(target) else {
             return false;
         };
@@ -186,7 +245,7 @@ impl<M> ConversationHost<M> {
         true
     }
 
-    pub(super) fn select_target(&mut self, target: EntityId) -> bool {
+    pub(super) fn select_target(&mut self, target: ConversationId) -> bool {
         if self.active == Some(target) || self.conversation(target).is_none() {
             return false;
         }
@@ -194,7 +253,7 @@ impl<M> ConversationHost<M> {
         true
     }
 
-    pub(super) fn set_active(&mut self, target: EntityId) -> bool {
+    pub(super) fn set_active(&mut self, target: ConversationId) -> bool {
         if self.conversation(target).is_none() {
             return false;
         }
@@ -203,7 +262,7 @@ impl<M> ConversationHost<M> {
         changed
     }
 
-    pub(super) fn remove(&mut self, target: EntityId) -> Option<RemovedConversation<M>> {
+    pub(super) fn remove(&mut self, target: ConversationId) -> Option<RemovedConversation<M>> {
         let index = self.conversation_index(target)?;
         let was_active = self.active == Some(target);
         let conversation = self.conversations.remove(index);
@@ -224,12 +283,12 @@ impl<M> ConversationHost<M> {
         self.active = self
             .conversations
             .get(removed_index)
-            .map(|conversation| conversation.view.entity_id())
+            .map(|conversation| conversation.id)
             .or_else(|| {
                 removed_index.checked_sub(1).and_then(|index| {
                     self.conversations
                         .get(index)
-                        .map(|conversation| conversation.view.entity_id())
+                        .map(|conversation| conversation.id)
                 })
             });
     }
@@ -251,11 +310,10 @@ impl<M> ConversationHost<M> {
             }
         }
         self.conversations = retained;
-        if self.active.is_some_and(|target| {
-            removed
-                .iter()
-                .any(|conversation| conversation.view.entity_id() == target)
-        }) {
+        if self
+            .active
+            .is_some_and(|target| removed.iter().any(|conversation| conversation.id == target))
+        {
             self.active = None;
         }
         removed
@@ -269,6 +327,7 @@ impl<M: Clone> ConversationHost<M> {
                 .conversations
                 .iter()
                 .map(|conversation| ConversationSnapshot {
+                    id: conversation.id,
                     view: conversation.view.clone(),
                     metadata: conversation.metadata.clone(),
                     title: conversation.title.clone(),

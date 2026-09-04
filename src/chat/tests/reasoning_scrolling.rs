@@ -13,7 +13,8 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for line in 0..50 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(
+                    this,
                     0,
                     "reasoning-0".into(),
                     &format!("Reasoning line {line}.\n\n"),
@@ -29,11 +30,13 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
         .debug_bounds("reasoning-body-0")
         .expect("the expanded reasoning body was drawn");
     let (bottom_offset, max_offset) = cx.update(|_, cx| {
-        chat.read(cx)
-            .messages
+        let chat = chat.read(cx);
+        chat.transcript
+            .read(cx)
+            .turns()
             .last()
-            .map_or((px(0.), px(0.)), |turn| {
-                let trace = reasoning_part(turn).expect("reasoning trace");
+            .map_or((px(0.), px(0.)), |_| {
+                let trace = reasoning_part(chat).expect("reasoning trace");
                 (trace.scroll_offset().y, trace.scroll_max().y)
             })
     });
@@ -51,7 +54,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     redraw(cx);
 
     let paused_offset = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             !trace.is_following(),
@@ -64,7 +67,8 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for line in 50..100 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(
+                    this,
                     0,
                     "reasoning-0".into(),
                     &format!("Reasoning line {line}.\n\n"),
@@ -77,7 +81,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     redraw(cx);
 
     let still_paused = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         reasoning_part(turn)
             .expect("reasoning trace")
             .scroll_offset()
@@ -99,7 +103,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     redraw(cx);
 
     let rearmed = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         assert!(
             trace.is_following(),
@@ -111,7 +115,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     });
     assert!(
         cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("assistant turn");
+            let turn = chat.read(cx);
             let trace = reasoning_part(turn).expect("reasoning trace");
             trace.scroll_max().y + rearmed <= STICK_THRESHOLD
         }),
@@ -120,14 +124,14 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "final line.\n\n", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "final line.\n\n", cx);
         });
     });
     redraw(cx);
     redraw(cx);
 
     assert!(cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let trace = reasoning_part(turn).expect("reasoning trace");
         trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD
     }));
@@ -143,7 +147,7 @@ fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppCon
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for line in 0..180 {
-                this.append_stream_reasoning(
+                test_support::append_reasoning(this,
                     0,
                     "reasoning-virtualized-follow".into(),
                     &format!(
@@ -161,8 +165,7 @@ fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppCon
         .debug_bounds("reasoning-body-0")
         .expect("the expanded reasoning body was drawn");
     let (bottom_offset, max_offset, virtualized) = cx.update(|_, cx| {
-        let trace = reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
-            .expect("reasoning trace");
+        let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
         (
             trace.scroll_offset().y,
             trace.scroll_max().y,
@@ -186,8 +189,7 @@ fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppCon
     });
     redraw(cx);
     let paused_offset = cx.update(|_, cx| {
-        let trace = reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
-            .expect("reasoning trace");
+        let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
         assert!(
             !trace.is_following(),
             "manual scroll must disarm tail follow"
@@ -201,7 +203,8 @@ fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppCon
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(
+            test_support::append_reasoning(
+                this,
                 0,
                 "reasoning-virtualized-follow".into(),
                 "new tail content must not steal the reader's position.\n\n",
@@ -212,7 +215,7 @@ fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppCon
     redraw(cx);
     redraw(cx);
     let after_append = cx.update(|_, cx| {
-        reasoning_part(chat.read(cx).messages.last().expect("assistant turn"))
+        reasoning_part(chat.read(cx))
             .expect("reasoning trace")
             .scroll_offset()
             .y
@@ -238,7 +241,8 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             });
             chat.update(cx, |this, cx| {
                 for index in 0..12 {
-                    this.messages.push(Message::from_canonical(
+                    test_support::push_canonical(
+                        this,
                         LlmMessage {
                             role: crate::llm::Role::Assistant,
                             content: vec![ContentBlock::Text {
@@ -248,13 +252,14 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                             provider_metadata: ProviderMetadata::default(),
                         },
                         cx,
-                    ));
+                    );
                 }
                 for role in [Role::User, Role::Assistant] {
-                    this.messages.push(Message::empty(role));
+                    test_support::push_empty(this, role, cx);
                 }
                 for line in 0..60 {
-                    this.append_stream_reasoning(
+                    test_support::append_reasoning(
+                        this,
                         0,
                         "reasoning-0".into(),
                         &format!("Reasoning line {line}.\n\n"),
@@ -275,10 +280,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             .expect("the latest reasoning card must be visible");
         let transcript_before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
         let card_before = cx.update(|_, cx| {
-            chat.read(cx)
-                .messages
-                .last()
-                .and_then(reasoning_part)
+            reasoning_part(chat.read(cx))
                 .expect("reasoning trace")
                 .scroll_offset()
                 .y
@@ -307,11 +309,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         let (transcript_after, card_offset, pending_transcript_scroll, pending_card_scroll) = cx
             .update(|_, cx| {
                 let chat = chat.read(cx);
-                let trace = chat
-                    .messages
-                    .last()
-                    .and_then(reasoning_part)
-                    .expect("reasoning trace");
+                let trace = reasoning_part(chat).expect("reasoning trace");
                 (
                     chat.list_state.logical_scroll_top(),
                     trace.scroll_offset().y,
@@ -348,10 +346,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             );
             redraw(cx);
             let eased_card_offset = cx.update(|_, cx| {
-                chat.read(cx)
-                    .messages
-                    .last()
-                    .and_then(reasoning_part)
+                reasoning_part(chat.read(cx))
                     .expect("reasoning trace")
                     .scroll_offset()
                     .y
@@ -367,12 +362,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                 ..Default::default()
             });
             let (precise_offset, pending_after_precise) = cx.update(|_, cx| {
-                let trace = chat
-                    .read(cx)
-                    .messages
-                    .last()
-                    .and_then(reasoning_part)
-                    .expect("reasoning trace");
+                let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
                 (trace.scroll_offset().y, trace.smooth_scroll_remaining())
             });
             assert!(
@@ -432,14 +422,17 @@ fn theme_switch_preserves_the_reasoning_body(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "```json\n{\"a\":1}\n```", cx);
+            test_support::append_reasoning(
+                this,
+                0,
+                "reasoning-0".into(),
+                "```json\n{\"a\":1}\n```",
+                cx,
+            );
         });
     });
     let before = cx.update(|_, cx| {
-        chat.read(cx)
-            .messages
-            .last()
-            .and_then(|turn| reasoning_part(turn))
+        reasoning_part(chat.read(cx))
             .expect("trace")
             .body_entity_id()
     });
@@ -452,7 +445,7 @@ fn theme_switch_preserves_the_reasoning_body(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("the trace survives a theme switch");
         assert_eq!(
             reasoning.body_entity_id(),
@@ -460,7 +453,7 @@ fn theme_switch_preserves_the_reasoning_body(cx: &mut TestAppContext) {
             "theme changes must not replace the streaming markdown state"
         );
         assert!(
-            reasoning_states(turn)[0].0.contains("json"),
+            reasoning_states(turn, cx)[0].0.contains("json"),
             "re-parsing must not lose what already streamed"
         );
     });

@@ -20,7 +20,7 @@ fn empty_generating_assistant_shows_waiting_until_text_arrives(cx: &mut TestAppC
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.mark_generating_for_test(cx));
+        chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
     assert!(
@@ -34,7 +34,7 @@ fn empty_generating_assistant_shows_waiting_until_text_arrives(cx: &mut TestAppC
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, "text-0".into(), "Hello.", cx);
+            test_support::append_text(this, 0, "text-0".into(), "Hello.", cx);
         });
     });
     redraw(cx);
@@ -51,14 +51,14 @@ fn waiting_hides_when_reasoning_appears(cx: &mut TestAppContext) {
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.mark_generating_for_test(cx));
+        chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
     assert!(cx.debug_bounds("assistant-waiting-1").is_some());
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a thought", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx);
         });
     });
     redraw(cx);
@@ -75,14 +75,16 @@ fn waiting_hides_when_error_card_appears(cx: &mut TestAppContext) {
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.mark_generating_for_test(cx));
+        chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
     assert!(cx.debug_bounds("assistant-waiting-1").is_some());
 
     let error = crate::llm::GatewayError::http(503, Some("unavailable".into()));
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.finish_reply(None, Some(error), cx));
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(this, None, Some(error), cx)
+        });
     });
     redraw(cx);
     assert!(
@@ -98,14 +100,14 @@ fn waiting_hides_when_a_named_tool_row_appears(cx: &mut TestAppContext) {
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.mark_generating_for_test(cx));
+        chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
     assert!(cx.debug_bounds("assistant-waiting-1").is_some());
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, _| {
-            this.start_stream_tool_call(0, 0, "call-0".into(), "lookup".into());
+        chat.update(cx, |this, cx| {
+            test_support::start_tool_call(this, 0, 0, "call-0".into(), "lookup".into(), cx);
         });
     });
     redraw(cx);
@@ -121,13 +123,13 @@ fn waiting_only_on_the_in_flight_assistant(cx: &mut TestAppContext) {
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
     cx.update(|_, cx| {
-        chat.update(cx, |this, _| {
-            this.messages.push(Message::empty(Role::User));
-            this.messages.push(Message::empty(Role::Assistant));
+        chat.update(cx, |this, cx| {
+            test_support::push_empty(this, Role::User, cx);
+            test_support::push_empty(this, Role::Assistant, cx);
         });
     });
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.mark_generating_for_test(cx));
+        chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
 
@@ -138,5 +140,84 @@ fn waiting_only_on_the_in_flight_assistant(cx: &mut TestAppContext) {
     assert!(
         cx.debug_bounds("assistant-waiting-3").is_some(),
         "only the in-flight assistant placeholder shows waiting"
+    );
+}
+
+#[gpui::test]
+fn a_tool_result_does_not_end_waiting(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::push_empty(this, Role::User, cx);
+            test_support::push_canonical(
+                this,
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_result: crate::llm::ToolResult {
+                            call_id: "call-0".into(),
+                            content: "lookup output".into(),
+                            is_error: false,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+            test_support::mark_generating(this, cx);
+        });
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("assistant-waiting-1").is_some(),
+        "a tool result is not visible wait-ending content"
+    );
+}
+
+#[gpui::test]
+fn a_tool_turn_renders_as_a_muted_result_card(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::push_canonical(
+                this,
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "lookup".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+            test_support::push_canonical(
+                this,
+                LlmMessage {
+                    role: crate::llm::Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_result: crate::llm::ToolResult {
+                            call_id: "call-0".into(),
+                            content: "lookup output".into(),
+                            is_error: false,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+    });
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("user-message-bubble-1").is_none(),
+        "a tool turn is not a user bubble"
+    );
+    assert!(
+        cx.debug_bounds("tool-result-1").is_some(),
+        "a tool turn renders the muted result card"
     );
 }

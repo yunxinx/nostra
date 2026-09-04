@@ -12,31 +12,35 @@ fn streaming_reasoning_reaches_an_expanded_card(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "Weighing ", cx);
-            this.append_stream_reasoning(0, "reasoning-0".into(), "the options.", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "Weighing ", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "the options.", cx);
         });
     });
 
     cx.update(|_, cx| {
         let this = chat.read(cx);
-        let turn = this.messages.last().expect("assistant turn");
+        let turn = this;
         let reasoning = reasoning_part(turn).expect("a trace was created");
 
         assert_eq!(
-            reasoning_states(turn)[0].0,
+            reasoning_states(turn, cx)[0].0,
             "Weighing the options.",
             "deltas accumulate into the card's own markdown source"
         );
         assert!(
-            reasoning.is_expanded() && !reasoning_states(turn)[0].1,
+            reasoning.is_expanded() && !reasoning_states(turn, cx)[0].1,
             "a live trace shows itself without being asked"
         );
         // Canonical content still carries it, for replay across turns.
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [ContentBlock::Reasoning { reasoning }] if reasoning.display == "Weighing the options."
         ));
-        assert_eq!(turn.parts.len(), 1, "no synthetic empty prose part");
+        assert_eq!(
+            last_turn(turn, cx).parts.len(),
+            1,
+            "no synthetic empty prose part"
+        );
     });
 
     // Draws the whole view, card included, without panicking.
@@ -58,27 +62,29 @@ fn reasoning_finished_collapses_the_card(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "thinking", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "Here is the answer.", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "Here is the answer.", cx);
         });
     });
 
     cx.update(|_, cx| {
         let this = chat.read(cx);
-        let turn = this.messages.last().expect("assistant turn");
+        let turn = this;
         let reasoning = reasoning_part(turn).expect("trace");
 
-        assert!(reasoning_states(turn)[0].1, "the block was closed");
+        assert!(reasoning_states(turn, cx)[0].1, "the block was closed");
         assert!(
             !reasoning.is_expanded(),
             "a finished trace folds down to its trigger"
         );
         assert!(
-            reasoning_states(turn)[0].0.contains("thinking"),
+            reasoning_states(turn, cx)[0].0.contains("thinking"),
             "the reasoning text is retained for re-expansion"
         );
-        assert!(matches!(turn.parts.as_slice(), [MessagePart::Reasoning { .. }, MessagePart::Text { text, .. }] if text == "Here is the answer."));
+        let parts = &last_turn(turn, cx).parts;
+        assert!(matches!(&parts[0].source, PartSource::Reasoning { .. }));
+        assert_eq!(parts[1].source.prose_text(), Some("Here is the answer."));
     });
 }
 
@@ -119,15 +125,15 @@ fn canonical_events_close_reasoning_before_prose_reaches_the_view(cx: &mut TestA
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert!(reasoning_part(turn).is_some());
-        assert_eq!(reasoning_states(turn)[0].0, "thinking");
+        assert_eq!(reasoning_states(turn, cx)[0].0, "thinking");
         assert!(
-            reasoning_states(turn)[0].1,
+            reasoning_states(turn, cx)[0].1,
             "the explicit boundary was replayed"
         );
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [ContentBlock::Reasoning { reasoning }, ContentBlock::Text { text, .. }]
                 if reasoning.display == "thinking" && text == "answer"
         ));
@@ -174,10 +180,10 @@ fn prose_does_not_infer_a_reasoning_boundary(cx: &mut TestAppContext) {
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert!(reasoning_part(turn).is_some());
         assert!(
-            !reasoning_states(turn)[0].1,
+            !reasoning_states(turn, cx)[0].1,
             "prose cannot close a different content block"
         );
     });
@@ -242,15 +248,15 @@ fn reasoning_after_prose_creates_a_second_ordered_card(cx: &mut TestAppContext) 
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let traces = reasoning_parts(turn);
         assert_eq!(traces.len(), 2);
         assert_eq!(
-            reasoning_states(turn),
+            reasoning_states(turn, cx),
             vec![("first", true), ("second", false)]
         );
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [
                 ContentBlock::Reasoning { reasoning: first },
                 ContentBlock::Text { text, .. },

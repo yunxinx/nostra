@@ -37,7 +37,8 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
             prefs.smooth_chat_scrolling = false;
         });
         chat.update(cx, |chat, cx| {
-            chat.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                chat,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -49,18 +50,12 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
 
-    let owner_id = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("reasoning turn");
-        let MessagePart::Reasoning { ui_id, .. } = &turn.parts[0] else {
-            panic!("reasoning part")
-        };
-        *ui_id
-    });
+    let owner_id = cx.update(|_, cx| last_reasoning_id(chat.read(cx)));
     let wrap_selector: &'static str =
         Box::leak(format!("markdown-code-wrap-{owner_id}-{fence_start}").into_boxed_str());
 
@@ -136,8 +131,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     let mut smooth_probes = Vec::new();
     for _ in 0..64 {
         let remaining = cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("reasoning turn");
-            reasoning_part(turn)
+            reasoning_part(chat.read(cx))
                 .expect("reasoning trace")
                 .smooth_scroll_remaining()
         });
@@ -158,8 +152,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     );
     assert!(
         cx.update(|_, cx| {
-            let turn = chat.read(cx).messages.last().expect("reasoning turn");
-            reasoning_part(turn)
+            reasoning_part(chat.read(cx))
                 .expect("reasoning trace")
                 .smooth_scroll_remaining()
                 == px(0.)
@@ -358,7 +351,7 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
                     provider_metadata: ProviderMetadata::default(),
                 },
             ] {
-                chat.messages.push(Message::from_canonical(message, cx));
+                test_support::push_canonical(chat, message, cx);
             }
             chat.sync_message_list_count();
             chat.list_state.scroll_to(ListOffset {
@@ -378,20 +371,14 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("combined turn");
+        let this = chat.read(cx);
         assert!(
-            reasoning_part(turn)
+            reasoning_part(this)
                 .expect("combined reasoning")
                 .uses_virtualized_scroll(),
             "combined reasoning must use the retained path"
         );
-        turn.parts
-            .iter()
-            .find_map(|part| match part {
-                MessagePart::Text { ui_id, .. } => Some(*ui_id),
-                _ => None,
-            })
-            .expect("combined answer text")
+        last_prose_id(this)
     });
     let selector = |kind: &str| -> &'static str {
         Box::leak(format!("markdown-code-{kind}-{owner_id}-{fence_start}").into_boxed_str())

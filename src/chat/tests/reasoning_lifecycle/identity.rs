@@ -9,37 +9,37 @@ fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "answer", cx);
-            this.append_stream_reasoning(2, "reasoning-1".into(), "second", cx);
-            this.finish_stream_reasoning(2, "reasoning-1", None, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "answer", cx);
+            test_support::append_reasoning(this, 2, "reasoning-1".into(), "second", cx);
+            test_support::finish_reasoning(this, 2, "reasoning-1", None, cx);
 
-            let turn = this.messages.last_mut().expect("assistant turn");
             assert_eq!(
-                reasoning_states(turn),
+                reasoning_states(this, cx),
                 vec![("first", true), ("second", true)]
             );
-            let reasoning_positions = turn
+            let reasoning_positions: Vec<usize> = last_assistant_mirror_mut(this)
                 .parts
                 .iter()
                 .enumerate()
                 .filter_map(|(index, part)| {
-                    matches!(part, MessagePart::Reasoning { .. }).then_some(index)
+                    matches!(part, PartMirror::Reasoning { .. }).then_some(index)
                 })
-                .collect::<Vec<_>>();
+                .collect();
             let [first, second] = reasoning_positions.as_slice() else {
                 panic!("two reasoning cards");
             };
-            let (before_second, second_and_after) = turn.parts.split_at_mut(*second);
-            let MessagePart::Reasoning {
+            let (before_second, second_and_after) =
+                last_assistant_mirror_mut(this).parts.split_at_mut(*second);
+            let PartMirror::Reasoning {
                 trace: Some(first_trace),
                 ..
             } = &mut before_second[*first]
             else {
                 panic!("first reasoning card");
             };
-            let MessagePart::Reasoning {
+            let PartMirror::Reasoning {
                 trace: Some(second_trace),
                 ..
             } = &mut second_and_after[0]
@@ -64,11 +64,11 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "answer", cx);
-            this.append_stream_reasoning(2, "reasoning-1".into(), "second", cx);
-            this.finish_stream_reasoning(2, "reasoning-1", None, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "answer", cx);
+            test_support::append_reasoning(this, 2, "reasoning-1".into(), "second", cx);
+            test_support::finish_reasoning(this, 2, "reasoning-1", None, cx);
         });
     });
 
@@ -86,7 +86,7 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
     cx.simulate_click(first_trigger.center(), gpui::Modifiers::default());
     draw(cx);
     chat.read_with(cx, |this, _| {
-        let traces = reasoning_parts(this.messages.last().expect("assistant turn"));
+        let traces = reasoning_parts(this);
         assert!(traces[0].is_expanded());
         assert!(!traces[1].is_expanded());
     });
@@ -97,7 +97,7 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
     cx.simulate_click(second_trigger.center(), gpui::Modifiers::default());
     draw(cx);
     chat.read_with(cx, |this, _| {
-        let traces = reasoning_parts(this.messages.last().expect("assistant turn"));
+        let traces = reasoning_parts(this);
         assert!(traces[0].is_expanded());
         assert!(traces[1].is_expanded());
     });
@@ -134,18 +134,18 @@ fn a_finished_reasoning_id_cannot_be_reused(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_reasoning(0, "reasoning-0".into(), "late", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "late", cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert!(reasoning_part(turn).is_some());
-        assert_eq!(reasoning_states(turn)[0].0, "first");
+        assert_eq!(reasoning_states(turn, cx)[0].0, "first");
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [ContentBlock::Reasoning { reasoning }] if reasoning.display == "first"
         ));
     });
@@ -167,20 +167,20 @@ fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppCon
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_reasoning(0, "reasoning-0".into());
-            this.finish_stream_reasoning(0, "reasoning-0", Some(replay.clone()), cx);
-            this.append_stream_reasoning(0, "reasoning-0".into(), "late", cx);
+            test_support::start_reasoning(this, 0, "reasoning-0".into(), cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", Some(replay.clone()), cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "late", cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert!(
             reasoning_part(turn).is_none(),
             "no visible body was streamed"
         );
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [ContentBlock::Reasoning { reasoning }]
                 if reasoning.display.is_empty() && reasoning.replay.as_ref() == Some(&replay)
         ));
@@ -196,17 +196,14 @@ fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext)
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "partial first", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "partial answer", cx);
-            this.append_stream_reasoning(2, "reasoning-1".into(), "partial second", cx);
-            let first = this
-                .messages
-                .last_mut()
-                .and_then(reasoning_part_mut)
-                .expect("first reasoning card");
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "partial first", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "partial answer", cx);
+            test_support::append_reasoning(this, 2, "reasoning-1".into(), "partial second", cx);
+            let first = reasoning_part_mut(this).expect("first reasoning card");
             first.toggle();
-            this.finish_reply(
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage::from_message(LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![
@@ -236,11 +233,11 @@ fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext)
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let traces = reasoning_parts(turn);
         assert_eq!(traces.len(), 2);
         assert_eq!(
-            reasoning_states(turn),
+            reasoning_states(turn, cx),
             vec![("first", true), ("second", true)]
         );
         assert!(
@@ -266,30 +263,36 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
 
     let (ui_id, body_id) = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_tool_call(0, 0, "call-0".into(), "lookup".into());
-            this.append_stream_reasoning(1, "reasoning-0".into(), "partial", cx);
-            this.finish_stream_reasoning(1, "reasoning-0", None, cx);
-            let turn = this.messages.last_mut().expect("assistant turn");
-            let MessagePart::Reasoning {
-                ui_id,
+            test_support::start_tool_call(this, 0, 0, "call-0".into(), "lookup".into(), cx);
+            test_support::append_reasoning(this, 1, "reasoning-0".into(), "partial", cx);
+            test_support::finish_reasoning(this, 1, "reasoning-0", None, cx);
+            let part_id = last_turn(this, cx)
+                .parts
+                .iter()
+                .find(|part| part.content_index == 1)
+                .map(|part| part.part_id)
+                .expect("reasoning slot");
+            let PartMirror::Reasoning {
+                part_id: current_id,
                 trace: Some(trace),
                 ..
-            } = turn
+            } = last_assistant_mirror_mut(this)
                 .parts
                 .iter_mut()
-                .find(|part| part.content_index() == 1)
-                .expect("reasoning slot")
+                .find(|part| part.part_id() == part_id)
+                .expect("reasoning mirror")
             else {
                 panic!("reasoning part")
             };
             trace.toggle();
-            (*ui_id, trace.body_entity_id())
+            (current_id.as_u64(), trace.body_entity_id())
         })
     });
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_reply(
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![IndexedContentBlock {
@@ -310,22 +313,29 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let this = chat.read(cx);
         assert_eq!(
-            turn.parts.len(),
+            last_turn(this, cx).parts.len(),
             1,
             "unfinished tool placeholder was filtered"
         );
-        let MessagePart::Reasoning {
-            ui_id: current_ui_id,
-            reasoning,
-            trace: Some(trace),
-            ..
-        } = &turn.parts[0]
-        else {
+        let part = &last_turn(this, cx).parts[0];
+        let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("terminal reasoning part")
         };
-        assert_eq!(*current_ui_id, ui_id);
+        let PartMirror::Reasoning {
+            part_id: current_id,
+            trace: Some(trace),
+            ..
+        } = last_assistant_mirror(this)
+            .parts
+            .iter()
+            .find(|mirror| mirror.part_id() == part.part_id)
+            .expect("reasoning mirror")
+        else {
+            panic!("terminal reasoning mirror")
+        };
+        assert_eq!(current_id.as_u64(), ui_id);
         assert_eq!(trace.body_entity_id(), body_id);
         assert!(
             trace.is_expanded(),
@@ -366,17 +376,20 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
                 ],
                 cx,
             );
-            let turn = this.messages.last_mut().expect("assistant turn");
-            let MessagePart::Reasoning {
-                ui_id,
+            let PartMirror::Reasoning {
+                part_id,
                 trace: Some(trace),
                 ..
-            } = &mut turn.parts[0]
+            } = last_assistant_mirror_mut(this)
+                .parts
+                .iter_mut()
+                .find(|part| matches!(part, PartMirror::Reasoning { .. }))
+                .expect("reasoning mirror")
             else {
                 panic!("reasoning part")
             };
             trace.toggle();
-            (*ui_id, trace.body_entity_id(), trace.elapsed())
+            (part_id.as_u64(), trace.body_entity_id(), trace.elapsed())
         })
     });
 
@@ -405,21 +418,27 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
-        let MessagePart::Reasoning {
-            ui_id: current_ui_id,
-            reasoning,
-            finished,
-            trace: Some(trace),
-            ..
-        } = &turn.parts[0]
-        else {
+        let this = chat.read(cx);
+        let part = &last_turn(this, cx).parts[0];
+        let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("reasoning part")
         };
-        assert_eq!(*current_ui_id, ui_id);
+        let PartMirror::Reasoning {
+            part_id: current_id,
+            trace: Some(trace),
+            ..
+        } = last_assistant_mirror(this)
+            .parts
+            .iter()
+            .find(|mirror| mirror.part_id() == part.part_id)
+            .expect("reasoning mirror")
+        else {
+            panic!("reasoning mirror")
+        };
+        assert_eq!(current_id.as_u64(), ui_id);
         assert_eq!(trace.body_entity_id(), body_id);
         assert_eq!(trace.elapsed(), elapsed);
-        assert!(trace.is_expanded() && *finished);
+        assert!(trace.is_expanded() && part.finished);
         assert_eq!(reasoning.display, "authoritative summary");
         assert_eq!(
             reasoning
@@ -492,10 +511,10 @@ fn reasoning_after_a_tool_call_creates_a_second_ordered_card(cx: &mut TestAppCon
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert_eq!(reasoning_parts(turn).len(), 2);
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [
                 ContentBlock::Reasoning { reasoning: first },
                 ContentBlock::ToolCall { tool_call: middle },

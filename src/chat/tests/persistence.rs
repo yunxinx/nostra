@@ -9,13 +9,6 @@ fn public_turn_flow_emits_binding_and_persists_a_completed_terminal(cx: &mut Tes
         scripted_completed_events(),
     ));
     let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
-    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
-    let _subscription = cx.update(|_, cx| {
-        let observed = observed.clone();
-        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
-            observed.borrow_mut().push(event.clone());
-        })
-    });
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model".into(),
@@ -29,16 +22,12 @@ fn public_turn_flow_emits_binding_and_persists_a_completed_terminal(cx: &mut Tes
     });
     cx.run_until_parked();
 
-    let events = observed.borrow();
-    assert!(events.iter().any(|event| {
-        matches!(event, ChatEvent::TitleChanged(title) if title == "hello runtime")
-    }));
-    let session_id = events.iter().find_map(|event| match event {
-        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
-        _ => None,
+    let session_id = chat.read_with(cx, |this, _| {
+        this.durable_session_id_for_test()
+            .expect("durable begin binds a session")
     });
-    drop(events);
-    let session_id = session_id.expect("durable begin emits a public session binding");
+    let title = chat.read_with(cx, |this, cx| this.transcript.read(cx).title());
+    assert_eq!(title.as_deref(), Some("hello runtime"));
     let state = catalog
         .load_session(&session_id, None)
         .expect("load the completed Chat turn");
@@ -60,13 +49,6 @@ fn public_cancel_flow_persists_a_cancelled_terminal(cx: &mut TestAppContext) {
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let generation = Arc::new(ScriptedGenerationService::pending());
     let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
-    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
-    let _subscription = cx.update(|_, cx| {
-        let observed = observed.clone();
-        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
-            observed.borrow_mut().push(event.clone());
-        })
-    });
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model".into(),
@@ -83,11 +65,10 @@ fn public_cancel_flow_persists_a_cancelled_terminal(cx: &mut TestAppContext) {
     cx.update(|_, cx| chat.update(cx, |this, cx| this.cancel_reply(cx)));
     cx.run_until_parked();
 
-    let session_id = observed.borrow().iter().find_map(|event| match event {
-        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
-        _ => None,
+    let session_id = chat.read_with(cx, |this, _| {
+        this.durable_session_id_for_test()
+            .expect("durable begin binds a session")
     });
-    let session_id = session_id.expect("durable begin emits a public session binding");
     let state = catalog
         .load_session(&session_id, None)
         .expect("load the cancelled Chat turn");
@@ -104,13 +85,6 @@ fn repeated_cancel_requests_persist_one_cancelled_terminal(cx: &mut TestAppConte
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
     let generation = Arc::new(ScriptedGenerationService::pending());
     let (chat, cx) = add_chat_window_with_generation_service(cx, stores, generation);
-    let observed = Rc::new(RefCell::new(Vec::<ChatEvent>::new()));
-    let _subscription = cx.update(|_, cx| {
-        let observed = observed.clone();
-        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
-            observed.borrow_mut().push(event.clone());
-        })
-    });
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
@@ -134,11 +108,10 @@ fn repeated_cancel_requests_persist_one_cancelled_terminal(cx: &mut TestAppConte
     });
     cx.run_until_parked();
 
-    let session_id = observed.borrow().iter().find_map(|event| match event {
-        ChatEvent::SessionBound(session_id) => Some(session_id.clone()),
-        _ => None,
+    let session_id = chat.read_with(cx, |this, _| {
+        this.durable_session_id_for_test()
+            .expect("durable begin binds a session")
     });
-    let session_id = session_id.expect("durable begin emits a public session binding");
     let state = catalog
         .load_session(&session_id, None)
         .expect("load the cancelled Chat turn");
@@ -249,7 +222,12 @@ fn closing_a_conversation_scope_waits_for_terminal_persistence(cx: &mut TestAppC
 
     cx.update(|window, cx| {
         chat.update(cx, |this, cx| {
-            assert!(this.start_durable_pending_reply_for_test(Rc::clone(&dropped), window, cx));
+            assert!(test_support::start_durable_pending_reply(
+                this,
+                Rc::clone(&dropped),
+                window,
+                cx
+            ));
         });
     });
     cx.run_until_parked();
@@ -318,9 +296,9 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
                 .expect("controller lock")
                 .begin_turn(user.clone(), selection, "turn-1")
                 .expect("begin");
-            this.mark_turn_pending_for_test(start.session_id, "turn-1", cx);
-            this.messages.push(Message::from_canonical(user, cx));
-            this.messages.push(Message::empty(Role::Assistant));
+            test_support::mark_turn_pending(this, start.session_id, "turn-1", cx);
+            test_support::push_canonical(this, user, cx);
+            test_support::push_empty(this, Role::Assistant, cx);
             this.runtime.read(cx).session_controller_for_test()
         })
     });
@@ -329,7 +307,8 @@ fn deletion_overtaking_terminal_persistence_is_not_reported_as_a_failure(cx: &mu
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             let generation = this.runtime_snapshot_for_test().request_generation();
-            this.finish_reply_with_terminal(
+            test_support::finish_reply_with_terminal(
+                this,
                 generation,
                 None,
                 ChatTurnTerminal::cancelled(),
@@ -402,7 +381,7 @@ fn deletion_after_durable_begin_does_not_start_provider_or_publish_the_turn(
     cx.update(|window, cx| {
         chat.read_with(cx, |this, app| {
             assert!(
-                this.messages.is_empty(),
+                this.transcript.read(app).turns().is_empty(),
                 "a deleted durable begin must not publish a visible turn"
             );
             assert!(
@@ -460,16 +439,13 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
     assert_eq!(state.messages.len(), 1);
 
     let (other, cx) = add_chat_window_with_stores(cx, stores);
-    let restored = cx.update(|_, cx| {
-        other.update(cx, |this, cx| {
-            this.restore_from_session(&session_id, &state, cx)
-        })
-    });
+    let restored = cx
+        .update(|_, cx| other.update(cx, |this, cx| this.restore_session(&session_id, &state, cx)));
     assert!(restored.is_ok(), "restore should succeed on an idle view");
     cx.run_until_parked();
     cx.update(|_, cx| {
         other.read_with(cx, |this, app| {
-            assert_eq!(this.messages.len(), 1);
+            assert_eq!(this.transcript.read(app).turns().len(), 1);
             assert_eq!(this.durable_session_id_for_test(), Some(session_id.clone()));
             assert!(
                 this.runtime.read(app).next_turn_id >= 2,
@@ -487,7 +463,7 @@ fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppC
     let dropped = Rc::new(std::cell::Cell::new(false));
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_pending_reply_for_test(dropped, cx);
+            test_support::start_pending_reply(this, dropped, cx);
         });
     });
     let session_id: SessionId = "chat-01923f5e-7f4a-7f4a-8f4a-0123456789ab"
@@ -503,11 +479,8 @@ fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppC
         latest_config: None,
         latest_compaction: None,
     };
-    let result = cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            this.restore_from_session(&session_id, &state, cx)
-        })
-    });
+    let result = cx
+        .update(|_, cx| chat.update(cx, |this, cx| this.restore_session(&session_id, &state, cx)));
     assert!(result.is_err(), "restore must reject a streaming view");
 }
 
@@ -531,7 +504,13 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
     let turn_id = "turn-1".to_string();
     let start = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.seed_pending_turn_for_test(user.clone(), selection.clone(), turn_id.clone(), cx)
+            test_support::seed_pending_turn(
+                this,
+                user.clone(),
+                selection.clone(),
+                turn_id.clone(),
+                cx,
+            )
         })
     });
 
@@ -544,7 +523,8 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_current_reply_with_terminal_for_test(
+            test_support::finish_current_reply_with_terminal(
+                this,
                 None,
                 ChatTurnTerminal::cancelled(),
                 None,
@@ -596,7 +576,7 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
     };
     let controller = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.seed_pending_turn_for_test(user.clone(), selection, "turn-1", cx);
+            test_support::seed_pending_turn(this, user.clone(), selection, "turn-1", cx);
             this.runtime.read(cx).session_controller_for_test()
         })
     });
@@ -604,7 +584,8 @@ fn queued_terminal_persistence_finishes_before_store_shutdown(cx: &mut TestAppCo
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_current_reply_with_terminal_for_test(
+            test_support::finish_current_reply_with_terminal(
+                this,
                 None,
                 ChatTurnTerminal::cancelled(),
                 None,
@@ -646,7 +627,9 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            this.runtime.update(cx, |runtime, _| {
+                runtime.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            });
             assert!(this.submit("hold generation open".into(), window, cx));
         });
     });
@@ -679,7 +662,8 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_current_reply_with_terminal_for_test(
+            test_support::finish_current_reply_with_terminal(
+                this,
                 None,
                 ChatTurnTerminal::cancelled(),
                 None,
@@ -725,7 +709,7 @@ fn failed_delete_reservation_does_not_cancel_active_generation(cx: &mut TestAppC
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_pending_reply_for_test(Rc::clone(&dropped), cx);
+            test_support::start_pending_reply(this, Rc::clone(&dropped), cx);
             this.runtime
                 .read(cx)
                 .session_controller_for_test()
@@ -883,7 +867,9 @@ fn preparing_the_chat_view_for_shutdown_persists_a_cancelled_terminal(cx: &mut T
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            this.runtime.update(cx, |runtime, _| {
+                runtime.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            });
             assert!(this.submit("close during generation".into(), window, cx));
         });
     });
@@ -946,7 +932,9 @@ fn released_chat_retries_its_exact_cancelled_terminal_once(cx: &mut TestAppConte
                 model_id: "model-a".into(),
             });
             this.selection_available = true;
-            this.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            this.runtime.update(cx, |runtime, _| {
+                runtime.next_reply_drop_flag = Some(Rc::clone(&dropped));
+            });
             assert!(this.submit("close through one transient failure".into(), window, cx));
         });
     });
@@ -1001,7 +989,8 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
     };
     let session_id = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let start = this.seed_pending_turn_for_test(
+            let start = test_support::seed_pending_turn(
+                this,
                 user.clone(),
                 ModelSelection {
                     profile_id: "profile".into(),
@@ -1022,7 +1011,8 @@ fn shutdown_during_inflight_terminal_retries_the_exact_terminal(cx: &mut TestApp
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_current_reply_with_terminal_for_test(
+            test_support::finish_current_reply_with_terminal(
+                this,
                 None,
                 ChatTurnTerminal::cancelled(),
                 None,
@@ -1082,8 +1072,9 @@ fn terminal_persistence_failure_unblocks_chat_and_notifies_the_user(cx: &mut Tes
     let turn_id = "turn-1".to_string();
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.seed_pending_turn_for_test(user.clone(), selection, turn_id, cx);
-            this.finish_current_reply_with_terminal_for_test(
+            test_support::seed_pending_turn(this, user.clone(), selection, turn_id, cx);
+            test_support::finish_current_reply_with_terminal(
+                this,
                 None,
                 ChatTurnTerminal::cancelled(),
                 None,
@@ -1134,7 +1125,7 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
             });
             assert!(this.submit("original draft".into(), window, cx));
             assert!(this.runtime_snapshot_for_test().persistence_pending());
-            assert!(this.messages.is_empty());
+            assert!(this.transcript.read(cx).turns().is_empty());
             assert!(!this.runtime.read(cx).reply_task.is_some());
             assert_eq!(
                 this.composer.read(cx).input().read(cx).value(),
@@ -1160,7 +1151,7 @@ fn durable_begin_runs_off_foreground_and_preserves_a_newer_draft(cx: &mut TestAp
                 this.composer.read(cx).input().read(cx).value(),
                 "newer draft"
             );
-            assert!(!this.messages.is_empty());
+            assert!(!this.transcript.read(cx).turns().is_empty());
         });
     });
 }
@@ -1206,7 +1197,7 @@ fn durable_begin_failure_keeps_the_composer_and_notifies(cx: &mut TestAppContext
     cx.update(|window, cx| {
         chat.read_with(cx, |this, cx| {
             assert!(!this.runtime_snapshot_for_test().persistence_pending());
-            assert!(this.messages.is_empty());
+            assert!(this.transcript.read(cx).turns().is_empty());
             assert_eq!(this.composer.read(cx).input().read(cx).value(), "new draft");
         });
         let notifications = gpui_component::Root::read(window, cx)

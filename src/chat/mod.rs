@@ -1,23 +1,22 @@
-//! Single conversation view: message list, streaming assistant turn, and
-//! composer input.
+//! Single conversation view: transcript projection, streaming follow, and composer.
 //!
-//! [`ChatView`] owns the transcript and the composer. The pieces a turn is made
-//! of live beside it: [`assistant`] bridges gateway events into this view's
-//! entities, and [`error_card`] / [`reasoning_card`] render the two turn parts
-//! that need more than markdown prose.
+//! Canonical content lives on [`transcript::Transcript`]. [`ChatView`] subscribes
+//! to it and keeps a presentation mirror. [`conversation_runtime::ConversationRuntime`]
+//! is the only writer.
 
 mod assistant;
 pub(crate) mod conversation_runtime;
 mod error_card;
 mod hover_reveal;
-mod message;
 mod persistence;
 mod reasoning_card;
 mod render;
 mod scrolling;
+pub(crate) mod transcript;
 
 use std::{
     cell::Cell,
+    collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc,
@@ -25,28 +24,18 @@ use std::{
     },
 };
 
-use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AppContext as _, Context, ElementId, Entity, EventEmitter,
-    FollowMode, InteractiveElement as _, IntoElement, ListAlignment, ListOffset, ListState,
-    ParentElement as _, Pixels, Render, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    Window, div, list, point, px,
+    AnyWindowHandle, App, AppContext as _, Context, Entity, FollowMode, ListState, Pixels,
+    SharedString, Subscription, Window, px,
 };
-use gpui_component::{
-    ActiveTheme, ElementExt as _, StyledExt as _, h_flex,
-    input::{InputEvent, RopeExt as _},
-    scroll::ScrollableElement as _,
-    shimmer::ShimmerText,
-    text::{TextView, TextViewStyle},
-    v_flex,
-};
+use gpui_component::input::{InputEvent, RopeExt as _};
 use rust_i18n::t;
 
-use crate::llm::{
-    ContentBlock, GenerationService, IndexedMessage, Message as LlmMessage, ModelSelection,
-    ProviderMetadata, ReasoningContent, ToolCall, ToolResult,
-};
+#[cfg(test)]
+use crate::llm::{ContentBlock, IndexedMessage, Message as LlmMessage, ProviderMetadata};
+use crate::llm::{GenerationService, ModelSelection};
 use crate::providers;
+use crate::runtime::RuntimeServices;
 #[cfg(test)]
 use crate::session::SessionStores;
 use crate::session::{ConversationContext, SessionId};
@@ -57,37 +46,45 @@ use crate::ui::{
 #[cfg(test)]
 use crate::{llm::GatewayError, session::ChatTurnTerminal};
 
+#[cfg(test)]
+use self::conversation_runtime::ConversationStreamEvent;
 use self::conversation_runtime::{ConversationRuntime, ConversationRuntimeSnapshot};
 use self::error_card::TurnError;
-use self::hover_reveal::hover_reveal_copy;
-pub use self::message::{Message, MessagePart, Role};
-pub(crate) use self::persistence::restore::derive_title_from_state;
 use self::reasoning_card::ReasoningTrace;
-use self::render::copyable_text;
+use self::scrolling::SmoothScrollState;
 pub(crate) use self::scrolling::set_smooth_scrolling;
 #[cfg(test)]
 use self::scrolling::{
     SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, reasoning_smooth_invalidations,
-    record_reasoning_smooth_invalidation, reset_reasoning_smooth_invalidations,
+    reset_reasoning_smooth_invalidations,
 };
-use self::scrolling::{SmoothScrollState, smooth_scroll_animation_enabled};
+use self::transcript::{
+    Part, PartChange, PartId, PartSource, Role, Transcript, TranscriptEvent, TranscriptSnapshot,
+    TranscriptUpdate, Turn, TurnId, has_copyable_text, stream_ended,
+};
+
+pub(crate) use self::persistence::restore::ChatRestoreError;
+#[cfg(test)]
+pub(crate) use self::transcript::is_replayable;
+pub(crate) use self::transcript::{derive_title, title_from_resolved_state};
 
 const CONTENT_MAX_WIDTH: Pixels = px(760.);
 
 const MESSAGE_LIST_OVERDRAW: Pixels = px(1_000.);
 const MESSAGE_HEIGHT_HINT: Pixels = px(160.);
+
+fn next_body_owner_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 const STICK_THRESHOLD: Pixels = px(48.);
 
 /// First-frame fallback until the floating composer reports its actual height.
 const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);
 
 /// Deliberately over-scrolled deferred target for the composer viewport.
-/// `InputState::set_scroll_offset` applies it after the next layout pass and
-/// clamps it to the fresh content size, so this lands exactly at the bottom.
 const COMPOSER_SCROLL_TO_END: Pixels = px(-1_000_000.);
-
-static NEXT_MESSAGE_UI_ID: AtomicU64 = AtomicU64::new(1);
-static NEXT_MESSAGE_PART_UI_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 struct UnavailableGenerationService;
@@ -104,19 +101,6 @@ impl GenerationService for UnavailableGenerationService {
     }
 }
 
-#[derive(Clone)]
-pub enum ChatEvent {
-    TitleChanged(SharedString),
-    SelectionChanged(ModelSelection),
-    /// Emitted when the view's runtime snapshot changes in a way that affects
-    /// workspace annotations such as generation state.
-    StateChanged,
-    /// Emitted once a durable turn begin has bound a persisted session id to
-    /// this view.  Carries the session id now authoritative for the view.
-    SessionBound(SessionId),
-    DeleteCompleted,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChatDeleteRequest {
     RemoveNow,
@@ -128,39 +112,158 @@ pub(crate) fn create_conversation_runtime(
     scope: crate::runtime::ConversationScopeHandle,
     conversation: ConversationContext,
     generation_service: Arc<dyn GenerationService>,
+    transcript: Entity<Transcript>,
     cx: &mut App,
 ) -> Entity<ConversationRuntime> {
-    cx.new(|_| ConversationRuntime::new(scope, conversation, generation_service))
+    cx.new(|_| ConversationRuntime::new(scope, conversation, generation_service, transcript))
+}
+
+pub(crate) fn create_chat_composer(
+    runtime: &Entity<ConversationRuntime>,
+    window: &mut Window,
+    cx: &mut App,
+) -> (
+    Entity<ChatReferenceComposer>,
+    Rc<Cell<ComposerStatus>>,
+    bool,
+) {
+    let references_enabled = runtime.read(cx).supports_references();
+    let references = runtime.read(cx).references();
+    let composer_status = Rc::new(Cell::new(ComposerStatus::default()));
+    let status = composer_status.clone();
+    let composer = cx.new(|cx| {
+        if references_enabled {
+            ChatReferenceComposer::with_references(status, references, window, cx)
+        } else {
+            ChatReferenceComposer::chat(status, references, window, cx)
+        }
+    });
+    (composer, composer_status, references_enabled)
+}
+
+pub(crate) struct SpawnedConversation {
+    pub transcript: Entity<Transcript>,
+    pub runtime: Entity<ConversationRuntime>,
+    pub composer: Entity<ChatReferenceComposer>,
+    pub view: Entity<ChatView>,
+}
+
+struct ChatViewHost {
+    runtime: Entity<ConversationRuntime>,
+    transcript: Entity<Transcript>,
+    composer: Entity<ChatReferenceComposer>,
+    composer_status: Rc<Cell<ComposerStatus>>,
+    references_enabled: bool,
+}
+
+impl ChatViewHost {
+    fn from_runtime(
+        runtime: Entity<ConversationRuntime>,
+        transcript: Entity<Transcript>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let (composer, composer_status, references_enabled) =
+            create_chat_composer(&runtime, window, cx);
+        Self {
+            runtime,
+            transcript,
+            composer,
+            composer_status,
+            references_enabled,
+        }
+    }
+}
+
+pub(crate) fn spawn_conversation(
+    scope: crate::runtime::ConversationScopeHandle,
+    conversation: ConversationContext,
+    generation_service: Arc<dyn GenerationService>,
+    services: &RuntimeServices,
+    window: &mut Window,
+    cx: &mut App,
+) -> SpawnedConversation {
+    let transcript = cx.new(Transcript::new);
+    let runtime = create_conversation_runtime(
+        scope,
+        conversation,
+        generation_service,
+        transcript.clone(),
+        cx,
+    );
+    let host = ChatViewHost::from_runtime(runtime.clone(), transcript.clone(), window, cx);
+    let composer = host.composer.clone();
+    let view = ChatView::view_with_runtime_services(host, services, window, cx);
+    SpawnedConversation {
+        transcript,
+        runtime,
+        composer,
+        view,
+    }
+}
+
+/// Presentation-only projection of one transcript turn. Carries everything
+/// render needs; rendering must not lock the [`Transcript`] entity.
+pub(crate) struct TurnMirror {
+    pub(in crate::chat) turn_id: TurnId,
+    pub(in crate::chat) role: Role,
+    pub(in crate::chat) parts: Vec<PartMirror>,
+    pub(in crate::chat) error: Option<TurnError>,
+    /// `stream_ended` and non-empty prose, computed on the model side at
+    /// mirror update time so render never reads the canonical turn.
+    pub(in crate::chat) copyable: bool,
+}
+
+pub(crate) enum PartMirror {
+    Prose {
+        part_id: PartId,
+        text: String,
+        body: MarkdownBody,
+    },
+    Reasoning {
+        part_id: PartId,
+        content_index: usize,
+        display: String,
+        finished: bool,
+        trace: Option<ReasoningTrace>,
+    },
+    ToolCall {
+        part_id: PartId,
+        name: String,
+    },
+    ToolResult {
+        part_id: PartId,
+        body: MarkdownBody,
+    },
+}
+
+impl PartMirror {
+    fn part_id(&self) -> PartId {
+        match self {
+            Self::Prose { part_id, .. }
+            | Self::Reasoning { part_id, .. }
+            | Self::ToolCall { part_id, .. }
+            | Self::ToolResult { part_id, .. } => *part_id,
+        }
+    }
 }
 
 pub struct ChatView {
     window_handle: AnyWindowHandle,
-    messages: Vec<Message>,
+    pub(in crate::chat) mirrors: Vec<TurnMirror>,
     composer: Entity<ChatReferenceComposer>,
     composer_status: Rc<Cell<ComposerStatus>>,
     references_enabled: bool,
-    runtime: Entity<ConversationRuntime>,
+    pub(in crate::chat) runtime: Entity<ConversationRuntime>,
     runtime_snapshot: ConversationRuntimeSnapshot,
-    /// Placeholder text currently installed in the input state.  Compared
-    /// against the live translation each frame so a language switch updates
-    /// the composer without rebuilding it (and without notify loops).
+    pub(in crate::chat) transcript: Entity<Transcript>,
+    transcript_snapshot: TranscriptSnapshot,
     placeholder: SharedString,
-    /// Last measured height of the complete floating composer, including its
-    /// outer padding. Used as the transcript's bottom inset.
     composer_height: Pixels,
-    /// Composer height measured while the input was empty, i.e. at its
-    /// single-row resting size.  The empty state centers against this instead
-    /// of the live height so a multi-line draft grows the composer upward
-    /// *over* the greeting rather than pushing it up the panel.  Re-measured
-    /// whenever the input goes back to empty, so a font or text-size change
-    /// recalibrates it on its own.
     base_composer_height: Pixels,
-    /// Snapshot maintained by the input subscription. Rendering hooks must not
-    /// read the external input entity while recording layout bounds or deciding
-    /// whether the current draft can be submitted.
     input_empty: bool,
     input_blank: bool,
-    list_state: ListState,
+    pub(in crate::chat) list_state: ListState,
     smooth_scroll: SmoothScrollState,
     preference_snapshot: crate::preferences::Preferences,
     catalog_handle: crate::providers::ProviderCatalogHandle,
@@ -168,8 +271,6 @@ pub struct ChatView {
     markdown_presentation: MarkdownPresentation,
     selection: Option<ModelSelection>,
     selection_available: bool,
-    #[cfg(test)]
-    next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
     composer_revision: u64,
     _subscriptions: Vec<Subscription>,
     #[cfg(test)]
@@ -210,44 +311,61 @@ impl ChatView {
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
+        let transcript = cx.new(Transcript::new);
         let runtime = create_conversation_runtime(
             crate::runtime::ConversationScopeHandle::for_test(),
             conversation,
             Arc::new(UnavailableGenerationService),
+            transcript.clone(),
             cx,
         );
-        Self::view_with_generation_service_and_preferences(runtime, preference_handle, window, cx)
+        Self::view_with_generation_service_and_preferences(
+            runtime,
+            transcript,
+            preference_handle,
+            window,
+            cx,
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn view_with_generation_service_and_preferences(
         runtime: Entity<ConversationRuntime>,
+        transcript: Entity<Transcript>,
         preference_handle: crate::preferences::PreferenceHandle,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let markdown_extensions = crate::ui::markdown::test_extension_snapshot();
-        cx.new(|cx| Self::new(runtime, preference_handle, markdown_extensions, window, cx))
+        let host = ChatViewHost::from_runtime(runtime, transcript, window, cx);
+        cx.new(|cx| Self::new(host, preference_handle, markdown_extensions, window, cx))
     }
 
-    pub(crate) fn view_with_runtime_services(
-        runtime: Entity<ConversationRuntime>,
+    fn view_with_runtime_services(
+        host: ChatViewHost,
         services: &crate::runtime::RuntimeServices,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let preference_handle = services.preference_handle().clone();
         let markdown_extensions = services.markdown_extensions().clone();
-        cx.new(|cx| Self::new(runtime, preference_handle, markdown_extensions, window, cx))
+        cx.new(|cx| Self::new(host, preference_handle, markdown_extensions, window, cx))
     }
 
     fn new(
-        runtime: Entity<ConversationRuntime>,
+        host: ChatViewHost,
         preference_handle: crate::preferences::PreferenceHandle,
         markdown_extensions: MarkdownExtensionSnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let ChatViewHost {
+            runtime,
+            transcript,
+            composer,
+            composer_status,
+            references_enabled,
+        } = host;
         let preference_snapshot = preference_handle.snapshot();
         let catalog_handle = crate::providers::ensure_global(cx);
         let catalog_snapshot = catalog_handle.snapshot();
@@ -256,27 +374,12 @@ impl ChatView {
             MarkdownPresentation::new(preference_state, markdown_extensions);
         let preferences_for_observer = preference_handle.clone();
         let catalog_for_observer = catalog_handle.clone();
-        let references_enabled = runtime.read(cx).supports_references();
-        let references = runtime.read(cx).references();
         let placeholder: SharedString = if references_enabled {
             t!("reference_picker.composer_placeholder").to_string()
         } else {
             t!("chat.placeholder").to_string()
         }
         .into();
-        let composer_status = Rc::new(Cell::new(ComposerStatus::default()));
-        let composer = cx.new(|cx| {
-            if references_enabled {
-                ChatReferenceComposer::with_references(
-                    composer_status.clone(),
-                    references.clone(),
-                    window,
-                    cx,
-                )
-            } else {
-                ChatReferenceComposer::chat(composer_status.clone(), references, window, cx)
-            }
-        });
         let input = composer.read(cx).input();
 
         let composer_subscription = cx.subscribe_in(
@@ -308,7 +411,7 @@ impl ChatView {
                 this.input_blank = input_blank;
                 if lines_len > 1 && cursor_line + 1 == lines_len {
                     input.update(cx, |state, cx| {
-                        state.set_scroll_offset(point(x, COMPOSER_SCROLL_TO_END), cx);
+                        state.set_scroll_offset(gpui::point(x, COMPOSER_SCROLL_TO_END), cx);
                     });
                 }
             }
@@ -317,21 +420,27 @@ impl ChatView {
         let selection = providers::last_selection_from(&catalog_snapshot);
         let selection_available =
             providers::selection_is_available_from(selection.as_ref(), &catalog_snapshot);
-        let list_state = ListState::new(0, ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
+        let list_state = ListState::new(0, gpui::ListAlignment::Top, MESSAGE_LIST_OVERDRAW)
             .with_uniform_item_height(MESSAGE_HEIGHT_HINT);
         list_state.set_follow_mode(FollowMode::Tail);
         let runtime_snapshot = runtime.read(cx).snapshot();
+        let transcript_snapshot = transcript.read(cx).snapshot();
         let runtime_subscription = cx.subscribe(&runtime, |this, _, update, cx| {
             this.handle_runtime_update(update, cx);
         });
-        Self {
+        let transcript_subscription = cx.subscribe(&transcript, |this, _, update, cx| {
+            this.handle_transcript_update(update, cx);
+        });
+        let mut this = Self {
             window_handle: window.window_handle(),
-            messages: Vec::new(),
+            mirrors: Vec::new(),
             composer,
             composer_status,
             references_enabled,
             runtime,
             runtime_snapshot,
+            transcript,
+            transcript_snapshot,
             placeholder,
             composer_height: DEFAULT_COMPOSER_HEIGHT,
             base_composer_height: DEFAULT_COMPOSER_HEIGHT,
@@ -345,13 +454,12 @@ impl ChatView {
             markdown_presentation,
             selection,
             selection_available,
-            #[cfg(test)]
-            next_reply_drop_flag: None,
             composer_revision: 0,
             _subscriptions: vec![
                 composer_subscription,
                 subscription,
                 runtime_subscription,
+                transcript_subscription,
                 cx.observe_global_in::<crate::preferences::Prefs>(window, move |this, _, cx| {
                     let snapshot = preferences_for_observer.snapshot();
                     if this.preference_snapshot == snapshot {
@@ -375,7 +483,9 @@ impl ChatView {
             ],
             #[cfg(test)]
             materialized_message_indices: std::collections::BTreeSet::new(),
-        }
+        };
+        this.sync_from_transcript(cx);
+        this
     }
 
     #[cfg(test)]
@@ -427,325 +537,15 @@ impl ChatView {
         self.runtime_snapshot.has_in_flight_work()
     }
 
-    /// Force the newest message into view.  Used right after the user sends a
-    /// message, where jumping to the bottom is always the desired behavior.
     pub fn scroll_to_bottom(&self) {
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.list_state.scroll_to_end();
     }
 
-    /// Called on every streaming update.  Keeps the latest tokens in view, but
-    /// only while auto-follow is armed and the user is actually reading the
-    /// bottom of the transcript, so scrolling up to re-read earlier turns is
-    /// never interrupted. GPUI's tail-follow state re-engages after the user
-    /// scrolls back to the true bottom.
     pub fn follow_stream(&self) {
         if self.list_state.is_following_tail() {
             self.list_state.scroll_to_end();
         }
-    }
-
-    pub fn start_stream_text(&mut self, content_index: usize, id: String, cx: &mut App) {
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        if last
-            .parts
-            .iter()
-            .any(|part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id))
-        {
-            return;
-        }
-        let ui_id = NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed);
-        last.parts.push(MessagePart::Text {
-            content_index,
-            ui_id,
-            id,
-            text: String::new(),
-            replay: ProviderMetadata::default(),
-            finished: false,
-            body: MarkdownBody::new_streaming_with_presentation(
-                "",
-                ui_id,
-                &self.markdown_presentation,
-                cx,
-            ),
-        });
-        last.parts.sort_by_key(MessagePart::content_index);
-    }
-
-    pub fn append_stream_text(
-        &mut self,
-        content_index: usize,
-        id: String,
-        delta: &str,
-        cx: &mut App,
-    ) {
-        // OpenAI Responses, like pi's adapter, forwards text deltas as received;
-        // an empty delta carries no content and must not create a canonical block
-        // or alter the independent reasoning lifecycle.
-        if delta.is_empty() {
-            return;
-        }
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        let Some(position) = last.parts.iter().position(
-            |part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
-        ) else {
-            self.start_stream_text(content_index, id.clone(), cx);
-            self.append_stream_text(content_index, id, delta, cx);
-            return;
-        };
-        if let MessagePart::Text {
-            text,
-            finished,
-            body,
-            ..
-        } = &mut last.parts[position]
-        {
-            if *finished {
-                return;
-            }
-            text.push_str(delta);
-            body.push_str(delta, cx);
-        }
-    }
-
-    pub fn finish_stream_text(
-        &mut self,
-        content_index: usize,
-        id: &str,
-        replay: Option<ProviderMetadata>,
-        cx: &mut App,
-    ) {
-        let Some(MessagePart::Text {
-            replay: current,
-            finished,
-            body,
-            ..
-        }) = self.messages.last_mut().and_then(|message| {
-            message
-                .parts
-                .iter_mut()
-                .find(|part| matches!(part, MessagePart::Text { content_index: current, id: current_id, .. } if *current == content_index && current_id == id))
-        })
-        else {
-            return;
-        };
-        if let Some(replay) = replay {
-            *current = replay;
-        }
-        *finished = true;
-        body.finish(cx);
-    }
-
-    /// Start the reasoning content block identified by the gateway stream.
-    ///
-    /// Protocol adapters emit this boundary before starting a different content
-    /// block, so the presentation layer never infers one block's lifecycle from
-    /// another block's deltas.
-    pub fn start_stream_reasoning(&mut self, content_index: usize, id: String) {
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        if last.parts.iter().any(
-            |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
-        ) {
-            return;
-        }
-        last.parts.push(MessagePart::Reasoning {
-            content_index,
-            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
-            id,
-            reasoning: ReasoningContent {
-                display: String::new(),
-                replay: None,
-            },
-            finished: false,
-            trace: None,
-        });
-        last.parts.sort_by_key(MessagePart::content_index);
-    }
-
-    pub fn append_stream_reasoning(
-        &mut self,
-        content_index: usize,
-        id: String,
-        delta: &str,
-        cx: &mut App,
-    ) {
-        // Empty protocol deltas carry no visible state and must not create a
-        // card or start its duration clock.
-        if delta.is_empty() {
-            return;
-        }
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        let Some(position) = last.parts.iter().position(
-            |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == &id),
-        ) else {
-            self.start_stream_reasoning(content_index, id.clone());
-            self.append_stream_reasoning(content_index, id, delta, cx);
-            return;
-        };
-        if let MessagePart::Reasoning {
-            ui_id,
-            reasoning,
-            finished,
-            trace,
-            ..
-        } = &mut last.parts[position]
-        {
-            // A finished block is immutable. Protocol adapters must allocate a
-            // new id for later reasoning so its card, timer, disclosure, and
-            // canonical position remain independent.
-            if *finished {
-                return;
-            }
-            reasoning.display.push_str(delta);
-            trace
-                .get_or_insert_with(|| {
-                    ReasoningTrace::new_with_presentation(*ui_id, &self.markdown_presentation, cx)
-                })
-                .push(delta, cx);
-        }
-    }
-
-    pub fn finish_stream_reasoning(
-        &mut self,
-        content_index: usize,
-        id: &str,
-        replay: Option<ProviderMetadata>,
-        cx: &mut App,
-    ) {
-        let Some(MessagePart::Reasoning {
-            reasoning,
-            finished,
-            trace,
-            ..
-        }) = self.messages.last_mut().and_then(|message| {
-            message.parts.iter_mut().find(
-                |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == id),
-            )
-        })
-        else {
-            return;
-        };
-        if let Some(replay) = replay {
-            reasoning.replay = Some(replay);
-        }
-        *finished = true;
-        if let Some(trace) = trace {
-            trace.finish(cx);
-        }
-    }
-
-    /// Apply an authoritative provider snapshot without changing this block's
-    /// disclosure, timer, or stable GPUI identity.
-    pub fn update_stream_reasoning_snapshot(
-        &mut self,
-        content_index: usize,
-        id: &str,
-        snapshot: ReasoningContent,
-        cx: &mut App,
-    ) {
-        let Some(MessagePart::Reasoning {
-            ui_id,
-            reasoning,
-            finished,
-            trace,
-            ..
-        }) = self.messages.last_mut().and_then(|message| {
-            message.parts.iter_mut().find(
-                |part| matches!(part, MessagePart::Reasoning { content_index: current, id: current_id, .. } if *current == content_index && current_id == id),
-            )
-        })
-        else {
-            return;
-        };
-        if !*finished {
-            return;
-        }
-        if snapshot.display.is_empty() {
-            *trace = None;
-        } else if let Some(trace) = trace.as_mut() {
-            trace.set_source(&snapshot.display, cx);
-        } else {
-            *trace = Some(ReasoningTrace::completed_with_presentation(
-                snapshot.display.clone(),
-                *ui_id,
-                &self.markdown_presentation,
-                cx,
-            ));
-        }
-        *reasoning = snapshot;
-    }
-
-    pub fn start_stream_tool_call(
-        &mut self,
-        content_index: usize,
-        index: usize,
-        id: String,
-        name: String,
-    ) {
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        if last.parts.iter().any(
-            |part| matches!(part, MessagePart::ToolCall { content_index: current, .. } if *current == content_index),
-        ) {
-            return;
-        }
-        last.parts.push(MessagePart::ToolCall {
-            content_index,
-            ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
-            index,
-            id,
-            name,
-            tool_call: None,
-        });
-        last.parts.sort_by_key(MessagePart::content_index);
-    }
-
-    pub fn finish_stream_tool_call(
-        &mut self,
-        content_index: usize,
-        index: usize,
-        tool_call: ToolCall,
-    ) {
-        let Some(last) = self.messages.last_mut() else {
-            return;
-        };
-        if let Some(MessagePart::ToolCall {
-            id,
-            name,
-            tool_call: current,
-            ..
-        }) = last.parts.iter_mut().find(
-            |part| matches!(part, MessagePart::ToolCall { content_index: current, index: current_index, .. } if *current == content_index && *current_index == index),
-        ) {
-            *id = tool_call.id.clone();
-            *name = tool_call.name.clone();
-            *current = Some(tool_call);
-        } else {
-            last.parts.push(MessagePart::ToolCall {
-                content_index,
-                ui_id: NEXT_MESSAGE_PART_UI_ID.fetch_add(1, Ordering::Relaxed),
-                index,
-                id: tool_call.id.clone(),
-                name: tool_call.name.clone(),
-                tool_call: Some(tool_call),
-            });
-            last.parts.sort_by_key(MessagePart::content_index);
-        }
-    }
-
-    pub fn finish_stream_batch(&mut self, cx: &mut Context<Self>) {
-        self.remeasure_latest_message();
-        self.follow_stream();
-        cx.notify();
     }
 
     pub fn cancel_reply(&mut self, cx: &mut Context<Self>) {
@@ -763,109 +563,305 @@ impl ChatView {
         true
     }
 
-    /// The transcript turn with `ui_id`, or `None` once the view is dropped or
-    /// the turn is replaced by a replay.
-    fn message_by_ui_id(&self, ui_id: u64) -> Option<&Message> {
-        self.messages.iter().find(|message| message.ui_id == ui_id)
+    fn handle_transcript_update(&mut self, update: &TranscriptUpdate, cx: &mut Context<Self>) {
+        let revision = update.snapshot().revision();
+        if revision <= self.transcript_snapshot.revision() {
+            return;
+        }
+        if revision > self.transcript_snapshot.revision().saturating_add(1) {
+            self.sync_from_transcript(cx);
+            self.transcript_snapshot = update.snapshot().clone();
+            cx.notify();
+            return;
+        }
+        match update.event() {
+            TranscriptEvent::Reset => {
+                self.sync_from_transcript(cx);
+            }
+            TranscriptEvent::TailAppended { turn_ids } => {
+                self.append_mirrors(turn_ids, cx);
+            }
+            TranscriptEvent::PartInserted { turn_id, part_id } => {
+                self.insert_part_mirror(*turn_id, *part_id, cx);
+                self.refresh_turn_flags(*turn_id, cx);
+            }
+            TranscriptEvent::PartChanged {
+                turn_id,
+                part_id,
+                change,
+                delta,
+            } => {
+                self.apply_part_change(*turn_id, *part_id, *change, delta, cx);
+                self.refresh_turn_flags(*turn_id, cx);
+            }
+            TranscriptEvent::TurnReplaced { turn_id } => {
+                self.replace_turn_mirror(*turn_id, cx);
+                self.refresh_turn_flags(*turn_id, cx);
+            }
+        }
+        self.transcript_snapshot = update.snapshot().clone();
+        debug_assert_eq!(self.transcript_snapshot.turn_count(), self.mirrors.len());
+        debug_assert_eq!(
+            self.transcript_snapshot.is_streaming(),
+            self.transcript_snapshot.streaming().is_some()
+        );
+        if self.transcript_snapshot.streaming().is_some() {
+            self.follow_stream();
+        }
+        self.sync_message_list_count();
+        cx.notify();
     }
 
-    /// The complete prose of the turn with `ui_id`, for the message-level copy
-    /// button. Read from the live message at click time rather than a render
-    /// snapshot, so the clipboard always reflects the latest state.
-    fn copyable_message_text(&self, ui_id: u64) -> Option<SharedString> {
-        self.message_by_ui_id(ui_id).map(copyable_text)
+    fn sync_from_transcript(&mut self, cx: &mut App) {
+        let turn_ids: Vec<TurnId> = self
+            .transcript
+            .read(cx)
+            .turns()
+            .iter()
+            .map(|turn| turn.turn_id)
+            .collect();
+        self.mirrors = turn_ids
+            .iter()
+            .filter_map(|turn_id| {
+                let turn = self.transcript.read(cx).turn(*turn_id)?.clone();
+                Some(self.mirror_from_turn(&turn, cx))
+            })
+            .collect();
+        self.sync_message_list_count();
     }
 
-    /// The reasoning source of the block `reasoning_ui_id` inside the turn
-    /// `message_ui_id`, for the reasoning card's copy button.
+    fn append_mirrors(&mut self, turn_ids: &[TurnId], cx: &mut App) {
+        for turn_id in turn_ids {
+            if self.mirrors.iter().any(|mirror| mirror.turn_id == *turn_id) {
+                continue;
+            }
+            let Some(turn) = self.transcript.read(cx).turn(*turn_id).cloned() else {
+                continue;
+            };
+            self.mirrors.push(self.mirror_from_turn(&turn, cx));
+        }
+    }
+
+    /// Recompute the presentation flags derived from the canonical turn
+    /// (`copyable`) after the transcript changed under an existing mirror.
+    fn refresh_turn_flags(&mut self, turn_id: TurnId, cx: &App) {
+        let Some(turn) = self.transcript.read(cx).turn(turn_id) else {
+            return;
+        };
+        let copyable = stream_ended(turn) && has_copyable_text(turn);
+        let Some(mirror) = self
+            .mirrors
+            .iter_mut()
+            .find(|mirror| mirror.turn_id == turn_id)
+        else {
+            return;
+        };
+        mirror.copyable = copyable;
+    }
+
+    fn insert_part_mirror(&mut self, turn_id: TurnId, part_id: PartId, cx: &mut App) {
+        let Some((part, order)) = ({
+            let transcript = self.transcript.read(cx);
+            transcript.turn(turn_id).map(|turn| {
+                (
+                    turn.parts
+                        .iter()
+                        .find(|part| part.part_id == part_id)
+                        .cloned(),
+                    turn.parts
+                        .iter()
+                        .map(|part| part.part_id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        }) else {
+            return;
+        };
+        let Some(part) = part else {
+            return;
+        };
+        let Some(mirror) = self
+            .mirrors
+            .iter_mut()
+            .find(|mirror| mirror.turn_id == turn_id)
+        else {
+            return;
+        };
+        if mirror
+            .parts
+            .iter()
+            .any(|existing| existing.part_id() == part_id)
+        {
+            return;
+        }
+        mirror
+            .parts
+            .push(inserted_part_mirror(&part, &self.markdown_presentation, cx));
+        mirror.parts.sort_by_key(|existing| {
+            order
+                .iter()
+                .position(|id| *id == existing.part_id())
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    fn apply_part_change(
+        &mut self,
+        turn_id: TurnId,
+        part_id: PartId,
+        change: PartChange,
+        delta: &SharedString,
+        cx: &mut App,
+    ) {
+        let replace_prose = (change == PartChange::Replace).then(|| {
+            self.transcript.read(cx).turn(turn_id).and_then(|turn| {
+                turn.parts
+                    .iter()
+                    .find(|part| part.part_id == part_id)
+                    .and_then(|part| part.source.prose_text().map(str::to_string))
+            })
+        });
+        let replace_reasoning = (change == PartChange::Replace).then(|| {
+            self.transcript.read(cx).turn(turn_id).and_then(|turn| {
+                turn.parts.iter().find_map(|part| match &part.source {
+                    PartSource::Reasoning { reasoning, .. } if part.part_id == part_id => {
+                        Some(reasoning.display.clone())
+                    }
+                    _ => None,
+                })
+            })
+        });
+        let Some(mirror) = self
+            .mirrors
+            .iter_mut()
+            .find(|mirror| mirror.turn_id == turn_id)
+        else {
+            return;
+        };
+        let Some(part) = mirror
+            .parts
+            .iter_mut()
+            .find(|part| part.part_id() == part_id)
+        else {
+            return;
+        };
+        match (part, change) {
+            (PartMirror::Prose { text, body, .. }, PartChange::Append) => {
+                text.push_str(delta);
+                body.push_str(delta, cx);
+            }
+            (PartMirror::Prose { text, body, .. }, PartChange::Replace) => {
+                if let Some(source) = replace_prose.flatten() {
+                    *text = source.clone();
+                    body.set_text(&source, cx);
+                }
+            }
+            (PartMirror::Prose { body, .. }, PartChange::Finished) => body.finish(cx),
+            (PartMirror::Reasoning { display, trace, .. }, PartChange::Append) => {
+                display.push_str(delta);
+                trace
+                    .get_or_insert_with(|| {
+                        ReasoningTrace::new_with_presentation(
+                            next_body_owner_id(),
+                            &self.markdown_presentation,
+                            cx,
+                        )
+                    })
+                    .push(delta, cx);
+            }
+            (PartMirror::Reasoning { display, trace, .. }, PartChange::Replace) => {
+                let source = replace_reasoning.flatten().unwrap_or_default();
+                *display = source.clone();
+                if source.is_empty() {
+                    *trace = None;
+                } else if let Some(trace) = trace.as_mut() {
+                    trace.set_source(&source, cx);
+                } else {
+                    *trace = Some(ReasoningTrace::completed_with_presentation(
+                        source,
+                        next_body_owner_id(),
+                        &self.markdown_presentation,
+                        cx,
+                    ));
+                }
+            }
+            (
+                PartMirror::Reasoning {
+                    finished,
+                    trace: Some(trace),
+                    ..
+                },
+                PartChange::Finished,
+            ) => {
+                *finished = true;
+                trace.finish(cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn replace_turn_mirror(&mut self, turn_id: TurnId, cx: &mut App) {
+        let Some(turn) = self.transcript.read(cx).turn(turn_id).cloned() else {
+            return;
+        };
+        let Some(mirror) = self
+            .mirrors
+            .iter_mut()
+            .find(|mirror| mirror.turn_id == turn_id)
+        else {
+            self.mirrors.push(self.mirror_from_turn(&turn, cx));
+            return;
+        };
+        let mut previous = std::mem::take(&mut mirror.parts)
+            .into_iter()
+            .map(|part| (part.part_id(), part))
+            .collect::<BTreeMap<_, _>>();
+        mirror.parts = turn
+            .parts
+            .iter()
+            .map(|part| match previous.remove(&part.part_id) {
+                Some(existing) => {
+                    reuse_part_mirror(existing, part, &self.markdown_presentation, cx)
+                }
+                None => part_mirror(part, &self.markdown_presentation, cx),
+            })
+            .collect();
+        mirror.role = turn.role;
+        mirror.error = turn.error.clone().map(|error| TurnError::new(error, cx));
+    }
+
+    fn mirror_from_turn(&self, turn: &Turn, cx: &mut App) -> TurnMirror {
+        TurnMirror {
+            turn_id: turn.turn_id,
+            role: turn.role,
+            parts: turn
+                .parts
+                .iter()
+                .map(|part| part_mirror(part, &self.markdown_presentation, cx))
+                .collect(),
+            error: turn.error.clone().map(|error| TurnError::new(error, cx)),
+            copyable: stream_ended(turn) && has_copyable_text(turn),
+        }
+    }
+
+    fn copyable_message_text(&self, turn_id: TurnId, cx: &App) -> Option<SharedString> {
+        self.transcript.read(cx).copyable_text(turn_id)
+    }
+
     fn reasoning_copy_source(
         &self,
-        message_ui_id: u64,
-        reasoning_ui_id: u64,
+        turn_id: TurnId,
+        part_id: PartId,
+        cx: &App,
     ) -> Option<SharedString> {
-        self.message_by_ui_id(message_ui_id).and_then(|message| {
-            message.parts.iter().find_map(|part| match part {
-                MessagePart::Reasoning {
-                    ui_id,
-                    reasoning,
-                    trace: Some(_),
-                    ..
-                } if *ui_id == reasoning_ui_id => Some(reasoning.display.clone().into()),
+        self.transcript.read(cx).turn(turn_id).and_then(|turn| {
+            turn.parts.iter().find_map(|part| match &part.source {
+                PartSource::Reasoning { reasoning, .. } if part.part_id == part_id => {
+                    Some(reasoning.display.clone().into())
+                }
                 _ => None,
             })
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_pending_reply_for_test(
-        &mut self,
-        dropped: std::rc::Rc<std::cell::Cell<bool>>,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self.runtime.update(cx, |runtime, cx| {
-            runtime.request_generation = runtime
-                .current_generation()
-                .next()
-                .expect("test request generation");
-            runtime.generating = true;
-            runtime.publish_state(cx);
-            runtime.snapshot()
-        });
-        self.apply_runtime_snapshot(snapshot);
-        self.runtime.update(cx, |runtime, cx| {
-            runtime.reply_task = Some(assistant::ReplyTask::pending_for_test(dropped, cx));
-        });
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seed_pending_turn_for_test(
-        &mut self,
-        user_message: LlmMessage,
-        selection: ModelSelection,
-        turn_id: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) -> crate::session::ChatTurnStart {
-        let turn_id = turn_id.into();
-        let start = self
-            .runtime
-            .read(cx)
-            .session_controller_for_test()
-            .lock()
-            .expect("test controller lock")
-            .begin_turn(user_message.clone(), selection, turn_id.clone())
-            .expect("persist test turn begin");
-        self.mark_turn_pending_for_test(start.session_id.clone(), turn_id, cx);
-        self.messages
-            .push(Message::from_canonical_with_presentation(
-                user_message,
-                &self.markdown_presentation,
-                cx,
-            ));
-        self.messages.push(Message::empty(Role::Assistant));
-        start
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_turn_pending_for_test(
-        &mut self,
-        session_id: SessionId,
-        turn_id: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let snapshot = self.runtime.update(cx, |runtime, cx| {
-            runtime.mark_turn_pending_for_test(session_id, turn_id, cx);
-            runtime.snapshot()
-        });
-        self.apply_runtime_snapshot(snapshot);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mark_generating_for_test(&mut self, cx: &mut Context<Self>) {
-        let snapshot = self.runtime.update(cx, |runtime, cx| {
-            runtime.mark_generating_for_test(cx);
-            runtime.snapshot()
-        });
-        self.apply_runtime_snapshot(snapshot);
     }
 
     #[cfg(test)]
@@ -874,43 +870,533 @@ impl ChatView {
     }
 
     #[cfg(test)]
-    pub(in crate::chat) fn finish_current_reply_with_terminal_for_test(
-        &mut self,
-        message: Option<IndexedMessage>,
-        terminal: ChatTurnTerminal,
-        error: Option<GatewayError>,
-        cx: &mut Context<Self>,
-    ) {
-        let generation = self.runtime_snapshot.request_generation();
-        self.finish_reply_with_terminal(generation, message, terminal, error, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn start_durable_pending_reply_for_test(
-        &mut self,
-        dropped: std::rc::Rc<std::cell::Cell<bool>>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.selection = Some(ModelSelection {
-            profile_id: "fixture-profile".into(),
-            model_id: "fixture-model".into(),
-        });
-        self.selection_available = true;
-        self.next_reply_drop_flag = Some(dropped);
-        self.submit("close during generation".to_string(), window, cx)
-    }
-
-    #[cfg(test)]
     pub(crate) fn durable_session_id_for_test(&self) -> Option<crate::session::SessionId> {
         self.runtime_snapshot.session_id().cloned()
     }
 
-    #[cfg(test)]
-    pub(crate) fn persist_session_for_test(
+    pub fn select_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+        if self.selection.as_ref() == Some(&selection) {
+            return;
+        }
+        providers::select_model(selection.clone(), &self.catalog_handle, cx);
+        self.set_selection(selection, cx);
+    }
+
+    pub(crate) fn set_selection(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
+        if !self.update_selection(selection) {
+            return;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn restore_session(
         &mut self,
+        session_id: &SessionId,
+        state: &crate::session::ResolvedSessionState,
         cx: &mut Context<Self>,
-    ) -> crate::session::SessionId {
+    ) -> Result<Option<ModelSelection>, ChatRestoreError> {
+        let (result, snapshot) = self.runtime.update(cx, |runtime, cx| {
+            let result = runtime.restore_session(session_id, state, cx);
+            (result, runtime.snapshot())
+        });
+        self.apply_runtime_snapshot(snapshot);
+        // Turns arrive through the deferred `TranscriptEvent::Reset`. Advancing
+        // `transcript_snapshot` here would make the view skip that event.
+        if let Ok(Some(selection)) = &result {
+            self.update_selection(selection.clone());
+        }
+        cx.notify();
+        result
+    }
+
+    fn update_selection(&mut self, selection: ModelSelection) -> bool {
+        if self.selection.as_ref() == Some(&selection) {
+            return false;
+        }
+        self.selection = Some(selection);
+        self.selection_available = true;
+        true
+    }
+
+    fn sync_selection_availability(&mut self) {
+        self.selection_available =
+            providers::selection_is_available_from(self.selection.as_ref(), &self.catalog_snapshot);
+    }
+}
+
+fn inserted_part_mirror(
+    part: &Part,
+    presentation: &MarkdownPresentation,
+    cx: &mut App,
+) -> PartMirror {
+    if part.finished {
+        return part_mirror(part, presentation, cx);
+    }
+    match &part.source {
+        // Unfinished inserts start empty. Stream batches publish Insert then
+        // Append after the model already contains the delta; seeding the body
+        // from `part` here would double the text on Append.
+        PartSource::Prose { .. } => PartMirror::Prose {
+            part_id: part.part_id,
+            text: String::new(),
+            body: MarkdownBody::new_streaming_with_presentation(
+                "",
+                next_body_owner_id(),
+                presentation,
+                cx,
+            ),
+        },
+        PartSource::Reasoning { .. } => PartMirror::Reasoning {
+            part_id: part.part_id,
+            content_index: part.content_index,
+            display: String::new(),
+            finished: false,
+            trace: None,
+        },
+        PartSource::ToolCall { .. } | PartSource::ToolResult(_) => {
+            part_mirror(part, presentation, cx)
+        }
+    }
+}
+
+fn part_mirror(part: &Part, presentation: &MarkdownPresentation, cx: &mut App) -> PartMirror {
+    let owner_id = next_body_owner_id();
+    match &part.source {
+        PartSource::Prose { text, .. } => {
+            let body = if part.finished {
+                MarkdownBody::new_with_presentation(text, owner_id, presentation, cx)
+            } else {
+                MarkdownBody::new_streaming_with_presentation(text, owner_id, presentation, cx)
+            };
+            PartMirror::Prose {
+                part_id: part.part_id,
+                text: text.clone(),
+                body,
+            }
+        }
+        PartSource::Reasoning { reasoning, .. } => {
+            let trace = if reasoning.display.is_empty() {
+                None
+            } else if part.finished {
+                Some(ReasoningTrace::completed_with_presentation(
+                    reasoning.display.clone(),
+                    owner_id,
+                    presentation,
+                    cx,
+                ))
+            } else {
+                let mut trace = ReasoningTrace::new_with_presentation(owner_id, presentation, cx);
+                trace.push(&reasoning.display, cx);
+                Some(trace)
+            };
+            PartMirror::Reasoning {
+                part_id: part.part_id,
+                content_index: part.content_index,
+                display: reasoning.display.clone(),
+                finished: part.finished,
+                trace,
+            }
+        }
+        PartSource::ToolCall { name, .. } => PartMirror::ToolCall {
+            part_id: part.part_id,
+            name: name.clone(),
+        },
+        PartSource::ToolResult(tool_result) => PartMirror::ToolResult {
+            part_id: part.part_id,
+            body: MarkdownBody::new_with_presentation(
+                &tool_result.content,
+                owner_id,
+                presentation,
+                cx,
+            ),
+        },
+    }
+}
+
+fn reuse_part_mirror(
+    existing: PartMirror,
+    part: &Part,
+    presentation: &MarkdownPresentation,
+    cx: &mut App,
+) -> PartMirror {
+    match (existing, &part.source) {
+        (
+            PartMirror::Prose {
+                part_id,
+                text: _,
+                mut body,
+            },
+            PartSource::Prose { text: source, .. },
+        ) => {
+            let text = source.clone();
+            body.set_text(source, cx);
+            if part.finished {
+                body.finish(cx);
+            }
+            PartMirror::Prose {
+                part_id,
+                text,
+                body,
+            }
+        }
+        (
+            PartMirror::Reasoning {
+                part_id,
+                display: _,
+                trace: Some(mut trace),
+                ..
+            },
+            PartSource::Reasoning { reasoning, .. },
+        ) if !reasoning.display.is_empty() => {
+            let display = reasoning.display.clone();
+            if trace.source_len() != reasoning.display.len() {
+                trace.set_source(&reasoning.display, cx);
+            }
+            trace.finish(cx);
+            PartMirror::Reasoning {
+                part_id,
+                content_index: part.content_index,
+                display,
+                finished: true,
+                trace: Some(trace),
+            }
+        }
+        (PartMirror::ToolCall { part_id, .. }, PartSource::ToolCall { name, .. }) => {
+            PartMirror::ToolCall {
+                part_id,
+                name: name.clone(),
+            }
+        }
+        (PartMirror::ToolResult { part_id, mut body }, PartSource::ToolResult(tool_result)) => {
+            body.set_text(&tool_result.content, cx);
+            PartMirror::ToolResult { part_id, body }
+        }
+        (_, _) => part_mirror(part, presentation, cx),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Test-only drivers for the conversation behind a [`ChatView`].
+    //!
+    //! [`ChatView`] itself owns no write methods: every helper here writes
+    //! through [`Transcript`] or [`ConversationRuntime`] and then drives the
+    //! presentation mirror with the same update path production events take.
+
+    use self::assistant::ReplyTask;
+    use self::conversation_runtime::ConversationRequestGeneration;
+    use super::*;
+    use crate::session::ChatTurnStart;
+
+    fn apply_transcript_updates(
+        chat: &mut ChatView,
+        updates: Vec<TranscriptUpdate>,
+        cx: &mut Context<ChatView>,
+    ) {
+        for update in updates {
+            chat.handle_transcript_update(&update, cx);
+        }
+    }
+
+    pub(crate) fn apply_stream(
+        chat: &mut ChatView,
+        events: &[ConversationStreamEvent],
+        cx: &mut Context<ChatView>,
+    ) {
+        let updates = chat.transcript.update(cx, |transcript, cx| {
+            transcript.apply_stream_batch(events, cx)
+        });
+        apply_transcript_updates(chat, updates, cx);
+        chat.remeasure_latest_message();
+        chat.follow_stream();
+    }
+
+    pub(crate) fn push_canonical(
+        chat: &mut ChatView,
+        message: LlmMessage,
+        cx: &mut Context<ChatView>,
+    ) {
+        let update = chat.transcript.update(cx, |transcript, cx| {
+            transcript.push_canonical_turn(message, cx)
+        });
+        apply_transcript_updates(chat, vec![update], cx);
+    }
+
+    pub(crate) fn push_empty(chat: &mut ChatView, role: Role, cx: &mut Context<ChatView>) {
+        let update = chat
+            .transcript
+            .update(cx, |transcript, cx| transcript.push_empty_turn(role, cx));
+        apply_transcript_updates(chat, vec![update], cx);
+    }
+
+    pub(crate) fn append_text(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: String,
+        delta: &str,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::TextDelta {
+                content_index,
+                id,
+                delta: delta.to_string(),
+            }],
+            cx,
+        );
+    }
+
+    pub(crate) fn start_text(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: String,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::TextStarted { content_index, id }],
+            cx,
+        );
+    }
+
+    pub(crate) fn finish_text(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: &str,
+        replay: Option<ProviderMetadata>,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::TextFinished {
+                content_index,
+                id: id.to_string(),
+                replay,
+            }],
+            cx,
+        );
+    }
+
+    pub(crate) fn append_reasoning(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: String,
+        delta: &str,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::ReasoningDelta {
+                content_index,
+                id,
+                delta: delta.to_string(),
+            }],
+            cx,
+        );
+    }
+
+    pub(crate) fn finish_reasoning(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: &str,
+        replay: Option<ProviderMetadata>,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::ReasoningFinished {
+                content_index,
+                id: id.to_string(),
+                replay,
+            }],
+            cx,
+        );
+    }
+
+    pub(crate) fn start_tool_call(
+        chat: &mut ChatView,
+        content_index: usize,
+        index: usize,
+        id: String,
+        name: String,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::ToolCallStarted {
+                content_index,
+                index,
+                id,
+                name,
+            }],
+            cx,
+        );
+    }
+
+    pub(crate) fn start_reasoning(
+        chat: &mut ChatView,
+        content_index: usize,
+        id: String,
+        cx: &mut Context<ChatView>,
+    ) {
+        apply_stream(
+            chat,
+            &[ConversationStreamEvent::ReasoningStarted { content_index, id }],
+            cx,
+        );
+    }
+
+    pub(crate) fn finish_stream_batch(chat: &mut ChatView) {
+        chat.remeasure_latest_message();
+        chat.follow_stream();
+    }
+
+    pub(crate) fn finish_reply(
+        chat: &mut ChatView,
+        message: Option<IndexedMessage>,
+        error: Option<GatewayError>,
+        cx: &mut Context<ChatView>,
+    ) {
+        let update = chat.transcript.update(cx, |transcript, cx| {
+            transcript.finish_turn(message, error, cx)
+        });
+        if let Some(update) = update {
+            chat.handle_transcript_update(&update, cx);
+        }
+        chat.follow_stream();
+        chat.remeasure_latest_message();
+        let snapshot = chat.runtime.update(cx, |runtime, cx| {
+            runtime.generating = false;
+            runtime.pending_turn_id = None;
+            runtime.terminal_persistence = None;
+            runtime.publish_state(cx);
+            runtime.snapshot()
+        });
+        chat.apply_runtime_snapshot(snapshot);
+    }
+
+    pub(crate) fn finish_reply_with_terminal(
+        chat: &mut ChatView,
+        generation: ConversationRequestGeneration,
+        message: Option<IndexedMessage>,
+        terminal: ChatTurnTerminal,
+        error: Option<GatewayError>,
+        cx: &mut Context<ChatView>,
+    ) {
+        if generation != chat.runtime_snapshot.request_generation() {
+            return;
+        }
+        let update = chat.transcript.update(cx, |transcript, cx| {
+            transcript.finish_turn(message, error, cx)
+        });
+        if let Some(update) = update {
+            chat.handle_transcript_update(&update, cx);
+        }
+        chat.follow_stream();
+        chat.remeasure_latest_message();
+        let snapshot = chat.runtime.update(cx, |runtime, cx| {
+            runtime.finish_terminal(generation, terminal, cx);
+            runtime.snapshot()
+        });
+        chat.apply_runtime_snapshot(snapshot);
+    }
+
+    pub(crate) fn finish_current_reply_with_terminal(
+        chat: &mut ChatView,
+        message: Option<IndexedMessage>,
+        terminal: ChatTurnTerminal,
+        error: Option<GatewayError>,
+        cx: &mut Context<ChatView>,
+    ) {
+        let generation = chat.runtime_snapshot.request_generation();
+        finish_reply_with_terminal(chat, generation, message, terminal, error, cx);
+    }
+
+    pub(crate) fn start_pending_reply(
+        chat: &mut ChatView,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        cx: &mut Context<ChatView>,
+    ) {
+        let snapshot = chat.runtime.update(cx, |runtime, cx| {
+            runtime.request_generation = runtime
+                .current_generation()
+                .next()
+                .expect("test request generation");
+            runtime.generating = true;
+            runtime.publish_state(cx);
+            runtime.snapshot()
+        });
+        chat.apply_runtime_snapshot(snapshot);
+        chat.runtime.update(cx, |runtime, cx| {
+            runtime.reply_task = Some(ReplyTask::pending_for_test(dropped, cx));
+        });
+    }
+
+    pub(crate) fn seed_pending_turn(
+        chat: &mut ChatView,
+        user_message: LlmMessage,
+        selection: ModelSelection,
+        turn_id: impl Into<String>,
+        cx: &mut Context<ChatView>,
+    ) -> ChatTurnStart {
+        let turn_id = turn_id.into();
+        let start = chat
+            .runtime
+            .read(cx)
+            .session_controller_for_test()
+            .lock()
+            .expect("test controller lock")
+            .begin_turn(user_message.clone(), selection, turn_id.clone())
+            .expect("persist test turn begin");
+        mark_turn_pending(chat, start.session_id.clone(), turn_id, cx);
+        let updates = chat.transcript.update(cx, |transcript, cx| {
+            let (_, update) = transcript.begin_turn(user_message, cx);
+            vec![update]
+        });
+        apply_transcript_updates(chat, updates, cx);
+        start
+    }
+
+    pub(crate) fn mark_turn_pending(
+        chat: &mut ChatView,
+        session_id: SessionId,
+        turn_id: impl Into<String>,
+        cx: &mut Context<ChatView>,
+    ) {
+        let snapshot = chat.runtime.update(cx, |runtime, cx| {
+            runtime.mark_turn_pending_for_test(session_id, turn_id, cx);
+            runtime.snapshot()
+        });
+        chat.apply_runtime_snapshot(snapshot);
+    }
+
+    pub(crate) fn mark_generating(chat: &mut ChatView, cx: &mut Context<ChatView>) {
+        let snapshot = chat.runtime.update(cx, |runtime, cx| {
+            runtime.mark_generating_for_test(cx);
+            runtime.snapshot()
+        });
+        chat.apply_runtime_snapshot(snapshot);
+    }
+
+    pub(crate) fn start_durable_pending_reply(
+        chat: &mut ChatView,
+        dropped: std::rc::Rc<std::cell::Cell<bool>>,
+        window: &mut Window,
+        cx: &mut Context<ChatView>,
+    ) -> bool {
+        chat.selection = Some(ModelSelection {
+            profile_id: "fixture-profile".into(),
+            model_id: "fixture-model".into(),
+        });
+        chat.selection_available = true;
+        chat.runtime.update(cx, |runtime, _| {
+            runtime.next_reply_drop_flag = Some(dropped);
+        });
+        chat.submit("close during generation".to_string(), window, cx)
+    }
+
+    pub(crate) fn persist_session(chat: &mut ChatView, cx: &mut Context<ChatView>) -> SessionId {
         let user_message = LlmMessage {
             role: crate::llm::Role::User,
             content: vec![ContentBlock::Text {
@@ -923,7 +1409,7 @@ impl ChatView {
             profile_id: "fixture-profile".into(),
             model_id: "fixture-model".into(),
         };
-        let (start, snapshot) = self.runtime.update(cx, |runtime, cx| {
+        let (start, snapshot) = chat.runtime.update(cx, |runtime, cx| {
             let controller = runtime
                 .session_controller
                 .as_ref()
@@ -940,70 +1426,9 @@ impl ChatView {
             runtime.publish_state(cx);
             (start, runtime.snapshot())
         });
-        self.apply_runtime_snapshot(snapshot);
-        cx.emit(ChatEvent::SessionBound(start.session_id.clone()));
+        chat.apply_runtime_snapshot(snapshot);
         start.session_id
     }
-
-    pub fn select_model(&mut self, selection: ModelSelection, cx: &mut Context<Self>) {
-        if !self.update_selection(selection.clone()) {
-            return;
-        }
-        providers::select_model(selection.clone(), &self.catalog_handle, cx);
-        cx.emit(ChatEvent::SelectionChanged(selection));
-        cx.notify();
-    }
-
-    fn update_selection(&mut self, selection: ModelSelection) -> bool {
-        if self.selection.as_ref() == Some(&selection) {
-            return false;
-        }
-        self.selection = Some(selection);
-        self.selection_available = true;
-        true
-    }
-
-    pub fn selection(&self) -> Option<ModelSelection> {
-        self.selection.clone()
-    }
-
-    /// Whether this view is currently streaming a provider reply.  Used by the
-    /// workspace sidebar to annotate the row without deriving other row data
-    /// from the view.
-    pub(crate) fn is_generating(&self) -> bool {
-        self.runtime_snapshot.is_generating()
-    }
-
-    fn sync_selection_availability(&mut self) {
-        self.selection_available =
-            providers::selection_is_available_from(self.selection.as_ref(), &self.catalog_snapshot);
-    }
-}
-
-impl EventEmitter<ChatEvent> for ChatView {}
-
-fn is_replayable(message: &LlmMessage) -> bool {
-    message.role != crate::llm::Role::Assistant || !message.content.is_empty()
-}
-
-fn derive_title(text: &str) -> SharedString {
-    let mut cleaned = text.replace('\n', " ");
-    if cleaned.chars().count() > 40 {
-        cleaned = cleaned.chars().take(37).collect::<String>() + "...";
-    }
-    if cleaned.trim().is_empty() {
-        t!("chat.default_title").to_string().into()
-    } else {
-        cleaned.into()
-    }
-}
-
-/// Derive a sidebar title from the first user message text.  Exported so the
-/// workspace can compute a title from a [`ResolvedSessionState`] before the
-/// hydrated view's first event callback fires.
-#[allow(dead_code)]
-pub(crate) fn derive_chat_title(text: &str) -> SharedString {
-    derive_title(text)
 }
 
 #[cfg(test)]

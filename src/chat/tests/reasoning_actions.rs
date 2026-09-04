@@ -11,27 +11,23 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "thinking", cx);
-            let reasoning = this
-                .messages
-                .last_mut()
-                .and_then(|turn| reasoning_part_mut(turn))
-                .expect("trace");
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            let reasoning = reasoning_part_mut(this).expect("trace");
             // Collapse it by hand mid-stream, then re-open it.
             reasoning.toggle();
             assert!(!reasoning.is_expanded());
             reasoning.toggle();
             assert!(reasoning.is_expanded());
 
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "answer", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "answer", cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("trace");
-        assert!(reasoning_states(turn)[0].1, "the stream still ended");
+        assert!(reasoning_states(turn, cx)[0].1, "the stream still ended");
         assert!(
             reasoning.is_expanded(),
             "explicit user intent outlives the auto-collapse"
@@ -54,9 +50,9 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
     // Reason, then answer: that collapses the card down to its trigger.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "The answer.", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
     cx.run_until_parked();
@@ -100,10 +96,10 @@ fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
             for line in 0..30 {
                 let delta = format!("Reasoning line {line}.\n\n");
                 expected.push_str(&delta);
-                this.append_stream_reasoning(0, "reasoning-0".into(), &delta, cx);
+                test_support::append_reasoning(this, 0, "reasoning-0".into(), &delta, cx);
             }
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "The answer.", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
     cx.run_until_parked();
@@ -140,10 +136,7 @@ fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
     // rather than inside it, and `Clipboard` stops propagation, so a copy must
     // leave the card exactly as the user left it.
     assert!(
-        chat.read_with(cx, |this, _| this
-            .messages
-            .last()
-            .and_then(|turn| reasoning_part(turn))
+        chat.read_with(cx, |this, _| reasoning_part(this)
             .is_some_and(|reasoning| !reasoning.is_expanded())),
         "copying must not toggle the card open"
     );
@@ -168,15 +161,12 @@ fn the_copy_button_appears_only_once_reasoning_has_ended(cx: &mut TestAppContext
     // An empty protocol delta is not evidence that reasoning started.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "", cx)
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "", cx)
         });
     });
     draw(cx);
     assert!(
-        chat.read_with(cx, |this, _| this
-            .messages
-            .last()
-            .is_some_and(|turn| reasoning_part(turn).is_none())),
+        chat.read_with(cx, |this, _| reasoning_part(this).is_none()),
         "empty deltas must not allocate a trace"
     );
     assert!(
@@ -188,7 +178,7 @@ fn the_copy_button_appears_only_once_reasoning_has_ended(cx: &mut TestAppContext
     // out.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a thought", cx)
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx)
         });
     });
     draw(cx);
@@ -200,7 +190,7 @@ fn the_copy_button_appears_only_once_reasoning_has_ended(cx: &mut TestAppContext
     // The stream boundary is what earns the button.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx)
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx)
         });
     });
     draw(cx);
@@ -224,7 +214,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     // Reasoning streams first; there is still no prose to copy.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a thought", cx)
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx)
         });
     });
     redraw(cx);
@@ -237,8 +227,8 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     // streaming, so a copy offered now would freeze a partial answer.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "The answer.", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
     redraw(cx);
@@ -250,7 +240,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     // Ending the stream is what earns the button.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_stream_text(1, "text-0", None, cx)
+            test_support::finish_text(this, 1, "text-0", None, cx)
         });
     });
     redraw(cx);
@@ -272,14 +262,14 @@ fn the_message_copy_button_copies_the_whole_answer(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a private thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "First part.", cx);
-            this.append_stream_text(2, "text-1".into(), "Second part.", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a private thought", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "First part.", cx);
+            test_support::append_text(this, 2, "text-1".into(), "Second part.", cx);
             // End the stream so the turn becomes copyable: the copy gate
             // requires every streamed block to have finished.
-            this.finish_stream_text(1, "text-0", None, cx);
-            this.finish_stream_text(2, "text-1", None, cx);
+            test_support::finish_text(this, 1, "text-0", None, cx);
+            test_support::finish_text(this, 2, "text-1", None, cx);
         });
     });
     redraw(cx);
@@ -321,8 +311,14 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
     // Prose lands and its stream ends, so the message-level button is up.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, "text-0".into(), "Partial answer before the failure.", cx);
-            this.finish_stream_text(0, "text-0", None, cx);
+            test_support::append_text(
+                this,
+                0,
+                "text-0".into(),
+                "Partial answer before the failure.",
+                cx,
+            );
+            test_support::finish_text(this, 0, "text-0", None, cx);
         });
     });
     redraw(cx);
@@ -334,12 +330,16 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
     // The turn then fails; the error card takes over the copy affordance.
     let error = crate::llm::GatewayError::http(503, Some("unavailable".into()));
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.finish_reply(None, Some(error), cx));
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(this, None, Some(error), cx)
+        });
     });
     redraw(cx);
     assert!(
-        chat.read_with(cx, |this, _| this
-            .messages
+        chat.read_with(cx, |this, app| this
+            .transcript
+            .read(app)
+            .turns()
             .last()
             .is_some_and(|turn| turn.error.is_some())),
         "the failed turn carries its error card"
@@ -362,10 +362,10 @@ fn hovering_a_reasoning_card_reveals_the_message_copy_button(cx: &mut TestAppCon
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "a private thought", cx);
-            this.finish_stream_reasoning(0, "reasoning-0", None, cx);
-            this.append_stream_text(1, "text-0".into(), "The visible answer.", cx);
-            this.finish_stream_text(1, "text-0", None, cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a private thought", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "The visible answer.", cx);
+            test_support::finish_text(this, 1, "text-0", None, cx);
         });
     });
     redraw(cx);
@@ -405,9 +405,15 @@ fn a_user_turn_gets_the_message_copy_button_too(cx: &mut TestAppContext) {
     // the copy gate treats it as settled.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::empty(Role::User));
-            this.append_stream_text(0, "text-0".into(), "What is the capital of France?", cx);
-            this.finish_stream_text(0, "text-0", None, cx);
+            test_support::push_empty(this, Role::User, cx);
+            test_support::append_text(
+                this,
+                0,
+                "text-0".into(),
+                "What is the capital of France?",
+                cx,
+            );
+            test_support::finish_text(this, 0, "text-0", None, cx);
         });
     });
     redraw(cx);
@@ -449,14 +455,14 @@ fn a_turn_without_reasoning_creates_only_its_text_part(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, "text-0".into(), "answer", cx);
+            test_support::append_text(this, 0, "text-0".into(), "answer", cx);
         });
     });
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
-        assert!(matches!(
-            turn.parts.as_slice(),
-            [MessagePart::Text { text, .. }] if text == "answer"
-        ));
+        let turn = chat.read(cx);
+        assert_eq!(
+            last_turn(turn, cx).parts[0].source.prose_text(),
+            Some("answer")
+        );
     });
 }

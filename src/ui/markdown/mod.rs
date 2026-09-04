@@ -195,6 +195,12 @@ impl MarkdownBody {
         Self::new_with_presentation_and_streaming(source, owner_id, presentation, true, cx)
     }
 
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn owner_id(&self) -> u64 {
+        self.extension_context.owner_id()
+    }
+
     fn new_with_presentation_and_streaming(
         source: &str,
         owner_id: u64,

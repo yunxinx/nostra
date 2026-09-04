@@ -8,7 +8,8 @@ fn block_math_after_markdown_text_is_rendered_as_its_own_block(cx: &mut TestAppC
     let markdown = "上文\n\n$$\n\\sum_{n=1}^{\\infty} \\frac{1}{n^2}\n$$\n\n下文";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -18,16 +19,14 @@ fn block_math_after_markdown_text_is_rendered_as_its_own_block(cx: &mut TestAppC
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$$").expect("block math delimiter"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$$").expect("block math delimiter"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -66,7 +65,8 @@ fn standalone_same_line_display_math_is_centered_as_a_block(cx: &mut TestAppCont
     let markdown = "上文\n\n$$x^2 + y^2$$\n\n下文";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -76,16 +76,14 @@ fn standalone_same_line_display_math_is_centered_as_a_block(cx: &mut TestAppCont
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$$").expect("display formula"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$$").expect("display formula"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -108,7 +106,8 @@ fn blockquote_display_math_uses_container_free_formula_source(cx: &mut TestAppCo
     let markdown = "> $$\n> x^2 + y^2\n> $$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -118,16 +117,14 @@ fn blockquote_display_math_uses_container_free_formula_source(cx: &mut TestAppCo
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$$").expect("display formula"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$$").expect("display formula"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -138,9 +135,7 @@ fn blockquote_display_math_uses_container_free_formula_source(cx: &mut TestAppCo
 
     let selected_all = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
-                panic!("assistant text part")
-            };
+            let (_, _, body) = prose_at(this, 0, 0);
             body.select_all_text(cx)
         })
     });
@@ -154,7 +149,8 @@ fn list_display_math_uses_container_free_formula_source(cx: &mut TestAppContext)
     let markdown = "- $$\n  x^2 + y^2\n  $$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -164,16 +160,14 @@ fn list_display_math_uses_container_free_formula_source(cx: &mut TestAppContext)
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$$").expect("display formula"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$$").expect("display formula"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -184,9 +178,7 @@ fn list_display_math_uses_container_free_formula_source(cx: &mut TestAppContext)
 
     let selected_all = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
-                panic!("assistant text part")
-            };
+            let (_, _, body) = prose_at(this, 0, 0);
             body.select_all_text(cx)
         })
     });
@@ -200,7 +192,8 @@ fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext
     let markdown = "$$\nx^2 + y^2\n$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -210,16 +203,14 @@ fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        ui_id
     });
     let formula_selector: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-0").into_boxed_str());
@@ -238,9 +229,7 @@ fn display_formula_participates_in_reverse_drag_and_copy(cx: &mut TestAppContext
 
     let selected_all = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
-                panic!("assistant text part")
-            };
+            let (_, _, body) = prose_at(this, 0, 0);
             body.select_all_text(cx)
         })
     });
@@ -254,7 +243,8 @@ fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut Te
     let markdown = "根据**定义**：\n$$\nE = mc^2\n$$";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -264,16 +254,14 @@ fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut Te
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$$").expect("display formula"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$$").expect("display formula"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -289,9 +277,7 @@ fn adjacent_markdown_and_display_math_keep_their_ordered_inline_flow(cx: &mut Te
 
     let selected_all = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[0].parts[0] else {
-                panic!("assistant text part")
-            };
+            let (_, _, body) = prose_at(this, 0, 0);
             body.select_all_text(cx)
         })
     });
@@ -306,7 +292,8 @@ fn inline_math_does_not_turn_markdown_marks_into_literal_text(cx: &mut TestAppCo
     let markdown = "**Bold** before $x^2$ and after";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -316,16 +303,14 @@ fn inline_math_does_not_turn_markdown_marks_into_literal_text(cx: &mut TestAppCo
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, formula_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, text.find("$x^2$").expect("inline math"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, text.find("$x^2$").expect("inline math"))
     });
     let formula: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
@@ -356,12 +341,14 @@ fn streamed_list_continuation_keeps_surrounding_math_renderable(cx: &mut TestApp
     let markdown = "before $a$\n\n- item\n    $$\n    x^2\n    $$\n\nafter $b$";
     let id = "streamed-list-continuation-math".to_string();
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.start_stream_text(0, id.clone(), cx));
+        chat.update(cx, |this, cx| {
+            test_support::start_text(this, 0, id.clone(), cx)
+        });
     });
     for chunk in markdown.split_inclusive('\n') {
         cx.update(|_, cx| {
             chat.update(cx, |this, cx| {
-                this.append_stream_text(0, id.clone(), chunk, cx);
+                test_support::append_text(this, 0, id.clone(), chunk, cx);
             });
         });
         redraw(cx);
@@ -369,10 +356,8 @@ fn streamed_list_continuation_keeps_surrounding_math_renderable(cx: &mut TestApp
     redraw_settled_math(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 1, 0);
+        ui_id
     });
     let snapshots = crate::ui::math::formula_cache_snapshots(owner_id);
     assert_eq!(
@@ -395,18 +380,18 @@ fn pending_quoted_display_does_not_downgrade_stable_math(cx: &mut TestAppContext
     let source = "$$\na\n$$\n\nbefore $s_0$\n\n> quote\n> $$\n> y^2\n> $$\n";
 
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.start_stream_text(0, id.clone(), cx));
+        chat.update(cx, |this, cx| {
+            test_support::start_text(this, 0, id.clone(), cx)
+        });
     });
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 1, 0);
+        ui_id
     });
     for chunk in source.split_inclusive('\n') {
         cx.update(|_, cx| {
             chat.update(cx, |this, cx| {
-                this.append_stream_text(0, id.clone(), chunk, cx);
+                test_support::append_text(this, 0, id.clone(), chunk, cx);
             });
         });
         redraw(cx);
@@ -422,15 +407,15 @@ fn pending_quoted_display_does_not_downgrade_stable_math(cx: &mut TestAppContext
         provider_metadata: ProviderMetadata::default(),
     });
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.finish_reply(Some(terminal), None, cx));
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(this, Some(terminal), None, cx)
+        });
     });
     redraw_settled_math(cx);
 
     let terminal_owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 1, 0);
+        ui_id
     });
     assert_eq!(terminal_owner_id, owner_id);
     let start = source.find("$s_0$").expect("stable inline formula");

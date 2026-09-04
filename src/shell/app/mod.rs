@@ -69,6 +69,8 @@ const TRAFFIC_LIGHT_PAD: Pixels = px(12.);
 
 use chat_workspace::{ChatWorkspace, ChatWorkspaceSnapshot};
 #[cfg(test)]
+use conversation_host::ConversationId;
+#[cfg(test)]
 use project_workspace::ProjectTarget;
 use project_workspace::{ProjectWorkspace, ProjectWorkspaceSnapshot};
 use workspace_host::{WorkspaceCommand, WorkspaceHost};
@@ -475,11 +477,11 @@ impl ChatApp {
             .conversations
             .conversations()
             .get(index)
-            .map(|conversation| conversation.view.entity_id());
+            .map(|conversation| conversation.id);
         if let Some(target) = target {
             self.dispatch_workspace_command(
                 CHAT_WORKSPACE_ID,
-                WorkspaceCommand::SelectView(target),
+                WorkspaceCommand::SelectConversation(target),
                 Some(window),
                 cx,
             );
@@ -490,7 +492,7 @@ impl ChatApp {
     #[cfg(test)]
     fn select_target(
         &mut self,
-        target: gpui::EntityId,
+        target: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -498,7 +500,7 @@ impl ChatApp {
             .update(cx, |picker, cx| picker.dismiss(window, cx));
         self.dispatch_workspace_command(
             CHAT_WORKSPACE_ID,
-            WorkspaceCommand::SelectView(target),
+            WorkspaceCommand::SelectConversation(target),
             Some(window),
             cx,
         );
@@ -526,13 +528,13 @@ impl ChatApp {
     #[cfg(test)]
     fn delete_conversation(
         &mut self,
-        target: gpui::EntityId,
+        target: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.dispatch_workspace_command(
             CHAT_WORKSPACE_ID,
-            WorkspaceCommand::DeleteView(target),
+            WorkspaceCommand::DeleteConversation(target),
             Some(window),
             cx,
         );

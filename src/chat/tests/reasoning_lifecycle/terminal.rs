@@ -11,17 +11,17 @@ fn empty_text_delta_does_not_finish_reasoning(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "thinking", cx);
-            this.append_stream_text(1, "text-0".into(), "", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            test_support::append_text(this, 1, "text-0".into(), "", cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("trace");
-        assert!(!reasoning_states(turn)[0].1 && reasoning.is_expanded());
+        assert!(!reasoning_states(turn, cx)[0].1 && reasoning.is_expanded());
         assert!(matches!(
-            turn.canonical().content.as_slice(),
+            last_llm(turn, cx).content.as_slice(),
             [ContentBlock::Reasoning { .. }]
         ));
     });
@@ -38,15 +38,15 @@ fn visible_text_does_not_finish_an_independent_reasoning_block(cx: &mut TestAppC
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "thinking", cx);
-            this.append_stream_text(1, "text-0".into(), "interleaved text", cx);
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            test_support::append_text(this, 1, "text-0".into(), "interleaved text", cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("trace");
-        assert!(!reasoning_states(turn)[0].1 && reasoning.is_expanded());
+        assert!(!reasoning_states(turn, cx)[0].1 && reasoning.is_expanded());
     });
 }
 
@@ -62,15 +62,21 @@ fn terminating_a_turn_closes_an_open_trace(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "interrupted mid-thought", cx);
-            this.finish_reply(None, None, cx);
+            test_support::append_reasoning(
+                this,
+                0,
+                "reasoning-0".into(),
+                "interrupted mid-thought",
+                cx,
+            );
+            test_support::finish_reply(this, None, None, cx);
         });
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("trace");
-        assert!(reasoning_states(turn)[0].1);
+        assert!(reasoning_states(turn, cx)[0].1);
         assert!(!reasoning.is_expanded());
     });
 }
@@ -86,8 +92,9 @@ fn terminal_message_replaces_streamed_reasoning_projection(cx: &mut TestAppConte
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_reasoning(0, "reasoning-0".into(), "partial", cx);
-            this.finish_reply(
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "partial", cx);
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage::from_message(LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -105,9 +112,9 @@ fn terminal_message_replaces_streamed_reasoning_projection(cx: &mut TestAppConte
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         assert_eq!(
-            reasoning_states(turn)[0].0,
+            reasoning_states(turn, cx)[0].0,
             "authoritative terminal reasoning"
         );
     });
@@ -124,7 +131,8 @@ fn terminal_message_can_create_a_reasoning_trace(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.finish_reply(
+            test_support::finish_reply(
+                this,
                 Some(IndexedMessage::from_message(LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Reasoning {
@@ -142,9 +150,12 @@ fn terminal_message_can_create_a_reasoning_trace(cx: &mut TestAppContext) {
     });
 
     cx.update(|_, cx| {
-        let turn = chat.read(cx).messages.last().expect("assistant turn");
+        let turn = chat.read(cx);
         let reasoning = reasoning_part(turn).expect("terminal trace");
-        assert_eq!(reasoning_states(turn)[0], ("backfilled reasoning", true));
+        assert_eq!(
+            reasoning_states(turn, cx)[0],
+            ("backfilled reasoning", true)
+        );
         assert!(!reasoning.is_expanded());
     });
 }

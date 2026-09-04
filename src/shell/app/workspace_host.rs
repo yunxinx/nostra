@@ -1,6 +1,6 @@
 //! Window-scoped ownership of the built-in workspace instances.
 
-use gpui::{App, AppContext as _, Context, Entity, EntityId, Window};
+use gpui::{App, AppContext as _, Context, Entity, Window};
 
 use crate::llm::ModelSelection;
 use crate::preferences::PreferenceHandle;
@@ -10,7 +10,10 @@ use crate::runtime::{
 };
 use crate::session::SessionId;
 
-use super::{chat_workspace::ChatWorkspace, project_workspace::ProjectWorkspace};
+use super::{
+    chat_workspace::ChatWorkspace, conversation_host::ConversationId,
+    project_workspace::ProjectWorkspace,
+};
 
 const CHAT_WORKSPACE_ORDER: u32 = 10;
 const PROJECT_WORKSPACE_ORDER: u32 = 20;
@@ -24,7 +27,7 @@ pub(super) enum WorkspaceCommand {
     New,
     OpenProjectFolder,
     OpenProjectDraft(String),
-    SelectView(EntityId),
+    SelectConversation(ConversationId),
     RestoreChatSession(SessionId),
     RestoreProjectSession {
         project_id: String,
@@ -32,7 +35,7 @@ pub(super) enum WorkspaceCommand {
     },
     SelectModel(ModelSelection),
     #[cfg(test)]
-    DeleteView(EntityId),
+    DeleteConversation(ConversationId),
     DeleteActive,
 }
 
@@ -156,7 +159,7 @@ impl WorkspaceHost {
                 });
                 true
             }
-            WorkspaceCommand::SelectView(target) => {
+            WorkspaceCommand::SelectConversation(target) => {
                 if workspace_id != CHAT_WORKSPACE_ID {
                     return false;
                 }
@@ -201,7 +204,7 @@ impl WorkspaceHost {
                 _ => false,
             },
             #[cfg(test)]
-            WorkspaceCommand::DeleteView(target) => {
+            WorkspaceCommand::DeleteConversation(target) => {
                 if workspace_id != CHAT_WORKSPACE_ID {
                     return false;
                 }

@@ -1,14 +1,13 @@
-use gpui::{Context, SharedString};
+use gpui::Context;
 
 use crate::{
     chat::conversation_runtime::ConversationRuntime,
-    chat::{ChatEvent, ChatView, Message, derive_title},
-    llm::{ContentBlock, ModelSelection},
+    chat::transcript::{ResolvedStateSource, TranscriptSource as _},
+    llm::ModelSelection,
     session::{ChatSessionControllerError, ResolvedSessionState, SessionId},
 };
 
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum ChatRestoreError {
     #[error("chat session controller lock is poisoned")]
     ControllerLockPoisoned,
@@ -21,7 +20,10 @@ pub enum ChatRestoreError {
 }
 
 impl ConversationRuntime {
-    fn restore_session(
+    /// Bind this runtime to a previously persisted session and replace the
+    /// transcript with the resolved tail. The view is not on this path: it
+    /// observes [`super::super::transcript::TranscriptEvent::Reset`].
+    pub(crate) fn restore_session(
         &mut self,
         session_id: &SessionId,
         state: &ResolvedSessionState,
@@ -52,72 +54,15 @@ impl ConversationRuntime {
         self.advance_generation();
         self.session_id = Some(session_id.clone());
         self.next_turn_id = next_turn_id_for(state).saturating_add(1);
+        let page = ResolvedStateSource::new(state.clone()).load_tail(usize::MAX);
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.load(page, None, cx);
+        });
         self.publish_state(cx);
         Ok(restored_model)
     }
 }
 
-impl ChatView {
-    /// Hydrate this view from a previously persisted [`ResolvedSessionState`].
-    ///
-    /// The view must be idle: no pending provider generation, durable begin,
-    /// terminal persistence, deletion, or shutdown.  The controller's
-    /// [`ChatSessionController::restore`] is invoked first so the durable
-    /// lifecycle shares one entry point with normal turns, then the canonical
-    /// messages are converted into retained [`Message`] entities with fresh
-    /// Markdown bodies.
-    ///
-    /// The next turn id is derived from the largest `turn-N` already present in
-    /// the resolved state so a subsequent send never reuses a durable turn id.
-    #[allow(dead_code)]
-    pub(crate) fn restore_from_session(
-        &mut self,
-        session_id: &SessionId,
-        state: &ResolvedSessionState,
-        cx: &mut Context<Self>,
-    ) -> Result<(), ChatRestoreError> {
-        let (restored_model, snapshot) = self.runtime.update(cx, |runtime, cx| {
-            let restored_model = runtime.restore_session(session_id, state, cx);
-            (restored_model, runtime.snapshot())
-        });
-        let restored_model = restored_model?;
-        self.apply_runtime_snapshot(snapshot);
-
-        let messages = state
-            .messages
-            .iter()
-            .map(|resolved| {
-                Message::from_canonical_with_presentation(
-                    resolved.message.clone(),
-                    &self.markdown_presentation,
-                    cx,
-                )
-            })
-            .collect::<Vec<_>>();
-        let previous_len = self.messages.len();
-        self.messages = messages;
-        let new_len = self.messages.len();
-        if previous_len != new_len {
-            self.list_state.splice(previous_len..previous_len, new_len);
-        }
-
-        if let Some(model) = restored_model {
-            self.selection = Some(model);
-            self.sync_selection_availability();
-        }
-
-        if let Some(title) = derive_title_from_state(state) {
-            cx.emit(ChatEvent::TitleChanged(title));
-        }
-        cx.emit(ChatEvent::SessionBound(session_id.clone()));
-        if let Some(model) = self.selection.clone() {
-            cx.emit(ChatEvent::SelectionChanged(model));
-        }
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
 fn next_turn_id_for(state: &ResolvedSessionState) -> u64 {
     let from_messages = state
         .messages
@@ -132,30 +77,8 @@ fn next_turn_id_for(state: &ResolvedSessionState) -> u64 {
     from_messages.chain(from_results).max().unwrap_or(0)
 }
 
-#[allow(dead_code)]
 fn turn_id_index(turn_id: &str) -> Option<u64> {
     turn_id
         .strip_prefix("turn-")
         .and_then(|rest| rest.parse::<u64>().ok())
-}
-
-/// Derive a conversation title from the first non-empty user message in a
-/// resolved session state.
-pub(crate) fn derive_title_from_state(state: &ResolvedSessionState) -> Option<SharedString> {
-    state
-        .messages
-        .iter()
-        .find(|message| message.message.role == crate::llm::Role::User)
-        .and_then(|message| {
-            message
-                .message
-                .content
-                .iter()
-                .find_map(|block| match block {
-                    ContentBlock::Text { text, .. } if !text.trim().is_empty() => {
-                        Some(derive_title(text))
-                    }
-                    _ => None,
-                })
-        })
 }

@@ -7,7 +7,8 @@ fn fenced_blocks_show_language_and_copy_their_own_code(cx: &mut TestAppContext) 
     let markdown = "Before\n\n```rust\nfn first() {}\n```\n\n```unknown-language-tag-that-must-truncate-cleanly\nsecond\n```\n\n```\nplain\n```";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -17,16 +18,14 @@ fn fenced_blocks_show_language_and_copy_their_own_code(cx: &mut TestAppContext) 
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
 
     let (owner_id, body_id_before) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, body, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, body.entity_id())
+        let (ui_id, _, body) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, body.entity_id())
     });
     let fences = markdown
         .match_indices("```")
@@ -133,9 +132,7 @@ fn fenced_blocks_show_language_and_copy_their_own_code(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     cx.update(|_, cx| {
-        let MessagePart::Text { body, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
+        let (_, _, body) = prose_at(chat.read(cx), 0, 0);
         assert_eq!(
             body.entity_id(),
             body_id_before,
@@ -162,7 +159,8 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
     let markdown = format!("```rust\n{long_line}\nsecond line\n```\n\n```text\n{long_line}\n```");
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -172,16 +170,14 @@ fn code_block_display_controls_apply_at_their_own_scopes(cx: &mut TestAppContext
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        ui_id
     });
     let fences = markdown
         .match_indices("```")
@@ -327,7 +323,8 @@ fn nowrap_code_block_exposes_a_horizontal_scrollbar(cx: &mut TestAppContext) {
     let markdown = format!("```rust\n{long_line}\n```\n\n{}", "tail\n\n".repeat(80));
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -337,17 +334,15 @@ fn nowrap_code_block_exposes_a_horizontal_scrollbar(cx: &mut TestAppContext) {
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        ui_id
     });
     let scrollbar: &'static str =
         Box::leak(format!("markdown-code-scrollbar-{owner_id}-0").into_boxed_str());
@@ -393,7 +388,8 @@ fn nowrap_code_block_hides_the_horizontal_scrollbar_without_overflow(cx: &mut Te
     let markdown = "```rust\nlet short = true;\n```";
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -403,16 +399,14 @@ fn nowrap_code_block_hides_the_horizontal_scrollbar_without_overflow(cx: &mut Te
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        ui_id
     });
     let scrollbar: &'static str =
         Box::leak(format!("markdown-code-scrollbar-{owner_id}-0").into_boxed_str());
@@ -432,7 +426,8 @@ fn nowrap_code_block_updates_scrollbar_visibility_after_resize(cx: &mut TestAppC
     let markdown = format!("```rust\n{medium_line}\n```");
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -442,17 +437,15 @@ fn nowrap_code_block_updates_scrollbar_visibility_after_resize(cx: &mut TestAppC
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        ui_id
     });
     let scrollbar: &'static str =
         Box::leak(format!("markdown-code-scrollbar-{owner_id}-0").into_boxed_str());
@@ -492,7 +485,8 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     );
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(
+                this,
                 LlmMessage {
                     role: crate::llm::Role::Assistant,
                     content: vec![ContentBlock::Text {
@@ -502,7 +496,7 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     redraw(cx);
@@ -514,10 +508,8 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     redraw(cx);
 
     let (owner_id, fence_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[0].parts[0] else {
-            panic!("assistant text part")
-        };
-        (*ui_id, markdown.find("```").expect("code fence"))
+        let (ui_id, _, _) = prose_at(chat.read(cx), 0, 0);
+        (ui_id, markdown.find("```").expect("code fence"))
     });
     let selector = |kind: &str, suffix: &str| -> &'static str {
         Box::leak(format!("markdown-code-{kind}-{owner_id}-{fence_start}{suffix}").into_boxed_str())
@@ -639,7 +631,8 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
                 } else {
                     format!("message {index}")
                 };
-                this.messages.push(Message::from_canonical(
+                test_support::push_canonical(
+                    this,
                     LlmMessage {
                         role: crate::llm::Role::Assistant,
                         content: vec![ContentBlock::Text {
@@ -649,7 +642,7 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
                         provider_metadata: ProviderMetadata::default(),
                     },
                     cx,
-                ));
+                );
             }
             this.sync_message_list_count();
             this.list_state.max_offset_for_scrollbar().y
@@ -663,10 +656,7 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
 
     let (first_owner, last_owner, bottom_materialized) = cx.update(|_, cx| {
         let chat = chat.read(cx);
-        let owner = |index: usize| match &chat.messages[index].parts[0] {
-            MessagePart::Text { ui_id, .. } => *ui_id,
-            _ => panic!("text fixture"),
-        };
+        let owner = |index: usize| prose_at(chat, index, 0).0;
         (owner(0), owner(99), chat.materialized_message_indices.len())
     });
     assert!(
@@ -712,7 +702,7 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
         chat.list_state.logical_scroll_top()
     });
     cx.update(|_, cx| {
-        chat.update(cx, |chat, cx| chat.finish_stream_batch(cx));
+        chat.update(cx, |chat, _cx| test_support::finish_stream_batch(chat));
     });
     redraw(cx);
     cx.update(|_, cx| {

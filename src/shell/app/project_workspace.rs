@@ -7,7 +7,10 @@ use gpui_component::{WindowExt as _, notification::NotificationType};
 use rust_i18n::t;
 
 use crate::chat::{
-    ChatDeleteRequest, ChatEvent, ChatView, create_conversation_runtime, derive_title_from_state,
+    ChatDeleteRequest, ChatView,
+    conversation_runtime::{ConversationRuntimeEvent, ConversationRuntimeUpdate},
+    spawn_conversation, title_from_resolved_state,
+    transcript::{TranscriptEvent, TranscriptUpdate},
 };
 use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle};
@@ -21,14 +24,15 @@ use super::{
     agent_workspace::{AgentLoadState, AgentWorkspace, merge_persisted_projects},
     chat_workspace::{SelectionEpoch, SelectionRequest},
     conversation_host::{
-        Conversation, ConversationHost, ConversationHostSnapshot, ConversationSnapshot,
+        Conversation, ConversationHost, ConversationHostSnapshot, ConversationId,
+        ConversationSnapshot, conversation_generating, seed_conversation_selection,
     },
 };
 
 /// Identity of a Project sidebar row.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum ProjectTarget {
-    View(gpui::EntityId),
+    Conversation(ConversationId),
     Session {
         project_id: String,
         session_id: SessionId,
@@ -85,7 +89,7 @@ impl ProjectWorkspaceSnapshot {
         self.conversations.conversations()
     }
 
-    pub(super) fn active(&self) -> Option<gpui::EntityId> {
+    pub(super) fn active(&self) -> Option<ConversationId> {
         self.conversations.active()
     }
 
@@ -95,7 +99,7 @@ impl ProjectWorkspaceSnapshot {
 
     pub(super) fn conversation(
         &self,
-        target: gpui::EntityId,
+        target: ConversationId,
     ) -> Option<&ProjectConversationSnapshot> {
         self.conversations.conversation(target)
     }
@@ -316,51 +320,93 @@ impl ProjectWorkspace {
 
     fn subscribe_conversation(
         &mut self,
-        view: &Entity<ChatView>,
+        runtime: &gpui::Entity<crate::chat::conversation_runtime::ConversationRuntime>,
+        transcript: &gpui::Entity<crate::chat::transcript::Transcript>,
+        id: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Subscription {
-        cx.subscribe_in(view, window, |workspace, view, event, window, cx| {
-            let target = view.entity_id();
-            let Some(index) = workspace.conversations.conversation_index(target) else {
-                return;
-            };
-            match event {
-                ChatEvent::TitleChanged(title) => {
-                    workspace.conversations.conversations_mut()[index].title = title.clone();
-                }
-                ChatEvent::SelectionChanged(selection) => {
-                    workspace.conversations.conversations_mut()[index].selection =
-                        Some(selection.clone());
-                }
-                ChatEvent::StateChanged => {
-                    workspace.conversations.conversations_mut()[index].is_generating =
-                        view.read(cx).is_generating();
-                }
-                ChatEvent::SessionBound(session_id) => {
-                    let project_id = workspace.conversations.conversations()[index]
+    ) -> [Subscription; 2] {
+        let runtime_sub = cx.subscribe_in(
+            runtime,
+            window,
+            move |workspace, _, update: &ConversationRuntimeUpdate, window, cx| {
+                workspace.handle_conversation_runtime(id, update, window, cx);
+            },
+        );
+        let transcript_sub = cx.subscribe_in(
+            transcript,
+            window,
+            move |workspace, _, update: &TranscriptUpdate, _, cx| {
+                workspace.handle_conversation_transcript(id, update, cx);
+            },
+        );
+        [runtime_sub, transcript_sub]
+    }
+
+    fn handle_conversation_runtime(
+        &mut self,
+        id: ConversationId,
+        update: &ConversationRuntimeUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.conversations.conversation_index(id) else {
+            return;
+        };
+        match update.event() {
+            ConversationRuntimeEvent::StateChanged => {
+                self.conversations.conversations_mut()[index].is_generating =
+                    update.snapshot().is_generating();
+                if let Some(session_id) = update.snapshot().session_id().cloned() {
+                    let project_id = self.conversations.conversations()[index]
                         .metadata
                         .project_id
                         .clone();
-                    if workspace
-                        .conversations
-                        .bind_session(target, session_id.clone())
-                    {
-                        workspace
-                            .catalog
+                    if self.conversations.bind_session(id, session_id.clone()) {
+                        self.catalog
                             .bind_draft_session(project_id.clone(), session_id.clone());
-                        workspace.refresh_agent_sessions(project_id, cx);
+                        self.refresh_agent_sessions(project_id, cx);
                     }
                 }
-                ChatEvent::DeleteCompleted => {
-                    cx.defer_in(window, move |workspace, window, cx| {
-                        workspace.remove_conversation(target, window, cx);
-                    });
-                    return;
+            }
+            ConversationRuntimeEvent::TurnStarted(turn) => {
+                let project_id = self.conversations.conversations()[index]
+                    .metadata
+                    .project_id
+                    .clone();
+                if self.conversations.bind_session(id, turn.session_id.clone()) {
+                    self.catalog
+                        .bind_draft_session(project_id.clone(), turn.session_id.clone());
+                    self.refresh_agent_sessions(project_id, cx);
                 }
             }
-            workspace.notify_changed(cx);
-        })
+            ConversationRuntimeEvent::DeleteCompleted => {
+                cx.defer_in(window, move |workspace, window, cx| {
+                    workspace.remove_conversation(id, window, cx);
+                });
+                return;
+            }
+            _ => return,
+        }
+        self.notify_changed(cx);
+    }
+
+    fn handle_conversation_transcript(
+        &mut self,
+        id: ConversationId,
+        update: &TranscriptUpdate,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.conversations.conversation_index(id) else {
+            return;
+        };
+        if matches!(
+            update.event(),
+            TranscriptEvent::TailAppended { .. } | TranscriptEvent::Reset
+        ) && self.conversations.conversations_mut()[index].refresh_title(cx)
+        {
+            self.notify_changed(cx);
+        }
     }
 
     pub(super) fn open_draft(
@@ -376,7 +422,7 @@ impl ProjectWorkspace {
             .find(|conversation| {
                 conversation.metadata.project_id == project_id && conversation.session_id.is_none()
             })
-            .map(|conversation| conversation.view.entity_id())
+            .map(|conversation| conversation.id)
         {
             self.invalidate_selection_request();
             self.catalog.open_draft(project_id);
@@ -396,26 +442,34 @@ impl ProjectWorkspace {
             return;
         };
         self.invalidate_selection_request();
-        let runtime = create_conversation_runtime(
+        let spawned = spawn_conversation(
             scope,
             self.runtime_services.project_conversation(identity),
             self.runtime_services.generation_service(),
+            &self.runtime_services,
+            window,
             cx,
         );
-        let view =
-            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
-        let selection = view.read(cx).selection();
-        let subscription = self.subscribe_conversation(&view, window, cx);
+        let id = self.conversations.allocate_id();
+        let subscriptions =
+            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let selection = seed_conversation_selection(None, cx);
+        let is_generating = conversation_generating(&spawned.runtime, cx);
+        let view = spawned.view.clone();
         self.conversations.push_and_activate(Conversation {
-            view: view.clone(),
+            id,
+            runtime: spawned.runtime,
+            transcript: spawned.transcript,
+            composer: spawned.composer,
+            view: spawned.view,
             metadata: ProjectConversationMetadata {
                 project_id: project_id.clone(),
             },
             title: t!("agent.new_draft").to_string().into(),
             selection,
             session_id: None,
-            is_generating: view.read(cx).is_generating(),
-            _subscription: subscription,
+            is_generating,
+            _subscriptions: subscriptions,
         });
         self.catalog.new_project_draft(project_id.clone());
         self.start_agent_sessions_load(project_id, cx);
@@ -515,45 +569,56 @@ impl ProjectWorkspace {
         let Some(scope) = self.create_scope(window, cx) else {
             return;
         };
-        let runtime = create_conversation_runtime(
+        let spawned = spawn_conversation(
             scope,
             self.runtime_services
                 .project_conversation(restore.project.clone()),
             self.runtime_services.generation_service(),
+            &self.runtime_services,
+            window,
             cx,
         );
-        let view =
-            ChatView::view_with_runtime_services(runtime, &self.runtime_services, window, cx);
 
-        let title = derive_title_from_state(&restore.state)
+        let title = title_from_resolved_state(&restore.state)
             .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
-        if let Err(error) = view.update(cx, |chat, cx| {
-            chat.restore_from_session(&restore.session_id, &restore.state, cx)
+        let restored_model = match spawned.view.update(cx, |chat, cx| {
+            chat.restore_session(&restore.session_id, &restore.state, cx)
         }) {
-            crate::logging::error(
-                "agent.restore",
-                format_args!(
-                    "failed to restore Agent session {}: {error}",
-                    restore.session_id
-                ),
-            );
-            view.update(cx, |view, cx| view.close_scope(cx));
-            self.session_load_state =
-                AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
-            self.notify_changed(cx);
-            return;
-        }
-        let subscription = self.subscribe_conversation(&view, window, cx);
+            Ok(model) => model,
+            Err(error) => {
+                crate::logging::error(
+                    "agent.restore",
+                    format_args!(
+                        "failed to restore Agent session {}: {error}",
+                        restore.session_id
+                    ),
+                );
+                spawned.view.update(cx, |view, cx| view.close_scope(cx));
+                self.session_load_state =
+                    AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
+                self.notify_changed(cx);
+                return;
+            }
+        };
+        let id = self.conversations.allocate_id();
+        let subscriptions =
+            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let selection = seed_conversation_selection(restored_model, cx);
+        let is_generating = conversation_generating(&spawned.runtime, cx);
         self.conversations.push_and_activate(Conversation {
-            selection: view.read(cx).selection(),
-            is_generating: view.read(cx).is_generating(),
-            view,
+            id,
+            runtime: spawned.runtime,
+            transcript: spawned.transcript,
+            composer: spawned.composer,
+            selection,
+            is_generating,
+            view: spawned.view,
             metadata: ProjectConversationMetadata {
                 project_id: restore.project_id,
             },
             title,
             session_id: Some(restore.session_id),
-            _subscription: subscription,
+            _subscriptions: subscriptions,
         });
         self.notify_changed(cx);
     }
@@ -566,9 +631,10 @@ impl ProjectWorkspace {
         let Some(target) = self.conversations.active() else {
             return false;
         };
-        let Some(conversation) = self.conversations.conversation(target) else {
+        let Some(conversation) = self.conversations.conversation_mut(target) else {
             return false;
         };
+        conversation.selection = Some(selection.clone());
         conversation
             .view
             .update(cx, |chat, cx| chat.select_model(selection, cx));
@@ -590,30 +656,37 @@ impl ProjectWorkspace {
 
     fn remove_conversation(
         &mut self,
-        target: gpui::EntityId,
+        target: ConversationId,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(removed) = self.conversations.remove(target) else {
             return;
         };
-        let project_id = removed.conversation.metadata.project_id;
-        if removed.conversation.session_id.is_none() {
-            removed
-                .conversation
-                .view
-                .update(cx, |view, cx| view.close_scope(cx));
+        let Conversation {
+            view,
+            runtime,
+            transcript,
+            composer,
+            session_id,
+            metadata,
+            ..
+        } = removed.conversation;
+        let project_id = metadata.project_id;
+        if session_id.is_none() {
+            view.update(cx, |view, cx| view.close_scope(cx));
         }
-        if let Some(session_id) = removed.conversation.session_id {
+        if let Some(session_id) = session_id {
             self.catalog.remove_session(&project_id, &session_id);
         }
+        drop((runtime, transcript, composer, view));
         self.catalog.discard_draft(&project_id);
         self.notify_changed(cx);
     }
 
     fn delete_conversation(
         &mut self,
-        target: gpui::EntityId,
+        target: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -835,7 +908,7 @@ impl ProjectWorkspace {
         };
         let project_id = conversation.metadata.project_id.clone();
         let sidebar_target = conversation.session_id.clone().map_or_else(
-            || ProjectTarget::View(target),
+            || ProjectTarget::Conversation(target),
             |session_id| ProjectTarget::Session {
                 project_id: project_id.clone(),
                 session_id,
@@ -853,13 +926,13 @@ impl ProjectWorkspace {
         cx: &mut Context<Self>,
     ) {
         match target {
-            ProjectTarget::View(entity) => self.delete_conversation(entity, window, cx),
+            ProjectTarget::Conversation(entity) => self.delete_conversation(entity, window, cx),
             ProjectTarget::Session {
                 project_id,
                 session_id,
             } => {
                 if let Some(conversation) = self.snapshot.opened_session(&session_id) {
-                    self.delete_conversation(conversation.target(), window, cx);
+                    self.delete_conversation(conversation.id(), window, cx);
                 } else {
                     self.delete_unopened_session(project_id, session_id, window, cx);
                 }

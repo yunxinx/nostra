@@ -258,6 +258,10 @@ impl ReasoningTrace {
         }
     }
 
+    pub(crate) fn source_len(&self) -> usize {
+        self.source_bytes
+    }
+
     /// Apply the terminal message's complete reasoning snapshot while retaining
     /// disclosure, timing, and keyed markdown entity accumulated during
     /// streaming.
@@ -438,6 +442,11 @@ impl ReasoningTrace {
     #[cfg(test)]
     pub(crate) fn body_entity_id(&self) -> gpui::EntityId {
         self.body.entity_id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owner_id(&self) -> u64 {
+        self.body.owner_id()
     }
 
     #[cfg(test)]

@@ -17,8 +17,7 @@ use gpui::{Context, Task};
 
 use crate::{
     chat::conversation_runtime::{
-        ConversationRequestGeneration, ConversationRuntime, ConversationRuntimeEvent,
-        ConversationStreamEvent,
+        ConversationRequestGeneration, ConversationRuntime, ConversationStreamEvent,
     },
     llm::{
         GatewayError, GenerateRequest, GenerationEvent, GenerationHandle, GenerationOutcome,
@@ -333,13 +332,7 @@ fn flush_pending_frame(
     let events = deltas.into_iter().map(semantic_event).collect();
     runtime
         .update(cx, |runtime, cx| {
-            runtime.publish_event(
-                ConversationRuntimeEvent::StreamBatch {
-                    generation: request_generation,
-                    events,
-                },
-                cx,
-            )
+            runtime.publish_stream_batch(request_generation, events, cx)
         })
         .is_err()
 }
@@ -426,66 +419,12 @@ pub(crate) fn apply_generation_events_for_test(
     events: Vec<GenerationEvent>,
     cx: &mut Context<ChatView>,
 ) {
-    for event in events {
-        match project_stream_delta(event).map(semantic_event) {
-            Some(ConversationStreamEvent::TextStarted { content_index, id }) => {
-                chat.start_stream_text(content_index, id, cx);
-            }
-            Some(ConversationStreamEvent::TextDelta {
-                content_index,
-                id,
-                delta,
-            }) => {
-                chat.append_stream_text(content_index, id, &delta, cx);
-            }
-            Some(ConversationStreamEvent::TextFinished {
-                content_index,
-                id,
-                replay,
-            }) => {
-                chat.finish_stream_text(content_index, &id, replay, cx);
-            }
-            Some(ConversationStreamEvent::ReasoningStarted { content_index, id }) => {
-                chat.start_stream_reasoning(content_index, id);
-            }
-            Some(ConversationStreamEvent::ReasoningDelta {
-                content_index,
-                id,
-                delta,
-            }) => {
-                chat.append_stream_reasoning(content_index, id, &delta, cx);
-            }
-            Some(ConversationStreamEvent::ReasoningFinished {
-                content_index,
-                id,
-                replay,
-            }) => {
-                chat.finish_stream_reasoning(content_index, &id, replay, cx);
-            }
-            Some(ConversationStreamEvent::ReasoningSnapshotUpdated {
-                content_index,
-                id,
-                reasoning,
-            }) => {
-                chat.update_stream_reasoning_snapshot(content_index, &id, reasoning, cx);
-            }
-            Some(ConversationStreamEvent::ToolCallStarted {
-                content_index,
-                index,
-                id,
-                name,
-            }) => {
-                chat.start_stream_tool_call(content_index, index, id, name);
-            }
-            Some(ConversationStreamEvent::ToolCallFinished {
-                content_index,
-                index,
-                tool_call,
-            }) => {
-                chat.finish_stream_tool_call(content_index, index, *tool_call);
-            }
-            None => {}
-        }
+    let stream_events: Vec<_> = events
+        .into_iter()
+        .filter_map(|event| project_stream_delta(event).map(semantic_event))
+        .collect();
+    if !stream_events.is_empty() {
+        super::test_support::apply_stream(chat, &stream_events, cx);
     }
 }
 

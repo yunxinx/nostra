@@ -36,14 +36,16 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
         );
     error.request_id = Some("nostra-1".into());
     cx.update(|_, cx| {
-        chat.update(cx, |this, cx| this.finish_reply(None, Some(error), cx));
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(this, None, Some(error), cx)
+        });
     });
 
     cx.update(|_, cx| {
         let this = chat.read(cx);
-        // Attached to the assistant turn, not the user's message.
-        let assistant = this.messages.last().expect("assistant turn");
-        assert_eq!(assistant.role, Role::Assistant);
+        let assistant_turn = last_turn(this, cx);
+        let assistant = last_assistant_mirror(this);
+        assert_eq!(assistant_turn.role, Role::Assistant);
         assert!(
             assistant.error.is_some(),
             "card attached to the failed turn"
@@ -57,15 +59,17 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
             "the visible card retains the correlation id"
         );
         assert!(
-            this.messages[0].error.is_none(),
+            this.transcript.read(cx).turns()[0].error.is_none(),
             "the user's own turn carries no error"
         );
         // The provider's error text must not leak into replayable history.
         assert!(
-            this.messages
+            this.transcript
+                .read(cx)
+                .turns()
                 .iter()
                 .all(
-                    |message| message.canonical().content.iter().all(|block| !matches!(
+                    |message| message.to_llm().content.iter().all(|block| !matches!(
                         block,
                         ContentBlock::Text { text, .. } if text.contains("rate_limit_exceeded")
                     ))
@@ -83,9 +87,9 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
 
     let error_body_before_theme_switch = cx.update(|_, cx| {
         chat.read(cx)
-            .messages
+            .mirrors
             .last()
-            .and_then(|message| message.error.as_ref())
+            .and_then(|mirror| mirror.error.as_ref())
             .and_then(|error| error.body_entity_id())
             .expect("error body entity")
     });
@@ -100,9 +104,9 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let this = chat.read(cx);
         let error = this
-            .messages
+            .mirrors
             .last()
-            .and_then(|message| message.error.as_ref())
+            .and_then(|mirror| mirror.error.as_ref())
             .expect("the card survives a theme switch");
         let error_body_after_theme_switch = error.body_entity_id().expect("error body entity");
         assert_eq!(
@@ -204,7 +208,7 @@ fn user_message_bubble_shrinks_with_the_viewport(cx: &mut TestAppContext) {
     let chat = cx.update(ChatView::view);
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.messages.push(Message::from_canonical(
+            test_support::push_canonical(this,
                 LlmMessage {
                     role: crate::llm::Role::User,
                     content: vec![ContentBlock::Text {
@@ -215,7 +219,7 @@ fn user_message_bubble_shrinks_with_the_viewport(cx: &mut TestAppContext) {
                     provider_metadata: ProviderMetadata::default(),
                 },
                 cx,
-            ));
+            );
         });
     });
     cx.run_until_parked();

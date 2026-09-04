@@ -6,18 +6,14 @@ use rust_i18n::t;
 
 use crate::{
     chat::{
-        ChatDeleteRequest, ChatEvent, ChatView, Message, Role,
+        ChatDeleteRequest, ChatView,
         conversation_runtime::{
             BeginTurnAdmissionError, ConversationRequestGeneration, ConversationRuntime,
             ConversationRuntimeEvent, ConversationRuntimeFailure, ConversationRuntimeUpdate,
             PendingBeginRequest, StartedConversationTurn,
         },
-        derive_title, is_replayable,
     },
-    llm::{
-        ContentBlock, GatewayError, IndexedMessage, Message as LlmMessage, ModelSelection,
-        ProviderMetadata,
-    },
+    llm::{ContentBlock, Message as LlmMessage, ModelSelection, ProviderMetadata},
     session::{ChatSessionControllerError, ChatTurnTerminal},
 };
 
@@ -27,7 +23,6 @@ impl ConversationRuntime {
     /// generation before any provider work can begin.
     pub(super) fn begin_turn(
         &mut self,
-        text: String,
         user_message: LlmMessage,
         selection: ModelSelection,
         composer_revision: u64,
@@ -66,7 +61,6 @@ impl ConversationRuntime {
         self.request_generation = generation;
         let turn_id = format!("turn-{}", self.next_turn_id);
         let request = PendingBeginRequest {
-            text,
             user_message,
             selection,
             turn_id,
@@ -159,12 +153,35 @@ impl ConversationRuntime {
         self.pending_turn_id = Some(request.turn_id.clone());
         self.session_id = Some(start.session_id.clone());
         self.next_turn_id = self.next_turn_id.saturating_add(1);
+        self.transcript.update(cx, |transcript, cx| {
+            transcript.begin_turn(request.user_message.clone(), cx);
+        });
+        let history = self.transcript.read(cx).replayable_history();
+        let selection = request.selection.clone();
+        let turn_id = request.turn_id.clone();
+        let generation = request.request_generation;
+        let session_id = start.session_id.clone();
         self.publish_state(cx);
         self.publish_event(
             ConversationRuntimeEvent::TurnStarted(Box::new(StartedConversationTurn {
                 request,
                 session_id: start.session_id,
             })),
+            cx,
+        );
+        #[cfg(test)]
+        if let Some(dropped) = self.next_reply_drop_flag.take() {
+            self.reply_task = Some(super::super::assistant::ReplyTask::pending_for_test(
+                dropped, cx,
+            ));
+            return;
+        }
+        self.start_generation(
+            history,
+            selection,
+            session_id.to_string(),
+            turn_id,
+            generation,
             cx,
         );
     }
@@ -547,148 +564,55 @@ impl ChatView {
         }
         match update.event() {
             ConversationRuntimeEvent::StateChanged => {
-                cx.emit(ChatEvent::StateChanged);
                 cx.notify();
             }
             ConversationRuntimeEvent::TurnStarted(turn) => {
                 if turn.request.request_generation != runtime_snapshot.request_generation() {
                     return;
                 }
-                self.start_runtime_turn((**turn).clone(), cx);
+                if self.composer_revision == turn.request.composer_revision {
+                    self.input_empty = true;
+                    self.input_blank = true;
+                    let composer = self.composer.clone();
+                    let window_handle = self.window_handle;
+                    cx.defer(move |cx| {
+                        let _ = window_handle.update(cx, |_, window, cx| {
+                            composer
+                                .update(cx, |composer, cx| composer.clear_after_submit(window, cx));
+                        });
+                    });
+                }
+                self.scroll_to_bottom();
+                cx.notify();
             }
             ConversationRuntimeEvent::StreamBatch { generation, events } => {
                 if *generation == runtime_snapshot.request_generation() {
-                    self.apply_stream_batch(events, cx);
+                    if !events.is_empty() {
+                        self.follow_stream();
+                        self.remeasure_latest_message();
+                    }
+                    cx.notify();
                 }
             }
-            ConversationRuntimeEvent::GenerationRequestFailed { generation, error } => {
+            ConversationRuntimeEvent::GenerationRequestFailed { generation } => {
                 if *generation == runtime_snapshot.request_generation() {
-                    self.finish_reply_visual(None, Some(error.clone()), cx);
+                    self.follow_stream();
+                    self.remeasure_latest_message();
+                    cx.notify();
                 }
             }
-            ConversationRuntimeEvent::GenerationFinished(turn) => {
-                if turn.generation == runtime_snapshot.request_generation() {
+            ConversationRuntimeEvent::GenerationFinished(generation) => {
+                if *generation == runtime_snapshot.request_generation() {
                     self.follow_stream();
-                    self.finish_reply_visual(turn.message.clone(), turn.error.clone(), cx);
+                    self.remeasure_latest_message();
+                    cx.notify();
                 }
             }
             ConversationRuntimeEvent::Failure(failure) => {
                 self.notify_runtime_failure(*failure, cx);
             }
-            ConversationRuntimeEvent::DeleteCompleted => cx.emit(ChatEvent::DeleteCompleted),
+            ConversationRuntimeEvent::DeleteCompleted => {}
         }
-    }
-
-    fn start_runtime_turn(&mut self, turn: StartedConversationTurn, cx: &mut Context<Self>) {
-        let request = turn.request;
-        if self.messages.is_empty() {
-            cx.emit(ChatEvent::TitleChanged(derive_title(&request.text)));
-        }
-        let old_len = self.messages.len();
-        self.messages
-            .push(Message::from_canonical_with_presentation(
-                request.user_message,
-                &self.markdown_presentation,
-                cx,
-            ));
-        self.messages.push(Message::empty(Role::Assistant));
-        self.list_state.splice(old_len..old_len, 2);
-        cx.emit(ChatEvent::SessionBound(turn.session_id.clone()));
-        let history = self
-            .messages
-            .iter()
-            .take(self.messages.len().saturating_sub(1))
-            .map(Message::canonical)
-            .filter(is_replayable)
-            .collect();
-        #[cfg(test)]
-        let pending_drop = self.next_reply_drop_flag.take();
-        self.runtime.update(cx, move |runtime, cx| {
-            #[cfg(test)]
-            if let Some(dropped) = pending_drop {
-                runtime.reply_task = Some(super::super::assistant::ReplyTask::pending_for_test(
-                    dropped, cx,
-                ));
-                return;
-            }
-            runtime.start_generation(
-                history,
-                request.selection,
-                turn.session_id.to_string(),
-                request.turn_id,
-                request.request_generation,
-                cx,
-            );
-        });
-        if self.composer_revision == request.composer_revision {
-            self.input_empty = true;
-            self.input_blank = true;
-            let composer = self.composer.clone();
-            let window_handle = self.window_handle;
-            cx.defer(move |cx| {
-                let _ = window_handle.update(cx, |_, window, cx| {
-                    composer.update(cx, |composer, cx| composer.clear_after_submit(window, cx));
-                });
-            });
-        }
-        self.scroll_to_bottom();
-        cx.notify();
-    }
-
-    fn apply_stream_batch(
-        &mut self,
-        events: &[super::super::conversation_runtime::ConversationStreamEvent],
-        cx: &mut Context<Self>,
-    ) {
-        for event in events {
-            match event {
-                super::super::conversation_runtime::ConversationStreamEvent::TextStarted {
-                    content_index,
-                    id,
-                } => self.start_stream_text(*content_index, id.clone(), cx),
-                super::super::conversation_runtime::ConversationStreamEvent::TextDelta {
-                    content_index,
-                    id,
-                    delta,
-                } => self.append_stream_text(*content_index, id.clone(), delta, cx),
-                super::super::conversation_runtime::ConversationStreamEvent::TextFinished {
-                    content_index,
-                    id,
-                    replay,
-                } => self.finish_stream_text(*content_index, id, replay.clone(), cx),
-                super::super::conversation_runtime::ConversationStreamEvent::ReasoningStarted {
-                    content_index,
-                    id,
-                } => self.start_stream_reasoning(*content_index, id.clone()),
-                super::super::conversation_runtime::ConversationStreamEvent::ReasoningDelta {
-                    content_index,
-                    id,
-                    delta,
-                } => self.append_stream_reasoning(*content_index, id.clone(), delta, cx),
-                super::super::conversation_runtime::ConversationStreamEvent::ReasoningFinished {
-                    content_index,
-                    id,
-                    replay,
-                } => self.finish_stream_reasoning(*content_index, id, replay.clone(), cx),
-                super::super::conversation_runtime::ConversationStreamEvent::ReasoningSnapshotUpdated {
-                    content_index,
-                    id,
-                    reasoning,
-                } => self.update_stream_reasoning_snapshot(*content_index, id, reasoning.clone(), cx),
-                super::super::conversation_runtime::ConversationStreamEvent::ToolCallStarted {
-                    content_index,
-                    index,
-                    id,
-                    name,
-                } => self.start_stream_tool_call(*content_index, *index, id.clone(), name.clone()),
-                super::super::conversation_runtime::ConversationStreamEvent::ToolCallFinished {
-                    content_index,
-                    index,
-                    tool_call,
-                } => self.finish_stream_tool_call(*content_index, *index, (**tool_call).clone()),
-            }
-        }
-        self.finish_stream_batch(cx);
     }
 
     pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
@@ -730,7 +654,7 @@ impl ChatView {
         };
         let composer_revision = self.composer_revision;
         let (result, snapshot) = self.runtime.update(cx, |runtime, cx| {
-            let result = runtime.begin_turn(text, user_message, selection, composer_revision, cx);
+            let result = runtime.begin_turn(user_message, selection, composer_revision, cx);
             (result, runtime.snapshot())
         });
         self.apply_runtime_snapshot(snapshot);
@@ -754,44 +678,6 @@ impl ChatView {
         }
     }
 
-    #[cfg(test)]
-    pub fn finish_reply(
-        &mut self,
-        message: Option<IndexedMessage>,
-        error: Option<GatewayError>,
-        cx: &mut Context<Self>,
-    ) {
-        self.finish_reply_visual(message, error, cx);
-        let snapshot = self.runtime.update(cx, |runtime, cx| {
-            runtime.generating = false;
-            runtime.pending_turn_id = None;
-            runtime.terminal_persistence = None;
-            runtime.publish_state(cx);
-            runtime.snapshot()
-        });
-        self.apply_runtime_snapshot(snapshot);
-    }
-
-    #[cfg(test)]
-    pub(in crate::chat) fn finish_reply_with_terminal(
-        &mut self,
-        generation: ConversationRequestGeneration,
-        message: Option<IndexedMessage>,
-        terminal: ChatTurnTerminal,
-        error: Option<GatewayError>,
-        cx: &mut Context<Self>,
-    ) {
-        if generation != self.runtime_snapshot.request_generation() {
-            return;
-        }
-        self.finish_reply_visual(message, error, cx);
-        let snapshot = self.runtime.update(cx, |runtime, cx| {
-            runtime.finish_terminal(generation, terminal, cx);
-            runtime.snapshot()
-        });
-        self.apply_runtime_snapshot(snapshot);
-    }
-
     fn notify_runtime_failure(&self, failure: ConversationRuntimeFailure, cx: &mut Context<Self>) {
         let message = match failure {
             ConversationRuntimeFailure::Begin => t!("chat.error.persistence_start_failed"),
@@ -808,26 +694,5 @@ impl ChatView {
                 window.push_notification((NotificationType::Error, message), cx);
             });
         });
-    }
-
-    fn finish_reply_visual(
-        &mut self,
-        message: Option<IndexedMessage>,
-        error: Option<GatewayError>,
-        cx: &mut Context<Self>,
-    ) {
-        let turn_error = error.map(|error| super::super::error_card::TurnError::new(error, cx));
-        if let Some(last) = self.messages.last_mut() {
-            if let Some(message) = message {
-                last.replace_with_canonical_with_presentation(
-                    message,
-                    &self.markdown_presentation,
-                    cx,
-                );
-            }
-            last.error = turn_error;
-            last.finish_reasoning(None, cx);
-        }
-        self.remeasure_latest_message();
     }
 }

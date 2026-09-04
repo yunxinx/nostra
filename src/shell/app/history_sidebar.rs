@@ -40,6 +40,7 @@ use super::ChatApp;
 use super::chat_workspace::{
     ChatConversationSnapshot, ChatTarget, ChatWorkspace, ChatWorkspaceSnapshot,
 };
+use super::conversation_host::ConversationId;
 use super::history_groups::{HistoryRow, history_sections};
 use super::workspace_host::WorkspaceCommand;
 use crate::runtime::CHAT_WORKSPACE_ID;
@@ -662,7 +663,7 @@ impl ChatApp {
             for row in section.rows {
                 match row {
                     HistoryRow::Pending(conversation) => {
-                        let target = conversation.target();
+                        let target = conversation.id();
                         rows.push(
                             self.render_host_row(snapshot, conversation, target, window, cx)
                                 .into_any_element(),
@@ -811,20 +812,20 @@ impl ChatApp {
         &self,
         snapshot: &ChatWorkspaceSnapshot,
         conversation: &ChatConversationSnapshot,
-        target: gpui::EntityId,
+        target: ConversationId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let title = conversation.title();
         let is_active = snapshot.active() == Some(target);
         let is_generating = conversation.is_generating();
-        let sidebar_target = ChatTarget::View(target);
+        let sidebar_target = ChatTarget::Conversation(target);
         let is_confirming = snapshot.confirming() == Some(&sidebar_target);
         let app = cx.entity().downgrade();
 
         self.render_history_row(
-            ("conv-row", target),
-            ("conv", target),
+            ("conv-row", target.as_u64()),
+            ("conv", target.as_u64()),
             title,
             is_active,
             is_generating,
@@ -838,7 +839,7 @@ impl ChatApp {
                     app.update(cx, |app, cx| {
                         app.dispatch_workspace_command(
                             CHAT_WORKSPACE_ID,
-                            WorkspaceCommand::SelectView(target),
+                            WorkspaceCommand::SelectConversation(target),
                             None,
                             cx,
                         );
@@ -853,7 +854,7 @@ impl ChatApp {
                         app.update(cx, |app, cx| {
                             app.dispatch_workspace_command(
                                 CHAT_WORKSPACE_ID,
-                                WorkspaceCommand::SelectView(target),
+                                WorkspaceCommand::SelectConversation(target),
                                 None,
                                 cx,
                             );
@@ -902,7 +903,7 @@ impl ChatApp {
                     .preview
                     .as_ref()
                     .filter(|preview| !preview.trim().is_empty())
-                    .map(|preview| crate::chat::derive_chat_title(preview))
+                    .map(|preview| crate::chat::derive_title(preview))
             })
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
 
@@ -1115,9 +1116,9 @@ impl ChatApp {
         let confirming = reveal.pinned;
         let workspace = self.chat_workspace().downgrade();
         let ids = match &target {
-            ChatTarget::View(entity) => SidebarActionIds {
-                trigger_id: ("conversation-actions", *entity).into(),
-                confirm_id: ("conversation-delete-confirm", *entity).into(),
+            ChatTarget::Conversation(entity) => SidebarActionIds {
+                trigger_id: ("conversation-actions", entity.as_u64()).into(),
+                confirm_id: ("conversation-delete-confirm", entity.as_u64()).into(),
                 trigger_debug_selector: format!("conversation-actions-{}", entity.as_u64()),
                 delete_label: t!("sidebar.delete_chat").to_string(),
                 confirm_title: t!("sidebar.delete_chat_title").to_string(),
@@ -1314,21 +1315,21 @@ pub(super) fn is_pending_history_conversation(
 
 fn chat_history_generating_selector(target: &ChatTarget) -> String {
     match target {
-        ChatTarget::View(entity) => format!("conversation-generating-{}", entity.as_u64()),
+        ChatTarget::Conversation(entity) => format!("conversation-generating-{}", entity.as_u64()),
         ChatTarget::Session(session) => format!("history-generating-{session}"),
     }
 }
 
 fn chat_history_row_selector(target: &ChatTarget) -> String {
     match target {
-        ChatTarget::View(entity) => format!("conversation-row-{}", entity.as_u64()),
+        ChatTarget::Conversation(entity) => format!("conversation-row-{}", entity.as_u64()),
         ChatTarget::Session(session) => format!("history-row-{session}"),
     }
 }
 
 fn chat_history_favorite_selector(target: &ChatTarget) -> String {
     match target {
-        ChatTarget::View(entity) => format!("conversation-favorite-{}", entity.as_u64()),
+        ChatTarget::Conversation(entity) => format!("conversation-favorite-{}", entity.as_u64()),
         ChatTarget::Session(session) => format!("history-favorite-{session}"),
     }
 }

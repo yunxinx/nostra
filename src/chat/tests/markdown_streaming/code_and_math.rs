@@ -50,8 +50,8 @@ fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut Te
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
-            this.append_stream_text(0, id.clone(), first, cx);
+            test_support::start_text(this, 0, id.clone(), cx);
+            test_support::append_text(this, 0, id.clone(), first, cx);
         });
     });
     // The first draw installs the custom extensions. Before the regression
@@ -61,10 +61,8 @@ fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut Te
     });
 
     let (owner_id, first_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        (*ui_id, text.find("```").expect("first fence"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 1, 0);
+        (ui_id, text.find("```").expect("first fence"))
     });
     let first_header: &'static str =
         Box::leak(format!("markdown-code-header-{owner_id}-{first_start}").into_boxed_str());
@@ -75,7 +73,7 @@ fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut Te
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id.clone(), second, cx);
+            test_support::append_text(this, 0, id.clone(), second, cx);
         });
     });
     cx.run_until_parked();
@@ -85,16 +83,14 @@ fn streamed_fences_never_fall_back_to_the_native_code_block_renderer(cx: &mut Te
     );
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id, third, cx);
+            test_support::append_text(this, 0, id, third, cx);
         });
     });
     redraw(cx);
 
     let (owner_id, source) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        (*ui_id, text.clone())
+        let (ui_id, text, _) = prose_at(chat.read(cx), 1, 0);
+        (ui_id, text.to_string())
     });
     let fences = source
         .match_indices("```")
@@ -121,17 +117,15 @@ fn streamed_indented_code_keeps_the_native_renderer(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
-            this.append_stream_text(0, id.clone(), "    print('first')", cx);
+            test_support::start_text(this, 0, id.clone(), cx);
+            test_support::append_text(this, 0, id.clone(), "    print('first')", cx);
         });
     });
     redraw(cx);
 
     let owner_id = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        *ui_id
+        let (ui_id, _, _) = prose_at(chat.read(cx), 1, 0);
+        ui_id
     });
     let header: &'static str =
         Box::leak(format!("markdown-code-header-{owner_id}-0").into_boxed_str());
@@ -142,7 +136,7 @@ fn streamed_indented_code_keeps_the_native_renderer(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id, "\n    print('second')", cx);
+            test_support::append_text(this, 0, id, "\n    print('second')", cx);
         });
     });
     redraw(cx);
@@ -152,9 +146,7 @@ fn streamed_indented_code_keeps_the_native_renderer(cx: &mut TestAppContext) {
     );
     let rendered_text = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { body, .. } = &this.messages[1].parts[0] else {
-                panic!("streamed assistant text")
-            };
+            let (_, _, body) = prose_at(this, 1, 0);
             body.select_all_text(cx)
         })
     });
@@ -174,22 +166,17 @@ fn raw_html_dollars_remain_literal_and_selectable(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, "raw-html-math".to_string(), cx);
-            this.append_stream_text(0, "raw-html-math".to_string(), source, cx);
+            test_support::start_text(this, 0, "raw-html-math".to_string(), cx);
+            test_support::append_text(this, 0, "raw-html-math".to_string(), source, cx);
         });
     });
     redraw(cx);
 
     let (owner_id, start, selected) = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text {
-                ui_id, text, body, ..
-            } = &this.messages[1].parts[0]
-            else {
-                panic!("streamed assistant text")
-            };
+            let (ui_id, text, body) = prose_at(this, 1, 0);
             (
-                *ui_id,
+                ui_id,
                 text.find("$raw$").expect("literal dollars"),
                 body.select_all_text(cx),
             )
@@ -215,17 +202,15 @@ fn streamed_math_keeps_custom_nodes_after_later_appends(cx: &mut TestAppContext)
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
-            this.append_stream_text(0, id.clone(), first, cx);
+            test_support::start_text(this, 0, id.clone(), cx);
+            test_support::append_text(this, 0, id.clone(), first, cx);
         });
     });
     redraw_settled_math(cx);
 
     let (owner_id, display_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        (*ui_id, text.find("$$").expect("display formula"))
+        let (ui_id, text, _) = prose_at(chat.read(cx), 1, 0);
+        (ui_id, text.find("$$").expect("display formula"))
     });
     let display: &'static str =
         Box::leak(format!("markdown-math-{owner_id}-{display_start}").into_boxed_str());
@@ -236,15 +221,13 @@ fn streamed_math_keeps_custom_nodes_after_later_appends(cx: &mut TestAppContext)
     // cannot later restore a native paragraph and erase the custom formula.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id, second, cx);
+            test_support::append_text(this, 0, id, second, cx);
         });
     });
     redraw_settled_math(cx);
 
     let inline_start = cx.update(|_, cx| {
-        let MessagePart::Text { text, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
+        let (_, text, _) = prose_at(chat.read(cx), 1, 0);
         text.find("$x^2$").expect("inline formula")
     });
     let inline: &'static str =
@@ -276,7 +259,7 @@ fn incomplete_streamed_math_keeps_stable_text_visible_and_recovers(cx: &mut Test
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
+            test_support::start_text(this, 0, id.clone(), cx);
         });
     });
 
@@ -284,16 +267,14 @@ fn incomplete_streamed_math_keeps_stable_text_visible_and_recovers(cx: &mut Test
         expected.push_str(chunk);
         cx.update(|_, cx| {
             chat.update(cx, |this, cx| {
-                this.append_stream_text(0, id.clone(), chunk, cx);
+                test_support::append_text(this, 0, id.clone(), chunk, cx);
             });
         });
         redraw_settled_math(cx);
 
         let selected = cx.update(|_, cx| {
             chat.update(cx, |this, cx| {
-                let MessagePart::Text { body, .. } = &this.messages[1].parts[0] else {
-                    panic!("streamed assistant text")
-                };
+                let (_, _, body) = prose_at(this, 1, 0);
                 body.select_all_text(cx)
             })
         });
@@ -306,11 +287,9 @@ fn incomplete_streamed_math_keeps_stable_text_visible_and_recovers(cx: &mut Test
     }
 
     let (owner_id, display_start, inline_start) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, text, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
+        let (ui_id, text, _) = prose_at(chat.read(cx), 1, 0);
         (
-            *ui_id,
+            ui_id,
             text.find("$$").expect("display formula"),
             text.rfind("$E = mc^2$").expect("inline formula"),
         )
@@ -346,22 +325,20 @@ retained";
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
-            this.append_stream_text(0, id.clone(), first, cx);
+            test_support::start_text(this, 0, id.clone(), cx);
+            test_support::append_text(this, 0, id.clone(), first, cx);
         });
     });
     redraw(cx);
 
     let (owner_id, body_id) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, body, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        (*ui_id, body.entity_id())
+        let (ui_id, _, body) = prose_at(chat.read(cx), 1, 0);
+        (ui_id, body.entity_id())
     });
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id, second, cx);
+            test_support::append_text(this, 0, id, second, cx);
         });
     });
     redraw_settled_math(cx);
@@ -387,9 +364,7 @@ retained";
 
     let selected = cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            let MessagePart::Text { text, body, .. } = &this.messages[1].parts[0] else {
-                panic!("streamed assistant text")
-            };
+            let (_, text, body) = prose_at(this, 1, 0);
             assert_eq!(body.entity_id(), body_id);
             assert_eq!(text, &format!("{first}{second}"));
             body.select_all_text(cx)
@@ -412,21 +387,19 @@ fn streaming_does_not_resolve_a_latent_prepared_reference(cx: &mut TestAppContex
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.start_stream_text(0, id.clone(), cx);
-            this.append_stream_text(0, id.clone(), first, cx);
+            test_support::start_text(this, 0, id.clone(), cx);
+            test_support::append_text(this, 0, id.clone(), first, cx);
         });
     });
     redraw(cx);
     let (owner_id, body_id) = cx.update(|_, cx| {
-        let MessagePart::Text { ui_id, body, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
-        (*ui_id, body.entity_id())
+        let (ui_id, _, body) = prose_at(chat.read(cx), 1, 0);
+        (ui_id, body.entity_id())
     });
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.append_stream_text(0, id, second, cx);
+            test_support::append_text(this, 0, id, second, cx);
         });
     });
     redraw_settled_math(cx);
@@ -453,11 +426,9 @@ fn streaming_does_not_resolve_a_latent_prepared_reference(cx: &mut TestAppContex
     );
 
     cx.update(|_, cx| {
-        let MessagePart::Text { text, body, .. } = &chat.read(cx).messages[1].parts[0] else {
-            panic!("streamed assistant text")
-        };
+        let (_ui_id, text, body) = prose_at(chat.read(cx), 1, 0);
         assert_eq!(body.entity_id(), body_id);
-        assert_eq!(text, &format!("{first}{second}"));
+        assert_eq!(text, format!("{first}{second}"));
     });
 }
 
@@ -470,22 +441,9 @@ fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContex
         profile_id: "next-provider".into(),
         model_id: "next-model".into(),
     };
-    let observed = Rc::new(RefCell::new(Vec::new()));
-    let _subscription = cx.update(|_, cx| {
-        let observed = observed.clone();
-        cx.subscribe(&chat, move |_, event: &ChatEvent, _| {
-            if let ChatEvent::SelectionChanged(selection) = event {
-                observed.borrow_mut().push(selection.clone());
-            }
-        })
-    });
-
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            this.mark_generating_for_test(cx);
-            // Drive the public command path, not the state projection helper:
-            // this also proves persistence and SelectionChanged emission stay
-            // enabled while the current generation remains pending.
+            test_support::mark_generating(this, cx);
             this.select_model(next.clone(), cx);
             assert!(
                 this.runtime_snapshot_for_test().is_generating(),
@@ -498,10 +456,6 @@ fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContex
 
     cx.update(|_, cx| {
         assert_eq!(crate::providers::last_selection(cx), Some(next.clone()));
+        assert_eq!(chat.read(cx).selection.as_ref(), Some(&next));
     });
-    assert_eq!(
-        observed.borrow().as_slice(),
-        std::slice::from_ref(&next),
-        "the owning ChatApp receives exactly one selection synchronization event"
-    );
 }
