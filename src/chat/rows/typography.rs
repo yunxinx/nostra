@@ -32,6 +32,24 @@ pub(crate) const BUDGET_VIEWPORT_RATIO: f32 = 0.45;
 /// scrollable viewport instead of natural height.
 pub(crate) const RESULT_BUDGET_BYTES: usize = 8 * 1024;
 
+/// A natural-height prose or reasoning-full body switches to the fork's
+/// windowed block layout past either threshold (P4 PRD R5): source ≥ 64 KiB,
+/// or ≥ 300 blocks for sources the byte gate would miss (many short
+/// paragraphs cost more to lay out than one block of the same bytes).
+pub(crate) const WINDOWED_SOURCE_BYTES: usize = 64 * 1024;
+
+/// Block count at which a natural-height row body renders through the
+/// windowed block layout regardless of byte size.
+pub(crate) const WINDOWED_SOURCE_BLOCKS: usize = 300;
+
+/// Whether a natural-height row body renders through the windowed block
+/// layout. Evaluated per frame from the renderer's authoritative source, so a
+/// stream crossing the threshold flips to windowed on the next paint and the
+/// fork's late-enable alignment picks it up without a reset.
+pub(crate) fn windowed_body(source_len: usize, block_count: usize) -> bool {
+    source_len >= WINDOWED_SOURCE_BYTES || block_count >= WINDOWED_SOURCE_BLOCKS
+}
+
 /// Heading scale for transcript prose: h1 1.5×, h2 1.3×, h3 1.15× the base,
 /// deeper headings at the base size.
 fn heading_scale() -> Arc<dyn Fn(u8, Pixels) -> Pixels + Send + Sync + 'static> {

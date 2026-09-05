@@ -298,6 +298,11 @@ impl MarkdownBody {
         self.text_view(style).scrollable(true)
     }
 
+    /// The number of top-level blocks in the parsed document.
+    pub(crate) fn block_count(&self, cx: &App) -> usize {
+        self.state.read(cx).block_count()
+    }
+
     pub(crate) fn scroll_state(&self, cx: &App) -> gpui::ListState {
         self.state.read(cx).scroll_state()
     }

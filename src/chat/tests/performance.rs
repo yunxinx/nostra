@@ -684,3 +684,142 @@ fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut Test
         );
     });
 }
+
+/// AC1 (P4): a far-beyond-threshold prose row renders through the fork's
+/// windowed block layout, and its first frame and scroll-only p95 stay inside
+/// the frame budget. The structural half of AC1 (laid-out blocks ≤ visible +
+/// overdraw) is enforced by the fork's own windowed unit tests; this guard
+/// covers the Nostra wiring end to end.
+#[gpui::test]
+fn long_windowed_prose_first_frame_and_scroll_stay_in_budget(cx: &mut TestAppContext) {
+    // Parsing six megabytes of Markdown in a debug build costs minutes for no
+    // signal (budgets are release-only below), so debug runs the same shape
+    // at one tenth scale.
+    const LINES: usize = if cfg!(debug_assertions) {
+        10_000
+    } else {
+        100_000
+    };
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(760.), px(560.)));
+
+    // Mixed prose: paragraph pairs with a heading every 50 lines, so the
+    // document carries ~LINES/2 blocks — 25× the 300-block gate.
+    let mut source = String::with_capacity(LINES * 96);
+    let mut line = 0;
+    while line < LINES {
+        if line % 50 == 0 {
+            source.push_str(&format!("## Section {}\n\n", line / 50));
+            line += 1;
+            continue;
+        }
+        source.push_str(&format!(
+            "Windowed paragraph {line} carries enough body text to exercise real layout, \
+             with inline markup like `code` and **emphasis**.\n\n"
+        ));
+        line += 2;
+    }
+
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = false);
+        chat.update(cx, |chat, cx| {
+            test_support::push_canonical(
+                chat,
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: source,
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        assert!(
+            renderer_for_row(
+                chat.read(cx),
+                rows_of_kind(chat.read(cx), RowKind::AssistantProse)
+                    .first()
+                    .expect("the long prose row"),
+            )
+            .expect("prose renderer")
+            .is_windowed(cx),
+            "a 100k-line row must render through the windowed block layout"
+        );
+    });
+
+    // First painted frame: only the visible band may lay out, never the
+    // whole document.
+    let first_frame = cx.update(|window, cx| {
+        let started = Instant::now();
+        let _ = window.draw(cx);
+        started.elapsed()
+    });
+    redraw_settled(cx);
+    // The transcript follows the tail on push; anchor at the top so the 48
+    // gestures traverse fresh document instead of pushing against the end.
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, _| {
+            chat.view
+                .list_state
+                .set_follow_mode(gpui::FollowMode::Normal);
+            chat.view.list_state.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        });
+    });
+    redraw_settled(cx);
+    let before_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+
+    // Scroll-only frames: repeated wheel gestures over the windowed row, one
+    // redraw per gesture with easing off. The point sits mid-viewport, clear
+    // of the composer.
+    let wheel_point = point(px(380.), px(280.));
+    let mut scroll_draws = Vec::new();
+    for _ in 0..48 {
+        cx.simulate_event(ScrollWheelEvent {
+            position: wheel_point,
+            delta: ScrollDelta::Lines(point(0., -9.)),
+            ..Default::default()
+        });
+        let (draw, _) = measured_redraw(cx);
+        scroll_draws.push(draw);
+    }
+    let after_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+    assert!(
+        after_scroll.item_ix > before_scroll.item_ix
+            || after_scroll.offset_in_item > before_scroll.offset_in_item,
+        "the wheel gestures must actually advance the transcript or the \
+         scroll timings above prove nothing"
+    );
+    let scroll_p95 = duration_percentile(&scroll_draws, 95);
+
+    eprintln!(
+        "WINDOWED_PROSE_PERF lines={LINES} first_frame={first_frame:?} \
+         scroll_frames={} scroll_p95={scroll_p95:?} scroll_max={:?}",
+        scroll_draws.len(),
+        scroll_draws.iter().copied().max().unwrap_or_default(),
+    );
+
+    if !cfg!(debug_assertions) {
+        // Frame budget: 60 fps is 16.7 ms. The windowed first frame paints
+        // only the visible band (observed single-digit ms); the scroll p95
+        // mirrors the frozen steady-frame guards. Both carry headroom for
+        // machine variance while staying inside the budget.
+        assert!(
+            first_frame <= Duration::from_millis(16),
+            "release windowed first frame must stay inside the frame budget: {first_frame:?}"
+        );
+        assert!(
+            scroll_p95 <= Duration::from_millis(16),
+            "release windowed scroll-only p95 must stay inside the frame budget: {scroll_p95:?}"
+        );
+    }
+}

@@ -630,7 +630,12 @@ impl TranscriptView {
         let dispatch_hover = RowActionDispatch::new(cx.weak_entity());
         let dispatch_measure = dispatch_hover.clone();
         let turn_id = row.id().turn;
-        let settled = self.streaming_turn != Some(row.id().turn);
+        // A windowed row's outer height still moves as the fork's block
+        // cache measures more blocks (P4 PRD R5), so it records
+        // `Confidence::Measured` even with settled content and never serves
+        // as a cold-restore placeholder.
+        let settled =
+            self.streaming_turn != Some(row.id().turn) && !self.slots[ix].renderer.is_windowed(cx);
 
         let max_width = crate::chat::CONTENT_MAX_WIDTH;
         // An idle (non-waiting) placeholder row is visually nothing; keep it

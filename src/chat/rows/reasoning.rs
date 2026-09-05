@@ -460,6 +460,16 @@ impl RowRenderer for ReasoningRenderer {
         })
     }
 
+    fn is_windowed(&self, cx: &App) -> bool {
+        // Only the Full disclosure renders a natural-height body; the preview
+        // and the budgeted viewport are scrollable, where the fork ignores
+        // the windowed flag.
+        self.disclosure == ReasoningDisclosure::Full
+            && self.body.as_ref().is_some_and(|body| {
+                typography::windowed_body(self.display.len(), body.block_count(cx))
+            })
+    }
+
     #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -740,9 +750,8 @@ impl ReasoningRenderer {
                 )
             })
             .when(full, |this| {
-                // Natural height, no inner scrollbar. Long sources become the
-                // windowed path once P4 lands; until then this is the honest
-                // full document.
+                // Natural height, no inner scrollbar; long sources route
+                // through the fork's windowed block layout (P4 PRD R5).
                 this.child(
                     div()
                         .w_full()
@@ -752,7 +761,9 @@ impl ReasoningRenderer {
                         .text_sm()
                         .text_color(text_color)
                         .debug_selector(move || block_selector("body", content_index))
-                        .child(body.text_view(typography::reasoning(cx))),
+                        .child(body.text_view(typography::reasoning(cx)).windowed(
+                            typography::windowed_body(self.display.len(), body.block_count(cx)),
+                        )),
                 )
             })
             .into_any_element()

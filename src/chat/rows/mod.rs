@@ -245,6 +245,17 @@ pub(crate) trait RowRenderer {
         None
     }
 
+    /// Whether the row's current form renders its body through the fork's
+    /// windowed block layout (P4 PRD R5). A windowed body keeps unpainted
+    /// blocks on estimated heights and the fork exposes no convergence
+    /// signal, so while this is true the view must treat the row's outer
+    /// measurement as unsettleable (`Confidence::Measured`): it may still
+    /// move as more blocks paint, and must not serve as a cold-restore
+    /// placeholder.
+    fn is_windowed(&self, _cx: &App) -> bool {
+        false
+    }
+
     /// Test access to the concrete renderer.
     #[cfg(test)]
     fn as_any(&self) -> &dyn std::any::Any;

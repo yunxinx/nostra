@@ -120,6 +120,12 @@ impl RowRenderer for ProseRenderer {
         self.materialized
     }
 
+    fn is_windowed(&self, cx: &App) -> bool {
+        self.body
+            .as_ref()
+            .is_some_and(|body| typography::windowed_body(self.text.len(), body.block_count(cx)))
+    }
+
     fn apply(&mut self, change: &RowChange, ctx: &MaterializeContext, cx: &mut App) {
         match change {
             RowChange::Append { delta } => {
@@ -176,7 +182,11 @@ impl RowRenderer for ProseRenderer {
         div()
             .w_full()
             .when_some(self.body.as_ref(), |this, body| {
-                this.child(body.text_view(typography::prose(cx)))
+                // Natural height; large bodies route through the fork's
+                // windowed block layout (P4 PRD R5).
+                this.child(body.text_view(typography::prose(cx)).windowed(
+                    typography::windowed_body(self.text.len(), body.block_count(cx)),
+                ))
             })
             .into_any_element()
     }

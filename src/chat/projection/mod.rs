@@ -230,6 +230,12 @@ impl Row {
         self.height.estimated
     }
 
+    /// Confidence of the currently recorded measurement, if any.
+    #[cfg(test)]
+    pub(crate) fn recorded_confidence(&self) -> Option<Confidence> {
+        self.height.measured.map(|measured| measured.confidence)
+    }
+
     /// Current height: the cached measurement when fresh, the estimate
     /// otherwise.
     pub(crate) fn effective_height(&self, key: &MeasurementKey) -> Pixels {
