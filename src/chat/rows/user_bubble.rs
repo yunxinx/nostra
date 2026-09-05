@@ -10,12 +10,12 @@ use gpui::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
     Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::{ActiveTheme as _, h_flex, text::TextView, text::TextViewStyle};
+use gpui_component::{ActiveTheme as _, h_flex, text::TextView};
 
 use crate::chat::projection::RowKind;
 use crate::ui::markdown::MarkdownBody;
 
-use super::{MaterializeContext, RowChange, RowRenderContext, RowRenderer};
+use super::{MaterializeContext, RowChange, RowRenderContext, RowRenderer, typography};
 
 pub(crate) struct UserBubbleRenderer {
     text: String,
@@ -101,6 +101,9 @@ impl RowRenderer for UserBubbleRenderer {
                 div()
                     .debug_selector(move || bubble_selector)
                     .min_w_0()
+                    // Layout-structure constant (review-exempted): the R6
+                    // bubble width cap from the PRD, paired with `min_w_0`
+                    // so the bubble still shrinks in a narrow column.
                     .max_w(px(560.))
                     .rounded(radius_lg)
                     .bg(bubble)
@@ -108,13 +111,13 @@ impl RowRenderer for UserBubbleRenderer {
                     .px_3()
                     .py_1p5()
                     .when_some(self.body.as_ref(), |this, body| {
-                        this.child(body.text_view(TextViewStyle::default()))
+                        this.child(body.text_view(typography::prose(cx)))
                     })
                     .when(self.body.is_none(), |this| {
                         this.child(
                             TextView::plain(("user-message-plain", part_id), text)
                                 .selectable(true)
-                                .style(TextViewStyle::default()),
+                                .style(typography::prose(cx)),
                         )
                     }),
             )
@@ -129,5 +132,16 @@ impl RowRenderer for UserBubbleRenderer {
     #[cfg(test)]
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+impl UserBubbleRenderer {
+    /// Whether the Markdown projection entity exists (preference on) or the
+    /// row renders the keyed plain text view (preference off).
+    pub(crate) fn body_entity_for_test(&self) -> Option<gpui::EntityId> {
+        self.body
+            .as_ref()
+            .map(crate::ui::markdown::MarkdownBody::entity_id)
     }
 }

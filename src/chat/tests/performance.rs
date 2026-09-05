@@ -65,13 +65,11 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     redraw_settled(cx);
 
     crate::ui::markdown::reset_perf_probe();
-    let expand_started = Instant::now();
     let trigger = cx
         .debug_bounds("reasoning-trigger-0")
         .expect("collapsed reasoning trigger");
     cx.simulate_click(trigger.center(), gpui::Modifiers::default());
     let (expand_draw, expand_probe) = measured_redraw(cx);
-    let expand_elapsed = expand_started.elapsed();
 
     let trigger = cx
         .debug_bounds("reasoning-trigger-0")
@@ -180,7 +178,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         .unwrap_or_default();
 
     eprintln!(
-        "LONG_CONTENT_PERF expand_total={expand_elapsed:?} expand_draw={expand_draw:?} \
+        "LONG_CONTENT_PERF expand_draw={expand_draw:?} \
          expand={expand_probe:?} reopen_total={reopen_elapsed:?} reopen_draw={reopen_draw:?} \
          reopen={reopen_probe:?} wrap_total={wrap_elapsed:?} wrap_draw={wrap_draw:?} \
          wrap={wrap_probe:?} unwrap_total={unwrap_elapsed:?} unwrap_draw={unwrap_draw:?} \
@@ -388,7 +386,7 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
         assert!(
             reasoning_part(this)
                 .expect("combined reasoning")
-                .uses_virtualized_scroll(),
+                .is_scrollable(),
             "combined reasoning must use the retained path"
         );
         last_prose_id(this)
@@ -398,6 +396,15 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
     };
     let wrap_selector = selector("wrap");
     let block_selector = selector("block");
+
+    // The budgeted reasoning viewport is taller than the old seven-line card,
+    // so the long answer row starts below the fold: reveal it once before the
+    // wrap interactions so its code block (and wrap control) renders.
+    cx.update(|_, cx| {
+        chat.read(cx).view.list_state.scroll_to_reveal_item(7);
+    });
+    redraw(cx);
+    redraw(cx);
 
     let measure_toggle = |cx: &mut gpui::VisualTestContext| {
         let wrap = cx.debug_bounds(wrap_selector).expect("answer wrap control");
@@ -423,10 +430,12 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
         .debug_bounds(block_selector)
         .expect("wrapped answer code block");
     let before_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
-    // The nowrap block is ~13k px tall; its top sits far above the viewport
-    // once its bottom edge is revealed. Aim inside the visible part.
+    // The nowrap block is ~13k px tall; with the answer row revealed its top
+    // sits at the viewport top and the body fills the rest of the window, so
+    // aim inside the visible part, clear of the floating composer.
+    let wheel_point = point(block.left() + px(20.), px(300.));
     cx.simulate_event(ScrollWheelEvent {
-        position: point(block.left() + px(20.), block.bottom() - px(50.)),
+        position: wheel_point,
         delta: ScrollDelta::Lines(point(0., -3.)),
         ..Default::default()
     });
@@ -515,4 +524,163 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
          smooth_frames={} smooth_p95={smooth_p95:?}",
         smooth_draws.len()
     );
+}
+
+/// AC8 under the row model: a 4000-line code result plus an inline formula in
+/// one tool-activity row. The result body is lazy — no Markdown entity before
+/// the first expand — the expand builds exactly one continuous code-text
+/// element for the budgeted viewport, and the formula renders from that same
+/// body. Re-collapse releases the entity again.
+#[gpui::test]
+fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut TestAppContext) {
+    const CODE_LINES: usize = 4000;
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(760.), px(560.)));
+
+    let code = (0..CODE_LINES)
+        .map(|line| {
+            format!(
+                "let value_{line} = compute_really_long_identifier_{line}({line}, \"payload-{line}\");"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = format!("Result for $E=mc^2$:\n\n```rust\n{code}\n```\n\nDone.");
+    let formula_start = result.find("$E=mc^2$").expect("fixture formula");
+
+    cx.update(|_, cx| {
+        preferences::update_in_memory(cx, |prefs| {
+            prefs.code_block_line_numbers = false;
+            prefs.smooth_chat_scrolling = false;
+        });
+        chat.update(cx, |chat, cx| {
+            for message in [
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Run the fixture tool.".into(),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        tool_call: crate::llm::ToolCall {
+                            id: "call-perf".into(),
+                            name: "codegen".into(),
+                            arguments: serde_json::json!({}),
+                            raw_arguments: "{}".into(),
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                LlmMessage {
+                    role: crate::llm::Role::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_result: crate::llm::ToolResult {
+                            call_id: "call-perf".into(),
+                            content: result,
+                            is_error: false,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+            ] {
+                test_support::push_canonical(chat, message, cx);
+            }
+        });
+    });
+    redraw_settled(cx);
+
+    // The paired result exists but nothing was built while the row stayed
+    // folded (AC4, perf fixture variant).
+    crate::ui::markdown::reset_perf_probe();
+    cx.update(|_, cx| {
+        let activity = last_activity_renderer(chat.read(cx)).expect("activity row");
+        assert!(
+            activity.result_body_entity_id().is_none(),
+            "the result body is lazy before the first expand"
+        );
+    });
+    assert_eq!(
+        crate::ui::markdown::perf_probe().code_text_elements,
+        0,
+        "a folded activity row builds no code text"
+    );
+
+    // Expand: bounded work covering the 4000-line block. The first expand
+    // builds two bodies — the fenced-JSON arguments section and the result —
+    // so the structural bound is per *body*, never per source line. The
+    // probe covers exactly one settled draw: frame counts otherwise vary
+    // with scheduler load and would couple the bound to painted-frame count.
+    // No frame-time guard here: the lazy first build legitimately pays the
+    // one-time parse and highlight of the full 4000-line source; the
+    // bounded-build probe is the pass/fail signal (the re-disclosure draw
+    // guards live in the reasoning fixtures above).
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            assert!(toggle_activity_row(this, cx), "the activity row toggles");
+        });
+    });
+    cx.run_until_parked();
+    let expand_started = Instant::now();
+    let expand_probe = cx.update(|window, cx| {
+        crate::ui::markdown::reset_perf_probe();
+        let _ = window.draw(cx);
+        crate::ui::markdown::perf_probe()
+    });
+    let expand_draw = expand_started.elapsed();
+
+    let owner_id = cx.update(|_, cx| {
+        last_activity_renderer(chat.read(cx))
+            .and_then(|activity| activity.result_body_owner_for_test())
+            .expect("the expanded result body")
+    });
+    let math_selector: &'static str =
+        Box::leak(format!("markdown-math-{owner_id}-{formula_start}").into_boxed_str());
+    redraw_settled_math(cx);
+    assert!(
+        cx.debug_bounds(math_selector).is_some(),
+        "the result body renders its inline formula"
+    );
+
+    eprintln!(
+        "TOOL_RESULT_PERF expand_draw={expand_draw:?} \
+         expand={expand_probe:?}"
+    );
+    assert!(
+        expand_probe.code_text_elements <= 2,
+        "expanding builds one code-text element per body (arguments + result), \
+         never per line of the {CODE_LINES}-line result: {}",
+        expand_probe.code_text_elements
+    );
+    assert_eq!(
+        expand_probe.code_text_elements, expand_probe.code_block_renders,
+        "one continuous code-text element per rendered block"
+    );
+    assert!(
+        expand_probe.text_view_builds <= 2,
+        "the settled expand draw builds one text view per body (arguments + \
+         result): {}",
+        expand_probe.text_view_builds
+    );
+
+    // Re-collapse releases the entity again.
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            assert!(toggle_activity_row(this, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let activity = last_activity_renderer(chat.read(cx)).expect("activity row");
+        assert!(
+            activity.result_body_entity_id().is_none(),
+            "collapse releases the result body"
+        );
+    });
 }

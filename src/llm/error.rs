@@ -137,13 +137,6 @@ impl GatewayError {
         self.upstream_body.as_deref()
     }
 
-    /// Move the captured response into the failed turn's UI state. The contents
-    /// remain byte-for-byte unchanged; taking ownership only avoids retaining a
-    /// second large allocation in the terminal outcome.
-    pub(crate) fn take_upstream_body(&mut self) -> Option<String> {
-        self.upstream_body.take()
-    }
-
     /// Clone the safe observability tier while deliberately excluding the raw
     /// provider response. Storage boundaries use this instead of cloning and
     /// then clearing sensitive, potentially large text.

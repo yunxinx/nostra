@@ -85,13 +85,66 @@ impl RowId {
     }
 }
 
-/// Whether a foldable row is expanded. Kept on the projection so disclosure
-/// survives renderer release and cold rebuilds.
+/// Disclosure form of a reasoning row: a finished trace is either a collapsed
+/// trigger, a viewport bounded by the height budget, or natural full height.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum DisclosureState {
+pub(crate) enum ReasoningDisclosure {
     #[default]
     Collapsed,
-    Expanded,
+    Budgeted,
+    Full,
+}
+
+/// Disclosure form of one tool activity row: the body is either folded or
+/// open, and an open body remembers whether its arguments section was itself
+/// folded by the user.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ActivityDisclosure {
+    #[default]
+    Collapsed,
+    Open {
+        arguments_open: bool,
+    },
+}
+
+impl ActivityDisclosure {
+    /// Whether the body's arguments section is visible.
+    pub(crate) fn arguments_open(&self) -> bool {
+        match self {
+            Self::Collapsed => false,
+            Self::Open { arguments_open } => *arguments_open,
+        }
+    }
+}
+
+/// Per-row disclosure kept on the projection so it survives renderer release
+/// and cold rebuilds. `reasoning` carries the reasoning row's tri-state,
+/// `activity` the tool activity row's two-stage fold, and `group_open` the
+/// expanded/collapsed state of a tool-activity group row.
+/// `reasoning_user_controlled` records that the user worked a reasoning
+/// toggle, so auto expand/collapse keeps yielding to their choice even after
+/// the row's renderer was released and re-materialized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DisclosureState {
+    pub(crate) reasoning: ReasoningDisclosure,
+    pub(crate) reasoning_user_controlled: bool,
+    pub(crate) activity: ActivityDisclosure,
+    pub(crate) group_open: bool,
+}
+
+impl DisclosureState {
+    /// The generic expanded fold (activity and group rows).
+    pub(crate) const EXPANDED: Self = Self {
+        reasoning: ReasoningDisclosure::Collapsed,
+        reasoning_user_controlled: false,
+        activity: ActivityDisclosure::Collapsed,
+        group_open: true,
+    };
+
+    /// The generic two-state fold of this disclosure (group rows).
+    pub(crate) fn is_expanded(&self) -> bool {
+        self.group_open
+    }
 }
 
 /// One projected row.
@@ -117,6 +170,9 @@ pub(crate) struct Row {
     group: Option<RowId>,
     /// Whether this row is the first member of its expanded group.
     group_leader: bool,
+    /// Display name of the most recent member of the collapsed group this row
+    /// stands for (`ToolActivityGroup` rows only).
+    group_latest: Option<String>,
 }
 
 impl Row {
@@ -162,6 +218,11 @@ impl Row {
     /// that carries the group's collapse affordance.
     pub(crate) fn leads_group(&self) -> bool {
         self.group_leader
+    }
+
+    /// The most recent member's display name for a collapsed group header.
+    pub(crate) fn group_latest(&self) -> Option<&str> {
+        self.group_latest.as_deref()
     }
 
     #[cfg(test)]
@@ -247,6 +308,10 @@ pub(crate) struct RowProjection {
     /// Expanded tool-activity groups, keyed by the group row id. Survives
     /// rebuilds so a released group comes back in the same state.
     group_expanded: HashMap<RowId, DisclosureState>,
+    /// Disclosure of individual activity rows that are currently folded into
+    /// a collapsed group row. Without this, expand → tweak one member →
+    /// collapse → expand would lose the member's state. Cleared on `Reset`.
+    member_disclosure: HashMap<RowId, DisclosureState>,
 }
 
 impl RowProjection {
@@ -289,12 +354,20 @@ impl RowProjection {
 
     pub(crate) fn set_disclosure(&mut self, id: RowId, disclosure: DisclosureState) {
         if let Some(ix) = self.row_index(id) {
+            let kind = self.rows[ix].id.kind;
             self.rows[ix].disclosure = disclosure;
+            if kind == RowKind::ToolActivity {
+                // Keep the member's state reachable while it is folded into a
+                // collapsed group row.
+                self.member_disclosure.insert(id, disclosure);
+            }
         }
     }
 
     pub(crate) fn group_is_expanded(&self, group: RowId) -> bool {
-        self.group_expanded.get(&group).copied() == Some(DisclosureState::Expanded)
+        self.group_expanded
+            .get(&group)
+            .is_some_and(DisclosureState::is_expanded)
     }
 
     /// Expand or re-fold a tool activity group and re-derive the rows.
@@ -305,9 +378,9 @@ impl RowProjection {
         typography: &TypographySnapshot,
     ) -> ProjectionDiff {
         let next = if self.group_is_expanded(group) {
-            DisclosureState::Collapsed
+            DisclosureState::default()
         } else {
-            DisclosureState::Expanded
+            DisclosureState::EXPANDED
         };
         self.group_expanded.insert(group, next);
         self.rebuild(transcript, typography)
@@ -358,6 +431,7 @@ impl RowProjection {
             transcript,
             &self.activity_pairs,
             &self.group_expanded,
+            &self.member_disclosure,
             &previous,
             typography,
         );
@@ -376,6 +450,7 @@ impl RowProjection {
         self.index.clear();
         self.activity_pairs.clear();
         self.group_expanded.clear();
+        self.member_disclosure.clear();
     }
 
     /// Apply one transcript event.
@@ -394,9 +469,40 @@ impl RowProjection {
                     row_changes: Vec::new(),
                 }
             }
-            TranscriptEvent::TailAppended { .. } | TranscriptEvent::PagePrepended { .. } => {
-                // Ids stay monotonic across tail appends and page prepends,
-                // so cached heights and disclosure remain valid.
+            TranscriptEvent::TailAppended { turn_ids } => {
+                // Ids stay monotonic across tail appends, so cached heights
+                // and disclosure remain valid. A canonically appended turn
+                // can carry the result of an earlier activity row (the
+                // streaming path arrives as PartInserted); the paired row
+                // must re-read its content either way.
+                let mut row_changes = Vec::new();
+                for turn_id in turn_ids {
+                    for part in transcript
+                        .turn(*turn_id)
+                        .into_iter()
+                        .flat_map(|turn| turn.parts.iter().map(|part| part.part_id))
+                    {
+                        if let Some(call_row) = self.call_row_of_result(transcript, *turn_id, part)
+                        {
+                            row_changes.push((call_row, RowChangeKind::Replace));
+                        }
+                    }
+                }
+                let diff = self.rebuild(transcript, typography);
+                let remeasure = row_changes
+                    .iter()
+                    .filter_map(|(id, _)| self.row_index(*id))
+                    .collect();
+                ProjectionOutcome {
+                    diff,
+                    remeasure,
+                    row_changes,
+                }
+            }
+            TranscriptEvent::PagePrepended { .. } => {
+                // Prepended pages sit above the window: their rows are not
+                // materialized yet and materialize fresh with their paired
+                // results, so no live renderer needs re-reading.
                 ProjectionOutcome {
                     diff: self.rebuild(transcript, typography),
                     remeasure: Vec::new(),
@@ -461,6 +567,26 @@ impl RowProjection {
                 {
                     row_changes.push((call_row, RowChangeKind::Replace));
                     if let Some(ix) = self.row_index(call_row) {
+                        remeasure.push(ix);
+                    }
+                }
+                // A tool-call part publishes exactly one PartChanged
+                // (`Finished`, carrying the completed call), and
+                // `rows_for_part` deliberately skips activity rows. Route it
+                // here as a `Replace` so the lazy arguments section can
+                // materialize while the tool is still running.
+                if *change == PartChange::Finished
+                    && transcript.turn(*turn_id).is_some_and(|turn| {
+                        turn.parts.iter().any(|part| {
+                            part.part_id == *part_id
+                                && matches!(part.source, PartSource::ToolCall { .. })
+                        })
+                    })
+                {
+                    let activity = RowId::new(*turn_id, *part_id, RowKind::ToolActivity);
+                    if let Some(ix) = self.row_index(activity) {
+                        self.bump_content_revision(activity);
+                        row_changes.push((activity, RowChangeKind::Replace));
                         remeasure.push(ix);
                     }
                 }
@@ -671,6 +797,11 @@ struct RowDraft {
     group: Option<RowId>,
     /// Whether this row is the first member of its expanded group.
     group_leader: bool,
+    /// Tool call display name, carried so a collapsed group header can name
+    /// its most recent member.
+    name: Option<String>,
+    /// Most recent member's name for a collapsed group row.
+    group_latest: Option<String>,
 }
 
 fn draft(
@@ -690,6 +821,8 @@ fn draft(
         ends_waiting: false,
         group: None,
         group_leader: false,
+        name: None,
+        group_latest: None,
     }
 }
 
@@ -697,6 +830,7 @@ fn derive_rows(
     transcript: &Transcript,
     activity_pairs: &HashMap<CallId, (usize, PartId)>,
     group_expanded: &HashMap<RowId, DisclosureState>,
+    member_disclosure: &HashMap<RowId, DisclosureState>,
     previous: &HashMap<RowId, Row>,
     typography: &TypographySnapshot,
 ) -> Vec<Row> {
@@ -762,6 +896,7 @@ fn derive_rows(
                         1,
                     );
                     item.ends_waiting = !name.is_empty();
+                    item.name = Some(name.clone());
                     turn_drafts.push(item);
                 }
                 // A prose part inside a tool turn has no row of its own.
@@ -822,7 +957,7 @@ fn derive_rows(
         drafts.extend(turn_drafts);
     }
 
-    attach_rows(drafts, previous, typography)
+    attach_rows(drafts, member_disclosure, previous, typography)
 }
 
 /// Collapse runs of ≥ GROUP_THRESHOLD consecutive tool-activity rows into one
@@ -850,7 +985,10 @@ fn collapse_groups(
         }
         if run.len() >= GROUP_THRESHOLD {
             let group = RowId::new(turn_id, run[0].id.part, RowKind::ToolActivityGroup);
-            if group_expanded.get(&group).copied() == Some(DisclosureState::Expanded) {
+            if group_expanded
+                .get(&group)
+                .is_some_and(DisclosureState::is_expanded)
+            {
                 // Every member declares its group; the first one leads it, so
                 // the expand/collapse round trip uses one stable group id.
                 for (index, item) in run.iter_mut().enumerate() {
@@ -860,10 +998,13 @@ fn collapse_groups(
                 out.append(run);
             } else {
                 let count = run.len();
+                // The header names the step the user last saw happen.
+                let group_latest = run.iter().rev().find_map(|item| item.name.clone());
                 let first = run.remove(0);
                 out.push(RowDraft {
                     id: group,
                     group_count: count,
+                    group_latest,
                     ..first
                 });
                 run.clear();
@@ -886,6 +1027,7 @@ fn collapse_groups(
 
 fn attach_rows(
     drafts: Vec<RowDraft>,
+    member_disclosure: &HashMap<RowId, DisclosureState>,
     previous: &HashMap<RowId, Row>,
     typography: &TypographySnapshot,
 ) -> Vec<Row> {
@@ -902,12 +1044,20 @@ fn attach_rows(
         .map(|(ix, item)| {
             let estimate =
                 RowHeight::estimate(item.id.kind, item.source_len, item.block_hint, typography);
-            let (content_revision, disclosure, measured) = match previous.get(&item.id) {
+            // Disclosure comes from the surviving row when the identity is
+            // still projected, otherwise from the member side map so a
+            // member folded into a collapsed group keeps its state.
+            let disclosure = previous
+                .get(&item.id)
+                .map(|row| row.disclosure)
+                .or_else(|| member_disclosure.get(&item.id).copied())
+                .unwrap_or_default();
+            let (content_revision, measured) = match previous.get(&item.id) {
                 // Identity survived: keep the cached measurement (its
-                // freshness is guarded by the content revision) and the
-                // disclosure, but re-estimate for the current content.
-                Some(row) => (row.content_revision, row.disclosure, row.height.measured),
-                None => (0, DisclosureState::default(), None),
+                // freshness is guarded by the content revision), but
+                // re-estimate for the current content.
+                Some(row) => (row.content_revision, row.height.measured),
+                None => (0, None),
             };
             let height = RowHeight {
                 estimated: estimate,
@@ -928,6 +1078,7 @@ fn attach_rows(
                 ends_waiting: item.ends_waiting,
                 group: item.group,
                 group_leader: item.group_leader,
+                group_latest: item.group_latest,
             }
         })
         .collect()

@@ -17,8 +17,9 @@ mod window;
 
 use gpui::{
     AnyElement, App, Context, Entity, FollowMode, InteractiveElement as _, IntoElement, ListOffset,
-    ListState, ParentElement as _, Pixels, Point, Render, StatefulInteractiveElement as _,
-    Styled as _, Window, div, list, prelude::FluentBuilder as _, px,
+    ListState, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, list, prelude::FluentBuilder as _,
+    px,
 };
 use gpui_component::{
     ActiveTheme as _, ElementExt as _, IconName, Sizable as _, StyledExt as _, button::Button,
@@ -26,18 +27,18 @@ use gpui_component::{
 };
 use rust_i18n::t;
 
+use crate::chat::ChatView;
 use crate::chat::projection::{
     ProjectionDiff, RowChangeKind, RowId, RowKind, RowProjection, TypographySnapshot,
     turn_has_wait_ending_row,
 };
 use crate::chat::rows::{
-    MaterializeContext, RowAction, RowActionDispatch, RowChange, RowRenderContext, RowRenderer,
-    renderer_for,
+    DisclosureTarget, MaterializeContext, NestedScrollReplay, RowAction, RowActionDispatch,
+    RowChange, RowRenderContext, RowRenderer, renderer_for,
 };
 use crate::chat::transcript::{
     Part, PartSource, Transcript, TranscriptEvent, TranscriptSnapshot, TurnId,
 };
-use crate::chat::{ChatView, ReasoningTrace};
 use crate::ui::markdown::MarkdownPresentation;
 
 use self::scrolling::{SmoothScrollState, smooth_scroll_animation_enabled};
@@ -79,6 +80,9 @@ pub(in crate::chat) struct TranscriptView {
     sync_scheduled: bool,
     pub(in crate::chat) typography: TypographySnapshot,
     content_width: Pixels,
+    /// Conversation viewport height, recorded at prepaint of the message
+    /// list. Viewport-relative height budgets (reasoning) resolve against it.
+    pub(in crate::chat) viewport_height: Pixels,
     pub(in crate::chat) smooth_scroll: SmoothScrollState,
     is_generating: bool,
     streaming_turn: Option<TurnId>,
@@ -138,6 +142,7 @@ impl TranscriptView {
             sync_scheduled: false,
             typography,
             content_width: px(720.),
+            viewport_height: px(0.),
             smooth_scroll: SmoothScrollState::default(),
             is_generating: false,
             streaming_turn: snapshot.streaming().map(|(turn, _)| turn),
@@ -496,9 +501,12 @@ impl TranscriptView {
             append_replays_part,
         };
         let slot = &mut self.slots[ix];
-        slot.renderer.materialize(&ctx, cx);
+        // The disclosure arrives before materialization so the renderer
+        // rebuilds exactly the lazy bodies its restored state calls for
+        // (an activity row restored open re-creates its result body here).
         slot.renderer
             .sync_disclosure(self.projection.disclosure(row_id));
+        slot.renderer.materialize(&ctx, cx);
     }
 
     /// The diagnostics surface for materialized-row counts (review gates).
@@ -577,6 +585,7 @@ impl TranscriptView {
         let group_count = row.group_count();
         let group = row.group();
         let group_leader = row.leads_group();
+        let group_latest = row.group_latest().map(SharedString::from);
         let key = self.current_key();
         let dispatch = RowActionDispatch::new(cx.weak_entity());
 
@@ -607,7 +616,9 @@ impl TranscriptView {
                 role: row.role(),
                 turn_hovered: hovering,
                 waiting,
+                viewport_height: self.viewport_height,
                 group_count,
+                group_latest,
                 group,
                 group_leader,
                 dispatch,
@@ -740,12 +751,13 @@ impl TranscriptView {
         self.projection.record_height(row_id, height, key, settled);
     }
 
-    pub(in crate::chat) fn renderer_nested_trace(
+    /// Replay state for a row's own scrollable viewport, if it has one.
+    pub(in crate::chat) fn nested_scroll_replay(
         &mut self,
         row_id: RowId,
-    ) -> Option<&mut ReasoningTrace> {
+    ) -> Option<NestedScrollReplay<'_>> {
         let ix = self.projection.row_index(row_id)?;
-        self.slots.get_mut(ix)?.renderer.nested_scroll_trace()
+        self.slots.get_mut(ix)?.renderer.nested_scroll_replay()
     }
 
     // ------------------------------------------------------------------
@@ -1026,6 +1038,10 @@ impl ChatView {
             this.view.render_row(index, window, cx)
         });
         let show_jump = self.view.show_jump_button();
+        // Record the conversation viewport height for viewport-relative row
+        // budgets. The composer height is recorded the same way; a change
+        // repaints the list once.
+        let view = cx.weak_entity();
 
         div()
             .relative()
@@ -1061,6 +1077,15 @@ impl ChatView {
                         div()
                             .id("messages")
                             .size_full()
+                            .on_prepaint(move |bounds, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    if this.view.viewport_height != bounds.size.height {
+                                        this.view.viewport_height = bounds.size.height;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            })
                             .on_scroll_wheel(cx.listener(
                                 move |this, event: &gpui::ScrollWheelEvent, window, cx| {
                                     this.handle_message_scroll_wheel(
@@ -1158,19 +1183,23 @@ impl ChatView {
         }
     }
 
-    /// Reasoning-card easing: one frame step per scheduled frame, per card.
+    /// Reasoning-viewport easing: one frame step per scheduled frame, per
+    /// row. The renderer owns the queued distance and the follow flag; the
+    /// view owns the easing constants and the window-activation contract.
     pub(super) fn schedule_reasoning_scroll_frame(
         &mut self,
         row_id: RowId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(trace) = self.view.renderer_nested_trace(row_id) else {
+        let Some(nested) = self.view.nested_scroll_replay(row_id) else {
             return;
         };
-        if !trace.mark_smooth_frame_scheduled() {
+        if nested.smooth.frame_scheduled {
             return;
         }
+        nested.smooth.frame_scheduled = true;
+        drop(nested);
         cx.on_next_frame(window, move |this, window, cx| {
             this.advance_reasoning_scroll(row_id, window, cx);
         });
@@ -1182,23 +1211,35 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Reasoning cards share the same inactive-window frame throttling as
-        // the transcript, so cancel pending card easing when focus moves to a
-        // different window.
+        // Nested viewport motion shares the inactive-window frame throttling
+        // with the transcript: cancel queued card easing when focus moved to
+        // a different window instead of invalidating a throttled window.
         if !smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
         {
-            if let Some(trace) = self.view.renderer_nested_trace(row_id) {
-                trace.cancel_smooth_scroll_frame();
+            if let Some(nested) = self.view.nested_scroll_replay(row_id) {
+                nested.smooth.frame_scheduled = false;
+                nested.smooth.cancel_motion();
             }
             return;
         }
-        let Some(has_remaining) = self
-            .view
-            .renderer_nested_trace(row_id)
-            .and_then(|trace| trace.advance_smooth_scroll())
-        else {
+        let Some(nested) = self.view.nested_scroll_replay(row_id) else {
             return;
         };
+        nested.smooth.frame_scheduled = false;
+        let Some(step) = nested.smooth.next_step() else {
+            return;
+        };
+        let offset = nested.scroll.scroll_px_offset_for_scrollbar();
+        let max_offset = nested.scroll.max_offset_for_scrollbar();
+        let next_y = (offset.y + step).clamp(-max_offset.y, gpui::Pixels::ZERO);
+        nested
+            .scroll
+            .set_offset_from_scrollbar(gpui::point(offset.x, next_y));
+        if next_y == offset.y {
+            nested.smooth.cancel_motion();
+        }
+        let has_remaining = nested.smooth.remaining != Pixels::ZERO;
+        drop(nested);
         #[cfg(test)]
         scrolling::record_reasoning_smooth_invalidation();
         cx.notify();
@@ -1226,8 +1267,8 @@ impl ChatView {
                 height,
                 settled,
             } => self.view.record_measured(row_id, height, settled),
-            RowAction::ToggleDisclosure { row_id } => {
-                self.toggle_row_disclosure(row_id, window, cx)
+            RowAction::ToggleDisclosure { row_id, target } => {
+                self.toggle_row_disclosure(row_id, target, window, cx)
             }
             RowAction::ReplayNestedScroll {
                 row_id,
@@ -1241,12 +1282,13 @@ impl ChatView {
     fn toggle_row_disclosure(
         &mut self,
         row_id: RowId,
-        window: &mut Window,
+        target: DisclosureTarget,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // An expanded group routes by its group id alone: its member rows
         // replaced the header row, so the id has no index of its own.
-        if row_id.kind == RowKind::ToolActivityGroup {
+        if target == DisclosureTarget::Group {
             let transcript = self.transcript.clone();
             let diff = {
                 let guard = transcript.read(cx);
@@ -1263,27 +1305,12 @@ impl ChatView {
         let Some(ix) = self.view.projection.row_index(row_id) else {
             return;
         };
-        let Some(position) = self
-            .view
-            .slots
-            .get_mut(ix)
-            .and_then(|slot| slot.renderer.toggle_disclosure(cx))
-        else {
-            return;
-        };
-        let disclosure = self.view.slots[ix].renderer.disclosure();
-        self.view.projection.set_disclosure(row_id, disclosure);
+        if let Some(slot) = self.view.slots.get_mut(ix) {
+            slot.renderer.toggle_disclosure(target, cx);
+            let disclosure = slot.renderer.disclosure();
+            self.view.projection.set_disclosure(row_id, disclosure);
+        }
         cx.notify();
-        // Apply the captured relative position once the retained
-        // inner list has completed its first layout (P0 contract).
-        cx.on_next_frame(window, move |_, window, cx| {
-            cx.on_next_frame(window, move |this, _, cx| {
-                if let Some(trace) = this.view.renderer_nested_trace(row_id) {
-                    trace.apply_virtualized_position(position);
-                }
-                cx.notify();
-            });
-        });
     }
 
     fn replay_nested_scroll(
@@ -1295,23 +1322,49 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Nested card motion cancels any queued transcript easing first.
+        // Nested viewport motion cancels any queued transcript easing first.
         self.view.smooth_scroll.cancel_motion();
         let smooth =
             smooth_scroll_animation_enabled(window, self.preference_snapshot.smooth_chat_scrolling)
                 && !precise;
-        let Some(trace) = self.view.renderer_nested_trace(row_id) else {
+        let Some(nested) = self.view.nested_scroll_replay(row_id) else {
             return;
         };
-        trace.handle_scroll_dy(dy, cx);
+        // Follow semantics: an upward gesture hands the viewport to the
+        // reader; a downward gesture at the end re-arms tail following.
+        if dy > Pixels::ZERO {
+            *nested.follow = false;
+            nested.scroll.set_follow_mode(FollowMode::Normal);
+        } else if dy < Pixels::ZERO && nested.near_bottom() {
+            *nested.follow = true;
+            nested.scroll.set_follow_mode(FollowMode::Tail);
+        }
         if !smooth {
-            trace.cancel_smooth_scroll();
+            // One-shot native path: precise (touchpad) input, the disabled
+            // preference, or an inactive window must still move the viewport,
+            // so apply the delta directly instead of queueing eased frames.
+            // The containment handler owns the gesture at this pin — the
+            // inner list's own wheel listener does not fire past it.
+            nested.smooth.cancel_motion();
+            if dy == Pixels::ZERO {
+                return;
+            }
+            let offset = nested.scroll.scroll_px_offset_for_scrollbar();
+            let max_offset = nested.scroll.max_offset_for_scrollbar();
+            let next_y = (offset.y + dy).clamp(-max_offset.y, Pixels::ZERO);
+            nested
+                .scroll
+                .set_offset_from_scrollbar(gpui::point(offset.x, next_y));
             return;
         }
         if dy == Pixels::ZERO {
             return;
         }
-        trace.enqueue_smooth_scroll(anchor, dy);
+        // Restore the painted-frame anchor before easing so the native jump
+        // the list already applied never reaches a painted frame.
+        nested.scroll.set_offset_from_scrollbar(anchor);
+        nested.smooth.enqueue(dy);
+        drop(nested);
         self.schedule_reasoning_scroll_frame(row_id, window, cx);
     }
 

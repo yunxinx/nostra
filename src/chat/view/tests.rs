@@ -966,3 +966,238 @@ fn a_view_created_mid_stream_seeds_the_accumulated_stream(cx: &mut TestAppContex
         "the next delta continues the accumulated content instead of restarting it"
     );
 }
+
+/// AC5 through the real interaction path: a run of activities renders as one
+/// step-stack header; expanding splits it into individually expandable rows;
+/// each member's fold state survives a warm rebuild and a collapse/re-expand
+/// round trip of the stack itself.
+#[gpui::test]
+fn a_step_stack_splits_into_individually_expandable_rows(cx: &mut TestAppContext) {
+    use crate::chat::projection::{ActivityDisclosure, RowKind};
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::test_support::push_empty(chat, crate::chat::Role::Assistant, cx);
+            for index in 0..3 {
+                crate::chat::test_support::start_tool_call(
+                    chat,
+                    index,
+                    index,
+                    format!("call-{index}"),
+                    format!("tool-{index}"),
+                    cx,
+                );
+            }
+        });
+    });
+    redraw_settled(cx);
+
+    let group_id = cx
+        .update(|_, cx| {
+            chat.read(cx)
+                .view
+                .projection
+                .rows()
+                .iter()
+                .find(|row| row.kind() == RowKind::ToolActivityGroup)
+                .map(|row| row.id())
+        })
+        .expect("the run collapses into one step-stack row");
+    let expand_selector: &'static str =
+        Box::leak(format!("{}-expand", group_id.debug_name()).into_boxed_str());
+    let expand_bounds = cx
+        .debug_bounds(expand_selector)
+        .expect("the step-stack header is drawn");
+    cx.simulate_click(expand_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+
+    let member_ids = cx.update(|_, cx| {
+        let chat = chat.read(cx);
+        let members: Vec<_> = chat
+            .view
+            .projection
+            .rows()
+            .iter()
+            .filter(|row| row.kind() == RowKind::ToolActivity)
+            .map(|row| row.id())
+            .collect();
+        (
+            members,
+            chat.view
+                .projection
+                .rows()
+                .iter()
+                .filter(|row| row.leads_group())
+                .count(),
+        )
+    });
+    assert_eq!(
+        member_ids.0.len(),
+        3,
+        "expanding splits the stack into individual activity rows"
+    );
+    assert_eq!(member_ids.1, 1, "exactly one member leads the expansion");
+
+    // The first member expands through its own header.
+    let first = member_ids.0[0];
+    let header_selector: &'static str =
+        Box::leak(format!("{}-header", first.debug_name()).into_boxed_str());
+    let header_bounds = cx
+        .debug_bounds(header_selector)
+        .expect("the member's clickable header is drawn");
+    cx.simulate_click(header_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let open_state = cx.update(|_, cx| chat.read(cx).view.projection.disclosure(first).activity);
+    assert_eq!(
+        open_state,
+        ActivityDisclosure::Open {
+            arguments_open: true
+        },
+        "the member row folds independently"
+    );
+
+    // A warm rebuild (a new turn) keeps the member's state.
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::test_support::push_empty(chat, crate::chat::Role::User, cx);
+        });
+    });
+    redraw_settled(cx);
+    let after_rebuild = cx.update(|_, cx| chat.read(cx).view.projection.disclosure(first).activity);
+    assert_eq!(
+        after_rebuild, open_state,
+        "the member's fold state survives a rebuild"
+    );
+
+    // Collapse the stack through its leader and re-expand: the member state
+    // comes back with it.
+    let leader = cx
+        .update(|_, cx| {
+            chat.read(cx)
+                .view
+                .projection
+                .rows()
+                .iter()
+                .find(|row| row.leads_group())
+                .map(|row| row.id())
+        })
+        .expect("leader member row");
+    let collapse_selector: &'static str =
+        Box::leak(format!("{}-collapse", leader.debug_name()).into_boxed_str());
+    let collapse_bounds = cx
+        .debug_bounds(collapse_selector)
+        .expect("the leader row carries the stack's collapse control");
+    cx.simulate_click(collapse_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    assert!(
+        cx.update(|_, cx| {
+            chat.read(cx)
+                .view
+                .projection
+                .rows()
+                .iter()
+                .any(|row| row.id() == group_id)
+        }),
+        "the stack header returns"
+    );
+
+    let expand_bounds = cx
+        .debug_bounds(expand_selector)
+        .expect("header drawn again");
+    cx.simulate_click(expand_bounds.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    let after_round_trip =
+        cx.update(|_, cx| chat.read(cx).view.projection.disclosure(first).activity);
+    assert_eq!(
+        after_round_trip, open_state,
+        "the member's fold state survives the split round trip"
+    );
+}
+
+/// Regression (P3 dual-axis review): a tool call's arguments arrive with the
+/// call's `Finished` event while the tool is still running. The projection
+/// must route that change to the activity row, so a user who expanded the row
+/// mid-run reads the arguments instead of an empty body until turn end.
+#[gpui::test]
+fn a_running_tool_call_reveals_its_arguments_once_the_call_finishes(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::test_support::push_empty(chat, crate::chat::Role::Assistant, cx);
+            crate::chat::test_support::start_tool_call(
+                chat,
+                0,
+                0,
+                "call-0".into(),
+                "lookup".into(),
+                cx,
+            );
+        });
+    });
+    redraw_settled(cx);
+
+    let row_id = cx
+        .update(|_, cx| {
+            chat.read(cx)
+                .view
+                .projection
+                .rows()
+                .iter()
+                .find(|row| row.kind() == crate::chat::projection::RowKind::ToolActivity)
+                .map(|row| row.id())
+        })
+        .expect("the activity row of the live call");
+    let header_selector: &'static str =
+        Box::leak(format!("{}-header", row_id.debug_name()).into_boxed_str());
+    let header = cx
+        .debug_bounds(header_selector)
+        .expect("the activity header paints");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+
+    let arguments_selector: &'static str =
+        Box::leak(format!("{}-arguments", row_id.debug_name()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(arguments_selector).is_none(),
+        "no arguments exist while the call is still streaming"
+    );
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::test_support::apply_stream(
+                chat,
+                &[
+                    crate::chat::conversation_runtime::ConversationStreamEvent::ToolCallFinished {
+                        content_index: 0,
+                        index: 0,
+                        tool_call: Box::new(crate::llm::ToolCall {
+                            id: "call-0".into(),
+                            name: "lookup".into(),
+                            arguments: serde_json::json!({ "q": "nostra" }),
+                            raw_arguments: r#"{"q":"nostra"}"#.into(),
+                            provider_metadata: Default::default(),
+                        }),
+                    },
+                ],
+                cx,
+            );
+        });
+    });
+    redraw_settled(cx);
+
+    assert!(
+        cx.debug_bounds(arguments_selector).is_some(),
+        "the finished call's arguments appear while the tool still runs"
+    );
+}

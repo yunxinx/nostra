@@ -8,10 +8,8 @@
 
 mod assistant;
 pub(crate) mod conversation_runtime;
-mod error_card;
 mod persistence;
 pub(crate) mod projection;
-mod reasoning_card;
 pub(crate) mod rows;
 pub(crate) mod transcript;
 pub(crate) mod view;
@@ -54,11 +52,10 @@ use crate::session::SessionStores;
 use self::conversation_runtime::ConversationStreamEvent;
 use self::conversation_runtime::{ConversationRuntime, ConversationRuntimeSnapshot};
 use self::projection::{RowId, RowProjection, TypographySnapshot};
-use self::reasoning_card::ReasoningTrace;
 #[cfg(test)]
 use self::transcript::Role;
 use self::transcript::{Transcript, TranscriptEvent, TranscriptSnapshot, TranscriptUpdate};
-pub(in crate::chat) use self::view::scrolling::SmoothScrollState;
+pub(crate) use self::view::scrolling::SmoothScrollState;
 pub(crate) use self::view::scrolling::set_smooth_scrolling;
 #[cfg(test)]
 pub(crate) use self::view::scrolling::{
@@ -83,7 +80,7 @@ fn next_body_owner_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-const STICK_THRESHOLD: Pixels = px(48.);
+pub(in crate::chat) const STICK_THRESHOLD: Pixels = px(48.);
 
 /// First-frame fallback until the floating composer reports its actual height.
 const DEFAULT_COMPOSER_HEIGHT: Pixels = px(120.);

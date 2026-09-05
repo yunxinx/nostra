@@ -1,7 +1,7 @@
 //! Row renderers: one self-contained wrapper per projected row kind.
 //!
 //! A renderer owns only the content entities it creates itself
-//! (`MarkdownBody`, `ReasoningTrace`, error cards). Every round trip back to
+//! (`MarkdownBody` and its keyed views). Every round trip back to
 //! the view — hover, measurement, disclosure, nested scrolling, clipboard —
 //! goes through [`RowAction`] and [`RowActionDispatch`], which holds a *weak*
 //! handle. No renderer struct may contain an `Entity<ChatView>` or an
@@ -11,25 +11,32 @@
 mod prose;
 mod reasoning;
 mod tool_activity;
+mod tool_activity_group;
 mod turn_actions;
 mod turn_error;
+pub(crate) mod typography;
 mod user_bubble;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) use self::prose::ProseRenderer;
 pub(crate) use self::reasoning::ReasoningRenderer;
 pub(crate) use self::tool_activity::ToolActivityRenderer;
+pub(crate) use self::tool_activity_group::ToolActivityGroupRenderer;
 pub(crate) use self::turn_actions::TurnActionsRenderer;
 pub(crate) use self::turn_error::TurnErrorRenderer;
 pub(crate) use self::user_bubble::UserBubbleRenderer;
 
-use gpui::{AnyElement, App, Pixels, Point, SharedString, Window};
+use gpui::{AnyElement, App, ListState, Pixels, Point, SharedString, Window};
 
+use crate::chat::SmoothScrollState;
 use crate::chat::projection::{DisclosureState, RowId, RowKind};
 use crate::chat::transcript::{Part, PartSource, Role, Transcript, TurnId};
 use crate::llm::{GatewayError, ToolResult};
 use crate::ui::markdown::MarkdownPresentation;
 
-use super::{ChatView, ReasoningTrace};
+use super::ChatView;
 
 /// What a renderer should do with a content change.
 #[derive(Debug)]
@@ -89,8 +96,15 @@ pub(crate) struct RowRenderContext {
     /// This row's turn renders the wait shimmer instead of its rows; the
     /// view renders the shimmer itself, and renderers render nothing.
     pub(crate) waiting: bool,
+    /// Height of the conversation viewport, recorded by the view at
+    /// prepaint. Viewport-relative height budgets (reasoning) resolve
+    /// against it.
+    pub(crate) viewport_height: Pixels,
     /// Member count for a collapsed tool-activity group header.
     pub(crate) group_count: usize,
+    /// The most recent member's name for a collapsed tool-activity group
+    /// header ("… · Latest: <name>").
+    pub(crate) group_latest: Option<SharedString>,
     /// The expanded tool-activity group this row belongs to. Declared on
     /// every member row while the group is expanded.
     pub(crate) group: Option<RowId>,
@@ -100,11 +114,31 @@ pub(crate) struct RowRenderContext {
     pub(crate) dispatch: RowActionDispatch,
 }
 
+/// Which foldable surface a [`RowAction::ToggleDisclosure`] targets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisclosureTarget {
+    /// The reasoning trigger row: collapsed chip ↔ budgeted viewport.
+    Reasoning,
+    /// The reasoning full-text toggle: budgeted viewport ↔ natural height.
+    ReasoningFull,
+    /// A tool activity row's body.
+    Activity,
+    /// A tool activity row's arguments section, inside an open body.
+    ActivityArguments,
+    /// A tool-activity group row (expand/collapse the member list).
+    Group,
+    /// A turn error row's raw response body.
+    ErrorBody,
+}
+
 /// Actions a renderer can send back to the owning view.
 #[derive(Debug)]
 pub(crate) enum RowAction {
-    /// Toggle a foldable row (reasoning card / activity group).
-    ToggleDisclosure { row_id: RowId },
+    /// Toggle a foldable row surface.
+    ToggleDisclosure {
+        row_id: RowId,
+        target: DisclosureTarget,
+    },
     /// A renderer with its own viewport received wheel input; the view owns
     /// the easing replay and the nested scroll boundary.
     ReplayNestedScroll {
@@ -196,16 +230,18 @@ pub(crate) trait RowRenderer {
         let _ = disclosure;
     }
 
-    /// Toggle foldable content; `Some(relative_position)` must be applied to
-    /// a virtualized viewport after the next layout.
-    fn toggle_disclosure(&mut self, cx: &mut App) -> Option<f32> {
-        let _ = cx;
-        None
+    /// Toggle foldable content. `target` selects which surface of the row
+    /// toggles; renderers without that surface ignore the call.
+    fn toggle_disclosure(&mut self, target: DisclosureTarget, cx: &mut App) {
+        let _ = (target, cx);
     }
 
-    /// Viewport state for renderers that scroll independently (reasoning
-    /// cards). The view drives easing through it.
-    fn nested_scroll_trace(&mut self) -> Option<&mut ReasoningTrace> {
+    /// Viewport replay state for renderers with their own scrollable
+    /// [`TextView`](crate::ui::markdown) (reasoning preview / budgeted
+    /// viewport). The view owns the easing constants, the window-activation
+    /// check, and the nested scroll boundary; the renderer owns the follow
+    /// flag and the queued distance.
+    fn nested_scroll_replay(&mut self) -> Option<NestedScrollReplay<'_>> {
         None
     }
 
@@ -218,15 +254,35 @@ pub(crate) trait RowRenderer {
 }
 
 /// Static dispatch from a row kind to its wrapper renderer. The `match` must
-/// stay exhaustive over [`RowKind`] (AC7).
+/// stay exhaustive over [`RowKind`].
 pub(crate) fn renderer_for(kind: RowKind) -> Box<dyn RowRenderer> {
     match kind {
         RowKind::UserBubble => Box::new(UserBubbleRenderer::new()),
         RowKind::AssistantProse => Box::new(ProseRenderer::new()),
         RowKind::Reasoning => Box::new(ReasoningRenderer::new()),
         RowKind::ToolActivity => Box::new(ToolActivityRenderer::new()),
-        RowKind::ToolActivityGroup => Box::new(ToolActivityRenderer::new_group()),
+        RowKind::ToolActivityGroup => Box::new(ToolActivityGroupRenderer::new()),
         RowKind::TurnError => Box::new(TurnErrorRenderer::new()),
         RowKind::TurnActions => Box::new(TurnActionsRenderer::new()),
+    }
+}
+
+/// Everything the view needs to replay one nested wheel gesture into a row's
+/// own scrollable viewport. `scroll` is a handle onto the renderer's
+/// [`ListState`](gpui::ListState) (a clone shares the retained state); the
+/// `follow` flag and the queued smooth distance stay owned by the renderer so
+/// release/restore keeps them with the projection.
+pub(crate) struct NestedScrollReplay<'a> {
+    pub(crate) scroll: ListState,
+    pub(crate) follow: &'a mut bool,
+    pub(crate) smooth: &'a mut SmoothScrollState,
+}
+
+impl NestedScrollReplay<'_> {
+    /// Whether the viewport sits close enough to its end that a new delta
+    /// should re-arm tail following (the transcript's stick semantics).
+    pub(crate) fn near_bottom(&self) -> bool {
+        self.scroll.max_offset_for_scrollbar().y + self.scroll.scroll_px_offset_for_scrollbar().y
+            <= crate::chat::STICK_THRESHOLD
     }
 }

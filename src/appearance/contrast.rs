@@ -274,8 +274,8 @@ mod tests {
     use super::*;
     use crate::appearance::theme;
     use crate::preferences::{self, Preferences};
-    use gpui::TestAppContext;
-    use gpui_component::{Theme, ThemeMode};
+    use gpui::{TestAppContext, transparent_white};
+    use gpui_component::{Colorize as _, Theme, ThemeMode};
 
     /// A floor is only reachable while there is lightness left to spend: a
     /// colour already at black or white cannot take the last step, and the
@@ -391,9 +391,13 @@ mod tests {
     fn transcript_blocks_and_outlines_hold_the_pane_in_every_theme(cx: &mut TestAppContext) {
         with_every_bundled_theme(cx, |name, cx| {
             let pane = cx.theme().background;
-            for (label, fill) in [
-                ("user bubble", cx.theme().secondary),
-                ("code block", cx.theme().muted),
+            for (label, fill, text_base) in [
+                (
+                    "user bubble",
+                    cx.theme().secondary,
+                    cx.theme().secondary_foreground,
+                ),
+                ("code block", cx.theme().muted, cx.theme().foreground),
             ] {
                 let block = pane_block(fill, cx);
                 let reads = ratio(block, pane);
@@ -401,10 +405,10 @@ mod tests {
                     reads >= MIN_NESTED_SURFACE_CONTRAST,
                     "{name}: the {label} reads at {reads:.3} on the pane"
                 );
-                let bubble_text = text_on(cx.theme().secondary_foreground, block, cx);
-                let text = ratio(bubble_text, block);
+                let block_text = text_on(text_base, block, cx);
+                let text = ratio(block_text, block);
                 assert!(
-                    clears(text, bubble_text, MIN_BODY_TEXT_CONTRAST),
+                    clears(text, block_text, MIN_BODY_TEXT_CONTRAST),
                     "{name}: text on the {label} reads at {text:.2}"
                 );
             }
@@ -412,6 +416,87 @@ mod tests {
             assert!(
                 outline >= MIN_OUTLINE_CONTRAST,
                 "{name}: a card outline reads at {outline:.3} on the pane"
+            );
+        });
+    }
+
+    /// The transcript row pairings with no divider between them: the
+    /// reasoning rail, the tool-activity header against its body, the step
+    /// stack header, and the hover-revealed turn-actions bar. Every fill and
+    /// outline goes through the same derivation the renderers call, so the
+    /// assertion tracks the views instead of restating them.
+    #[gpui::test]
+    fn transcript_row_surfaces_hold_their_pairings_in_every_theme(cx: &mut TestAppContext) {
+        with_every_bundled_theme(cx, |name, cx| {
+            let theme = cx.theme();
+            let pane = theme.background;
+
+            // The reasoning rail is a bare 2px line against the pane.
+            let rail = pane_outline(theme.border, cx);
+            let rail_reads = ratio(rail, pane);
+            assert!(
+                rail_reads >= MIN_OUTLINE_CONTRAST,
+                "{name}: the reasoning rail reads at {rail_reads:.3} on the pane"
+            );
+
+            // Tool-activity and step-stack headers, and the actions bar,
+            // share one recipe: a muted block on the pane, body text on it.
+            for (label, text_base) in [
+                ("activity header", theme.foreground),
+                ("group header", theme.foreground),
+                ("actions bar", theme.muted_foreground),
+            ] {
+                let header = pane_block(theme.muted, cx);
+                let header_reads = ratio(header, pane);
+                assert!(
+                    header_reads >= MIN_NESTED_SURFACE_CONTRAST,
+                    "{name}: the {label} reads at {header_reads:.3} on the pane"
+                );
+                let header_text = text_on(text_base, header, cx);
+                let text_reads = ratio(header_text, header);
+                assert!(
+                    clears(text_reads, header_text, MIN_BODY_TEXT_CONTRAST),
+                    "{name}: text on the {label} reads at {text_reads:.2}"
+                );
+
+                // The body sits directly against the header with no divider.
+                let body = distinct_surface(
+                    theme.background.into(),
+                    theme.background,
+                    header,
+                    MIN_NESTED_SURFACE_CONTRAST,
+                    theme.is_dark(),
+                );
+                let body_reads = ratio(body.color, header);
+                assert!(
+                    body_reads >= MIN_NESTED_SURFACE_CONTRAST,
+                    "{name}: the body against the {label} reads at {body_reads:.3}"
+                );
+                let body_text = text_on(theme.group_box_foreground, body.color, cx);
+                let body_text_reads = ratio(body_text, body.color);
+                assert!(
+                    clears(body_text_reads, body_text, MIN_BODY_TEXT_CONTRAST),
+                    "{name}: body text against the {label} reads at {body_text_reads:.2}"
+                );
+            }
+
+            // The error row's outline uses the same tinting recipe as the
+            // component library's error Alert.
+            let error_edge = pane_outline(theme.danger.mix_oklab(transparent_white(), 0.3), cx);
+            let error_reads = ratio(error_edge, pane);
+            assert!(
+                error_reads >= MIN_OUTLINE_CONTRAST,
+                "{name}: the error row outline reads at {error_reads:.3} on the pane"
+            );
+
+            // The error headline sits on the washed card fill, derived the
+            // way `TurnErrorRenderer` derives it.
+            let error_surface = theme.danger.mix_oklab(transparent_white(), 0.04);
+            let error_headline = text_on(theme.danger, error_surface, cx);
+            let headline_reads = ratio(error_headline, error_surface);
+            assert!(
+                clears(headline_reads, error_headline, MIN_BODY_TEXT_CONTRAST),
+                "{name}: the error headline reads at {headline_reads:.2} on the card fill"
             );
         });
     }

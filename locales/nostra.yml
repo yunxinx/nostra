@@ -141,15 +141,25 @@ chat:
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
-  tool_group:
-    en: "Tool activity (%{count})"
-    zh-CN: "工具活动（%{count} 条）"
-  tool_group_expand:
-    en: Expand tool activity
-    zh-CN: 展开工具活动
   tool_group_collapse:
     en: Collapse tool activity
     zh-CN: 收拢工具活动
+  tool:
+    running:
+      en: Running…
+      zh-CN: 运行中…
+    completed:
+      en: Completed
+      zh-CN: 已完成
+    failed:
+      en: Failed
+      zh-CN: 失败
+    steps:
+      en: "Ran %{count} steps · Latest: %{name}"
+      zh-CN: "执行了 %{count} 步 · 最近：%{name}"
+    arguments:
+      en: Arguments
+      zh-CN: 参数
   jump_to_latest:
     en: Back to latest
     zh-CN: 回到最新
@@ -164,15 +174,12 @@ chat:
       en: Wrap long lines
       zh-CN: 自动换行
   reasoning:
-    streaming:
-      en: Thinking…
-      zh-CN: 正在思考…
     finished:
       en: "Thought for %{duration}s"
       zh-CN: "已思考 %{duration} 秒"
     completed:
-      en: Thought process
-      zh-CN: 思考过程
+      en: Thought
+      zh-CN: 已思考
     collapse:
       en: Collapse reasoning
       zh-CN: 折叠思考过程
@@ -182,6 +189,12 @@ chat:
     copy:
       en: Copy reasoning
       zh-CN: 复制思考过程
+    expand_all:
+      en: Expand full text
+      zh-CN: 全文展开
+    collapse_all:
+      en: Collapse full text
+      zh-CN: 收起全文
   error:
     runtime_unavailable:
       en: Unable to open a conversation right now. Please try again.

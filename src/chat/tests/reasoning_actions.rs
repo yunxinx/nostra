@@ -1,7 +1,8 @@
 use super::*;
 
 /// Once the user works the toggle, the stream stops deciding for them: a
-/// trace deliberately opened during streaming stays open when it ends.
+/// trace the user re-opened after the automatic fold stays open through the
+/// terminal reconciliation, while a trace the user left alone stays folded.
 #[gpui::test]
 fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
     init_app(cx);
@@ -11,13 +12,6 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
-            let reasoning = reasoning_part_mut(this).expect("trace");
-            // Collapse it by hand mid-stream, then re-open it.
-            reasoning.toggle();
-            assert!(!reasoning.is_expanded());
-            reasoning.toggle();
-            assert!(reasoning.is_expanded());
-
             test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
             test_support::append_text(this, 1, "text-0".into(), "answer", cx);
         });
@@ -28,8 +22,61 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
         let reasoning = reasoning_part(turn).expect("trace");
         assert!(reasoning_states(turn, cx)[0].1, "the stream still ended");
         assert!(
-            reasoning.is_expanded(),
-            "explicit user intent outlives the auto-collapse"
+            !reasoning.is_expanded(),
+            "the finished trace folds down automatically"
+        );
+    });
+
+    // The user re-opens the folded trace through the real toggle path.
+    cx.update(|_, cx| {
+        chat.update(cx, |this, _| {
+            let row_id = rows_of_kind(this, RowKind::Reasoning)
+                .first()
+                .map(|row| row.id())
+                .expect("reasoning row");
+            assert!(toggle_reasoning_row_by_id(this, row_id));
+        });
+    });
+    cx.update(|_, cx| {
+        let turn = chat.read(cx);
+        assert!(
+            reasoning_part(turn).is_some_and(|reasoning| reasoning.is_expanded()),
+            "the user's toggle re-opens the trace"
+        );
+    });
+
+    // A late authoritative snapshot must not override the user's choice.
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::finish_reply(
+                this,
+                Some(IndexedMessage::from_message(LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![
+                        ContentBlock::Reasoning {
+                            reasoning: crate::llm::ReasoningContent {
+                                display: "thinking".into(),
+                                replay: None,
+                            },
+                        },
+                        ContentBlock::Text {
+                            text: "answer".into(),
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                    ],
+                    provider_metadata: ProviderMetadata::default(),
+                })),
+                None,
+                cx,
+            );
+        });
+    });
+
+    cx.update(|_, cx| {
+        let turn = chat.read(cx);
+        assert!(
+            reasoning_part(turn).is_some_and(|reasoning| reasoning.is_expanded()),
+            "explicit user intent outlives the terminal reconciliation"
         );
     });
 }
@@ -353,7 +400,7 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
 /// button too. The copy action stays hidden from hit testing until then —
 /// this test exercises the real hover → reveal → click interaction.
 #[gpui::test]
-fn hovering_a_reasoning_card_reveals_the_message_copy_button(cx: &mut TestAppContext) {
+fn hovering_a_reasoning_row_reveals_the_message_copy_button(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);

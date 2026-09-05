@@ -1,7 +1,7 @@
 use super::super::*;
 
 #[gpui::test]
-fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
+fn separate_reasoning_rows_keep_independent_state(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
@@ -37,7 +37,7 @@ fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
 /// each closure must also resolve the same block identity when it reaches back
 /// into `ChatView` for disclosure and clipboard content.
 #[gpui::test]
-fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContext) {
+fn separate_reasoning_rows_toggle_and_copy_independently(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
@@ -84,6 +84,12 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
 
     let copy_and_read =
         |selector: &'static str, trigger: &'static str, cx: &mut gpui::VisualTestContext| {
+            // Budgeted viewports are taller than the old seven-line cards;
+            // bring the trigger row back into the window before interacting.
+            chat.update(cx, |this, _| {
+                this.view.list_state.scroll_to(ListOffset::default());
+            });
+            draw(cx);
             let trigger = cx.debug_bounds(trigger).expect("reasoning trigger");
             cx.simulate_mouse_move(trigger.center(), None, gpui::Modifiers::default());
             draw(cx);
@@ -166,7 +172,7 @@ fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext) {
+fn terminal_snapshot_preserves_separate_reasoning_rows(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
@@ -178,7 +184,7 @@ fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext)
             test_support::append_text(this, 1, "text-0".into(), "partial answer", cx);
             test_support::append_reasoning(this, 2, "reasoning-1".into(), "partial second", cx);
             let first = reasoning_part_mut(this).expect("first reasoning card");
-            first.toggle();
+            first.toggle_for_test();
             test_support::finish_reply(
                 this,
                 Some(IndexedMessage::from_message(LlmMessage {
@@ -250,8 +256,11 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
                 .expect("reasoning slot");
             let row_id = reasoning_row_for_part(this, part_id).expect("reasoning row");
             assert!(toggle_reasoning_row_by_id(this, row_id));
-            let trace = reasoning_trace_by_part(this, part_id).expect("reasoning trace");
-            (part_id.as_u64(), trace.body_entity_id())
+            let renderer = reasoning_renderer_by_part(this, part_id).expect("reasoning renderer");
+            (
+                part_id.as_u64(),
+                renderer.body_entity_id().expect("reasoning body"),
+            )
         })
     });
 
@@ -289,11 +298,11 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
         let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("terminal reasoning part")
         };
-        let trace = reasoning_trace_by_part(this, part.part_id).expect("reasoning trace");
+        let renderer = reasoning_renderer_by_part(this, part.part_id).expect("reasoning renderer");
         assert_eq!(part.part_id.as_u64(), ui_id);
-        assert_eq!(trace.body_entity_id(), body_id);
+        assert_eq!(renderer.body_entity_id().expect("reasoning body"), body_id);
         assert!(
-            trace.is_expanded(),
+            renderer.is_expanded(),
             "manual disclosure survives reconciliation"
         );
         assert_eq!(reasoning.display, "authoritative");
@@ -338,8 +347,12 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
                 .expect("reasoning part");
             let row_id = reasoning_row_for_part(this, part_id).expect("reasoning row");
             assert!(toggle_reasoning_row_by_id(this, row_id));
-            let trace = reasoning_trace_by_part(this, part_id).expect("reasoning trace");
-            (part_id.as_u64(), trace.body_entity_id(), trace.elapsed())
+            let renderer = reasoning_renderer_by_part(this, part_id).expect("reasoning renderer");
+            (
+                part_id.as_u64(),
+                renderer.body_entity_id().expect("reasoning body"),
+                renderer.elapsed(),
+            )
         })
     });
 
@@ -373,11 +386,11 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
         let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("reasoning part")
         };
-        let trace = reasoning_trace_by_part(this, part.part_id).expect("reasoning trace");
+        let renderer = reasoning_renderer_by_part(this, part.part_id).expect("reasoning renderer");
         assert_eq!(part.part_id.as_u64(), ui_id);
-        assert_eq!(trace.body_entity_id(), body_id);
-        assert_eq!(trace.elapsed(), elapsed);
-        assert!(trace.is_expanded() && part.finished);
+        assert_eq!(renderer.body_entity_id().expect("reasoning body"), body_id);
+        assert_eq!(renderer.elapsed(), elapsed);
+        assert!(renderer.is_expanded() && part.finished);
         assert_eq!(reasoning.display, "authoritative summary");
         assert_eq!(
             reasoning

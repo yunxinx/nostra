@@ -69,7 +69,7 @@ fn waiting_hides_when_reasoning_appears(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn waiting_hides_when_error_card_appears(cx: &mut TestAppContext) {
+fn waiting_hides_when_the_error_row_appears(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);

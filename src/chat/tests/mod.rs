@@ -26,12 +26,11 @@ use crate::session::{
     SessionId, SessionReadStore, SessionStores, TurnStatus,
 };
 
-use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
-use super::rows::{ProseRenderer, ReasoningRenderer};
+use super::rows::{ProseRenderer, ReasoningRenderer, RowRenderer as _};
 pub(crate) use super::test_support;
 use super::transcript::{PartId, PartSource};
 use super::{
-    ChatDeleteRequest, ChatView, ReasoningTrace, Role, SMOOTH_SCROLL_FINISH_THRESHOLD,
+    ChatDeleteRequest, ChatView, Role, SMOOTH_SCROLL_FINISH_THRESHOLD,
     SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD, SmoothScrollState, Turn, is_replayable,
     reasoning_smooth_invalidations, reset_reasoning_smooth_invalidations,
 };
@@ -138,8 +137,8 @@ pub(in crate::chat) fn seed_turn(chat: &gpui::Entity<ChatView>, cx: &mut gpui::V
     });
 }
 
-/// The turn error captured by the last error row's renderer.
-fn last_error_card(chat: &ChatView) -> Option<&crate::chat::error_card::TurnError> {
+/// The last turn-error row's renderer.
+fn last_error_renderer(chat: &ChatView) -> Option<&crate::chat::rows::TurnErrorRenderer> {
     rows_of_kind(chat, RowKind::TurnError)
         .last()
         .and_then(|row| renderer_for_row(chat, row))
@@ -148,7 +147,80 @@ fn last_error_card(chat: &ChatView) -> Option<&crate::chat::error_card::TurnErro
                 .as_any()
                 .downcast_ref::<crate::chat::rows::TurnErrorRenderer>()
         })
-        .and_then(crate::chat::rows::TurnErrorRenderer::error_for_test)
+}
+
+/// The last user bubble renderer.
+fn last_user_bubble_renderer(chat: &ChatView) -> Option<&crate::chat::rows::UserBubbleRenderer> {
+    rows_of_kind(chat, RowKind::UserBubble)
+        .last()
+        .and_then(|row| renderer_for_row(chat, row))
+        .and_then(|renderer| {
+            renderer
+                .as_any()
+                .downcast_ref::<crate::chat::rows::UserBubbleRenderer>()
+        })
+}
+
+/// Fold/unfold the last turn-error row's raw response body. Returns whether
+/// a renderer was found.
+fn toggle_error_row(chat: &mut ChatView, cx: &mut App) -> bool {
+    let Some(row_id) = rows_of_kind(chat, RowKind::TurnError)
+        .last()
+        .map(|row| row.id())
+    else {
+        return false;
+    };
+    let Some(ix) = chat.view.projection.row_index(row_id) else {
+        return false;
+    };
+    let Some(renderer) = chat.view.slots[ix]
+        .renderer
+        .as_any_mut()
+        .downcast_mut::<crate::chat::rows::TurnErrorRenderer>()
+    else {
+        return false;
+    };
+    renderer.toggle_disclosure(crate::chat::rows::DisclosureTarget::ErrorBody, cx);
+    let disclosure = renderer.disclosure();
+    chat.view.projection.set_disclosure(row_id, disclosure);
+    true
+}
+
+/// The last tool-activity row's renderer.
+fn last_activity_renderer(chat: &ChatView) -> Option<&crate::chat::rows::ToolActivityRenderer> {
+    rows_of_kind(chat, RowKind::ToolActivity)
+        .last()
+        .and_then(|row| renderer_for_row(chat, row))
+        .and_then(|renderer| {
+            renderer
+                .as_any()
+                .downcast_ref::<crate::chat::rows::ToolActivityRenderer>()
+        })
+}
+
+/// Expand/collapse the last tool-activity row's body. Returns whether a
+/// renderer was found.
+fn toggle_activity_row(chat: &mut ChatView, cx: &mut App) -> bool {
+    let Some(row_id) = rows_of_kind(chat, RowKind::ToolActivity)
+        .last()
+        .map(|row| row.id())
+    else {
+        return false;
+    };
+    let Some(ix) = chat.view.projection.row_index(row_id) else {
+        return false;
+    };
+    let Some(renderer) = chat.view.slots[ix]
+        .renderer
+        .as_any_mut()
+        .downcast_mut::<crate::chat::rows::ToolActivityRenderer>()
+    else {
+        return false;
+    };
+    renderer.toggle_disclosure(crate::chat::rows::DisclosureTarget::Activity, cx);
+    let disclosure = renderer.disclosure();
+    chat.view.projection.set_disclosure(row_id, disclosure);
+    true
 }
 
 fn reasoning_row_for_part(chat: &ChatView, part_id: PartId) -> Option<RowId> {
@@ -162,26 +234,24 @@ fn toggle_reasoning_row_by_id(chat: &mut ChatView, row_id: RowId) -> bool {
     let Some(ix) = chat.view.projection.row_index(row_id) else {
         return false;
     };
-    let Some(trace) = chat.view.slots[ix]
+    let Some(renderer) = chat.view.slots[ix]
         .renderer
         .as_any_mut()
         .downcast_mut::<ReasoningRenderer>()
-        .and_then(ReasoningRenderer::trace_for_test_mut)
     else {
         return false;
     };
-    trace.toggle();
+    renderer.toggle_for_test();
     true
 }
 
-fn reasoning_trace_by_part(chat: &ChatView, part_id: PartId) -> Option<&ReasoningTrace> {
+fn reasoning_renderer_by_part(chat: &ChatView, part_id: PartId) -> Option<&ReasoningRenderer> {
     let row_id = reasoning_row_for_part(chat, part_id)?;
     let ix = chat.view.projection.row_index(row_id)?;
     chat.view.slots[ix]
         .renderer
         .as_any()
-        .downcast_ref::<ReasoningRenderer>()?
-        .trace_for_test()
+        .downcast_ref::<ReasoningRenderer>()
 }
 
 fn last_llm(chat: &ChatView, cx: &App) -> LlmMessage {
@@ -190,7 +260,7 @@ fn last_llm(chat: &ChatView, cx: &App) -> LlmMessage {
 
 fn last_reasoning_id(chat: &ChatView) -> u64 {
     reasoning_part(chat)
-        .map(ReasoningTrace::owner_id)
+        .map(ReasoningRenderer::owner_id)
         .expect("reasoning part")
 }
 
@@ -259,39 +329,49 @@ fn prose_body_mut(
         .expect("materialized prose body")
 }
 
-fn reasoning_part(chat: &ChatView) -> Option<&ReasoningTrace> {
-    // P1 parity: the first reasoning card of the projected transcript.
+/// The first reasoning renderer that owns a markdown body — the rows that
+/// actually show (or can show) reasoning content. Replay-only parts allocate
+/// no body and read as absent.
+fn reasoning_part(chat: &ChatView) -> Option<&ReasoningRenderer> {
     rows_of_kind(chat, RowKind::Reasoning)
         .iter()
         .find_map(|row| {
-            renderer_for_row(chat, row)?
+            let renderer = renderer_for_row(chat, row)?
                 .as_any()
-                .downcast_ref::<ReasoningRenderer>()?
-                .trace_for_test()
+                .downcast_ref::<ReasoningRenderer>()?;
+            renderer.body_for_test()?;
+            Some(renderer)
         })
 }
 
-fn reasoning_part_mut(chat: &mut ChatView) -> Option<&mut ReasoningTrace> {
-    // P1 parity: mutate the first reasoning card.
+/// Mutate the first reasoning renderer that owns a markdown body.
+fn reasoning_part_mut(chat: &mut ChatView) -> Option<&mut ReasoningRenderer> {
     let row_id = rows_of_kind(chat, RowKind::Reasoning)
-        .first()
-        .map(|row| row.id())?;
+        .iter()
+        .find(|row| {
+            renderer_for_row(chat, row)
+                .and_then(|renderer| renderer.as_any().downcast_ref::<ReasoningRenderer>())
+                .is_some_and(|renderer| renderer.body_for_test().is_some())
+        })?
+        .id();
     let ix = chat.view.projection.row_index(row_id)?;
-    chat.view.slots[ix]
+    let renderer = chat.view.slots[ix]
         .renderer
         .as_any_mut()
-        .downcast_mut::<ReasoningRenderer>()?
-        .trace_for_test_mut()
+        .downcast_mut::<ReasoningRenderer>()?;
+    renderer.body_for_test()?;
+    Some(renderer)
 }
 
-fn reasoning_parts(chat: &ChatView) -> Vec<&ReasoningTrace> {
+fn reasoning_parts(chat: &ChatView) -> Vec<&ReasoningRenderer> {
     rows_of_kind(chat, RowKind::Reasoning)
         .iter()
         .filter_map(|row| {
-            renderer_for_row(chat, row)?
+            let renderer = renderer_for_row(chat, row)?
                 .as_any()
-                .downcast_ref::<ReasoningRenderer>()?
-                .trace_for_test()
+                .downcast_ref::<ReasoningRenderer>()?;
+            renderer.body_for_test()?;
+            Some(renderer)
         })
         .collect()
 }

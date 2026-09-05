@@ -33,9 +33,9 @@ pub(in crate::chat) fn record_reasoning_smooth_invalidation() {
 }
 
 #[derive(Default)]
-pub(in crate::chat) struct SmoothScrollState {
-    pub(in crate::chat) remaining: Pixels,
-    pub(in crate::chat) frame_scheduled: bool,
+pub(crate) struct SmoothScrollState {
+    pub(crate) remaining: Pixels,
+    pub(crate) frame_scheduled: bool,
 }
 
 impl SmoothScrollState {
@@ -59,6 +59,12 @@ impl SmoothScrollState {
 
     pub(in crate::chat) fn cancel_motion(&mut self) {
         self.remaining = Pixels::ZERO;
+        // No queued motion means no pending frame. Rows call this from
+        // `release`/`close` while a scheduled frame may still be outstanding;
+        // leaving the flag set would make every later
+        // `schedule_*_scroll_frame` bail without ever scheduling, killing
+        // that row's easing for the lifetime of the renderer.
+        self.frame_scheduled = false;
     }
 }
 

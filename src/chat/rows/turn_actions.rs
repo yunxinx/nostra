@@ -12,7 +12,7 @@ use gpui::{
     App, ElementId, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     Styled as _, Window, div, prelude::FluentBuilder as _,
 };
-use gpui_component::{clipboard::Clipboard, h_flex};
+use gpui_component::{ActiveTheme as _, clipboard::Clipboard, h_flex};
 use rust_i18n::t;
 
 use crate::chat::projection::RowKind;
@@ -61,7 +61,7 @@ impl RowRenderer for TurnActionsRenderer {
         &self,
         ctx: &RowRenderContext,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> gpui::AnyElement {
         let Some(turn_id) = self.turn_id else {
             return div().into_any_element();
@@ -74,6 +74,10 @@ impl RowRenderer for TurnActionsRenderer {
         let row_id = ctx.row_id;
         let ui_id = turn_id.as_u64();
         let copy_selector = format!("{}-copy", row_id.debug_name());
+        // The bar only paints while the turn is hovered; the surface it paints
+        // then still sits on the pane with no divider, so it takes the
+        // contrast-derived block fill like the activity headers.
+        let bar = crate::appearance::contrast::pane_block(cx.theme().muted, cx);
         justify
             .w_full()
             .mt_1()
@@ -81,6 +85,8 @@ impl RowRenderer for TurnActionsRenderer {
                 div()
                     .flex_none()
                     .debug_selector(move || copy_selector)
+                    .rounded(cx.theme().radius_lg)
+                    .bg(bar)
                     .invisible()
                     .when(ctx.turn_hovered, |this| this.visible())
                     .child(

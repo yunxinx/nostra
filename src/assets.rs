@@ -94,6 +94,7 @@ mod tests {
             "icons/square-pen.svg",
             "icons/wrap-text.svg",
             "icons/trash-2.svg",
+            "icons/tool.svg",
         ] {
             assert!(super::embedded(path).is_some(), "missing embed: {path}");
         }

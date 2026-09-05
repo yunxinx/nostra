@@ -2,7 +2,7 @@ use super::*;
 
 /// Streaming reasoning follows the same manual-scroll contract as the main
 /// transcript: an upward gesture pauses following, and a later downward
-/// gesture at the end re-arms it.
+/// gesture at the end re-arms it (AC1).
 #[gpui::test]
 fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) {
     init_app(cx);
@@ -28,17 +28,10 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     let body = cx
         .debug_bounds("reasoning-body-0")
-        .expect("the expanded reasoning body was drawn");
+        .expect("the streaming reasoning preview was drawn");
     let (bottom_offset, max_offset) = cx.update(|_, cx| {
-        let chat = chat.read(cx);
-        chat.transcript
-            .read(cx)
-            .turns()
-            .last()
-            .map_or((px(0.), px(0.)), |_| {
-                let trace = reasoning_part(chat).expect("reasoning trace");
-                (trace.scroll_offset().y, trace.scroll_max().y)
-            })
+        let renderer = reasoning_part(chat.read(cx)).expect("reasoning renderer");
+        (renderer.scroll_offset().y, renderer.scroll_max().y)
     });
     assert!(
         max_offset > px(80.),
@@ -55,14 +48,17 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     let paused_offset = cx.update(|_, cx| {
         let turn = chat.read(cx);
-        let trace = reasoning_part(turn).expect("reasoning trace");
+        let renderer = reasoning_part(turn).expect("reasoning renderer");
         assert!(
-            !trace.is_following(),
+            !renderer.is_following(),
             "upward scrolling must pause following"
         );
-        trace.scroll_offset().y
+        renderer.scroll_offset().y
     });
-    assert!(paused_offset > bottom_offset, "the card should move upward");
+    assert!(
+        paused_offset > bottom_offset,
+        "the preview should move upward"
+    );
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -83,7 +79,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
     let still_paused = cx.update(|_, cx| {
         let turn = chat.read(cx);
         reasoning_part(turn)
-            .expect("reasoning trace")
+            .expect("reasoning renderer")
             .scroll_offset()
             .y
     });
@@ -94,7 +90,7 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     let body = cx
         .debug_bounds("reasoning-body-0")
-        .expect("the reasoning body remains visible");
+        .expect("the reasoning preview remains visible");
     cx.simulate_event(ScrollWheelEvent {
         position: body.center(),
         delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
@@ -104,22 +100,22 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     let rearmed = cx.update(|_, cx| {
         let turn = chat.read(cx);
-        let trace = reasoning_part(turn).expect("reasoning trace");
+        let renderer = reasoning_part(turn).expect("reasoning renderer");
         assert!(
-            trace.is_following(),
+            renderer.is_following(),
             "scrolling down at the end must re-arm following (offset={:?}, max={:?})",
-            trace.scroll_offset(),
-            trace.scroll_max()
+            renderer.scroll_offset(),
+            renderer.scroll_max()
         );
-        trace.scroll_offset().y
+        renderer.scroll_offset().y
     });
     assert!(
         cx.update(|_, cx| {
             let turn = chat.read(cx);
-            let trace = reasoning_part(turn).expect("reasoning trace");
-            trace.scroll_max().y + rearmed <= STICK_THRESHOLD
+            let renderer = reasoning_part(turn).expect("reasoning renderer");
+            renderer.scroll_max().y + rearmed <= STICK_THRESHOLD
         }),
-        "the downward gesture should reach the card's end"
+        "the downward gesture should reach the preview's end"
     );
 
     cx.update(|_, cx| {
@@ -132,102 +128,15 @@ fn streaming_reasoning_respects_manual_scroll_position(cx: &mut TestAppContext) 
 
     assert!(cx.update(|_, cx| {
         let turn = chat.read(cx);
-        let trace = reasoning_part(turn).expect("reasoning trace");
-        trace.scroll_max().y + trace.scroll_offset().y <= STICK_THRESHOLD
+        let renderer = reasoning_part(turn).expect("reasoning renderer");
+        renderer.scroll_max().y + renderer.scroll_offset().y <= STICK_THRESHOLD
     }));
 }
 
-#[gpui::test]
-fn virtualized_reasoning_stops_following_after_manual_scroll(cx: &mut TestAppContext) {
-    init_app(cx);
-    let (chat, cx) = add_chat_window(cx);
-    cx.simulate_resize(gpui::size(px(900.), px(700.)));
-    seed_turn(&chat, cx);
-
-    cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            for line in 0..180 {
-                test_support::append_reasoning(this,
-                    0,
-                    "reasoning-virtualized-follow".into(),
-                    &format!(
-                        "Reasoning line {line}: this fixture keeps enough prose to exercise the retained virtual list.\n\n"
-                    ),
-                    cx,
-                );
-            }
-        });
-    });
-    redraw(cx);
-    redraw(cx);
-
-    let body = cx
-        .debug_bounds("reasoning-body-0")
-        .expect("the expanded reasoning body was drawn");
-    let (bottom_offset, max_offset, virtualized) = cx.update(|_, cx| {
-        let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
-        (
-            trace.scroll_offset().y,
-            trace.scroll_max().y,
-            trace.uses_virtualized_scroll(),
-        )
-    });
-    assert!(
-        virtualized,
-        "long reasoning must use the retained virtual list"
-    );
-    assert!(
-        max_offset > px(100.),
-        "the fixture must have scrollable reasoning"
-    );
-    assert_eq!(bottom_offset, -max_offset);
-
-    cx.simulate_event(ScrollWheelEvent {
-        position: body.center(),
-        delta: ScrollDelta::Pixels(point(px(0.), px(80.))),
-        ..Default::default()
-    });
-    redraw(cx);
-    let paused_offset = cx.update(|_, cx| {
-        let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
-        assert!(
-            !trace.is_following(),
-            "manual scroll must disarm tail follow"
-        );
-        trace.scroll_offset().y
-    });
-    assert!(
-        paused_offset > bottom_offset,
-        "the card should move away from its tail"
-    );
-
-    cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            test_support::append_reasoning(
-                this,
-                0,
-                "reasoning-virtualized-follow".into(),
-                "new tail content must not steal the reader's position.\n\n",
-                cx,
-            );
-        });
-    });
-    redraw(cx);
-    redraw(cx);
-    let after_append = cx.update(|_, cx| {
-        reasoning_part(chat.read(cx))
-            .expect("reasoning trace")
-            .scroll_offset()
-            .y
-    });
-    assert_eq!(
-        after_append, paused_offset,
-        "streaming into a virtualized card must preserve a manually chosen offset"
-    );
-}
-
 /// The reasoning viewport owns every vertical wheel gesture inside its bounds.
-/// This remains true regardless of whether transcript wheel smoothing is on.
+/// This remains true regardless of whether transcript wheel smoothing is on
+/// (AC3: nested boundaries never leak into the transcript, and the eased
+/// replay keeps its anchor-then-replay shape).
 #[gpui::test]
 fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
     init_app(cx);
@@ -277,18 +186,18 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         );
         let body = cx
             .debug_bounds("reasoning-body-0")
-            .expect("the latest reasoning card must be visible");
+            .expect("the latest reasoning preview must be visible");
         let transcript_before =
             cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
         let card_before = cx.update(|_, cx| {
             reasoning_part(chat.read(cx))
-                .expect("reasoning trace")
+                .expect("reasoning renderer")
                 .scroll_offset()
                 .y
         });
 
         // A previously queued transcript animation must be abandoned as soon
-        // as the pointer enters the nested card.
+        // as the pointer enters the nested viewport.
         if smooth_scrolling {
             cx.simulate_event(ScrollWheelEvent {
                 position: point(px(320.), px(40.)),
@@ -310,12 +219,12 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         let (transcript_after, card_offset, pending_transcript_scroll, pending_card_scroll) = cx
             .update(|_, cx| {
                 let chat = chat.read(cx);
-                let trace = reasoning_part(chat).expect("reasoning trace");
+                let renderer = reasoning_part(chat).expect("reasoning renderer");
                 (
                     chat.view.list_state.logical_scroll_top(),
-                    trace.scroll_offset().y,
+                    renderer.scroll_offset().y,
                     chat.view.smooth_scroll.remaining,
-                    trace.smooth_scroll_remaining(),
+                    renderer.smooth_scroll_remaining(),
                 )
             });
         assert_eq!(transcript_after.item_ix, transcript_before.item_ix);
@@ -325,7 +234,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         );
         assert!(
             card_offset < px(0.),
-            "the reasoning card itself must consume the wheel input"
+            "the reasoning preview itself must consume the wheel input"
         );
         assert_eq!(
             pending_transcript_scroll,
@@ -339,7 +248,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             );
             assert!(
                 pending_card_scroll != px(0.),
-                "reasoning wheel input must queue eased card motion"
+                "reasoning wheel input must queue eased viewport motion"
             );
             assert!(
                 cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
@@ -348,13 +257,13 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             redraw(cx);
             let eased_card_offset = cx.update(|_, cx| {
                 reasoning_part(chat.read(cx))
-                    .expect("reasoning trace")
+                    .expect("reasoning renderer")
                     .scroll_offset()
                     .y
             });
             assert!(
                 eased_card_offset > card_before,
-                "the animation frame must advance the reasoning card"
+                "the animation frame must advance the reasoning viewport"
             );
 
             cx.simulate_event(ScrollWheelEvent {
@@ -363,12 +272,15 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                 ..Default::default()
             });
             let (precise_offset, pending_after_precise) = cx.update(|_, cx| {
-                let trace = reasoning_part(chat.read(cx)).expect("reasoning trace");
-                (trace.scroll_offset().y, trace.smooth_scroll_remaining())
+                let renderer = reasoning_part(chat.read(cx)).expect("reasoning renderer");
+                (
+                    renderer.scroll_offset().y,
+                    renderer.smooth_scroll_remaining(),
+                )
             });
             assert!(
                 precise_offset > eased_card_offset,
-                "precise touchpad input must keep the card's native immediate path"
+                "precise touchpad input must keep the viewport's native immediate path"
             );
             assert_eq!(
                 pending_after_precise,
@@ -384,7 +296,9 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         }
 
         // Repeated wheel ticks at either nested boundary are still contained;
-        // they must not fall through just because the card cannot move further.
+        // they must not fall through just because the viewport cannot move
+        // further, and the transcript anchor plus any queued easing must be
+        // untouched (AC3).
         for delta in [
             ScrollDelta::Lines(point(0., 1_000.)),
             ScrollDelta::Lines(point(0., 1_000.)),
@@ -393,6 +307,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         ] {
             let transcript_before_boundary =
                 cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+            let queued_before = cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining);
             cx.simulate_event(ScrollWheelEvent {
                 position: body.center(),
                 delta,
@@ -408,59 +323,11 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                 transcript_after_boundary.offset_in_item, transcript_before_boundary.offset_in_item,
                 "boundary wheel input changed the transcript offset (smooth={smooth_scrolling})"
             );
+            assert_eq!(
+                cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining),
+                queued_before,
+                "boundary wheel input must not queue transcript easing (smooth={smooth_scrolling})"
+            );
         }
     }
-}
-
-/// Reasoning code blocks resolve the active palette in their custom renderer,
-/// so a theme change must not churn the streaming markdown entity.
-#[gpui::test]
-fn theme_switch_preserves_the_reasoning_body(cx: &mut TestAppContext) {
-    init_app(cx);
-    let (chat, cx) = add_chat_window(cx);
-    seed_turn(&chat, cx);
-
-    cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            test_support::append_reasoning(
-                this,
-                0,
-                "reasoning-0".into(),
-                "```json\n{\"a\":1}\n```",
-                cx,
-            );
-        });
-    });
-    let before = cx.update(|_, cx| {
-        reasoning_part(chat.read(cx))
-            .expect("trace")
-            .body_entity_id()
-    });
-
-    // `Theme::change` rather than `theme::set_mode`: the latter persists to
-    // the user's real configuration directory.
-    cx.update(|_, cx| {
-        gpui_component::Theme::change(gpui_component::ThemeMode::Light, None, cx);
-    });
-    cx.run_until_parked();
-
-    cx.update(|_, cx| {
-        let turn = chat.read(cx);
-        let reasoning = reasoning_part(turn).expect("the trace survives a theme switch");
-        assert_eq!(
-            reasoning.body_entity_id(),
-            before,
-            "theme changes must not replace the streaming markdown state"
-        );
-        assert!(
-            reasoning_states(turn, cx)[0].0.contains("json"),
-            "re-parsing must not lose what already streamed"
-        );
-    });
-
-    cx.draw(
-        gpui::point(px(0.), px(0.)),
-        gpui::size(px(900.), px(700.)),
-        |_, _| chat.clone().into_any_element(),
-    );
 }

@@ -8,13 +8,12 @@
 use gpui::{
     App, IntoElement, ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _,
 };
-use gpui_component::text::TextViewStyle;
 
 use crate::chat::projection::RowKind;
 use crate::chat::transcript::PartSource;
 use crate::ui::markdown::MarkdownBody;
 
-use super::{MaterializeContext, RowChange, RowRenderContext, RowRenderer};
+use super::{MaterializeContext, RowChange, RowRenderContext, RowRenderer, typography};
 
 pub(crate) struct ProseRenderer {
     text: String,
@@ -164,7 +163,7 @@ impl RowRenderer for ProseRenderer {
         &self,
         ctx: &RowRenderContext,
         _window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> gpui::AnyElement {
         // A waiting turn renders the shimmer instead of its rows; the view
         // builds the shimmer for the turn's first row.
@@ -177,7 +176,7 @@ impl RowRenderer for ProseRenderer {
         div()
             .w_full()
             .when_some(self.body.as_ref(), |this, body| {
-                this.child(body.text_view(TextViewStyle::default()))
+                this.child(body.text_view(typography::prose(cx)))
             })
             .into_any_element()
     }

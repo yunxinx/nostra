@@ -639,7 +639,7 @@ fn rebuild_preserves_measurement_and_disclosure_by_row_id(cx: &mut gpui::TestApp
             .expect("prose row");
         let key = typography.measurement_key(48);
         projection.record_height(prose, px(333.), key, true);
-        projection.set_disclosure(prose, DisclosureState::Expanded);
+        projection.set_disclosure(prose, DisclosureState::EXPANDED);
 
         // Rebuilding after a new turn must preserve both.
         transcript.update(cx, |transcript, cx| {
@@ -649,7 +649,7 @@ fn rebuild_preserves_measurement_and_disclosure_by_row_id(cx: &mut gpui::TestApp
         let row_ix = projection.row_index(prose).expect("prose row survives");
         let row = &projection.rows()[row_ix];
         assert_eq!(row.effective_height(&key), px(333.));
-        assert_eq!(row.disclosure(), DisclosureState::Expanded);
+        assert_eq!(row.disclosure(), DisclosureState::EXPANDED);
     });
 }
 
