@@ -3,8 +3,7 @@ use super::super::*;
 #[gpui::test]
 fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -19,36 +18,17 @@ fn separate_reasoning_cards_keep_independent_state(cx: &mut TestAppContext) {
                 reasoning_states(this, cx),
                 vec![("first", true), ("second", true)]
             );
-            let reasoning_positions: Vec<usize> = last_assistant_mirror_mut(this)
-                .parts
+            let reasoning_rows: Vec<RowId> = rows_of_kind(this, RowKind::Reasoning)
                 .iter()
-                .enumerate()
-                .filter_map(|(index, part)| {
-                    matches!(part, PartMirror::Reasoning { .. }).then_some(index)
-                })
+                .map(|row| row.id())
                 .collect();
-            let [first, second] = reasoning_positions.as_slice() else {
+            let [first, _second] = reasoning_rows.as_slice() else {
                 panic!("two reasoning cards");
             };
-            let (before_second, second_and_after) =
-                last_assistant_mirror_mut(this).parts.split_at_mut(*second);
-            let PartMirror::Reasoning {
-                trace: Some(first_trace),
-                ..
-            } = &mut before_second[*first]
-            else {
-                panic!("first reasoning card");
-            };
-            let PartMirror::Reasoning {
-                trace: Some(second_trace),
-                ..
-            } = &mut second_and_after[0]
-            else {
-                panic!("second reasoning card");
-            };
-            first_trace.toggle();
-            assert!(first_trace.is_expanded());
-            assert!(!second_trace.is_expanded());
+            assert!(toggle_reasoning_row_by_id(this, *first));
+            let traces = reasoning_parts(this);
+            assert!(traces[0].is_expanded());
+            assert!(!traces[1].is_expanded());
         });
     });
 }
@@ -128,8 +108,7 @@ fn separate_reasoning_cards_toggle_and_copy_independently(cx: &mut TestAppContex
 #[gpui::test]
 fn a_finished_reasoning_id_cannot_be_reused(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -154,8 +133,7 @@ fn a_finished_reasoning_id_cannot_be_reused(cx: &mut TestAppContext) {
 #[gpui::test]
 fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
     let replay = ProviderMetadata {
         chat: Some(crate::llm::ChatReplayMetadata {
@@ -190,8 +168,7 @@ fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppCon
 #[gpui::test]
 fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -257,8 +234,7 @@ fn terminal_snapshot_preserves_separate_reasoning_cards(cx: &mut TestAppContext)
 #[gpui::test]
 fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     let (ui_id, body_id) = cx.update(|_, cx| {
@@ -272,20 +248,10 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
                 .find(|part| part.content_index == 1)
                 .map(|part| part.part_id)
                 .expect("reasoning slot");
-            let PartMirror::Reasoning {
-                part_id: current_id,
-                trace: Some(trace),
-                ..
-            } = last_assistant_mirror_mut(this)
-                .parts
-                .iter_mut()
-                .find(|part| part.part_id() == part_id)
-                .expect("reasoning mirror")
-            else {
-                panic!("reasoning part")
-            };
-            trace.toggle();
-            (current_id.as_u64(), trace.body_entity_id())
+            let row_id = reasoning_row_for_part(this, part_id).expect("reasoning row");
+            assert!(toggle_reasoning_row_by_id(this, row_id));
+            let trace = reasoning_trace_by_part(this, part_id).expect("reasoning trace");
+            (part_id.as_u64(), trace.body_entity_id())
         })
     });
 
@@ -323,19 +289,8 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
         let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("terminal reasoning part")
         };
-        let PartMirror::Reasoning {
-            part_id: current_id,
-            trace: Some(trace),
-            ..
-        } = last_assistant_mirror(this)
-            .parts
-            .iter()
-            .find(|mirror| mirror.part_id() == part.part_id)
-            .expect("reasoning mirror")
-        else {
-            panic!("terminal reasoning mirror")
-        };
-        assert_eq!(current_id.as_u64(), ui_id);
+        let trace = reasoning_trace_by_part(this, part.part_id).expect("reasoning trace");
+        assert_eq!(part.part_id.as_u64(), ui_id);
         assert_eq!(trace.body_entity_id(), body_id);
         assert!(
             trace.is_expanded(),
@@ -350,8 +305,7 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
 #[gpui::test]
 fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     let (ui_id, body_id, elapsed) = cx.update(|_, cx| {
@@ -376,19 +330,15 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
                 ],
                 cx,
             );
-            let PartMirror::Reasoning {
-                part_id,
-                trace: Some(trace),
-                ..
-            } = last_assistant_mirror_mut(this)
+            let part_id = last_turn(this, cx)
                 .parts
-                .iter_mut()
-                .find(|part| matches!(part, PartMirror::Reasoning { .. }))
-                .expect("reasoning mirror")
-            else {
-                panic!("reasoning part")
-            };
-            trace.toggle();
+                .iter()
+                .find(|part| matches!(part.source, PartSource::Reasoning { .. }))
+                .map(|part| part.part_id)
+                .expect("reasoning part");
+            let row_id = reasoning_row_for_part(this, part_id).expect("reasoning row");
+            assert!(toggle_reasoning_row_by_id(this, row_id));
+            let trace = reasoning_trace_by_part(this, part_id).expect("reasoning trace");
             (part_id.as_u64(), trace.body_entity_id(), trace.elapsed())
         })
     });
@@ -423,19 +373,8 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
         let PartSource::Reasoning { reasoning, .. } = &part.source else {
             panic!("reasoning part")
         };
-        let PartMirror::Reasoning {
-            part_id: current_id,
-            trace: Some(trace),
-            ..
-        } = last_assistant_mirror(this)
-            .parts
-            .iter()
-            .find(|mirror| mirror.part_id() == part.part_id)
-            .expect("reasoning mirror")
-        else {
-            panic!("reasoning mirror")
-        };
-        assert_eq!(current_id.as_u64(), ui_id);
+        let trace = reasoning_trace_by_part(this, part.part_id).expect("reasoning trace");
+        assert_eq!(part.part_id.as_u64(), ui_id);
         assert_eq!(trace.body_entity_id(), body_id);
         assert_eq!(trace.elapsed(), elapsed);
         assert!(trace.is_expanded() && part.finished);
@@ -454,8 +393,7 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
 #[gpui::test]
 fn reasoning_after_a_tool_call_creates_a_second_ordered_card(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     let tool_call = crate::llm::ToolCall {

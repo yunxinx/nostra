@@ -23,8 +23,9 @@ use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
 use super::{
     conversation_host::{
-        Conversation, ConversationHost, ConversationHostSnapshot, ConversationId,
-        conversation_generating, seed_conversation_selection,
+        Conversation, ConversationHost, ConversationHostSnapshot, ConversationId, IDLE_COLD_AFTER,
+        IDLE_COLD_INTERVAL, WARM_CONVERSATIONS, conversation_generating,
+        seed_conversation_selection,
     },
     history_groups::HistorySectionKind,
     history_sidebar::ChatHistorySidebar,
@@ -190,6 +191,7 @@ pub(super) struct ChatWorkspace {
     pub(super) runtime_services: RuntimeServices,
     pub(super) preference_handle: PreferenceHandle,
     pub(super) snapshot: ChatWorkspaceSnapshot,
+    _idle_cold_task: Option<Task<()>>,
 }
 
 impl ChatWorkspace {
@@ -217,8 +219,10 @@ impl ChatWorkspace {
             runtime_services: services,
             preference_handle,
             snapshot: ChatWorkspaceSnapshot::empty(),
+            _idle_cold_task: None,
         };
         workspace.start_catalog_initial_load(window, cx);
+        workspace.start_idle_cold_timer(cx);
         workspace.publish_snapshot();
         workspace
     }
@@ -269,9 +273,7 @@ impl ChatWorkspace {
 
     pub(super) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
         for conversation in self.conversations.conversations() {
-            conversation
-                .view
-                .update(cx, |chat, cx| chat.prepare_for_shutdown(cx));
+            conversation.prepare_for_shutdown(cx);
         }
     }
 
@@ -290,31 +292,113 @@ impl ChatWorkspace {
             cx,
         );
         let id = self.conversations.allocate_id();
-        let subscriptions =
-            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let subscriptions = self.subscribe_conversation(
+            &spawned.parts.runtime,
+            &spawned.parts.transcript,
+            id,
+            window,
+            cx,
+        );
         let selection = seed_conversation_selection(None, cx);
-        let is_generating = conversation_generating(&spawned.runtime, cx);
+        let is_generating = conversation_generating(&spawned.parts.runtime, cx);
+        let now = std::time::Instant::now();
         self.conversations.push_and_activate(Conversation {
             id,
-            runtime: spawned.runtime,
-            transcript: spawned.transcript,
-            composer: spawned.composer,
-            view: spawned.view,
+            runtime: spawned.parts.runtime,
+            transcript: spawned.parts.transcript,
+            composer: spawned.parts.composer,
+            composer_status: spawned.parts.composer_status,
+            references_enabled: spawned.parts.references_enabled,
+            view: Some(spawned.view),
+            projection: None,
+            scroll_anchor: None,
             metadata: (),
             title,
             selection,
             session_id: None,
             is_generating,
+            last_active_at: now,
             _subscriptions: subscriptions,
         });
         self.notify_changed(cx);
     }
 
-    pub(super) fn select_target(&mut self, target: ConversationId, cx: &mut Context<Self>) {
+    pub(super) fn select_target(
+        &mut self,
+        target: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.invalidate_selection_request();
         if self.conversations.select_target(target) {
+            self.conversations.touch(target);
+            self.warm_if_cold(target, window, cx);
+            self.cool_idle_conversations(cx);
             self.notify_changed(cx);
         }
+    }
+
+    /// Rebuild the view of a cold conversation with its saved projection and
+    /// scroll anchor (R8).
+    pub(super) fn warm_if_cold(
+        &mut self,
+        target: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversations.is_cold(target) {
+            return;
+        }
+        let preference_handle = self.preference_handle.clone();
+        let markdown_extensions = self.runtime_services.markdown_extensions().clone();
+        self.conversations.warm(target, |parts, restore| {
+            crate::chat::build_chat_view(
+                parts,
+                preference_handle,
+                markdown_extensions,
+                restore,
+                window,
+                cx,
+            )
+        });
+    }
+
+    /// Drop views of idle conversations outside the warm set (R8).
+    /// Drop views of idle conversations outside the warm set (R8). Returns
+    /// whether any conversation went cold, so callers can republish the
+    /// snapshot (the timer path has no other notify trigger).
+    pub(super) fn cool_idle_conversations(&mut self, cx: &mut Context<Self>) -> bool {
+        let now = std::time::Instant::now();
+        let candidates =
+            self.conversations
+                .cold_candidates(now, WARM_CONVERSATIONS, IDLE_COLD_AFTER);
+        let mut changed = false;
+        for id in candidates {
+            changed |= self.conversations.cool(id, cx);
+        }
+        changed
+    }
+
+    /// Periodic idle check: conversations outside the warm set that have been
+    /// inactive past the threshold release their view.
+    fn start_idle_cold_timer(&mut self, cx: &mut Context<Self>) {
+        self._idle_cold_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(IDLE_COLD_INTERVAL).await;
+                let changed = this
+                    .update(cx, |workspace, cx| workspace.cool_idle_conversations(cx))
+                    .unwrap_or_default();
+                if !changed {
+                    continue;
+                }
+                // A cooldown drops view entities: the published snapshot must
+                // follow, or its strong `view` references keep zombie views
+                // alive (and reacting to streaming events) after the cold
+                // transition.
+                this.update(cx, |workspace, cx| workspace.notify_changed(cx))
+                    .ok();
+            }
+        }));
     }
 
     pub(super) fn select_session(
@@ -324,7 +408,7 @@ impl ChatWorkspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(target) = self.conversations.opened_target(&session_id) {
-            self.select_target(target, cx);
+            self.select_target(target, window, cx);
             return;
         }
         let catalog_store = match self.runtime_services.session_services().chat_catalog() {
@@ -449,21 +533,32 @@ impl ChatWorkspace {
             }
         };
         let id = self.conversations.allocate_id();
-        let subscriptions =
-            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let subscriptions = self.subscribe_conversation(
+            &spawned.parts.runtime,
+            &spawned.parts.transcript,
+            id,
+            window,
+            cx,
+        );
         let selection = seed_conversation_selection(restored_model, cx);
-        let is_generating = conversation_generating(&spawned.runtime, cx);
+        let is_generating = conversation_generating(&spawned.parts.runtime, cx);
+        let now = std::time::Instant::now();
         self.conversations.push_and_activate(Conversation {
             id,
-            runtime: spawned.runtime,
-            transcript: spawned.transcript,
-            composer: spawned.composer,
+            runtime: spawned.parts.runtime,
+            transcript: spawned.parts.transcript,
+            composer: spawned.parts.composer,
+            composer_status: spawned.parts.composer_status,
+            references_enabled: spawned.parts.references_enabled,
             selection,
             is_generating,
-            view: spawned.view,
+            view: Some(spawned.view),
+            projection: None,
+            scroll_anchor: None,
             metadata: (),
             title,
             session_id: Some(restore.session_id.clone()),
+            last_active_at: now,
             _subscriptions: subscriptions,
         });
         self.record_active_session(&restore.session_id, cx);
@@ -573,9 +668,9 @@ impl ChatWorkspace {
             return false;
         };
         conversation.selection = Some(selection.clone());
-        conversation
-            .view
-            .update(cx, |chat, cx| chat.select_model(selection, cx));
+        if let Some(view) = &conversation.view {
+            view.update(cx, |chat, cx| chat.select_model(selection, cx));
+        }
         true
     }
 
@@ -611,9 +706,9 @@ impl ChatWorkspace {
             }
             return;
         };
-        let request = conversation
-            .view
-            .update(cx, |chat, cx| chat.request_delete(cx));
+        // A cold conversation has no view, but its runtime still serves the
+        // delete request (R8).
+        let request = conversation.request_delete(cx);
         if request == ChatDeleteRequest::RemoveNow {
             self.remove_conversation(target, window, cx);
             return;
@@ -641,18 +736,35 @@ impl ChatWorkspace {
             runtime,
             transcript,
             composer,
+            composer_status: _,
+            references_enabled: _,
+            projection,
+            scroll_anchor,
             session_id,
             ..
         } = removed.conversation;
         if session_id.is_none() {
-            view.update(cx, |chat, cx| chat.close_scope(cx));
+            // The view may already be cold; the runtime always serves the
+            // scope close (R8).
+            runtime.update(cx, |runtime, cx| runtime.close_scope(cx));
         }
         if let Some(session_id) = &session_id {
             self.history.remove(session_id);
         }
-        drop((runtime, transcript, composer, view));
+        drop((
+            view,
+            runtime,
+            transcript,
+            composer,
+            projection,
+            scroll_anchor,
+        ));
         if removed.was_active {
             self.conversations.select_neighbor(removed.index);
+            if let Some(neighbor) = self.conversations.active() {
+                self.conversations.touch(neighbor);
+                self.cool_idle_conversations(cx);
+            }
         }
         self.notify_changed(cx);
     }

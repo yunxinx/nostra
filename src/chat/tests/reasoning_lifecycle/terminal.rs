@@ -5,8 +5,7 @@ use super::super::*;
 #[gpui::test]
 fn empty_text_delta_does_not_finish_reasoning(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -32,8 +31,7 @@ fn empty_text_delta_does_not_finish_reasoning(cx: &mut TestAppContext) {
 #[gpui::test]
 fn visible_text_does_not_finish_an_independent_reasoning_block(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -56,8 +54,7 @@ fn visible_text_does_not_finish_an_independent_reasoning_block(cx: &mut TestAppC
 #[gpui::test]
 fn terminating_a_turn_closes_an_open_trace(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -86,8 +83,7 @@ fn terminating_a_turn_closes_an_open_trace(cx: &mut TestAppContext) {
 #[gpui::test]
 fn terminal_message_replaces_streamed_reasoning_projection(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -125,8 +121,7 @@ fn terminal_message_replaces_streamed_reasoning_projection(cx: &mut TestAppConte
 #[gpui::test]
 fn terminal_message_can_create_a_reasoning_trace(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -148,6 +143,16 @@ fn terminal_message_can_create_a_reasoning_trace(cx: &mut TestAppContext) {
             );
         });
     });
+
+    // The terminal reconcile creates a new row; the deferred window sync
+    // materializes it once the list has laid out. Force the scheduled frame
+    // so the sync runs, then draw the materialized content.
+    redraw(cx);
+    cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
+    });
+    cx.run_until_parked();
+    redraw(cx);
 
     cx.update(|_, cx| {
         let turn = chat.read(cx);

@@ -291,7 +291,9 @@ impl ConversationRuntime {
         self.publish_state(cx);
     }
 
-    pub(in crate::chat) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
+    /// `pub(crate)` so a workspace can route shutdown through the runtime of
+    /// a cold conversation whose view no longer exists (R8).
+    pub(crate) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
         if self.shutdown_requested {
             return;
         }
@@ -338,7 +340,9 @@ impl ConversationRuntime {
         self.publish_state(cx);
     }
 
-    pub(super) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
+    /// `pub(crate)` so a workspace can request deletion through the runtime
+    /// of a cold conversation whose view no longer exists (R8).
+    pub(crate) fn request_delete(&mut self, cx: &mut Context<Self>) -> ChatDeleteRequest {
         if self.deletion_pending {
             return ChatDeleteRequest::Pending;
         }
@@ -586,25 +590,20 @@ impl ChatView {
                 cx.notify();
             }
             ConversationRuntimeEvent::StreamBatch { generation, events } => {
-                if *generation == runtime_snapshot.request_generation() {
-                    if !events.is_empty() {
-                        self.follow_stream();
-                        self.remeasure_latest_message();
-                    }
-                    cx.notify();
+                if *generation == runtime_snapshot.request_generation() && !events.is_empty() {
+                    self.follow_stream();
                 }
+                cx.notify();
             }
             ConversationRuntimeEvent::GenerationRequestFailed { generation } => {
                 if *generation == runtime_snapshot.request_generation() {
                     self.follow_stream();
-                    self.remeasure_latest_message();
                     cx.notify();
                 }
             }
             ConversationRuntimeEvent::GenerationFinished(generation) => {
                 if *generation == runtime_snapshot.request_generation() {
                     self.follow_stream();
-                    self.remeasure_latest_message();
                     cx.notify();
                 }
             }

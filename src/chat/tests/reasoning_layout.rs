@@ -8,8 +8,7 @@ use super::*;
 #[gpui::test]
 fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     let draw = |cx: &mut gpui::VisualTestContext| {
@@ -20,7 +19,7 @@ fn a_saturated_card_stops_moving_the_content_below_it(cx: &mut TestAppContext) {
         );
     };
     let transcript_content_height = |cx: &mut gpui::VisualTestContext| {
-        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y)
+        cx.update(|_, cx| chat.read(cx).view.list_state.max_offset_for_scrollbar().y)
     };
 
     // Well past a seven-line budget, so the cap is already engaged.

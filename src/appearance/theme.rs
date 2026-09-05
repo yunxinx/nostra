@@ -46,6 +46,7 @@ pub fn init(prefs: &Preferences, cx: &mut App) {
         theme.dark_theme = dark;
     }
 
+    crate::chat::projection::note_theme_changed();
     apply_mode(prefs.theme_mode, cx);
 }
 
@@ -110,6 +111,7 @@ pub fn select_theme(name: &str, preference_handle: &preferences::PreferenceHandl
 /// Keeping this separate from [`select_theme`] lets tests exercise every
 /// bundled palette without touching the process-wide preferences file.
 fn apply_theme_config(config: Rc<ThemeConfig>, cx: &mut App) {
+    crate::chat::projection::note_theme_changed();
     let theme = Theme::global_mut(cx);
     if config.mode.is_dark() {
         theme.dark_theme = config;
@@ -154,6 +156,7 @@ pub fn slot_theme_name(dark: bool, cx: &App) -> gpui::SharedString {
 /// Apply a mode preference without persisting it (used at startup and by
 /// [`set_mode`]).
 fn apply_mode(mode: Option<preferences::ThemeMode>, cx: &mut App) {
+    crate::chat::projection::note_theme_changed();
     match mode {
         None => Theme::sync_system_appearance(None, cx),
         Some(m) => Theme::change(to_ui_mode(m), None, cx),

@@ -22,21 +22,20 @@ fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestApp
                     cx,
                 );
             }
-            chat.sync_message_list_count();
-            chat.list_state.scroll_to(ListOffset::default());
+            chat.view.list_state.scroll_to(ListOffset::default());
         });
     });
     redraw(cx);
 
-    let before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    let before = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     cx.simulate_event(ScrollWheelEvent {
         position: point(px(320.), px(100.)),
         delta: ScrollDelta::Lines(point(0., -3.)),
         ..Default::default()
     });
 
-    let deferred = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
-    let pending = cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining);
+    let deferred = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+    let pending = cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining);
     assert!(pending > px(0.), "wheel event must queue smooth motion");
     assert_eq!(deferred.item_ix, before.item_ix);
     assert_eq!(deferred.offset_in_item, before.offset_in_item);
@@ -46,7 +45,7 @@ fn smooth_scrolling_defers_discrete_wheel_movement_when_enabled(cx: &mut TestApp
         "the wheel event must schedule an animation frame"
     );
     redraw(cx);
-    let eased = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    let eased = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     assert!(
         eased.item_ix > before.item_ix || eased.offset_in_item > before.offset_in_item,
         "an animation frame must advance the deferred wheel distance"
@@ -78,19 +77,18 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
                     cx,
                 );
             }
-            chat.sync_message_list_count();
-            chat.list_state.scroll_to(ListOffset::default());
+            chat.view.list_state.scroll_to(ListOffset::default());
         });
     });
     redraw(cx);
-    let before_active = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    let before_active = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     cx.simulate_event(ScrollWheelEvent {
         position: point(px(320.), px(100.)),
         delta: ScrollDelta::Lines(point(0., -3.)),
         ..Default::default()
     });
     assert!(
-        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining) > px(0.),
+        cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining) > px(0.),
         "active line-wheel input must queue easing before the focus transition"
     );
     cx.deactivate_window();
@@ -100,7 +98,7 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
         assert!(window.simulate_next_frame(cx) > 0);
     });
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining),
+        cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining),
         px(0.),
         "a frame delivered after deactivation must cancel pending easing"
     );
@@ -111,7 +109,7 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
         ..Default::default()
     });
 
-    let after_inactive = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+    let after_inactive = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     assert!(
         after_inactive.item_ix > before_active.item_ix
             || after_inactive.offset_in_item > before_active.offset_in_item,
@@ -119,7 +117,7 @@ fn inactive_chat_window_does_not_queue_smooth_scroll(cx: &mut TestAppContext) {
     );
 
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining),
+        cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining),
         px(0.),
         "inactive chat windows must not queue custom smooth scrolling"
     );

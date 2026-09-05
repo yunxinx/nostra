@@ -8,7 +8,7 @@ fn seed_turn_without_generating_does_not_show_waiting(cx: &mut TestAppContext) {
     redraw(cx);
 
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "an empty assistant placeholder is not a wait state"
     );
 }
@@ -24,11 +24,11 @@ fn empty_generating_assistant_shows_waiting_until_text_arrives(cx: &mut TestAppC
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_some(),
+        cx.debug_bounds("row-prose-2-0").is_some(),
         "the assistant wait shimmer is the only content before the first visible part"
     );
     assert!(
-        cx.debug_bounds("assistant-waiting-0").is_none(),
+        cx.debug_bounds("row-prose-1-0").is_none(),
         "user turns never show the assistant wait shimmer"
     );
 
@@ -39,7 +39,7 @@ fn empty_generating_assistant_shows_waiting_until_text_arrives(cx: &mut TestAppC
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "the wait shimmer must leave the tree once visible text arrives"
     );
 }
@@ -54,7 +54,7 @@ fn waiting_hides_when_reasoning_appears(cx: &mut TestAppContext) {
         chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
-    assert!(cx.debug_bounds("assistant-waiting-1").is_some());
+    assert!(cx.debug_bounds("row-prose-2-0").is_some());
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -63,7 +63,7 @@ fn waiting_hides_when_reasoning_appears(cx: &mut TestAppContext) {
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "a reasoning card is visible content, so waiting must not sit beside it"
     );
 }
@@ -78,7 +78,7 @@ fn waiting_hides_when_error_card_appears(cx: &mut TestAppContext) {
         chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
-    assert!(cx.debug_bounds("assistant-waiting-1").is_some());
+    assert!(cx.debug_bounds("row-prose-2-0").is_some());
 
     let error = crate::llm::GatewayError::http(503, Some("unavailable".into()));
     cx.update(|_, cx| {
@@ -88,7 +88,7 @@ fn waiting_hides_when_error_card_appears(cx: &mut TestAppContext) {
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "an error card replaces waiting rather than sharing the column"
     );
 }
@@ -103,7 +103,7 @@ fn waiting_hides_when_a_named_tool_row_appears(cx: &mut TestAppContext) {
         chat.update(cx, test_support::mark_generating);
     });
     redraw(cx);
-    assert!(cx.debug_bounds("assistant-waiting-1").is_some());
+    assert!(cx.debug_bounds("row-prose-2-0").is_some());
 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
@@ -112,7 +112,7 @@ fn waiting_hides_when_a_named_tool_row_appears(cx: &mut TestAppContext) {
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "a named tool row is visible content"
     );
 }
@@ -134,11 +134,11 @@ fn waiting_only_on_the_in_flight_assistant(cx: &mut TestAppContext) {
     redraw(cx);
 
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_none(),
+        cx.debug_bounds("row-prose-2-0").is_none(),
         "a leftover empty assistant must not shimmer while a later turn generates"
     );
     assert!(
-        cx.debug_bounds("assistant-waiting-3").is_some(),
+        cx.debug_bounds("row-prose-4-0").is_some(),
         "only the in-flight assistant placeholder shows waiting"
     );
 }
@@ -169,8 +169,11 @@ fn a_tool_result_does_not_end_waiting(cx: &mut TestAppContext) {
         });
     });
     redraw(cx);
+    // The turn's only row (the unpaired result) is replaced by the wait
+    // shimmer while the conversation generates, so the row's own selector
+    // resolves to the shimmer element.
     assert!(
-        cx.debug_bounds("assistant-waiting-1").is_some(),
+        cx.debug_bounds("row-toolactivity-2-1").is_some(),
         "a tool result is not visible wait-ending content"
     );
 }
@@ -213,11 +216,11 @@ fn a_tool_turn_renders_as_a_muted_result_card(cx: &mut TestAppContext) {
     redraw(cx);
 
     assert!(
-        cx.debug_bounds("user-message-bubble-1").is_none(),
+        cx.debug_bounds("row-userbubble-2-2").is_none(),
         "a tool turn is not a user bubble"
     );
     assert!(
-        cx.debug_bounds("tool-result-1").is_some(),
+        cx.debug_bounds("row-toolactivity-2-2").is_some(),
         "a tool turn renders the muted result card"
     );
 }

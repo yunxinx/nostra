@@ -5,8 +5,7 @@ use super::*;
 #[gpui::test]
 fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -43,8 +42,7 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     // Reason, then answer: that collapses the card down to its trigger.
@@ -67,7 +65,7 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
         .expect("the collapsed trigger was drawn");
 
     assert!(
-        trigger.size.width < CONTENT_MAX_WIDTH,
+        trigger.size.width < crate::chat::CONTENT_MAX_WIDTH,
         "the trigger stretched to the content column ({:?}) instead of hugging its label",
         trigger.size.width
     );
@@ -219,7 +217,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("message-copy-1").is_none(),
+        cx.debug_bounds("row-turnactions-2-0-copy").is_none(),
         "no message copy button while the turn has nothing to copy"
     );
 
@@ -233,7 +231,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("message-copy-1").is_none(),
+        cx.debug_bounds("row-turnactions-2-0-copy").is_none(),
         "no message copy button while the turn is still streaming"
     );
 
@@ -245,7 +243,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("message-copy-1").is_some(),
+        cx.debug_bounds("row-turnactions-2-0-copy").is_some(),
         "the message copy button appears once the turn finished streaming"
     );
 }
@@ -275,10 +273,10 @@ fn the_message_copy_button_copies_the_whole_answer(cx: &mut TestAppContext) {
     redraw(cx);
 
     let copy = cx
-        .debug_bounds("message-copy-1")
+        .debug_bounds("row-turnactions-2-0-copy")
         .expect("the message copy button is in the tree once the turn finished streaming");
     let content = cx
-        .debug_bounds("assistant-message-content-1")
+        .debug_bounds("row-prose-2-2")
         .expect("the assistant content is in the tree");
     // The copy action is intentionally hidden from hit testing and keyboard
     // focus until its group is hovered. Exercise that real interaction
@@ -323,7 +321,7 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
     });
     redraw(cx);
     assert!(
-        cx.debug_bounds("message-copy-1").is_some(),
+        cx.debug_bounds("row-turnactions-2-0-copy").is_some(),
         "the message copy button appears once the turn finished streaming"
     );
 
@@ -345,7 +343,7 @@ fn a_failed_turn_offers_no_message_copy_button(cx: &mut TestAppContext) {
         "the failed turn carries its error card"
     );
     assert!(
-        cx.debug_bounds("message-copy-1").is_none(),
+        cx.debug_bounds("row-turnactions-2-0-copy").is_none(),
         "a failed turn must not offer a message-level copy button"
     );
 }
@@ -374,7 +372,7 @@ fn hovering_a_reasoning_card_reveals_the_message_copy_button(cx: &mut TestAppCon
         .debug_bounds("reasoning-trigger-0")
         .expect("the reasoning trigger is in the tree");
     let copy = cx
-        .debug_bounds("message-copy-1")
+        .debug_bounds("row-turnactions-2-0-copy")
         .expect("the message copy button is in the tree once the turn finished streaming");
     // Hover only the nested reasoning card — the message body itself is never
     // hovered — and the shared message hover group must still reveal the row.
@@ -417,17 +415,18 @@ fn a_user_turn_gets_the_message_copy_button_too(cx: &mut TestAppContext) {
         });
     });
     redraw(cx);
+    redraw(cx);
 
     assert!(
-        cx.debug_bounds("message-copy-0").is_some(),
+        cx.debug_bounds("row-turnactions-1-0-copy").is_some(),
         "a user message with prose offers the message-level copy button"
     );
 
     let bubble = cx
-        .debug_bounds("user-message-bubble-0")
+        .debug_bounds("row-userbubble-1-1-bubble")
         .expect("the user bubble is in the tree");
     let copy = cx
-        .debug_bounds("message-copy-0")
+        .debug_bounds("row-turnactions-1-0-copy")
         .expect("the message copy button is in the tree");
     cx.simulate_mouse_move(bubble.center(), None, gpui::Modifiers::default());
     redraw(cx);
@@ -449,8 +448,7 @@ fn a_user_turn_gets_the_message_copy_button_too(cx: &mut TestAppContext) {
 #[gpui::test]
 fn a_turn_without_reasoning_creates_only_its_text_part(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {

@@ -6,8 +6,7 @@ use super::super::*;
 #[gpui::test]
 fn streaming_reasoning_reaches_an_expanded_card(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -56,8 +55,7 @@ fn streaming_reasoning_reaches_an_expanded_card(cx: &mut TestAppContext) {
 #[gpui::test]
 fn reasoning_finished_collapses_the_card(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -94,8 +92,7 @@ fn reasoning_finished_collapses_the_card(cx: &mut TestAppContext) {
 #[gpui::test]
 fn canonical_events_close_reasoning_before_prose_reaches_the_view(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -145,8 +142,7 @@ fn canonical_events_close_reasoning_before_prose_reaches_the_view(cx: &mut TestA
 #[gpui::test]
 fn prose_does_not_infer_a_reasoning_boundary(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {
@@ -195,8 +191,7 @@ fn prose_does_not_infer_a_reasoning_boundary(cx: &mut TestAppContext) {
 #[gpui::test]
 fn reasoning_after_prose_creates_a_second_ordered_card(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {

@@ -27,13 +27,29 @@ use crate::session::{
 };
 
 use super::reasoning_card::VIRTUALIZED_SOURCE_BYTES;
+use super::rows::{ProseRenderer, ReasoningRenderer};
 pub(crate) use super::test_support;
+use super::transcript::{PartId, PartSource};
 use super::{
-    CONTENT_MAX_WIDTH, ChatDeleteRequest, ChatView, PartMirror, PartSource, ReasoningTrace, Role,
-    SMOOTH_SCROLL_FINISH_THRESHOLD, SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD,
-    SmoothScrollState, Turn, is_replayable, reasoning_smooth_invalidations,
-    reset_reasoning_smooth_invalidations,
+    ChatDeleteRequest, ChatView, ReasoningTrace, Role, SMOOTH_SCROLL_FINISH_THRESHOLD,
+    SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD, SmoothScrollState, Turn, is_replayable,
+    reasoning_smooth_invalidations, reset_reasoning_smooth_invalidations,
 };
+use crate::chat::projection::{Row, RowId, RowKind};
+
+fn rows_of_kind(chat: &ChatView, kind: RowKind) -> Vec<&Row> {
+    chat.view
+        .projection
+        .rows()
+        .iter()
+        .filter(|row| row.kind() == kind)
+        .collect()
+}
+
+fn renderer_for_row<'a>(chat: &'a ChatView, row: &Row) -> Option<&'a dyn super::rows::RowRenderer> {
+    let ix = chat.view.projection.row_index(row.id())?;
+    Some(chat.view.slots[ix].renderer.as_ref())
+}
 
 #[test]
 fn smooth_scroll_state_eases_and_accumulates_wheel_distance() {
@@ -112,7 +128,7 @@ fn delayed_runtime_snapshots_cannot_revert_the_chat_view_projection(cx: &mut Tes
 /// A completed user turn plus the assistant placeholder a reply streams
 /// into. Pushed directly rather than through `submit`, which is gated on a
 /// configured provider that a unit test has no reason to stand up.
-fn seed_turn(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestContext) {
+pub(in crate::chat) fn seed_turn(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             for role in [Role::User, Role::Assistant] {
@@ -122,12 +138,50 @@ fn seed_turn(chat: &gpui::Entity<ChatView>, cx: &mut gpui::VisualTestContext) {
     });
 }
 
-fn last_assistant_mirror_mut(chat: &mut ChatView) -> &mut super::TurnMirror {
-    chat.mirrors
-        .iter_mut()
-        .rev()
-        .find(|mirror| mirror.role == Role::Assistant)
-        .expect("assistant mirror")
+/// The turn error captured by the last error row's renderer.
+fn last_error_card(chat: &ChatView) -> Option<&crate::chat::error_card::TurnError> {
+    rows_of_kind(chat, RowKind::TurnError)
+        .last()
+        .and_then(|row| renderer_for_row(chat, row))
+        .and_then(|renderer| {
+            renderer
+                .as_any()
+                .downcast_ref::<crate::chat::rows::TurnErrorRenderer>()
+        })
+        .and_then(crate::chat::rows::TurnErrorRenderer::error_for_test)
+}
+
+fn reasoning_row_for_part(chat: &ChatView, part_id: PartId) -> Option<RowId> {
+    rows_of_kind(chat, RowKind::Reasoning)
+        .into_iter()
+        .map(|row| row.id())
+        .find(|id| id.part == part_id)
+}
+
+fn toggle_reasoning_row_by_id(chat: &mut ChatView, row_id: RowId) -> bool {
+    let Some(ix) = chat.view.projection.row_index(row_id) else {
+        return false;
+    };
+    let Some(trace) = chat.view.slots[ix]
+        .renderer
+        .as_any_mut()
+        .downcast_mut::<ReasoningRenderer>()
+        .and_then(ReasoningRenderer::trace_for_test_mut)
+    else {
+        return false;
+    };
+    trace.toggle();
+    true
+}
+
+fn reasoning_trace_by_part(chat: &ChatView, part_id: PartId) -> Option<&ReasoningTrace> {
+    let row_id = reasoning_row_for_part(chat, part_id)?;
+    let ix = chat.view.projection.row_index(row_id)?;
+    chat.view.slots[ix]
+        .renderer
+        .as_any()
+        .downcast_ref::<ReasoningRenderer>()?
+        .trace_for_test()
 }
 
 fn last_llm(chat: &ChatView, cx: &App) -> LlmMessage {
@@ -141,13 +195,14 @@ fn last_reasoning_id(chat: &ChatView) -> u64 {
 }
 
 fn last_prose_id(chat: &ChatView) -> u64 {
-    chat.mirrors
+    rows_of_kind(chat, RowKind::AssistantProse)
         .last()
-        .and_then(|mirror| {
-            mirror.parts.iter().find_map(|part| match part {
-                PartMirror::Prose { body, .. } => Some(body.owner_id()),
-                _ => None,
-            })
+        .and_then(|row| renderer_for_row(chat, row))
+        .and_then(|renderer| {
+            renderer
+                .as_any()
+                .downcast_ref::<ProseRenderer>()
+                .and_then(ProseRenderer::body_owner_for_test)
         })
         .expect("prose part")
 }
@@ -165,10 +220,21 @@ fn prose_at(
     turn_index: usize,
     part_index: usize,
 ) -> (u64, &str, &crate::ui::markdown::MarkdownBody) {
-    match &chat.mirrors[turn_index].parts[part_index] {
-        PartMirror::Prose { text, body, .. } => (body.owner_id(), text.as_str(), body),
-        _ => panic!("part at ({turn_index}, {part_index}) is not prose"),
-    }
+    let rows: Vec<&Row> = rows_of_kind(chat, RowKind::AssistantProse)
+        .into_iter()
+        .filter(|row| row.turn_index() == turn_index)
+        .collect();
+    let row = rows
+        .get(part_index)
+        .unwrap_or_else(|| panic!("no prose row at ({turn_index}, {part_index})"));
+    let renderer = renderer_for_row(chat, row)
+        .and_then(|renderer| renderer.as_any().downcast_ref::<ProseRenderer>())
+        .expect("prose renderer");
+    (
+        renderer.body_owner_for_test().expect("prose owner"),
+        renderer.text_for_test(),
+        renderer.body_for_test().expect("materialized prose body"),
+    )
 }
 
 fn prose_body_mut(
@@ -176,52 +242,56 @@ fn prose_body_mut(
     turn_index: usize,
     part_index: usize,
 ) -> &mut crate::ui::markdown::MarkdownBody {
-    match &mut chat.mirrors[turn_index].parts[part_index] {
-        PartMirror::Prose { body, .. } => body,
-        _ => panic!("part at ({turn_index}, {part_index}) is not prose"),
-    }
-}
-
-fn last_assistant_mirror(chat: &ChatView) -> &super::TurnMirror {
-    chat.mirrors
-        .iter()
-        .rev()
-        .find(|mirror| mirror.role == Role::Assistant)
-        .expect("assistant mirror")
+    let row_id = {
+        let rows: Vec<&Row> = rows_of_kind(chat, RowKind::AssistantProse)
+            .into_iter()
+            .filter(|row| row.turn_index() == turn_index)
+            .collect();
+        rows[part_index].id()
+    };
+    let ix = chat.view.projection.row_index(row_id).expect("prose row");
+    chat.view.slots[ix]
+        .renderer
+        .as_any_mut()
+        .downcast_mut::<ProseRenderer>()
+        .expect("prose renderer")
+        .body_for_test_mut()
+        .expect("materialized prose body")
 }
 
 fn reasoning_part(chat: &ChatView) -> Option<&ReasoningTrace> {
-    last_assistant_mirror(chat)
-        .parts
+    // P1 parity: the first reasoning card of the projected transcript.
+    rows_of_kind(chat, RowKind::Reasoning)
         .iter()
-        .find_map(|part| match part {
-            PartMirror::Reasoning {
-                trace: Some(trace), ..
-            } => Some(trace),
-            _ => None,
+        .find_map(|row| {
+            renderer_for_row(chat, row)?
+                .as_any()
+                .downcast_ref::<ReasoningRenderer>()?
+                .trace_for_test()
         })
 }
 
 fn reasoning_part_mut(chat: &mut ChatView) -> Option<&mut ReasoningTrace> {
-    chat.mirrors.iter_mut().rev().find_map(|mirror| {
-        mirror.parts.iter_mut().find_map(|part| match part {
-            PartMirror::Reasoning {
-                trace: Some(trace), ..
-            } => Some(trace),
-            _ => None,
-        })
-    })
+    // P1 parity: mutate the first reasoning card.
+    let row_id = rows_of_kind(chat, RowKind::Reasoning)
+        .first()
+        .map(|row| row.id())?;
+    let ix = chat.view.projection.row_index(row_id)?;
+    chat.view.slots[ix]
+        .renderer
+        .as_any_mut()
+        .downcast_mut::<ReasoningRenderer>()?
+        .trace_for_test_mut()
 }
 
 fn reasoning_parts(chat: &ChatView) -> Vec<&ReasoningTrace> {
-    last_assistant_mirror(chat)
-        .parts
+    rows_of_kind(chat, RowKind::Reasoning)
         .iter()
-        .filter_map(|part| match part {
-            PartMirror::Reasoning {
-                trace: Some(trace), ..
-            } => Some(trace),
-            _ => None,
+        .filter_map(|row| {
+            renderer_for_row(chat, row)?
+                .as_any()
+                .downcast_ref::<ReasoningRenderer>()?
+                .trace_for_test()
         })
         .collect()
 }
@@ -239,7 +309,7 @@ fn reasoning_states<'a>(chat: &'a ChatView, cx: &'a App) -> Vec<(&'a str, bool)>
         .collect()
 }
 
-fn init_app(cx: &mut TestAppContext) {
+pub(in crate::chat) fn init_app(cx: &mut TestAppContext) {
     let prefs = preferences::Preferences::default();
     cx.update(|cx| {
         gpui_component::init(cx);
@@ -248,7 +318,7 @@ fn init_app(cx: &mut TestAppContext) {
     });
 }
 
-fn add_chat_window(
+pub(in crate::chat) fn add_chat_window(
     cx: &mut TestAppContext,
 ) -> (gpui::Entity<ChatView>, &mut gpui::VisualTestContext) {
     add_chat_window_with_session_services(cx, SessionStores::default().chat_conversation())
@@ -485,11 +555,21 @@ impl gpui::Render for ComposerPair {
     }
 }
 
-fn redraw(cx: &mut gpui::VisualTestContext) {
+pub(in crate::chat) fn redraw(cx: &mut gpui::VisualTestContext) {
     cx.run_until_parked();
+    // A production frame runs its scheduled frame callbacks (the windowed
+    // transcript's materialization sync) before painting; mirror that here.
     cx.update(|window, cx| {
+        window.simulate_next_frame(cx);
         let _ = window.draw(cx);
     });
+}
+
+/// Redraw until the windowed materialization settles: the first frame lets
+/// the render pass request syncs, the second consumes them.
+pub(in crate::chat) fn redraw_settled(cx: &mut gpui::VisualTestContext) {
+    redraw(cx);
+    redraw(cx);
 }
 
 fn redraw_settled_math(cx: &mut gpui::VisualTestContext) {
@@ -522,6 +602,7 @@ fn duration_percentile(samples: &[Duration], percentile: usize) -> Duration {
 }
 
 mod code_blocks;
+pub(in crate::chat) mod fixtures;
 mod markdown_streaming;
 mod math_interaction;
 mod math_rendering;

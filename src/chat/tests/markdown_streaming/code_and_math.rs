@@ -435,8 +435,7 @@ fn streaming_does_not_resolve_a_latent_prepared_reference(cx: &mut TestAppContex
 #[gpui::test]
 fn streaming_does_not_block_the_next_turn_model_selection(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     let next = crate::llm::ModelSelection {
         profile_id: "next-provider".into(),
         model_id: "next-model".into(),

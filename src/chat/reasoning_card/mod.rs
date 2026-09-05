@@ -38,13 +38,38 @@ use gpui::{
     px, rems,
 };
 use gpui_component::{
-    ActiveTheme, Sizable as _, button::Button, h_flex, scroll::ScrollableElement as _,
-    text::TextViewStyle, v_flex,
+    ActiveTheme, Sizable as _, button::Button, clipboard::Clipboard, h_flex,
+    scroll::ScrollableElement as _, text::TextViewStyle, v_flex,
 };
 use rust_i18n::t;
 
-use super::hover_reveal::hover_reveal_copy;
 use crate::ui::markdown::{MarkdownBody, MarkdownPresentation};
+
+/// A copy button hidden until the pointer enters `hover_group`.
+///
+/// `id` must be unique within the window: [`Clipboard`] keys its Copy→Check
+/// feedback state by it, so a stable id keeps that state across reconciliation
+/// and list reordering. `value_fn` runs at click time rather than capturing a
+/// render snapshot, so the clipboard always reflects the message's latest
+/// state.
+///
+/// The turn-level copy affordance became a projected row in P2; the
+/// reasoning card is the one remaining element-scoped consumer of this
+/// idiom.
+pub(crate) fn hidden_until_hover_copy(
+    id: impl Into<ElementId>,
+    hover_group: SharedString,
+    tooltip: impl Into<SharedString>,
+    value_fn: impl Fn(&mut Window, &mut App) -> SharedString + 'static,
+    debug_selector: impl FnOnce() -> String,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        .debug_selector(debug_selector)
+        .invisible()
+        .group_hover(hover_group, |this| this.visible())
+        .child(Clipboard::new(id).value_fn(value_fn).tooltip(tooltip))
+}
 
 /// Per-block test hook. Stable protocol slots make it possible to drive one
 /// card without accidentally matching another card in the same turn.
@@ -235,6 +260,18 @@ impl ReasoningTrace {
         self.expanded = !self.expanded;
     }
 
+    /// Current disclosure, for the projection's release-time snapshot.
+    pub(crate) fn disclosed(&self) -> bool {
+        self.expanded
+    }
+
+    /// Restore a disclosure captured by the projection. Deliberately does not
+    /// mark the card user-controlled: a re-materialized streaming card keeps
+    /// its auto-collapse-on-finish behavior.
+    pub(crate) fn set_disclosed(&mut self, expanded: bool) {
+        self.expanded = expanded;
+    }
+
     /// Toggle disclosure and migrate a long natural trace when it is opened
     /// after the reader had scrolled away from the tail.
     pub(crate) fn toggle_with_cx(&mut self, cx: &mut App) -> Option<f32> {
@@ -279,15 +316,11 @@ impl ReasoningTrace {
         self.follow_scroll();
     }
 
-    /// Record wheel intent for the card's own follow state. The surrounding
-    /// transcript remains a separate scroll boundary.
-    pub(crate) fn handle_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        let dy = event.delta.pixel_delta(window.line_height()).y;
+    /// Record wheel intent for the card's own follow state from a signed
+    /// pixel delta. The surrounding transcript remains a separate scroll
+    /// boundary; the row renderer forwards wheel input without carrying the
+    /// event itself.
+    pub(crate) fn handle_scroll_dy(&mut self, dy: Pixels, cx: &mut App) {
         if dy > px(0.) {
             self.follow = false;
             self.scroll.set_follow_mode(FollowMode::Normal);
@@ -600,7 +633,7 @@ pub(crate) fn render(
                 // a copy offered mid-stream would freeze a partial thought, and
                 // whitespace-only source has nothing worth copying.
                 .when(finished && !source.trim().is_empty(), |this| {
-                    this.child(hover_reveal_copy(
+                    this.child(hidden_until_hover_copy(
                         ElementId::NamedInteger("turn-reasoning-copy".into(), ui_id),
                         hover_group.clone(),
                         t!("chat.reasoning.copy").to_string(),

@@ -32,6 +32,7 @@ use crate::session::{
 use crate::shell::app::chat_workspace::ChatTarget;
 use crate::ui::reference_picker::ChatReferenceComposer;
 
+use super::conversation_host::{IDLE_COLD_AFTER, IDLE_COLD_INTERVAL};
 use super::history_sidebar::is_pending_history_conversation;
 use super::*;
 
@@ -332,7 +333,8 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
             this.spawn_draft(window, cx);
             let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
-                .clone();
+                .clone()
+                .expect("a fresh conversation is warm");
             assert!(view.update(cx, |chat, cx| {
                 test_support::start_durable_pending_reply(chat, Rc::clone(&dropped), window, cx)
             }));
@@ -342,6 +344,7 @@ fn native_main_window_close_persists_the_active_turn_terminal(cx: &mut TestAppCo
     let session_id = app.read_with(cx, |this, cx| {
         this.chat_snapshot().conversations()[0]
             .view()
+            .expect("a fresh conversation is warm")
             .read_with(cx, |chat, _| chat.durable_session_id_for_test())
             .expect("durable Chat session id")
     });
@@ -377,7 +380,8 @@ fn confirmed_delete_removes_the_persisted_session_before_dropping_the_view(
             this.spawn_draft(window, cx);
             let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
-                .clone();
+                .clone()
+                .expect("a fresh conversation is warm");
             let session_id = view.update(cx, test_support::persist_session);
             (this.chat_snapshot().conversations()[0].id(), session_id)
         })
@@ -468,7 +472,11 @@ fn release_first_conversation(
         (
             conversation.id,
             ReleasedConversation {
-                view: conversation.view.downgrade(),
+                view: conversation
+                    .view
+                    .as_ref()
+                    .expect("warm before delete")
+                    .downgrade(),
                 runtime: conversation.runtime.downgrade(),
                 transcript: conversation.transcript.downgrade(),
                 composer: conversation.composer.downgrade(),
@@ -596,8 +604,9 @@ fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestA
             this.spawn_draft(window, cx);
             let middle = this.chat_snapshot().conversations()[1].id();
             let next = this.chat_snapshot().conversations()[2].id();
-            this.chat_workspace()
-                .update(cx, |workspace, cx| workspace.select_target(middle, cx));
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_target(middle, window, cx)
+            });
             this.delete_conversation(middle, window, cx);
             assert_eq!(this.chat_snapshot().active(), Some(next));
 
@@ -631,7 +640,8 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
             this.spawn_draft(window, cx);
             let view = this.chat_workspace().read(cx).conversations.conversations()[0]
                 .view
-                .clone();
+                .clone()
+                .expect("a fresh conversation is warm");
             view.update(cx, |chat, cx| {
                 test_support::start_pending_reply(chat, dropped.clone(), cx)
             });
@@ -668,7 +678,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
             let target = this.chat_snapshot().conversations()[0].id();
             let selected = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.select_target(target, cx);
+                workspace.select_target(target, window, cx);
                 workspace.begin_delete_confirmation(ChatTarget::Conversation(target), window, cx);
             });
             this.select(2, window, cx);
@@ -712,8 +722,9 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
             this.spawn_draft(window, cx);
             let target = this.chat_snapshot().conversations()[0].id();
             let selected = this.chat_snapshot().conversations()[2].id();
-            this.chat_workspace()
-                .update(cx, |workspace, cx| workspace.select_target(target, cx));
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_target(target, window, cx)
+            });
             (target, selected)
         })
     });
@@ -759,11 +770,14 @@ fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppC
     let target = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this.chat_snapshot().conversations()[0].view();
+            let view = this.chat_snapshot().conversations()[0]
+                .view()
+                .expect("a fresh conversation is warm");
             let target = this.chat_snapshot().conversations()[0].id();
             view.update(cx, test_support::mark_generating);
-            this.chat_workspace()
-                .update(cx, |workspace, cx| workspace.select_target(target, cx));
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_target(target, window, cx)
+            });
             target
         })
     });
@@ -1394,7 +1408,9 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
     let existing = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this.chat_snapshot().conversations()[0].view();
+            let view = this.chat_snapshot().conversations()[0]
+                .view()
+                .expect("a fresh conversation is warm");
             view.update(cx, test_support::persist_session)
         })
     });
@@ -1409,7 +1425,8 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
                 .iter()
                 .find(|conversation| conversation.session_id().is_none())
                 .expect("fresh draft")
-                .view();
+                .view()
+                .expect("a fresh conversation is warm");
             view.update(cx, test_support::persist_session)
         })
     });
@@ -1749,14 +1766,17 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
-            let first = this.chat_snapshot().conversations()[0].view();
+            let first = this.chat_snapshot().conversations()[0]
+                .view()
+                .expect("a fresh conversation is warm");
             let first_id = this.chat_snapshot().conversations()[0].id();
             let second_id = this.chat_snapshot().conversations()[1].id();
             first.update(cx, |chat, cx| {
                 test_support::start_pending_reply(chat, Rc::clone(&dropped), cx)
             });
-            this.chat_workspace()
-                .update(cx, |workspace, cx| workspace.select_target(second_id, cx));
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_target(second_id, window, cx)
+            });
             (first_id, second_id)
         })
     });
@@ -1805,7 +1825,9 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
             {
-                let view = this.chat_snapshot().conversations()[0].view();
+                let view = this.chat_snapshot().conversations()[0]
+                    .view()
+                    .expect("a fresh conversation is warm");
                 view.update(cx, test_support::persist_session)
             }
         })
@@ -1903,5 +1925,224 @@ fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestA
         assert_eq!(snapshot.active(), Some(draft_target));
         assert_eq!(snapshot.conversations().len(), 1);
         assert!(snapshot.conversations()[0].session_id().is_none());
+    });
+}
+
+/// R8: the idle timer must both cool stale conversations *and* republish the
+/// snapshot. The host drops the view entity on cooldown; a stale snapshot
+/// holding a strong `view` reference would keep a zombie view alive and
+/// reacting to streaming events after the cold transition.
+#[gpui::test]
+fn idle_timer_cools_stale_views_and_republishes_the_snapshot(cx: &mut TestAppContext) {
+    let (app, cx) = add_app_window(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            for _ in 0..4 {
+                this.spawn_draft(window, cx);
+            }
+        });
+    });
+
+    // Age the two oldest conversations past the idle threshold. Warm set =
+    // active + the three most recent, so only conversations[0] is a cooling
+    // candidate.
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, _| {
+                let conversations = workspace.conversations.conversations_mut();
+                for conversation in &mut conversations[..2] {
+                    conversation.last_active_at =
+                        std::time::Instant::now() - (IDLE_COLD_AFTER + Duration::from_secs(5));
+                }
+            });
+        });
+    });
+
+    // Fire the idle timer's tick and let the cooldown publish.
+    cx.executor().advance_clock(IDLE_COLD_INTERVAL);
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, _| {
+        let conversations = this.chat_snapshot().conversations();
+        assert_eq!(conversations.len(), 4);
+        assert!(
+            conversations[0].view().is_none(),
+            "the aged non-warm conversation must be cold after the timer tick"
+        );
+        for (index, conversation) in conversations.iter().enumerate().skip(1) {
+            assert!(
+                conversation.view().is_some(),
+                "conversation {index} is active or in the warm set and keeps its view"
+            );
+        }
+    });
+}
+
+/// R8/AC5: a conversation that goes cold while the host keeps receiving
+/// transcript writes resumes exactly where it left off on reselect — full
+/// content, the saved scroll anchor, and the untouched composer draft.
+#[gpui::test]
+fn cold_conversation_keeps_streaming_and_restores_on_reselect(cx: &mut TestAppContext) {
+    fn prose_message(role: crate::llm::Role, text: &str) -> crate::llm::Message {
+        crate::llm::Message {
+            role,
+            content: vec![crate::llm::ContentBlock::Text {
+                text: text.to_string(),
+                provider_metadata: crate::llm::ProviderMetadata::default(),
+            }],
+            provider_metadata: crate::llm::ProviderMetadata::default(),
+        }
+    }
+
+    let draft_text = "draft kept across cold";
+    let (app, cx) = add_app_window(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.spawn_draft(window, cx);
+        });
+    });
+
+    // Seed two turns in conversation A through its live view.
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            let view = this.chat_workspace().read(cx).conversations.conversations()[0]
+                .view
+                .clone()
+                .expect("a fresh conversation is warm");
+            view.update(cx, |chat, cx| {
+                test_support::push_canonical(
+                    chat,
+                    prose_message(crate::llm::Role::User, "cold question"),
+                    cx,
+                );
+                test_support::push_canonical(
+                    chat,
+                    prose_message(crate::llm::Role::Assistant, "cold answer"),
+                    cx,
+                );
+            });
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    // Type a draft, park the reader on the first row, then go cold.
+    let (a_id, anchor_row) = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            let (a, b, composer, view) = {
+                let conversations = this.chat_workspace().read(cx).conversations.conversations();
+                (
+                    conversations[0].id,
+                    conversations[1].id,
+                    conversations[0].composer.clone(),
+                    conversations[0].view.clone().expect("warm before cold"),
+                )
+            };
+            composer.update(cx, |composer, cx| {
+                composer
+                    .input()
+                    .update(cx, |input, cx| input.set_value(draft_text, window, cx));
+            });
+            let anchor_row = view.update(cx, |chat, _| {
+                let anchor_row = chat
+                    .row_id_at_for_test(1)
+                    .expect("the second projected row");
+                chat.scroll_rows_to_for_test(1);
+                anchor_row
+            });
+            let _saved = view.update(cx, |chat, ctx| chat.cool_down(ctx));
+            this.chat_workspace().update(cx, |workspace, cx| {
+                assert!(
+                    workspace.conversations.cool(a, cx),
+                    "the conversation was warm and must go cold now"
+                );
+                // Conversation B (spawned second) is already active, so A is
+                // a non-active cold candidate for the idle path.
+                assert_eq!(workspace.conversations.active(), Some(b));
+            });
+            (a, anchor_row)
+        })
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |this, cx| {
+        let workspace = this.chat_workspace().read(cx);
+        assert!(
+            workspace.conversations.is_cold(a_id),
+            "conversation A must be cold with no view"
+        );
+    });
+
+    // Streaming continues into the cold conversation: the transcript grows
+    // with no view attached.
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            let (transcript, is_cold) = {
+                let workspace = this.chat_workspace().read(cx);
+                let conversation = workspace
+                    .conversations
+                    .conversations()
+                    .iter()
+                    .find(|conversation| conversation.id == a_id)
+                    .expect("cold conversation stays hosted");
+                (
+                    conversation.transcript.clone(),
+                    workspace.conversations.is_cold(a_id),
+                )
+            };
+            assert!(is_cold);
+            transcript.update(cx, |transcript, cx| {
+                transcript.push_canonical_turn(
+                    prose_message(crate::llm::Role::User, "late question"),
+                    cx,
+                );
+                transcript.push_canonical_turn(
+                    prose_message(crate::llm::Role::Assistant, "late answer"),
+                    cx,
+                );
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    // Reselecting re-warms from the saved projection and anchor.
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
+                assert!(workspace.conversations.select_target(a_id));
+                workspace.warm_if_cold(a_id, window, cx);
+            });
+        });
+    });
+    redraw(cx);
+    redraw(cx);
+
+    app.read_with(cx, |this, cx| {
+        let workspace = this.chat_workspace().read(cx);
+        let conversation = workspace
+            .conversations
+            .conversations()
+            .iter()
+            .find(|conversation| conversation.id == a_id)
+            .expect("conversation A stays hosted");
+        let view = conversation.view.as_ref().expect("re-warmed on reselect");
+        view.read_with(cx, |chat, cx| {
+            // Content complete: the two post-cold turns joined the rows.
+            assert_eq!(
+                chat.projection_len_for_test(),
+                8,
+                "four turns project two rows each (bubble/actions, prose/actions)"
+            );
+            // The reading position was restored onto the anchored content.
+            let top = chat.logical_top_item_for_test();
+            assert_eq!(top, 1, "the saved scroll anchor is restored");
+            assert_eq!(
+                chat.row_id_at_for_test(top),
+                Some(anchor_row),
+                "the anchor row keeps its content identity across the cold cycle"
+            );
+            // The composer draft survived on the shared composer entity.
+            assert_eq!(chat.composer_text_for_test(cx), draft_text);
+        });
     });
 }

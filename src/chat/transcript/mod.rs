@@ -51,6 +51,13 @@ pub(crate) enum TranscriptEvent {
     TurnReplaced {
         turn_id: TurnId,
     },
+    /// A page of earlier turns was prepended by the windowed loader.
+    /// Constructed by the test-driven `prepend` seam until the P5 storage
+    /// cursor lands; production transcripts load the full tail.
+    #[allow(dead_code)]
+    PagePrepended {
+        turn_ids: Vec<TurnId>,
+    },
     Reset,
 }
 
@@ -85,7 +92,6 @@ impl TranscriptSnapshot {
         self.streaming.is_some()
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn has_earlier(&self) -> bool {
         self.has_earlier
@@ -194,6 +200,26 @@ impl Transcript {
         self.source_cursor = cursor.or(page.cursor_before);
         self.streaming = None;
         self.publish(TranscriptEvent::Reset, cx)
+    }
+
+    /// Prepend one page of earlier turns (P2 windowed loading). Ids are
+    /// allocated fresh so they stay monotonic against the tail already held.
+    /// Driven by the test source until the P5 storage cursor lands.
+    #[allow(dead_code)]
+    pub(crate) fn prepend(
+        &mut self,
+        page: TranscriptPage,
+        cx: &mut Context<Self>,
+    ) -> TranscriptUpdate {
+        let adopted = self.adopt_turns(page.turns);
+        let turn_ids = adopted.iter().map(|turn| turn.turn_id).collect();
+        let mut turns = adopted;
+        turns.append(&mut self.turns);
+        self.turns = turns;
+        if page.cursor_before.is_some() {
+            self.source_cursor = page.cursor_before;
+        }
+        self.publish(TranscriptEvent::PagePrepended { turn_ids }, cx)
     }
 
     pub(crate) fn begin_turn(

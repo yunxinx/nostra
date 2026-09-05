@@ -1,8 +1,14 @@
+//! Smooth-scroll easing state, migrated from the former `chat/scrolling.rs`.
+//!
+//! Only line-based wheel deltas are eased; pixel-precise deltas stay on the
+//! native path. Inactive windows cancel queued motion instead of scheduling
+//! frames AppKit would throttle (see `quality-guidelines.md`).
+
 use gpui::{App, Pixels, Window, px};
 
 /// Fraction of the remaining wheel distance applied on each animation frame.
-pub(super) const SMOOTH_SCROLL_FRAME_FRACTION: f32 = 0.22;
-pub(super) const SMOOTH_SCROLL_FINISH_THRESHOLD: Pixels = px(0.75);
+pub(crate) const SMOOTH_SCROLL_FRAME_FRACTION: f32 = 0.22;
+pub(crate) const SMOOTH_SCROLL_FINISH_THRESHOLD: Pixels = px(0.75);
 
 #[cfg(test)]
 thread_local! {
@@ -12,32 +18,32 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(super) fn reset_reasoning_smooth_invalidations() {
+pub(crate) fn reset_reasoning_smooth_invalidations() {
     REASONING_SMOOTH_INVALIDATIONS.set(0);
 }
 
 #[cfg(test)]
-pub(super) fn reasoning_smooth_invalidations() -> usize {
+pub(crate) fn reasoning_smooth_invalidations() -> usize {
     REASONING_SMOOTH_INVALIDATIONS.get()
 }
 
 #[cfg(test)]
-pub(super) fn record_reasoning_smooth_invalidation() {
+pub(in crate::chat) fn record_reasoning_smooth_invalidation() {
     REASONING_SMOOTH_INVALIDATIONS.set(REASONING_SMOOTH_INVALIDATIONS.get().saturating_add(1));
 }
 
 #[derive(Default)]
-pub(super) struct SmoothScrollState {
-    pub(super) remaining: Pixels,
-    pub(super) frame_scheduled: bool,
+pub(in crate::chat) struct SmoothScrollState {
+    pub(in crate::chat) remaining: Pixels,
+    pub(in crate::chat) frame_scheduled: bool,
 }
 
 impl SmoothScrollState {
-    pub(super) fn enqueue(&mut self, distance: Pixels) {
+    pub(in crate::chat) fn enqueue(&mut self, distance: Pixels) {
         self.remaining += distance;
     }
 
-    pub(super) fn next_step(&mut self) -> Option<Pixels> {
+    pub(in crate::chat) fn next_step(&mut self) -> Option<Pixels> {
         if self.remaining >= -SMOOTH_SCROLL_FINISH_THRESHOLD
             && self.remaining <= SMOOTH_SCROLL_FINISH_THRESHOLD
         {
@@ -51,12 +57,12 @@ impl SmoothScrollState {
         Some(step)
     }
 
-    pub(super) fn cancel_motion(&mut self) {
+    pub(in crate::chat) fn cancel_motion(&mut self) {
         self.remaining = Pixels::ZERO;
     }
 }
 
-pub(super) fn smooth_scroll_animation_enabled(window: &Window, enabled: bool) -> bool {
+pub(in crate::chat) fn smooth_scroll_animation_enabled(window: &Window, enabled: bool) -> bool {
     window.is_window_active() && enabled
 }
 

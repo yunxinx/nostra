@@ -44,17 +44,10 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         let this = chat.read(cx);
         let assistant_turn = last_turn(this, cx);
-        let assistant = last_assistant_mirror(this);
+        let error = last_error_card(this).expect("card attached to the failed turn");
         assert_eq!(assistant_turn.role, Role::Assistant);
-        assert!(
-            assistant.error.is_some(),
-            "card attached to the failed turn"
-        );
         assert_eq!(
-            assistant
-                .error
-                .as_ref()
-                .and_then(crate::chat::error_card::TurnError::request_id),
+            error.request_id(),
             Some("nostra-1"),
             "the visible card retains the correlation id"
         );
@@ -86,10 +79,7 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
     );
 
     let error_body_before_theme_switch = cx.update(|_, cx| {
-        chat.read(cx)
-            .mirrors
-            .last()
-            .and_then(|mirror| mirror.error.as_ref())
+        last_error_card(chat.read(cx))
             .and_then(|error| error.body_entity_id())
             .expect("error body entity")
     });
@@ -103,11 +93,7 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
 
     cx.update(|_, cx| {
         let this = chat.read(cx);
-        let error = this
-            .mirrors
-            .last()
-            .and_then(|mirror| mirror.error.as_ref())
-            .expect("the card survives a theme switch");
+        let error = last_error_card(this).expect("the card survives a theme switch");
         let error_body_after_theme_switch = error.body_entity_id().expect("error body entity");
         assert_eq!(
             error_body_after_theme_switch, error_body_before_theme_switch,
@@ -128,12 +114,10 @@ fn failed_turn_renders_the_upstream_error_card(cx: &mut TestAppContext) {
 /// gets pushed up the panel one row at a time.
 #[gpui::test]
 fn growing_draft_leaves_the_resting_composer_height_alone(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        preferences::init_global(preferences::Preferences::default(), cx);
-    });
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    // The windowed helper renders the composer, which reads the font global;
+    // init_app installs it alongside the rest of the app state.
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
     let input = cx.update(|_, cx| chat.read(cx).composer.read(cx).input());
 
     // First measurement of an empty composer sets both heights.
@@ -230,14 +214,23 @@ fn user_message_bubble_shrinks_with_the_viewport(cx: &mut TestAppContext) {
             gpui::size(px(width), px(700.)),
             |_, _| chat.clone().into_any_element(),
         );
-        cx.debug_bounds("user-message-bubble-0")
+        cx.debug_bounds("row-userbubble-1-1-bubble")
             .expect("the user bubble was drawn")
     };
 
     let narrow_viewport_width = 440.;
     let content_inset = px(24.);
     let wide = draw(900., cx);
+    eprintln!(
+        "DEBUG wide: row={:?}",
+        cx.debug_bounds("row-userbubble-1-1")
+    );
     let narrow = draw(narrow_viewport_width, cx);
+    eprintln!(
+        "DEBUG narrow: row={:?} content={:?}",
+        cx.debug_bounds("row-userbubble-1-1"),
+        cx.debug_bounds("row-userbubble-1-1-bubble")
+    );
 
     assert_eq!(wide.size.width, px(560.), "wide bubbles keep their cap");
     assert!(

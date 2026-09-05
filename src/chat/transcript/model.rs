@@ -13,6 +13,12 @@ impl TurnId {
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_u64_for_test(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -22,6 +28,16 @@ impl PartId {
     #[must_use]
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Placeholder for turn-scoped rows (`TurnError`, `TurnActions`, the
+    /// synthetic wait placeholder) that do not belong to one part.
+    pub(crate) const NONE: PartId = PartId(0);
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_u64_for_test(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -83,6 +99,15 @@ pub(crate) enum PartSource {
 }
 
 impl PartSource {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn prose_text(&self) -> Option<&str> {
+        match self {
+            Self::Prose { text, .. } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub(crate) const fn kind(&self) -> PartKind {
         match self {
@@ -90,14 +115,6 @@ impl PartSource {
             Self::Reasoning { .. } => PartKind::Reasoning,
             Self::ToolCall { .. } => PartKind::ToolCall,
             Self::ToolResult(_) => PartKind::ToolResult,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn prose_text(&self) -> Option<&str> {
-        match self {
-            Self::Prose { text, .. } => Some(text.as_str()),
-            _ => None,
         }
     }
 }

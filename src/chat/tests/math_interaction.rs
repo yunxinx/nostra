@@ -29,7 +29,7 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
     });
     redraw_settled_math(cx);
     cx.update(|_, cx| {
-        chat.read(cx).list_state.scroll_to(ListOffset {
+        chat.read(cx).view.list_state.scroll_to(ListOffset {
             item_ix: 0,
             offset_in_item: px(0.),
         });
@@ -69,11 +69,16 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
     );
 
     assert!(
-        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
+        cx.update(|_, cx| chat.read(cx).view.list_state.max_offset_for_scrollbar().y > px(0.)),
         "the transcript fixture must have vertical overflow"
     );
-    let transcript_before_vertical =
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
+    let transcript_before_vertical = cx.update(|_, cx| {
+        chat.read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y
+    });
     let row = cx.debug_bounds(row_selector).expect("display row bounds");
     cx.simulate_event(ScrollWheelEvent {
         position: row.center(),
@@ -90,7 +95,12 @@ fn oversized_display_formula_scrolls_horizontally_and_bubbles_vertical_wheel(
         "vertical wheel input must not be remapped into horizontal formula scrolling"
     );
     assert!(
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y)
+        cx.update(|_, cx| chat
+            .read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y)
             < transcript_before_vertical,
         "vertical wheel input over a display formula must continue to scroll the transcript"
     );

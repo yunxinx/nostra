@@ -458,7 +458,9 @@ impl ConversationRuntime {
         });
     }
 
-    pub(super) fn close_scope(&mut self, cx: &mut Context<Self>) {
+    /// `pub(crate)` so a workspace can close the scope of a cold, session-less
+    /// conversation being removed (R8).
+    pub(crate) fn close_scope(&mut self, cx: &mut Context<Self>) {
         self.prepare_for_shutdown(cx);
         self.close_scope_after_quiescence(cx);
     }

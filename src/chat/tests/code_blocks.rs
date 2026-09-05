@@ -502,6 +502,7 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     redraw(cx);
     cx.update(|_, cx| {
         chat.read(cx)
+            .view
             .list_state
             .set_offset_from_scrollbar(point(px(0.), px(0.)));
     });
@@ -518,7 +519,7 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     let first_line = selector("line", "-0");
 
     assert!(
-        cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
+        cx.update(|_, cx| chat.read(cx).view.list_state.max_offset_for_scrollbar().y > px(0.)),
         "the transcript fixture must have vertical overflow"
     );
     let line_before = cx.debug_bounds(first_line).expect("first code line");
@@ -537,12 +538,18 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
 
     cx.update(|_, cx| {
         chat.read(cx)
+            .view
             .list_state
             .set_offset_from_scrollbar(point(px(0.), px(-20.)));
     });
     redraw(cx);
-    let transcript_before_left =
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
+    let transcript_before_left = cx.update(|_, cx| {
+        chat.read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y
+    });
     let line_before_left = cx
         .debug_bounds(first_line)
         .expect("right-scrolled code line");
@@ -562,7 +569,12 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
         "leftward navigation must move the code content back toward its origin"
     );
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y),
+        cx.update(|_, cx| chat
+            .read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y),
         transcript_before_left,
         "horizontal scrolling inside a code block must never move the transcript"
     );
@@ -577,8 +589,13 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     let line_at_left_boundary = cx.debug_bounds(first_line).expect("left-aligned code line");
     assert_eq!(line_at_left_boundary.left(), line_before.left());
 
-    let transcript_at_left_boundary =
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
+    let transcript_at_left_boundary = cx.update(|_, cx| {
+        chat.read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y
+    });
     let viewport_bounds = cx.debug_bounds(viewport).expect("horizontal viewport");
     cx.simulate_event(ScrollWheelEvent {
         position: viewport_bounds.center(),
@@ -587,14 +604,24 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
     });
     redraw(cx);
     assert_eq!(
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y),
+        cx.update(|_, cx| chat
+            .read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y),
         transcript_at_left_boundary,
         "continuing left at the code boundary must still not scroll the transcript"
     );
 
     let code_x_before_vertical = line_at_left_boundary.left();
-    let transcript_before_vertical =
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y);
+    let transcript_before_vertical = cx.update(|_, cx| {
+        chat.read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y
+    });
     let viewport_bounds = cx.debug_bounds(viewport).expect("horizontal viewport");
     cx.simulate_event(ScrollWheelEvent {
         position: viewport_bounds.center(),
@@ -611,7 +638,12 @@ fn horizontal_code_scroll_does_not_move_the_transcript(cx: &mut TestAppContext) 
         "vertical wheel input must not be remapped into horizontal code scrolling"
     );
     assert!(
-        cx.update(|_, cx| chat.read(cx).list_state.scroll_px_offset_for_scrollbar().y)
+        cx.update(|_, cx| chat
+            .read(cx)
+            .view
+            .list_state
+            .scroll_px_offset_for_scrollbar()
+            .y)
             < transcript_before_vertical,
         "vertical wheel input over a code block must continue to scroll the transcript"
     );
@@ -644,8 +676,8 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
                     cx,
                 );
             }
-            this.sync_message_list_count();
-            this.list_state.max_offset_for_scrollbar().y
+
+            this.view.list_state.max_offset_for_scrollbar().y
         })
     });
     assert!(
@@ -654,14 +686,16 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
     );
     redraw_settled_math(cx);
 
-    let (first_owner, last_owner, bottom_materialized) = cx.update(|_, cx| {
+    let (last_owner, bottom_materialized) = cx.update(|_, cx| {
         let chat = chat.read(cx);
         let owner = |index: usize| prose_at(chat, index, 0).0;
-        (owner(0), owner(99), chat.materialized_message_indices.len())
+        (owner(99), chat.view.materialized_row_indices().len())
     });
+    // Row granularity: the materialize/retain zones are screen-based, so the
+    // bound is expressed in rows (two rows per message) plus chrome.
     assert!(
-        bottom_materialized <= 80,
-        "virtual list materialized {bottom_materialized} of 100 messages"
+        bottom_materialized <= 96,
+        "virtual list materialized {bottom_materialized} of 200 projected rows"
     );
     assert!(
         cx.debug_bounds(Box::leak(
@@ -672,16 +706,21 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
     );
 
     cx.update(|_, cx| {
-        chat.read(cx).list_state.scroll_to(ListOffset {
+        chat.read(cx).view.list_state.scroll_to(ListOffset {
             item_ix: 0,
             offset_in_item: px(0.),
         });
     });
     redraw_settled_math(cx);
-    let top_materialized = cx.update(|_, cx| chat.read(cx).materialized_message_indices.len());
+    // The head row re-materializes on demand; its markdown owner (and with
+    // it the formula selector root) is captured from the settled renderer,
+    // then one more settled draw renders the regenerated formula.
+    let first_owner = cx.update(|_, cx| prose_at(chat.read(cx), 0, 0).0);
+    redraw_settled_math(cx);
+    let top_materialized = cx.update(|_, cx| chat.read(cx).view.materialized_row_indices().len());
     assert!(
-        top_materialized <= 80,
-        "top materialized {top_materialized} messages"
+        top_materialized <= 96,
+        "top materialized {top_materialized} of 200 projected rows"
     );
     assert!(
         cx.debug_bounds(Box::leak(
@@ -689,8 +728,8 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
         ))
         .is_some(),
         "head formula must regenerate after scrolling to the top; materialized={:?}, offset={:?}",
-        cx.update(|_, cx| chat.read(cx).materialized_message_indices.clone()),
-        cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top())
+        cx.update(|_, cx| chat.read(cx).view.materialized_row_indices()),
+        cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top())
     );
     let head_cache = crate::ui::math::formula_cache_snapshot(first_owner, 0)
         .expect("head formula cache after top render");
@@ -698,8 +737,8 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
 
     let top_before_stream = cx.update(|_, cx| {
         let chat = chat.read(cx);
-        assert!(!chat.list_state.is_following_tail());
-        chat.list_state.logical_scroll_top()
+        assert!(!chat.view.list_state.is_following_tail());
+        chat.view.list_state.logical_scroll_top()
     });
     cx.update(|_, cx| {
         chat.update(cx, |chat, _cx| test_support::finish_stream_batch(chat));
@@ -708,10 +747,10 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
     cx.update(|_, cx| {
         let chat = chat.read(cx);
         assert!(
-            !chat.list_state.is_following_tail(),
+            !chat.view.list_state.is_following_tail(),
             "a streaming update must not re-arm follow while the user is reading the top"
         );
-        let after_stream = chat.list_state.logical_scroll_top();
+        let after_stream = chat.view.list_state.logical_scroll_top();
         assert_eq!(after_stream.item_ix, top_before_stream.item_ix);
         assert_eq!(
             after_stream.offset_in_item,
@@ -731,9 +770,13 @@ fn long_formula_transcript_materializes_only_viewport_and_overdraw(cx: &mut Test
     });
     redraw_settled_math(cx);
     assert!(
-        cx.update(|_, cx| chat.read(cx).list_state.is_following_tail()),
+        cx.update(|_, cx| chat.read(cx).view.list_state.is_following_tail()),
         "scrolling back to the true bottom must re-arm tail following"
     );
+    // The tail row re-materializes with a fresh markdown owner; recapture it
+    // from the settled renderer before asserting the regenerated formula.
+    let last_owner = cx.update(|_, cx| prose_at(chat.read(cx), 99, 0).0);
+    redraw_settled_math(cx);
     assert!(
         cx.debug_bounds(Box::leak(
             format!("markdown-math-{last_owner}-0").into_boxed_str()

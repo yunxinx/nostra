@@ -47,8 +47,7 @@ fn block_math_after_markdown_text_is_rendered_as_its_own_block(cx: &mut TestAppC
         "a display formula narrower than its viewport must stay centered: {formula_bounds:?} vs {row_bounds:?}"
     );
 
-    let content: &'static str =
-        Box::leak("assistant-message-content-0".to_string().into_boxed_str());
+    let content: &'static str = Box::leak("row-prose-1-1".to_string().into_boxed_str());
     let content_bounds = cx.debug_bounds(content).expect("assistant content bounds");
     assert!(
         formula_bounds.top() >= content_bounds.top()
@@ -320,7 +319,7 @@ fn inline_math_does_not_turn_markdown_marks_into_literal_text(cx: &mut TestAppCo
     );
     let formula_bounds = cx.debug_bounds(formula).expect("formula bounds");
     let content_bounds = cx
-        .debug_bounds("assistant-message-content-0")
+        .debug_bounds("row-prose-1-1")
         .expect("assistant content bounds");
     assert!(
         formula_bounds.size.width > px(0.) && formula_bounds.size.height > px(0.),

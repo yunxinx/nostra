@@ -163,8 +163,12 @@ impl WorkspaceHost {
                 if workspace_id != CHAT_WORKSPACE_ID {
                     return false;
                 }
-                self.chat_workspace
-                    .update(cx, |workspace, cx| workspace.select_target(target, cx));
+                let Some(window) = window.take() else {
+                    return false;
+                };
+                self.chat_workspace.update(cx, |workspace, cx| {
+                    workspace.select_target(target, window, cx)
+                });
                 true
             }
             WorkspaceCommand::RestoreChatSession(session_id) => {

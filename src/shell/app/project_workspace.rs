@@ -25,7 +25,8 @@ use super::{
     chat_workspace::{SelectionEpoch, SelectionRequest},
     conversation_host::{
         Conversation, ConversationHost, ConversationHostSnapshot, ConversationId,
-        ConversationSnapshot, conversation_generating, seed_conversation_selection,
+        ConversationSnapshot, IDLE_COLD_AFTER, WARM_CONVERSATIONS, conversation_generating,
+        seed_conversation_selection,
     },
 };
 
@@ -214,6 +215,42 @@ impl ProjectWorkspace {
         self.notify_changed(cx);
     }
 
+    /// Rebuild the view of a cold conversation with its saved projection and
+    /// scroll anchor (R8).
+    fn warm_if_cold(
+        &mut self,
+        target: ConversationId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.conversations.is_cold(target) {
+            return;
+        }
+        let preference_handle = self.preference_handle.clone();
+        let markdown_extensions = self.runtime_services.markdown_extensions().clone();
+        self.conversations.warm(target, |parts, restore| {
+            crate::chat::build_chat_view(
+                parts,
+                preference_handle,
+                markdown_extensions,
+                restore,
+                window,
+                cx,
+            )
+        });
+    }
+
+    /// Drop views of idle conversations outside the warm set (R8).
+    fn cool_idle_conversations(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        let candidates =
+            self.conversations
+                .cold_candidates(now, WARM_CONVERSATIONS, IDLE_COLD_AFTER);
+        for id in candidates {
+            self.conversations.cool(id, cx);
+        }
+    }
+
     pub(super) fn toggle_project(&mut self, project_id: String, cx: &mut Context<Self>) {
         let expanded = self.catalog.toggle_project_expanded(project_id.clone());
         if expanded && self.catalog.sessions_need_load(&project_id) {
@@ -225,9 +262,7 @@ impl ProjectWorkspace {
 
     pub(super) fn prepare_for_shutdown(&mut self, cx: &mut Context<Self>) {
         for conversation in self.conversations.conversations() {
-            conversation
-                .view
-                .update(cx, |chat, cx| chat.prepare_for_shutdown(cx));
+            conversation.prepare_for_shutdown(cx);
         }
     }
 
@@ -235,10 +270,12 @@ impl ProjectWorkspace {
         let Some(target) = self.conversations.active() else {
             return;
         };
+        // The composer outlives a cold view, so dismiss on the entity
+        // directly: a cold conversation must not resurrect a stale popup (R8).
         if let Some(conversation) = self.conversations.conversation(target) {
             conversation
-                .view
-                .update(cx, |view, cx| view.dismiss_composer_completion(cx));
+                .composer
+                .update(cx, |composer, cx| composer.dismiss_completion(cx));
         }
     }
 
@@ -427,10 +464,13 @@ impl ProjectWorkspace {
             self.invalidate_selection_request();
             self.catalog.open_draft(project_id);
             self.conversations.set_active(existing_target);
-            if let Some(conversation) = self.conversations.conversation(existing_target) {
-                conversation
-                    .view
-                    .update(cx, |view, cx| view.focus_composer(window, cx));
+            self.conversations.touch(existing_target);
+            self.warm_if_cold(existing_target, window, cx);
+            self.cool_idle_conversations(cx);
+            if let Some(conversation) = self.conversations.conversation(existing_target)
+                && let Some(view) = &conversation.view
+            {
+                view.update(cx, |view, cx| view.focus_composer(window, cx));
             }
             self.notify_changed(cx);
             return;
@@ -451,17 +491,26 @@ impl ProjectWorkspace {
             cx,
         );
         let id = self.conversations.allocate_id();
-        let subscriptions =
-            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let subscriptions = self.subscribe_conversation(
+            &spawned.parts.runtime,
+            &spawned.parts.transcript,
+            id,
+            window,
+            cx,
+        );
         let selection = seed_conversation_selection(None, cx);
-        let is_generating = conversation_generating(&spawned.runtime, cx);
+        let is_generating = conversation_generating(&spawned.parts.runtime, cx);
         let view = spawned.view.clone();
         self.conversations.push_and_activate(Conversation {
             id,
-            runtime: spawned.runtime,
-            transcript: spawned.transcript,
-            composer: spawned.composer,
-            view: spawned.view,
+            runtime: spawned.parts.runtime,
+            transcript: spawned.parts.transcript,
+            composer: spawned.parts.composer,
+            composer_status: spawned.parts.composer_status,
+            references_enabled: spawned.parts.references_enabled,
+            view: Some(spawned.view),
+            projection: None,
+            scroll_anchor: None,
             metadata: ProjectConversationMetadata {
                 project_id: project_id.clone(),
             },
@@ -469,6 +518,7 @@ impl ProjectWorkspace {
             selection,
             session_id: None,
             is_generating,
+            last_active_at: std::time::Instant::now(),
             _subscriptions: subscriptions,
         });
         self.catalog.new_project_draft(project_id.clone());
@@ -488,6 +538,9 @@ impl ProjectWorkspace {
             self.invalidate_selection_request();
             self.catalog.select_session(project_id, session_id);
             self.conversations.set_active(existing_target);
+            self.conversations.touch(existing_target);
+            self.warm_if_cold(existing_target, window, cx);
+            self.cool_idle_conversations(cx);
             self.notify_changed(cx);
             return;
         }
@@ -562,6 +615,9 @@ impl ProjectWorkspace {
         self._open_task = None;
         if let Some(existing_target) = self.conversations.opened_target(&restore.session_id) {
             self.conversations.set_active(existing_target);
+            self.conversations.touch(existing_target);
+            self.warm_if_cold(existing_target, window, cx);
+            self.cool_idle_conversations(cx);
             self.notify_changed(cx);
             return;
         }
@@ -601,23 +657,34 @@ impl ProjectWorkspace {
             }
         };
         let id = self.conversations.allocate_id();
-        let subscriptions =
-            self.subscribe_conversation(&spawned.runtime, &spawned.transcript, id, window, cx);
+        let subscriptions = self.subscribe_conversation(
+            &spawned.parts.runtime,
+            &spawned.parts.transcript,
+            id,
+            window,
+            cx,
+        );
         let selection = seed_conversation_selection(restored_model, cx);
-        let is_generating = conversation_generating(&spawned.runtime, cx);
+        let is_generating = conversation_generating(&spawned.parts.runtime, cx);
+        let now = std::time::Instant::now();
         self.conversations.push_and_activate(Conversation {
             id,
-            runtime: spawned.runtime,
-            transcript: spawned.transcript,
-            composer: spawned.composer,
+            runtime: spawned.parts.runtime,
+            transcript: spawned.parts.transcript,
+            composer: spawned.parts.composer,
+            composer_status: spawned.parts.composer_status,
+            references_enabled: spawned.parts.references_enabled,
             selection,
             is_generating,
-            view: spawned.view,
+            view: Some(spawned.view),
+            projection: None,
+            scroll_anchor: None,
             metadata: ProjectConversationMetadata {
                 project_id: restore.project_id,
             },
             title,
             session_id: Some(restore.session_id),
+            last_active_at: now,
             _subscriptions: subscriptions,
         });
         self.notify_changed(cx);
@@ -635,9 +702,9 @@ impl ProjectWorkspace {
             return false;
         };
         conversation.selection = Some(selection.clone());
-        conversation
-            .view
-            .update(cx, |chat, cx| chat.select_model(selection, cx));
+        if let Some(view) = &conversation.view {
+            view.update(cx, |chat, cx| chat.select_model(selection, cx));
+        }
         true
     }
 
@@ -668,18 +735,31 @@ impl ProjectWorkspace {
             runtime,
             transcript,
             composer,
+            composer_status: _,
+            references_enabled: _,
+            projection,
+            scroll_anchor,
             session_id,
             metadata,
             ..
         } = removed.conversation;
         let project_id = metadata.project_id;
         if session_id.is_none() {
-            view.update(cx, |view, cx| view.close_scope(cx));
+            // The view may already be cold; the runtime always serves the
+            // scope close (R8).
+            runtime.update(cx, |runtime, cx| runtime.close_scope(cx));
         }
         if let Some(session_id) = session_id {
             self.catalog.remove_session(&project_id, &session_id);
         }
-        drop((runtime, transcript, composer, view));
+        drop((
+            view,
+            runtime,
+            transcript,
+            composer,
+            projection,
+            scroll_anchor,
+        ));
         self.catalog.discard_draft(&project_id);
         self.notify_changed(cx);
     }
@@ -697,9 +777,9 @@ impl ProjectWorkspace {
             self.remove_conversation(target, window, cx);
             return;
         }
-        let request = conversation
-            .view
-            .update(cx, |chat, cx| chat.request_delete(cx));
+        // A cold conversation has no view, but its runtime still serves the
+        // delete request (R8).
+        let request = conversation.request_delete(cx);
         if request == ChatDeleteRequest::RemoveNow {
             self.remove_conversation(target, window, cx);
         }
@@ -770,7 +850,7 @@ impl ProjectWorkspace {
             .conversations()
             .iter()
             .filter(|conversation| conversation.metadata.project_id == project.project_id)
-            .any(|conversation| conversation.view.read(cx).has_in_flight_work());
+            .any(|conversation| conversation.has_in_flight_work(cx));
         if has_in_flight_work {
             window.push_notification(
                 (NotificationType::Error, t!("agent.delete_busy").to_string()),
@@ -864,9 +944,9 @@ impl ProjectWorkspace {
             .conversations
             .retain(|conversation| conversation.metadata.project_id != project_id);
         for conversation in removed {
-            conversation
-                .view
-                .update(cx, |view, cx| view.close_scope(cx));
+            // The view may already be cold; the runtime always serves the
+            // scope close (R8).
+            conversation.close_scope(cx);
         }
         self.catalog.remove_project(project_id);
     }

@@ -272,13 +272,14 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
         redraw(cx);
 
         assert!(
-            cx.update(|_, cx| chat.read(cx).list_state.max_offset_for_scrollbar().y > px(0.)),
+            cx.update(|_, cx| chat.read(cx).view.list_state.max_offset_for_scrollbar().y > px(0.)),
             "the transcript fixture must be scrollable"
         );
         let body = cx
             .debug_bounds("reasoning-body-0")
             .expect("the latest reasoning card must be visible");
-        let transcript_before = cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+        let transcript_before =
+            cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
         let card_before = cx.update(|_, cx| {
             reasoning_part(chat.read(cx))
                 .expect("reasoning trace")
@@ -295,7 +296,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                 ..Default::default()
             });
             assert!(
-                cx.update(|_, cx| chat.read(cx).smooth_scroll.remaining != px(0.)),
+                cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining != px(0.)),
                 "the transcript fixture must have a queued smooth motion"
             );
         }
@@ -311,9 +312,9 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
                 let chat = chat.read(cx);
                 let trace = reasoning_part(chat).expect("reasoning trace");
                 (
-                    chat.list_state.logical_scroll_top(),
+                    chat.view.list_state.logical_scroll_top(),
                     trace.scroll_offset().y,
-                    chat.smooth_scroll.remaining,
+                    chat.view.smooth_scroll.remaining,
                     trace.smooth_scroll_remaining(),
                 )
             });
@@ -391,14 +392,14 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
             ScrollDelta::Lines(point(0., -1_000.)),
         ] {
             let transcript_before_boundary =
-                cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+                cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
             cx.simulate_event(ScrollWheelEvent {
                 position: body.center(),
                 delta,
                 ..Default::default()
             });
             let transcript_after_boundary =
-                cx.update(|_, cx| chat.read(cx).list_state.logical_scroll_top());
+                cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
             assert_eq!(
                 transcript_after_boundary.item_ix, transcript_before_boundary.item_ix,
                 "boundary wheel input leaked into the transcript (smooth={smooth_scrolling})"
@@ -416,8 +417,7 @@ fn reasoning_wheel_events_never_scroll_the_transcript(cx: &mut TestAppContext) {
 #[gpui::test]
 fn theme_switch_preserves_the_reasoning_body(cx: &mut TestAppContext) {
     init_app(cx);
-    let cx = cx.add_empty_window();
-    let chat = cx.update(ChatView::view);
+    let (chat, cx) = add_chat_window(cx);
     seed_turn(&chat, cx);
 
     cx.update(|_, cx| {

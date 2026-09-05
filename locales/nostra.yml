@@ -141,6 +141,18 @@ chat:
   tool_requested:
     en: "Tool requested: %{name}"
     zh-CN: "请求调用工具：%{name}"
+  tool_group:
+    en: "Tool activity (%{count})"
+    zh-CN: "工具活动（%{count} 条）"
+  tool_group_expand:
+    en: Expand tool activity
+    zh-CN: 展开工具活动
+  tool_group_collapse:
+    en: Collapse tool activity
+    zh-CN: 收拢工具活动
+  jump_to_latest:
+    en: Back to latest
+    zh-CN: 回到最新
   copy_message:
     en: Copy message
     zh-CN: 复制消息
