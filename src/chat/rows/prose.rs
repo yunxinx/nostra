@@ -2,8 +2,8 @@
 //!
 //! The wait placeholder row (an assistant turn with no other rows) carries
 //! `part = PartId::NONE` and collapses to nothing here; the *view* renders
-//! the P1 `ShimmerText` for a waiting turn. Real prose rows stream through
-//! a retained [`MarkdownBody`], exactly like the P1 mirror did.
+//! `ShimmerText` for a waiting turn. Real prose rows stream through
+//! a retained [`MarkdownBody`].
 
 use gpui::{
     App, IntoElement, ParentElement as _, Styled as _, Window, div, prelude::FluentBuilder as _,
@@ -34,7 +34,7 @@ impl ProseRenderer {
 
     fn rebuild_body(&mut self, ctx: &MaterializeContext, cx: &mut App) {
         // A streaming body exists from the moment its part is inserted (even
-        // empty), matching the P1 mirror: the first delta lands in the same
+        // empty): the first delta lands in the same
         // markdown state and tests can observe its owner immediately.
         self.body = if self.finished {
             if self.text.is_empty() {
@@ -91,7 +91,7 @@ impl RowRenderer for ProseRenderer {
                 if let PartSource::Prose { text, .. } = &part.source {
                     // A live insert seeds empty: the transcript part already
                     // carries the triggering delta and the following Append
-                    // replays it (P1 empty-seed rule). A late materialization
+                    // replays it. A late materialization
                     // (cold restore mid-stream, first layout) re-reads the
                     // accumulated content so no prefix is lost.
                     self.text = if part.finished || !ctx.append_replays_part {
@@ -120,10 +120,16 @@ impl RowRenderer for ProseRenderer {
         self.materialized
     }
 
-    fn is_windowed(&self, cx: &App) -> bool {
+    fn visit_layout_dependencies(&self, visit: &mut dyn FnMut(&MarkdownBody)) {
+        if let Some(body) = self.body.as_ref() {
+            visit(body);
+        }
+    }
+
+    fn requests_windowed_layout(&self) -> bool {
         self.body
             .as_ref()
-            .is_some_and(|body| typography::windowed_body(self.text.len(), body.block_count(cx)))
+            .is_some_and(|body| typography::windowed_body(self.text.len(), body.block_count()))
     }
 
     fn apply(&mut self, change: &RowChange, ctx: &MaterializeContext, cx: &mut App) {
@@ -182,11 +188,10 @@ impl RowRenderer for ProseRenderer {
         div()
             .w_full()
             .when_some(self.body.as_ref(), |this, body| {
-                // Natural height; large bodies route through the fork's
-                // windowed block layout (P4 PRD R5).
-                this.child(body.text_view(typography::prose(cx)).windowed(
-                    typography::windowed_body(self.text.len(), body.block_count(cx)),
-                ))
+                this.child(
+                    body.text_view(typography::prose(cx))
+                        .windowed(self.requests_windowed_layout()),
+                )
             })
             .into_any_element()
     }

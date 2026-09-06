@@ -2385,6 +2385,7 @@ dependencies = [
  "gpui_macros",
  "gpui_shared_string",
  "gpui_util",
+ "hdrhistogram",
  "heapless",
  "http_client",
  "image",
@@ -2435,7 +2436,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=7219abbcb0b9433c05caf7563b847ec7bc2026eb#7219abbcb0b9433c05caf7563b847ec7bc2026eb"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35#ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -2473,7 +2474,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.5.2"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=7219abbcb0b9433c05caf7563b847ec7bc2026eb#7219abbcb0b9433c05caf7563b847ec7bc2026eb"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35#ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2550,7 +2551,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-assets"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=7219abbcb0b9433c05caf7563b847ec7bc2026eb#7219abbcb0b9433c05caf7563b847ec7bc2026eb"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35#ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2564,7 +2565,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.5.1"
-source = "git+https://github.com/yunxinx/gpui-component.git?rev=7219abbcb0b9433c05caf7563b847ec7bc2026eb#7219abbcb0b9433c05caf7563b847ec7bc2026eb"
+source = "git+https://github.com/yunxinx/gpui-component.git?rev=ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35#ffbae29d5eaa9f193a0ea01b9f3a36a72e1edb35"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2913,6 +2914,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
 dependencies = [
  "hashbrown 0.14.5",
+]
+
+[[package]]
+name = "hdrhistogram"
+version = "7.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "765c9198f173dd59ce26ff9f95ef0aafd0a0fe01fb9d72841bc5066a4c06511d"
+dependencies = [
+ "byteorder",
+ "num-traits",
 ]
 
 [[package]]

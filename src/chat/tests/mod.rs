@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use gpui::{
@@ -196,31 +196,6 @@ fn last_activity_renderer(chat: &ChatView) -> Option<&crate::chat::rows::ToolAct
                 .as_any()
                 .downcast_ref::<crate::chat::rows::ToolActivityRenderer>()
         })
-}
-
-/// Expand/collapse the last tool-activity row's body. Returns whether a
-/// renderer was found.
-fn toggle_activity_row(chat: &mut ChatView, cx: &mut App) -> bool {
-    let Some(row_id) = rows_of_kind(chat, RowKind::ToolActivity)
-        .last()
-        .map(|row| row.id())
-    else {
-        return false;
-    };
-    let Some(ix) = chat.view.projection.row_index(row_id) else {
-        return false;
-    };
-    let Some(renderer) = chat.view.slots[ix]
-        .renderer
-        .as_any_mut()
-        .downcast_mut::<crate::chat::rows::ToolActivityRenderer>()
-    else {
-        return false;
-    };
-    renderer.toggle_disclosure(crate::chat::rows::DisclosureTarget::Activity, cx);
-    let disclosure = renderer.disclosure();
-    chat.view.projection.set_disclosure(row_id, disclosure);
-    true
 }
 
 fn reasoning_row_for_part(chat: &ChatView, part_id: PartId) -> Option<RowId> {
@@ -661,13 +636,56 @@ fn redraw_settled_math(cx: &mut gpui::VisualTestContext) {
     redraw(cx);
 }
 
-fn measured_redraw(
+fn measure_draws(
     cx: &mut gpui::VisualTestContext,
-) -> (std::time::Duration, crate::ui::markdown::MarkdownPerfProbe) {
-    crate::ui::markdown::reset_perf_probe();
-    let started = Instant::now();
-    redraw(cx);
-    (started.elapsed(), crate::ui::markdown::perf_probe())
+    action: impl FnOnce(&mut gpui::VisualTestContext),
+) -> Vec<Duration> {
+    let before = cx.update(|window, _| window.frame_duration_snapshot());
+    action(cx);
+    cx.run_until_parked();
+    let mut after = cx.update(|window, _| window.frame_duration_snapshot());
+    after
+        .draw_duration_histogram
+        .subtract(&before.draw_duration_histogram)
+        .expect("frame duration counters must be monotonic");
+    let mut samples = Vec::new();
+    for value in after.draw_duration_histogram.iter_recorded() {
+        let duration = Duration::from_nanos(value.value_iterated_to());
+        for _ in 0..value.count_since_last_iteration() {
+            samples.push(duration);
+        }
+    }
+    samples
+}
+
+fn settle_frame_callbacks(cx: &mut gpui::VisualTestContext) {
+    for _ in 0..64 {
+        cx.run_until_parked();
+        if cx.update(|window, cx| window.simulate_next_frame(cx)) == 0 {
+            return;
+        }
+    }
+    panic!("frame callbacks did not settle");
+}
+
+fn settled_frame_probe(cx: &mut gpui::VisualTestContext) -> crate::ui::markdown::MarkdownPerfProbe {
+    cx.update(|window, cx| {
+        crate::ui::markdown::reset_perf_probe();
+        let _ = window.draw(cx);
+        crate::ui::markdown::perf_probe()
+    })
+}
+
+fn measured_interaction(
+    cx: &mut gpui::VisualTestContext,
+    action: impl FnOnce(&mut gpui::VisualTestContext),
+) -> (Duration, crate::ui::markdown::MarkdownPerfProbe) {
+    let draws = measure_draws(cx, |cx| {
+        action(cx);
+        settle_frame_callbacks(cx);
+    });
+    let maximum = draws.into_iter().max().expect("the interaction must draw");
+    (maximum, settled_frame_probe(cx))
 }
 
 fn duration_percentile(samples: &[Duration], percentile: usize) -> Duration {
@@ -679,6 +697,20 @@ fn duration_percentile(samples: &[Duration], percentile: usize) -> Duration {
     sorted.sort_unstable();
     let index = ((sorted.len() - 1) * percentile.min(100)) / 100;
     sorted[index]
+}
+
+#[gpui::test]
+fn draw_measurement_records_effect_driven_frames(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (_, cx) = add_chat_window(cx);
+    settle_frame_callbacks(cx);
+
+    assert!(measure_draws(cx, |_| {}).is_empty());
+    let draws = measure_draws(cx, |cx| {
+        cx.update(|window, _| window.refresh());
+    });
+    assert!(!draws.is_empty(), "automatic drawing must be measured");
+    assert!(measure_draws(cx, |_| {}).is_empty());
 }
 
 mod code_blocks;

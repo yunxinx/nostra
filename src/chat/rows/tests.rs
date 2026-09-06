@@ -181,7 +181,307 @@ fn an_error_result_marks_the_activity_failed(cx: &mut TestAppContext) {
 }
 
 // ---------------------------------------------------------------------------
-// Projection level: pairing and the step stack (AC5)
+// Renderer layout dependencies
+// ---------------------------------------------------------------------------
+
+fn layout_dependency_ids(renderer: &dyn RowRenderer) -> Vec<gpui::EntityId> {
+    let mut ids = Vec::new();
+    renderer.visit_layout_dependencies(&mut |body| ids.push(body.entity_id()));
+    ids
+}
+
+fn layout_completions(renderer: &dyn RowRenderer) -> Vec<bool> {
+    let mut complete = Vec::new();
+    renderer.visit_layout_dependencies(&mut |body| complete.push(body.layout_snapshot().complete));
+    complete
+}
+
+#[gpui::test]
+fn requested_windowed_layout_does_not_reuse_inactive_completion(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let renderer = cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let part = Part {
+            part_id: PartId::from_u64_for_test(1),
+            content_index: 0,
+            source: PartSource::Prose {
+                text: "x".repeat(super::typography::WINDOWED_SOURCE_BYTES),
+                replay: ProviderMetadata::default(),
+                stream_id: String::new(),
+            },
+            finished: true,
+        };
+        let mut ctx = activity_ctx(&part, None, &presentation);
+        ctx.row_id = RowId::new(ctx.row_id.turn, part.part_id, RowKind::AssistantProse);
+        let mut renderer = super::ProseRenderer::new();
+        renderer.materialize(&ctx, cx);
+        assert!(renderer.requests_windowed_layout());
+        assert!(!renderer.is_layout_complete());
+        renderer
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_dependency_ids(&renderer).len(), 1);
+    renderer.visit_layout_dependencies(&mut |body| {
+        let layout = body.layout_snapshot();
+        assert!(layout.complete, "the source has finished parsing");
+        assert!(!layout.windowed, "no frame has activated windowed layout");
+    });
+    assert!(!renderer.is_layout_complete());
+}
+
+#[gpui::test]
+fn reasoning_height_dependency_tracks_its_natural_height_disclosure(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        for finished in [false, true] {
+            let presentation = MarkdownPresentation::for_test(cx);
+            let part = Part {
+                part_id: PartId::from_u64_for_test(1),
+                content_index: 0,
+                source: PartSource::Reasoning {
+                    reasoning: crate::llm::ReasoningContent {
+                        display: "x".repeat(super::typography::WINDOWED_SOURCE_BYTES),
+                        replay: None,
+                    },
+                    stream_id: String::new(),
+                },
+                finished,
+            };
+            let mut ctx = activity_ctx(&part, None, &presentation);
+            ctx.row_id = RowId::new(ctx.row_id.turn, part.part_id, RowKind::Reasoning);
+            let mut renderer = super::ReasoningRenderer::new();
+            renderer.materialize(&ctx, cx);
+            let body_id = renderer.body_entity_id().expect("reasoning body");
+            assert!(layout_dependency_ids(&renderer).is_empty());
+            assert!(renderer.is_layout_complete());
+            renderer.toggle_disclosure(DisclosureTarget::ReasoningFull, cx);
+            assert_eq!(
+                layout_dependency_ids(&renderer),
+                if finished { vec![body_id] } else { Vec::new() },
+                "streaming remains a fixed-height preview even with Full disclosure"
+            );
+            assert_eq!(renderer.requests_windowed_layout(), finished);
+            assert_eq!(renderer.is_layout_complete(), !finished);
+            renderer.toggle_disclosure(DisclosureTarget::ReasoningFull, cx);
+            assert!(layout_dependency_ids(&renderer).is_empty());
+            assert!(renderer.is_layout_complete());
+            assert_eq!(renderer.body_entity_id(), Some(body_id));
+        }
+    });
+}
+
+#[gpui::test]
+fn user_markdown_height_waits_for_parse_and_plain_text_has_no_dependency(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (mut renderer, part, presentation) = cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let part = Part {
+            part_id: PartId::from_u64_for_test(1),
+            content_index: 0,
+            source: PartSource::Prose {
+                text: "User paragraph.\n\n".repeat(400),
+                replay: ProviderMetadata::default(),
+                stream_id: String::new(),
+            },
+            finished: true,
+        };
+        let mut ctx = activity_ctx(&part, None, &presentation);
+        ctx.row_id = RowId::new(ctx.row_id.turn, part.part_id, RowKind::UserBubble);
+        ctx.user_message_markdown = true;
+        let mut renderer = super::UserBubbleRenderer::new();
+        renderer.materialize(&ctx, cx);
+        assert_eq!(
+            layout_dependency_ids(&renderer),
+            [renderer.body_entity_for_test().expect("Markdown body")]
+        );
+        assert!(!renderer.requests_windowed_layout());
+        assert!(!renderer.is_layout_complete());
+        (renderer, part, presentation)
+    });
+    cx.run_until_parked();
+    assert!(renderer.is_layout_complete());
+
+    cx.update(|cx| {
+        renderer.release(cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+        let mut ctx = activity_ctx(&part, None, &presentation);
+        ctx.row_id = RowId::new(ctx.row_id.turn, part.part_id, RowKind::UserBubble);
+        renderer.materialize(&ctx, cx);
+        assert!(renderer.body_entity_for_test().is_none());
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+    });
+}
+
+#[gpui::test]
+fn activity_height_waits_for_each_visible_body_and_ignores_hidden_bodies(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let part = call_part(1, "call-0", "lookup", r#"{"q":"hi"}"#);
+    let mut result = ToolResult {
+        call_id: "call-0".into(),
+        content: "initial result".into(),
+        is_error: false,
+    };
+    let (mut renderer, presentation) = cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let mut renderer = ToolActivityRenderer::new();
+        renderer.materialize(&activity_ctx(&part, Some(&result), &presentation), cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+        renderer.toggle_disclosure(DisclosureTarget::Activity, cx);
+        assert_eq!(layout_completions(&renderer), [false, false]);
+        assert!(!renderer.is_layout_complete());
+        (renderer, presentation)
+    });
+    cx.run_until_parked();
+    let arguments_id = renderer.arguments_body_entity_id().expect("arguments body");
+    let result_id = renderer.result_body_entity_id().expect("result body");
+    assert_eq!(layout_dependency_ids(&renderer), [arguments_id, result_id]);
+    assert_eq!(layout_completions(&renderer), [true, true]);
+    assert!(renderer.is_layout_complete());
+
+    cx.update(|cx| {
+        result.content = "x".repeat(super::typography::RESULT_BUDGET_BYTES);
+        renderer.apply(
+            &RowChange::Replace,
+            &activity_ctx(&part, Some(&result), &presentation),
+            cx,
+        );
+        assert_eq!(layout_dependency_ids(&renderer), [arguments_id, result_id]);
+        assert_eq!(layout_completions(&renderer), [true, false]);
+        assert!(!renderer.is_layout_complete());
+    });
+    cx.run_until_parked();
+    assert!(renderer.is_layout_complete());
+
+    cx.update(|cx| {
+        let part = call_part(1, "call-0", "lookup", &"argument ".repeat(700));
+        renderer.apply(
+            &RowChange::Replace,
+            &activity_ctx(&part, Some(&result), &presentation),
+            cx,
+        );
+        assert_eq!(layout_dependency_ids(&renderer), [arguments_id, result_id]);
+        assert_eq!(layout_completions(&renderer), [false, true]);
+        assert!(!renderer.is_layout_complete());
+
+        renderer.sync_disclosure(DisclosureState {
+            activity: ActivityDisclosure::Open {
+                arguments_open: false,
+            },
+            ..DisclosureState::default()
+        });
+        assert_eq!(renderer.arguments_body_entity_id(), Some(arguments_id));
+        assert_eq!(layout_dependency_ids(&renderer), [result_id]);
+        assert!(renderer.is_layout_complete());
+        renderer.sync_disclosure(DisclosureState::default());
+        assert!(renderer.result_body_entity_id().is_some());
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+        renderer.release(cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+    });
+}
+
+#[gpui::test]
+fn activity_result_height_dependency_matches_the_viewport_budget(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let budget = super::typography::RESULT_BUDGET_BYTES;
+        for (unpaired, bytes) in [(false, budget), (false, budget + 1), (true, budget + 1)] {
+            let result = ToolResult {
+                call_id: "call-0".into(),
+                content: "x".repeat(bytes),
+                is_error: false,
+            };
+            let part = if unpaired {
+                Part {
+                    part_id: PartId::from_u64_for_test(1),
+                    content_index: 0,
+                    source: PartSource::ToolResult(result.clone()),
+                    finished: true,
+                }
+            } else {
+                call_part(1, "call-0", "lookup", "")
+            };
+            let mut renderer = ToolActivityRenderer::new();
+            renderer.materialize(&activity_ctx(&part, Some(&result), &presentation), cx);
+            if !unpaired {
+                renderer.toggle_disclosure(DisclosureTarget::Activity, cx);
+            }
+            let result_id = renderer
+                .result_body_entity_id()
+                .expect("visible result body");
+            let natural_height = unpaired || bytes <= budget;
+            assert_eq!(
+                layout_dependency_ids(&renderer),
+                if natural_height {
+                    vec![result_id]
+                } else {
+                    Vec::new()
+                },
+                "unpaired={unpaired}, result bytes={bytes}"
+            );
+            assert_eq!(renderer.is_layout_complete(), !natural_height);
+            assert!(!renderer.requests_windowed_layout());
+            renderer.release(cx);
+            assert!(layout_dependency_ids(&renderer).is_empty());
+        }
+    });
+}
+
+#[gpui::test]
+fn error_height_dependency_follows_the_displayed_body(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut renderer = cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let error = crate::llm::GatewayError::http(502, None)
+            .with_upstream_body("Provider diagnostic line.\n".repeat(400));
+        let ctx = MaterializeContext {
+            row_id: RowId::new(
+                TurnId::from_u64_for_test(1),
+                PartId::NONE,
+                RowKind::TurnError,
+            ),
+            part: None,
+            paired_result: None,
+            error: Some(&error),
+            presentation: &presentation,
+            user_message_markdown: false,
+            owner_id: crate::chat::next_body_owner_id(),
+            append_replays_part: false,
+        };
+        let mut renderer = super::TurnErrorRenderer::new();
+        renderer.materialize(&ctx, cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+        renderer.toggle_disclosure(DisclosureTarget::ErrorBody, cx);
+        assert_eq!(
+            layout_dependency_ids(&renderer),
+            [renderer.body_entity_id().expect("expanded error body")]
+        );
+        assert!(!renderer.is_layout_complete());
+        assert!(!renderer.requests_windowed_layout());
+        renderer
+    });
+    cx.run_until_parked();
+    assert!(renderer.is_layout_complete());
+    cx.update(|cx| {
+        renderer.toggle_disclosure(DisclosureTarget::ErrorBody, cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+        renderer.toggle_disclosure(DisclosureTarget::ErrorBody, cx);
+        assert!(!renderer.is_layout_complete());
+        renderer.release(cx);
+        assert!(layout_dependency_ids(&renderer).is_empty());
+        assert!(renderer.is_layout_complete());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Projection level: pairing and the step stack
 // ---------------------------------------------------------------------------
 
 fn text_message(role: crate::llm::Role, text: &str) -> LlmMessage {

@@ -4,15 +4,17 @@ mod code_block;
 mod extension_registry;
 
 use std::{
+    cell::Cell,
     ops::Range,
+    rc::Rc,
     sync::{Arc, Mutex},
 };
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyElement, App, AppContext as _, Axis, Entity, HighlightStyle, Hsla, InteractiveElement as _,
-    IntoElement as _, ParentElement as _, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Task, Window, div, px,
+    AnyElement, App, AppContext as _, Axis, Context, Entity, EntityId, HighlightStyle, Hsla,
+    InteractiveElement as _, IntoElement as _, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, Rope, RopeExt as _, Sizable as _,
@@ -166,11 +168,30 @@ define_probe!(
     BackgroundHighlightProbe
 );
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownLayoutSnapshot {
+    pub(crate) block_count: usize,
+    pub(crate) windowed: bool,
+    pub(crate) complete: bool,
+}
+
+impl MarkdownLayoutSnapshot {
+    fn from_state(state: &TextViewState) -> Self {
+        Self {
+            block_count: state.block_count(),
+            windowed: state.is_windowed(),
+            complete: state.is_layout_complete(),
+        }
+    }
+}
+
 /// A Markdown body and the stable extension registry that renders its fenced
 /// code. Keeping the registry beside the state prevents a new extension
 /// revision from forcing a full Markdown reparse on every frame.
 pub(crate) struct MarkdownBody {
     state: Entity<TextViewState>,
+    layout: Rc<Cell<MarkdownLayoutSnapshot>>,
+    _layout_subscription: Subscription,
     extension_context: MarkdownExtensionInstallContext,
     extension_snapshot: MarkdownExtensionSnapshot,
     extensions: MarkdownExtensions,
@@ -214,8 +235,18 @@ impl MarkdownBody {
             presentation.preference_state.clone(),
             streaming,
         );
+        let state = cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx));
+        let layout = Rc::new(Cell::new(MarkdownLayoutSnapshot::from_state(
+            state.read(cx),
+        )));
+        let layout_subscription = cx.observe(&state, {
+            let layout = layout.clone();
+            move |state, cx| layout.set(MarkdownLayoutSnapshot::from_state(state.read(cx)))
+        });
         let mut body = Self {
-            state: cx.new(|cx| TextViewState::markdown_with_lazy_scroll_measurement(source, cx)),
+            state,
+            layout,
+            _layout_subscription: layout_subscription,
             extension_context,
             extension_snapshot: MarkdownExtensionSnapshot::empty(),
             extensions: MarkdownExtensions::default(),
@@ -263,12 +294,19 @@ impl MarkdownBody {
         if delta.is_empty() {
             return;
         }
-        self.state.update(cx, |state, cx| state.push_str(delta, cx));
+        let layout = self.state.update(cx, |state, cx| {
+            state.push_str(delta, cx);
+            MarkdownLayoutSnapshot::from_state(state)
+        });
+        self.layout.set(layout);
     }
 
     pub(crate) fn set_text(&mut self, source: &str, cx: &mut App) {
-        self.state
-            .update(cx, |state, cx| state.set_text(source, cx));
+        let layout = self.state.update(cx, |state, cx| {
+            state.set_text(source, cx);
+            MarkdownLayoutSnapshot::from_state(state)
+        });
+        self.layout.set(layout);
     }
 
     pub(crate) fn update_extension_snapshot(
@@ -299,15 +337,33 @@ impl MarkdownBody {
     }
 
     /// The number of top-level blocks in the parsed document.
-    pub(crate) fn block_count(&self, cx: &App) -> usize {
-        self.state.read(cx).block_count()
+    pub(crate) fn block_count(&self) -> usize {
+        self.layout.get().block_count
+    }
+
+    pub(crate) fn layout_snapshot(&self) -> MarkdownLayoutSnapshot {
+        self.layout.get()
+    }
+
+    /// Observe layout dependencies without retaining the subscriber. Geometry can
+    /// change while the block count and completion flag remain unchanged.
+    pub(crate) fn observe_layout<T: 'static>(
+        &self,
+        cx: &mut Context<T>,
+        mut on_change: impl FnMut(&mut T, EntityId, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        let layout = self.layout.clone();
+        cx.observe(&self.state, move |owner, state, cx| {
+            // Refresh here too so subscribers do not depend on observer order.
+            layout.set(MarkdownLayoutSnapshot::from_state(state.read(cx)));
+            on_change(owner, state.entity_id(), cx);
+        })
     }
 
     pub(crate) fn scroll_state(&self, cx: &App) -> gpui::ListState {
         self.state.read(cx).scroll_state()
     }
 
-    #[cfg(test)]
     pub(crate) fn entity_id(&self) -> gpui::EntityId {
         self.state.entity_id()
     }

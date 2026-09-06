@@ -416,6 +416,13 @@ impl RowProjection {
         });
     }
 
+    /// Preserve provisional geometry without allowing it to serve a cold restore.
+    pub(crate) fn invalidate_layout(&mut self, id: RowId) {
+        if let Some(ix) = self.row_index(id) {
+            self.rows[ix].height.invalidate_layout();
+        }
+    }
+
     pub(crate) fn bump_content_revision(&mut self, id: RowId) {
         if let Some(ix) = self.row_index(id) {
             self.rows[ix].content_revision = self.rows[ix].content_revision.saturating_add(1);

@@ -79,7 +79,7 @@ impl TranscriptView {
                 let row_id = self.projection.rows()[ix].id();
                 let disclosure = self.slots[ix].renderer.disclosure();
                 self.projection.set_disclosure(row_id, disclosure);
-                self.slots[ix].renderer.release(cx);
+                self.slots[ix].release(cx);
             }
         }
 

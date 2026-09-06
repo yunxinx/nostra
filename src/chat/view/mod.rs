@@ -16,10 +16,10 @@ mod tests;
 mod window;
 
 use gpui::{
-    AnyElement, App, Context, Entity, FollowMode, InteractiveElement as _, IntoElement, ListOffset,
-    ListState, ParentElement as _, Pixels, Point, Render, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, list, prelude::FluentBuilder as _,
-    px,
+    AnyElement, App, Context, Entity, EntityId, FollowMode, InteractiveElement as _, IntoElement,
+    ListOffset, ListState, ParentElement as _, Pixels, Point, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, list,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, ElementExt as _, IconName, Sizable as _, StyledExt as _, button::Button,
@@ -46,6 +46,53 @@ use self::scrolling::{SmoothScrollState, smooth_scroll_animation_enabled};
 /// One list slot, index-aligned with the projection rows.
 pub(in crate::chat) struct RowSlot {
     pub(in crate::chat) renderer: Box<dyn RowRenderer>,
+    layout_observations: Vec<RowLayoutObservation>,
+}
+
+struct RowLayoutObservation {
+    body_id: EntityId,
+    _subscription: Subscription,
+}
+
+impl RowSlot {
+    fn new(kind: RowKind) -> Self {
+        Self {
+            renderer: renderer_for(kind),
+            layout_observations: Vec::new(),
+        }
+    }
+
+    fn observe_layout(&mut self, row_id: RowId, cx: &mut Context<ChatView>) {
+        let observations = &mut self.layout_observations;
+        let mut retained = 0;
+        self.renderer.visit_layout_dependencies(&mut |body| {
+            let body_id = body.entity_id();
+            if let Some(offset) = observations[retained..]
+                .iter()
+                .position(|observation| observation.body_id == body_id)
+            {
+                observations.swap(retained, retained + offset);
+            } else {
+                let subscription = body.observe_layout(cx, move |chat, body_id, cx| {
+                    chat.view.layout_changed(row_id, body_id, cx);
+                });
+                observations.insert(
+                    retained,
+                    RowLayoutObservation {
+                        body_id,
+                        _subscription: subscription,
+                    },
+                );
+            }
+            retained += 1;
+        });
+        observations.truncate(retained);
+    }
+
+    fn release(&mut self, cx: &mut App) {
+        self.layout_observations.clear();
+        self.renderer.release(cx);
+    }
 }
 
 /// Estimated-height hint for rows the list has not measured yet.
@@ -116,9 +163,7 @@ impl TranscriptView {
         let slots: Vec<RowSlot> = projection
             .rows()
             .iter()
-            .map(|row| RowSlot {
-                renderer: renderer_for(row.kind()),
-            })
+            .map(|row| RowSlot::new(row.kind()))
             .collect();
         let slot_ids: Vec<RowId> = projection.rows().iter().map(|row| row.id()).collect();
         let list_state = ListState::new(
@@ -300,6 +345,7 @@ impl TranscriptView {
                 append_replays_part: false,
             };
             self.slots[ix].renderer.apply(&change, &ctx, cx);
+            self.slots[ix].observe_layout(*row_id, cx);
         }
 
         // Apply the list diff, then re-measure exactly the rows whose
@@ -365,9 +411,8 @@ impl TranscriptView {
             .rows()
             .iter()
             .map(|row| {
-                map.remove(&row.id()).unwrap_or(RowSlot {
-                    renderer: renderer_for(row.kind()),
-                })
+                map.remove(&row.id())
+                    .unwrap_or_else(|| RowSlot::new(row.kind()))
             })
             .collect();
         self.slot_ids = self.projection.rows().iter().map(|row| row.id()).collect();
@@ -507,6 +552,7 @@ impl TranscriptView {
         slot.renderer
             .sync_disclosure(self.projection.disclosure(row_id));
         slot.renderer.materialize(&ctx, cx);
+        slot.observe_layout(row_id, cx);
     }
 
     /// The diagnostics surface for materialized-row counts (review gates).
@@ -533,7 +579,7 @@ impl TranscriptView {
     pub(in crate::chat) fn release_user_bubble_rows(&mut self, cx: &mut Context<ChatView>) {
         for slot in &mut self.slots {
             if slot.renderer.kind() == RowKind::UserBubble && slot.renderer.is_materialized() {
-                slot.renderer.release(cx);
+                slot.release(cx);
             }
         }
         self.window_dirty = true;
@@ -630,12 +676,10 @@ impl TranscriptView {
         let dispatch_hover = RowActionDispatch::new(cx.weak_entity());
         let dispatch_measure = dispatch_hover.clone();
         let turn_id = row.id().turn;
-        // A windowed row's outer height still moves as the fork's block
-        // cache measures more blocks (P4 PRD R5), so it records
-        // `Confidence::Measured` even with settled content and never serves
-        // as a cold-restore placeholder.
-        let settled =
-            self.streaming_turn != Some(row.id().turn) && !self.slots[ix].renderer.is_windowed(cx);
+        let settled = materialized
+            && !waiting
+            && self.streaming_turn != Some(row.id().turn)
+            && self.slots[ix].renderer.is_layout_complete();
 
         let max_width = crate::chat::CONTENT_MAX_WIDTH;
         // An idle (non-waiting) placeholder row is visually nothing; keep it
@@ -661,15 +705,17 @@ impl TranscriptView {
                 );
             })
             .on_prepaint(move |bounds, window, cx| {
-                dispatch_measure.send(
-                    RowAction::Measured {
-                        row_id,
-                        height: bounds.size.height,
-                        settled,
-                    },
-                    window,
-                    cx,
-                );
+                if materialized {
+                    dispatch_measure.send(
+                        RowAction::Measured {
+                            row_id,
+                            height: bounds.size.height,
+                            settled,
+                        },
+                        window,
+                        cx,
+                    );
+                }
             })
             .child(
                 div()
@@ -745,6 +791,34 @@ impl TranscriptView {
     // ------------------------------------------------------------------
     // Measurement
     // ------------------------------------------------------------------
+
+    fn layout_changed(&mut self, row_id: RowId, body_id: EntityId, cx: &mut Context<ChatView>) {
+        let Some(ix) = self.projection.row_index(row_id) else {
+            return;
+        };
+        let current = self.slots.get(ix).is_some_and(|slot| {
+            if !slot.renderer.is_materialized()
+                || !slot
+                    .layout_observations
+                    .iter()
+                    .any(|observation| observation.body_id == body_id)
+            {
+                return false;
+            }
+            let mut depends_on_body = false;
+            slot.renderer.visit_layout_dependencies(&mut |body| {
+                depends_on_body |= body.entity_id() == body_id;
+            });
+            depends_on_body
+        });
+        if !current {
+            return;
+        }
+        self.projection.invalidate_layout(row_id);
+        self.remeasure_rows(&[ix]);
+        self.window_dirty = true;
+        self.schedule_sync(cx);
+    }
 
     pub(in crate::chat) fn record_measured(
         &mut self,
@@ -870,7 +944,7 @@ impl TranscriptView {
     ) -> (RowProjection, Option<ListOffset>) {
         for slot in &mut self.slots {
             if slot.renderer.is_materialized() {
-                slot.renderer.release(cx);
+                slot.release(cx);
             }
         }
         let projection = std::mem::take(&mut self.projection);
@@ -1312,6 +1386,7 @@ impl ChatView {
         };
         if let Some(slot) = self.view.slots.get_mut(ix) {
             slot.renderer.toggle_disclosure(target, cx);
+            slot.observe_layout(row_id, cx);
             let disclosure = slot.renderer.disclosure();
             self.view.projection.set_disclosure(row_id, disclosure);
         }

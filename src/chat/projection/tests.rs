@@ -596,6 +596,13 @@ fn height_cache_prefers_fresh_measurements_and_falls_back() {
     assert_eq!(height.effective(&key, 1), px(100.));
     // Settled measurements serve cold-restore first frames.
     assert_eq!(height.settled_height(&key), Some(px(240.)));
+    height.invalidate_layout();
+    assert_eq!(height.effective(&key, 0), px(240.));
+    assert_eq!(
+        height.measured.expect("provisional measurement").confidence,
+        Confidence::Measured
+    );
+    assert_eq!(height.settled_height(&key), None);
     height.invalidate();
     assert_eq!(height.settled_height(&key), None);
 }

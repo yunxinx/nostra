@@ -118,6 +118,67 @@ fn init_markdown_test(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn layout_snapshots_update_before_observers_and_observers_do_not_retain_owners(
+    cx: &mut TestAppContext,
+) {
+    struct LayoutObserver {
+        snapshots: Vec<MarkdownLayoutSnapshot>,
+        _subscription: Subscription,
+    }
+
+    init_markdown_test(cx);
+    let mut body = cx.update(|cx| MarkdownBody::new("first", 99001, cx));
+    assert!(!body.layout_snapshot().complete);
+    cx.run_until_parked();
+    assert_eq!(body.block_count(), 1);
+    assert!(!body.layout_snapshot().windowed);
+    assert!(body.layout_snapshot().complete);
+    let observer = cx.new(|cx| {
+        let layout = body.layout.clone();
+        let subscription = body.observe_layout(cx, move |observer: &mut LayoutObserver, _, _| {
+            observer.snapshots.push(layout.get());
+        });
+        LayoutObserver {
+            snapshots: Vec::new(),
+            _subscription: subscription,
+        }
+    });
+    cx.update(|cx| body.set_text("first\n\nsecond", cx));
+    cx.run_until_parked();
+    let snapshot = body.layout_snapshot();
+    assert_eq!(snapshot.block_count, 2);
+    let count = observer.read_with(cx, |observer, _| {
+        assert_eq!(observer.snapshots.last(), Some(&snapshot));
+        observer.snapshots.len()
+    });
+
+    body.state.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    observer.read_with(cx, |observer, _| {
+        assert_eq!(observer.snapshots.len(), count + 1);
+        assert_eq!(observer.snapshots.last(), Some(&snapshot));
+    });
+
+    cx.update(|cx| {
+        body.set_text(&"replacement ".repeat(1024), cx);
+        assert!(!body.layout_snapshot().complete);
+        assert_eq!(body.block_count(), 2);
+    });
+    cx.run_until_parked();
+    assert!(body.layout_snapshot().complete);
+    assert_eq!(body.block_count(), 1);
+
+    let weak_observer = observer.downgrade();
+    let weak_state = body.state.downgrade();
+    drop(observer);
+    cx.run_until_parked();
+    assert!(weak_observer.upgrade().is_none());
+    drop(body);
+    cx.run_until_parked();
+    assert!(weak_state.upgrade().is_none());
+}
+
 #[test]
 fn markdown_contribution_snapshot_preserves_stable_builtin_order() {
     const SCOPE: ScopeId = ScopeId::new(800);

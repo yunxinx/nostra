@@ -1,8 +1,8 @@
-//! Typography presets for transcript row content (PRD R7).
+//! Typography presets for transcript row content.
 //!
 //! Every `TextViewStyle` a row renderer applies is built here so heading
 //! scales, paragraph gaps, and table/inline-code treatment live in one place
-//! (AC7: no style constants in the renderer files). Colors come from the
+//! without style constants in renderer files. Colors come from the
 //! active theme through `appearance::contrast` derivations, never hardcoded.
 //!
 //! The component-level [`TextViewStyle`] folds onto the values the active
@@ -18,7 +18,7 @@ use crate::appearance::contrast;
 
 /// Visible height of the streaming reasoning preview, in lines of body text.
 /// The preview's outer height is exactly this many lines for the whole
-/// stream, which is what keeps the prose below it from moving (AC1).
+/// stream, which keeps the prose below it from moving.
 pub(crate) const PREVIEW_LINES: f32 = 6.;
 
 /// Minimum height of a budgeted reasoning viewport, in lines of body text.
@@ -33,7 +33,7 @@ pub(crate) const BUDGET_VIEWPORT_RATIO: f32 = 0.45;
 pub(crate) const RESULT_BUDGET_BYTES: usize = 8 * 1024;
 
 /// A natural-height prose or reasoning-full body switches to the fork's
-/// windowed block layout past either threshold (P4 PRD R5): source ≥ 64 KiB,
+/// windowed block layout past either threshold: source ≥ 64 KiB,
 /// or ≥ 300 blocks for sources the byte gate would miss (many short
 /// paragraphs cost more to lay out than one block of the same bytes).
 pub(crate) const WINDOWED_SOURCE_BYTES: usize = 64 * 1024;
@@ -43,9 +43,8 @@ pub(crate) const WINDOWED_SOURCE_BYTES: usize = 64 * 1024;
 pub(crate) const WINDOWED_SOURCE_BLOCKS: usize = 300;
 
 /// Whether a natural-height row body renders through the windowed block
-/// layout. Evaluated per frame from the renderer's authoritative source, so a
-/// stream crossing the threshold flips to windowed on the next paint and the
-/// fork's late-enable alignment picks it up without a reset.
+/// layout. Source length and the observed parsed block count determine the
+/// requested mode; the component separately reports actual layout completion.
 pub(crate) fn windowed_body(source_len: usize, block_count: usize) -> bool {
     source_len >= WINDOWED_SOURCE_BYTES || block_count >= WINDOWED_SOURCE_BLOCKS
 }

@@ -1,4 +1,4 @@
-//! Row renderer for the turn failure card (PRD R4, design contract 3).
+//! Row renderer for the turn failure card.
 //!
 //! A failed turn used to render as a markdown blockquote holding a localized
 //! sentence and nostra's own request id — which told the user nothing the
@@ -216,6 +216,12 @@ impl RowRenderer for TurnErrorRenderer {
 
     fn is_materialized(&self) -> bool {
         self.materialized
+    }
+
+    fn visit_layout_dependencies(&self, visit: &mut dyn FnMut(&MarkdownBody)) {
+        if let Some(body) = self.body.as_ref().filter(|_| self.expanded) {
+            visit(body);
+        }
     }
 
     fn apply(&mut self, change: &RowChange, ctx: &MaterializeContext, cx: &mut App) {

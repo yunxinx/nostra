@@ -1,10 +1,9 @@
 //! Row renderers: one self-contained wrapper per projected row kind.
 //!
 //! A renderer owns only the content entities it creates itself
-//! (`MarkdownBody` and its keyed views). Every round trip back to
-//! the view — hover, measurement, disclosure, nested scrolling, clipboard —
-//! goes through [`RowAction`] and [`RowActionDispatch`], which holds a *weak*
-//! handle. No renderer struct may contain an `Entity<ChatView>` or an
+//! (`MarkdownBody` and its keyed views). Interaction callbacks use
+//! [`RowAction`] and the weak [`RowActionDispatch`]; the retained row owner
+//! observes declared layout dependencies. No renderer struct may contain an `Entity<ChatView>` or an
 //! `Entity<Transcript>`; materialization happens only in update-phase
 //! (`sync_window` / deferred handlers), never inside a render closure.
 
@@ -34,7 +33,7 @@ use crate::chat::SmoothScrollState;
 use crate::chat::projection::{DisclosureState, RowId, RowKind};
 use crate::chat::transcript::{Part, PartSource, Role, Transcript, TurnId};
 use crate::llm::{GatewayError, ToolResult};
-use crate::ui::markdown::MarkdownPresentation;
+use crate::ui::markdown::{MarkdownBody, MarkdownPresentation};
 
 use super::ChatView;
 
@@ -245,15 +244,27 @@ pub(crate) trait RowRenderer {
         None
     }
 
-    /// Whether the row's current form renders its body through the fork's
-    /// windowed block layout (P4 PRD R5). A windowed body keeps unpainted
-    /// blocks on estimated heights and the fork exposes no convergence
-    /// signal, so while this is true the view must treat the row's outer
-    /// measurement as unsettleable (`Confidence::Measured`): it may still
-    /// move as more blocks paint, and must not serve as a cold-restore
-    /// placeholder.
-    fn is_windowed(&self, _cx: &App) -> bool {
+    /// Visit every body whose natural height contributes to the current row layout.
+    /// Fixed-height and collapsed forms have no outer height dependency.
+    fn visit_layout_dependencies(&self, _visit: &mut dyn FnMut(&MarkdownBody)) {}
+
+    /// Whether the next render requests windowed block measurement.
+    fn requests_windowed_layout(&self) -> bool {
         false
+    }
+
+    /// The current source must be parsed. A requested windowed layout must
+    /// also be active and have a measurement for every block.
+    fn is_layout_complete(&self) -> bool {
+        let requested = self.requests_windowed_layout();
+        let mut has_dependency = false;
+        let mut complete = true;
+        self.visit_layout_dependencies(&mut |body| {
+            has_dependency = true;
+            let layout = body.layout_snapshot();
+            complete &= layout.complete && (!requested || layout.windowed);
+        });
+        complete && (!requested || has_dependency)
     }
 
     /// Test access to the concrete renderer.

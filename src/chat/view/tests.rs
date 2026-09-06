@@ -4,6 +4,337 @@ use gpui::{ListOffset, Pixels, TestAppContext, point, px};
 
 use crate::chat::tests::{add_chat_window, init_app, redraw, redraw_settled};
 
+fn sole_layout_snapshot(
+    slot: &super::RowSlot,
+) -> (gpui::EntityId, crate::ui::markdown::MarkdownLayoutSnapshot) {
+    let mut dependency = None;
+    slot.renderer.visit_layout_dependencies(&mut |body| {
+        assert!(
+            dependency.is_none(),
+            "the row has exactly one layout dependency"
+        );
+        dependency = Some((body.entity_id(), body.layout_snapshot()));
+    });
+    dependency.expect("the row has a layout dependency")
+}
+
+#[gpui::test]
+fn layout_changes_remeasure_only_the_current_body_and_release_detaches_it(cx: &mut TestAppContext) {
+    use crate::chat::projection::{Confidence, RowKind};
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    chat.update(cx, |chat, cx| {
+        crate::chat::tests::fixtures::seed_large_conversation(chat, 2, 0, cx);
+    });
+    redraw_settled(cx);
+    chat.update(cx, |chat, cx| {
+        let row_id = chat
+            .view
+            .projection
+            .rows()
+            .iter()
+            .find(|row| row.kind() == RowKind::AssistantProse)
+            .expect("prose row")
+            .id();
+        let ix = chat.view.projection.row_index(row_id).expect("row index");
+        let (body_id, _) = sole_layout_snapshot(&chat.view.slots[ix]);
+        assert_eq!(
+            chat.view.slots[ix]
+                .layout_observations
+                .iter()
+                .map(|observation| observation.body_id)
+                .collect::<Vec<_>>(),
+            vec![body_id]
+        );
+        chat.view.record_measured(row_id, px(333.), true);
+        chat.view.last_remeasure_request = None;
+        chat.view.layout_changed(row_id, body_id, cx);
+        assert_eq!(chat.view.last_remeasure_request, Some(vec![ix]));
+        let row = chat.view.projection.row(ix).expect("row");
+        assert_eq!(row.recorded_confidence(), Some(Confidence::Measured));
+        assert_eq!(row.effective_height(&chat.view.current_key()), px(333.));
+
+        chat.view.slots[ix].release(cx);
+        assert!(chat.view.slots[ix].layout_observations.is_empty());
+        chat.view.last_remeasure_request = None;
+        chat.view.layout_changed(row_id, body_id, cx);
+        assert!(chat.view.last_remeasure_request.is_none());
+
+        chat.view.pending_materialize.push(row_id);
+        chat.sync_window_now(cx);
+        let (current_body_id, _) = sole_layout_snapshot(&chat.view.slots[ix]);
+        assert_ne!(current_body_id, body_id);
+        chat.view.last_remeasure_request = None;
+        chat.view.layout_changed(row_id, body_id, cx);
+        assert!(chat.view.last_remeasure_request.is_none());
+        chat.view.layout_changed(row_id, current_body_id, cx);
+        assert_eq!(chat.view.last_remeasure_request, Some(vec![ix]));
+    });
+}
+
+#[gpui::test]
+fn tool_layout_dependencies_follow_each_visible_body(cx: &mut TestAppContext) {
+    use crate::chat::projection::RowKind;
+    use crate::chat::rows::ToolActivityRenderer;
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(1000.)));
+    chat.update(cx, |chat, cx| {
+        crate::chat::tests::fixtures::seed_large_conversation(chat, 2, 2, cx);
+    });
+    redraw_settled(cx);
+    let row_id = chat.read_with(cx, |chat, _| {
+        let row = chat
+            .view
+            .projection
+            .rows()
+            .iter()
+            .find(|row| row.kind() == RowKind::ToolActivity)
+            .expect("paired tool row");
+        let ix = chat.view.projection.row_index(row.id()).expect("row index");
+        assert!(chat.view.slots[ix].layout_observations.is_empty());
+        row.id()
+    });
+    let header_selector: &'static str =
+        Box::leak(format!("{}-header", row_id.debug_name()).into_boxed_str());
+    let arguments_selector: &'static str =
+        Box::leak(format!("{}-arguments", row_id.debug_name()).into_boxed_str());
+    let header = cx.debug_bounds(header_selector).expect("tool header");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    redraw_settled(cx);
+
+    let (arguments_id, result_id) = chat.read_with(cx, |chat, _| {
+        let ix = chat.view.projection.row_index(row_id).expect("row index");
+        let slot = &chat.view.slots[ix];
+        let renderer = slot
+            .renderer
+            .as_any()
+            .downcast_ref::<ToolActivityRenderer>()
+            .expect("tool renderer");
+        let arguments_id = renderer.arguments_body_entity_id().expect("arguments");
+        let result_id = renderer.result_body_entity_id().expect("result");
+        let observed: Vec<_> = slot
+            .layout_observations
+            .iter()
+            .map(|observation| observation.body_id)
+            .collect();
+        assert_eq!(observed, vec![arguments_id, result_id]);
+        (arguments_id, result_id)
+    });
+
+    let arguments = cx
+        .debug_bounds(arguments_selector)
+        .expect("arguments toggle");
+    cx.simulate_click(arguments.center(), gpui::Modifiers::default());
+    redraw_settled(cx);
+    chat.update(cx, |chat, cx| {
+        let ix = chat.view.projection.row_index(row_id).expect("row index");
+        assert_eq!(chat.view.slots[ix].layout_observations.len(), 1);
+        assert_eq!(
+            chat.view.slots[ix].layout_observations[0].body_id,
+            result_id
+        );
+        chat.view.last_remeasure_request = None;
+        chat.view.layout_changed(row_id, arguments_id, cx);
+        assert!(chat.view.last_remeasure_request.is_none());
+        chat.view.layout_changed(row_id, result_id, cx);
+        assert_eq!(chat.view.last_remeasure_request, Some(vec![ix]));
+    });
+
+    let arguments = cx
+        .debug_bounds(arguments_selector)
+        .expect("arguments toggle");
+    cx.simulate_click(arguments.center(), gpui::Modifiers::default());
+    redraw_settled(cx);
+    chat.read_with(cx, |chat, _| {
+        let ix = chat.view.projection.row_index(row_id).expect("row index");
+        let slot = &chat.view.slots[ix];
+        let renderer = slot
+            .renderer
+            .as_any()
+            .downcast_ref::<ToolActivityRenderer>()
+            .expect("tool renderer");
+        let next_arguments_id = renderer.arguments_body_entity_id().expect("new arguments");
+        assert_ne!(next_arguments_id, arguments_id);
+        let observed: Vec<_> = slot
+            .layout_observations
+            .iter()
+            .map(|observation| observation.body_id)
+            .collect();
+        assert_eq!(observed, vec![next_arguments_id, result_id]);
+    });
+
+    let header = cx.debug_bounds(header_selector).expect("tool header");
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    redraw_settled(cx);
+    chat.read_with(cx, |chat, _| {
+        let ix = chat.view.projection.row_index(row_id).expect("row index");
+        assert!(chat.view.slots[ix].layout_observations.is_empty());
+    });
+}
+
+#[gpui::test]
+fn placeholder_prepaint_does_not_record_an_estimated_height_as_settled(cx: &mut TestAppContext) {
+    use std::{cell::Cell, rc::Rc};
+
+    use crate::chat::projection::{Confidence, RowKind};
+    use gpui::{AvailableSpace, IntoElement as _, ParentElement as _, Styled as _, div, size};
+    use gpui_component::ElementExt as _;
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    chat.update(cx, |chat, cx| {
+        crate::chat::tests::fixtures::seed_large_conversation(chat, 1, 0, cx);
+    });
+    redraw_settled(cx);
+    let observed = Rc::new(Cell::new(None));
+    cx.draw(
+        point(px(0.), px(0.)),
+        size(
+            AvailableSpace::Definite(px(500.)),
+            AvailableSpace::MaxContent,
+        ),
+        |window, cx| {
+            let (row_id, row) = chat.update(cx, |chat, cx| {
+                let row_id = chat
+                    .view
+                    .projection
+                    .rows()
+                    .iter()
+                    .find(|row| row.kind() == RowKind::AssistantProse)
+                    .expect("prose row")
+                    .id();
+                let ix = chat.view.projection.row_index(row_id).expect("row index");
+                chat.view.slots[ix].release(cx);
+                chat.view.record_measured(row_id, px(333.), false);
+                (row_id, chat.view.render_row(ix, window, cx))
+            });
+            div()
+                .w(px(500.))
+                .child(row)
+                .on_prepaint({
+                    let chat = chat.downgrade();
+                    let observed = observed.clone();
+                    move |_, _, cx| {
+                        let chat = chat.upgrade().expect("chat");
+                        let view = &chat.read(cx).view;
+                        let ix = view.projection.row_index(row_id).expect("row index");
+                        let row = view.projection.row(ix).expect("row");
+                        observed.set(Some((
+                            row.recorded_confidence(),
+                            row.effective_height(&view.current_key()),
+                        )));
+                    }
+                })
+                .into_any_element()
+        },
+    );
+    assert_eq!(observed.get(), Some((Some(Confidence::Measured), px(333.))));
+}
+
+#[gpui::test]
+fn pending_prose_replacement_does_not_reuse_settled_layout(cx: &mut TestAppContext) {
+    use crate::chat::projection::{Confidence, RowKind};
+    use crate::chat::test_support;
+    use crate::llm::{ContentBlock, IndexedMessage, Message as LlmMessage, ProviderMetadata};
+
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(30000.)));
+    let prose_message = |text: String| LlmMessage {
+        role: crate::llm::Role::Assistant,
+        content: vec![ContentBlock::Text {
+            text,
+            provider_metadata: ProviderMetadata::default(),
+        }],
+        provider_metadata: ProviderMetadata::default(),
+    };
+    chat.update(cx, |chat, cx| {
+        test_support::push_canonical(chat, prose_message("Old.\n\n".repeat(320)), cx);
+    });
+    redraw_settled(cx);
+    let (row_id, body_id) = chat.read_with(cx, |chat, _| {
+        let row = chat
+            .view
+            .projection
+            .rows()
+            .iter()
+            .find(|row| row.kind() == RowKind::AssistantProse)
+            .expect("prose row");
+        let ix = chat.view.projection.row_index(row.id()).expect("row index");
+        let (body_id, layout) = sole_layout_snapshot(&chat.view.slots[ix]);
+        assert!(layout.windowed);
+        assert!(layout.complete);
+        assert_eq!(row.recorded_confidence(), Some(Confidence::Settled));
+        (row.id(), body_id)
+    });
+
+    let (pending_confidence, pending_copy) = cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            test_support::finish_reply(
+                chat,
+                Some(IndexedMessage::from_message(prose_message(
+                    "Replacement paragraph pending asynchronous parse.\n\n".repeat(400),
+                ))),
+                None,
+                cx,
+            );
+        });
+        // Draw before yielding the UI update: the background parser's result
+        // cannot have been installed yet, so this frame still shows the old body.
+        let _ = window.draw(cx);
+        chat.update(cx, |chat, cx| {
+            let ix = chat
+                .view
+                .projection
+                .row_index(row_id)
+                .expect("retained row");
+            let confidence = chat
+                .view
+                .projection
+                .row(ix)
+                .expect("row")
+                .recorded_confidence();
+            let mut copy = None;
+            chat.view.slots[ix]
+                .renderer
+                .visit_layout_dependencies(&mut |body| {
+                    assert_eq!(body.entity_id(), body_id);
+                    copy = Some(body.select_all_text(cx));
+                });
+            (confidence, copy.expect("retained body"))
+        })
+    });
+    assert!(pending_copy.starts_with("Old."));
+    assert!(!pending_copy.contains("Replacement"));
+    assert_eq!(
+        pending_confidence,
+        Some(Confidence::Measured),
+        "the old parsed document must not settle the replacement's height"
+    );
+
+    redraw_settled(cx);
+    chat.read_with(cx, |chat, _| {
+        let ix = chat
+            .view
+            .projection
+            .row_index(row_id)
+            .expect("retained row");
+        let (_, layout) = sole_layout_snapshot(&chat.view.slots[ix]);
+        assert_eq!(layout.block_count, 400);
+        assert_eq!(
+            chat.view
+                .projection
+                .row(ix)
+                .expect("row")
+                .recorded_confidence(),
+            Some(Confidence::Settled)
+        );
+    });
+}
+
 #[gpui::test]
 fn open_window_materializes_only_rows_near_the_tail(cx: &mut TestAppContext) {
     init_app(cx);
@@ -1199,5 +1530,119 @@ fn a_running_tool_call_reveals_its_arguments_once_the_call_finishes(cx: &mut Tes
     assert!(
         cx.debug_bounds(arguments_selector).is_some(),
         "the finished call's arguments appear while the tool still runs"
+    );
+}
+
+#[gpui::test]
+fn pending_user_markdown_is_measured_until_parse_finishes(cx: &mut TestAppContext) {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui_component::text::TextViewState;
+
+    use crate::chat::projection::{Confidence, RowKind};
+    use crate::chat::rows::UserBubbleRenderer;
+    use crate::chat::test_support;
+    use crate::llm::{ContentBlock, Message as LlmMessage, ProviderMetadata};
+
+    init_app(cx);
+    cx.update(|cx| {
+        crate::preferences::update_in_memory(cx, |prefs| prefs.user_message_markdown = true);
+    });
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(30000.)));
+
+    // Observe creation only to inspect the real renderer-owned state. This
+    // adds no notification or row-height observer to the production path.
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let _created = cx.update(|_, cx| {
+        cx.observe_new::<TextViewState>({
+            let states = states.clone();
+            move |_, _, cx| states.borrow_mut().push(cx.weak_entity())
+        })
+    });
+    let (row_id, body_id, pending_confidence, pending_height) = cx.update(|window, cx| {
+        chat.update(cx, |chat, cx| {
+            test_support::push_canonical(
+                chat,
+                LlmMessage {
+                    role: crate::llm::Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "Pending user Markdown paragraph.\n\n".repeat(400),
+                        provider_metadata: ProviderMetadata::default(),
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+        // The source exceeds the synchronous parse budget. Stay inside this
+        // UI update so no background parse result can be installed yet.
+        let _ = window.draw(cx);
+        chat.read_with(cx, |chat, _| {
+            let row = chat
+                .view
+                .projection
+                .rows()
+                .iter()
+                .find(|row| row.kind() == RowKind::UserBubble)
+                .expect("user row");
+            let ix = chat.view.projection.row_index(row.id()).expect("row index");
+            let body_id = chat.view.slots[ix]
+                .renderer
+                .as_any()
+                .downcast_ref::<UserBubbleRenderer>()
+                .expect("user renderer")
+                .body_entity_for_test()
+                .expect("the preference creates a Markdown body");
+            assert_eq!(chat.view.slots[ix].layout_observations.len(), 1);
+            assert_eq!(chat.view.slots[ix].layout_observations[0].body_id, body_id);
+            (
+                row.id(),
+                body_id,
+                row.recorded_confidence(),
+                row.effective_height(&chat.view.current_key()),
+            )
+        })
+    });
+    let body = states
+        .borrow()
+        .iter()
+        .find(|state| state.entity_id() == body_id)
+        .expect("the user body's creation was observed")
+        .upgrade()
+        .expect("the user body remains materialized");
+    body.read_with(cx, |state, _| {
+        assert!(
+            !state.is_layout_complete(),
+            "the first frame is still pending"
+        );
+        assert_eq!(state.block_count(), 0);
+    });
+
+    redraw_settled(cx);
+    body.read_with(cx, |state, _| {
+        assert!(state.is_layout_complete());
+        assert_eq!(state.block_count(), 400);
+    });
+    let settled_height = chat.read_with(cx, |chat, _| {
+        let ix = chat
+            .view
+            .projection
+            .row_index(row_id)
+            .expect("retained row");
+        let row = chat.view.projection.row(ix).expect("row");
+        assert_eq!(chat.view.slots[ix].layout_observations.len(), 1);
+        assert_eq!(chat.view.slots[ix].layout_observations[0].body_id, body_id);
+        assert_eq!(row.recorded_confidence(), Some(Confidence::Settled));
+        row.effective_height(&chat.view.current_key())
+    });
+    assert!(
+        settled_height > pending_height + px(1000.),
+        "normal visible-row measurement should replace the pending height: {pending_height:?} -> {settled_height:?}"
+    );
+    assert_eq!(
+        pending_confidence,
+        Some(Confidence::Measured),
+        "a pending natural-height body must not be settled; normal redraw changed its height from {pending_height:?} to {settled_height:?}"
     );
 }

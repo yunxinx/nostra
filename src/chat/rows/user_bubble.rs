@@ -1,7 +1,7 @@
 //! Wrapper renderer for a user message bubble.
 //!
-//! The visual composition matches the P1 turn renderer: a right-aligned
-//! rounded bubble with the secondary surface and its contrast-derived text.
+//! A right-aligned rounded bubble with the secondary surface and its
+//! contrast-derived text.
 //! Markdown vs plain presentation follows the same
 //! `user_message_markdown` preference; the choice happens at materialize
 //! time, and the view re-materializes user rows when the preference flips.
@@ -65,6 +65,12 @@ impl RowRenderer for UserBubbleRenderer {
         self.materialized
     }
 
+    fn visit_layout_dependencies(&self, visit: &mut dyn FnMut(&MarkdownBody)) {
+        if let Some(body) = self.body.as_ref() {
+            visit(body);
+        }
+    }
+
     fn apply(&mut self, change: &RowChange, ctx: &MaterializeContext, cx: &mut App) {
         match change {
             RowChange::Replace => {
@@ -101,9 +107,8 @@ impl RowRenderer for UserBubbleRenderer {
                 div()
                     .debug_selector(move || bubble_selector)
                     .min_w_0()
-                    // Layout-structure constant (review-exempted): the R6
-                    // bubble width cap from the PRD, paired with `min_w_0`
-                    // so the bubble still shrinks in a narrow column.
+                    // Cap the bubble width while `min_w_0` lets it shrink
+                    // in a narrow column.
                     .max_w(px(560.))
                     .rounded(radius_lg)
                     .bg(bubble)

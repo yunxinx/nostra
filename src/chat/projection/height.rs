@@ -70,7 +70,7 @@ pub(crate) struct MeasurementKey {
 /// How trustworthy a cached measurement is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Confidence {
-    /// Measured while the row's content could still change (streaming).
+    /// Measured while content or block layout can still change.
     Measured,
     /// Measured with fully settled content; safe as a cold-restore
     /// first-frame placeholder.
@@ -132,6 +132,13 @@ impl RowHeight {
 
     pub(crate) fn record(&mut self, measured: Measured) {
         self.measured = Some(measured);
+    }
+
+    /// Keep the last height as a provisional estimate until the row is measured again.
+    pub(crate) fn invalidate_layout(&mut self) {
+        if let Some(measured) = &mut self.measured {
+            measured.confidence = Confidence::Measured;
+        }
     }
 
     /// Drop the cached measurement (typography or content changed).

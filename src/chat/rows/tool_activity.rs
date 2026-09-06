@@ -133,6 +133,14 @@ impl ToolActivityRenderer {
         self.is_result_row || self.disclosure != ActivityDisclosure::Collapsed
     }
 
+    fn result_uses_budgeted_viewport(&self) -> bool {
+        !self.is_result_row
+            && self
+                .result
+                .as_ref()
+                .is_some_and(|result| result.content.len() > typography::RESULT_BUDGET_BYTES)
+    }
+
     /// Create or refresh the lazy bodies from the current content. Update
     /// phase only (materialize / apply / toggle).
     fn sync_bodies(&mut self, cx: &mut App) {
@@ -314,6 +322,21 @@ impl RowRenderer for ToolActivityRenderer {
 
     fn is_materialized(&self) -> bool {
         self.materialized
+    }
+
+    fn visit_layout_dependencies(&self, visit: &mut dyn FnMut(&MarkdownBody)) {
+        if !self.is_result_row
+            && self.disclosure.arguments_open()
+            && let Some(body) = self.arguments_body.as_ref()
+        {
+            visit(body);
+        }
+        if self.wants_result_body()
+            && !self.result_uses_budgeted_viewport()
+            && let Some(body) = self.result_body.as_ref()
+        {
+            visit(body);
+        }
     }
 
     fn apply(&mut self, change: &RowChange, ctx: &MaterializeContext, cx: &mut App) {
@@ -662,11 +685,7 @@ impl ToolActivityRenderer {
         let Some(body) = self.result_body.as_ref() else {
             return Vec::new();
         };
-        let over_budget = self
-            .result
-            .as_ref()
-            .is_some_and(|result| result.content.len() > typography::RESULT_BUDGET_BYTES);
-        if !over_budget {
+        if !self.result_uses_budgeted_viewport() {
             return vec![
                 body.text_view(typography::prose(cx))
                     .text_color(text_color)
@@ -680,7 +699,11 @@ impl ToolActivityRenderer {
         let ui_id = self.ui_id;
         // Painted-frame anchor for the eased replay (same contract as the
         // reasoning viewport).
-        let anchor = body.scroll_state(cx).scroll_px_offset_for_scrollbar();
+        let anchor = self
+            .scroll
+            .as_ref()
+            .map(|scroll| scroll.scroll_px_offset_for_scrollbar())
+            .unwrap_or_default();
         let dispatch = ctx.dispatch.clone();
         let on_scroll = move |event: &ScrollWheelEvent, window: &mut Window, cx: &mut App| {
             dispatch.send(

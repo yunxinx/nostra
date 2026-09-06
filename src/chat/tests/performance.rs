@@ -1,14 +1,20 @@
 use super::*;
 
+fn init_performance_app(cx: &mut TestAppContext) {
+    init_app(cx);
+    // Decorative animations use wall-clock time; scroll easing is driven explicitly.
+    cx.update(|cx| cx.set_reduce_motion(true));
+}
+
 #[gpui::test]
 fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     const CODE_LINES: usize = 640;
-    const MAX_CODE_TEXT_ELEMENTS_PER_INTERACTION: usize = 128;
-    const MAX_TEXT_VIEW_BUILDS_PER_INTERACTION: usize = 1;
-    const MAX_CODE_BLOCK_RENDERS_PER_INTERACTION: usize = 1;
+    const MAX_CODE_TEXT_ELEMENTS_PER_SETTLED_FRAME: usize = 128;
+    const MAX_TEXT_VIEW_BUILDS_PER_SETTLED_FRAME: usize = 1;
+    const MAX_CODE_BLOCK_RENDERS_PER_SETTLED_FRAME: usize = 1;
     const MAX_SMOOTH_INVALIDATIONS: usize = 24;
 
-    init_app(cx);
+    init_performance_app(cx);
     let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(760.), px(560.)));
 
@@ -59,59 +65,51 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     let wrap_selector: &'static str =
         Box::leak(format!("markdown-code-wrap-{owner_id}-{fence_start}").into_boxed_str());
 
-    // Row model: settle the windowed materialization first so the timed span
-    // covers the expand interaction, not the row's first markdown build (the
-    // P1 mirror was always materialized).
-    redraw_settled(cx);
+    // Complete initial materialization before measuring disclosure changes.
+    settle_frame_callbacks(cx);
 
-    crate::ui::markdown::reset_perf_probe();
     let trigger = cx
         .debug_bounds("reasoning-trigger-0")
         .expect("collapsed reasoning trigger");
-    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-    let (expand_draw, expand_probe) = measured_redraw(cx);
+    let (expand_draw, expand_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    });
 
     let trigger = cx
         .debug_bounds("reasoning-trigger-0")
         .expect("expanded reasoning trigger");
     cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-    redraw(cx);
-    let reopen_started = Instant::now();
+    settle_frame_callbacks(cx);
     let trigger = cx
         .debug_bounds("reasoning-trigger-0")
         .expect("collapsed reasoning trigger after first expansion");
-    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
-    let (reopen_draw, reopen_probe) = measured_redraw(cx);
-    let reopen_elapsed = reopen_started.elapsed();
+    let (reopen_draw, reopen_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    });
 
     let wrap = cx
         .debug_bounds(wrap_selector)
         .expect("wrap control in expanded reasoning");
-    crate::ui::markdown::reset_perf_probe();
-    let wrap_started = Instant::now();
-    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
-    let (wrap_draw, wrap_probe) = measured_redraw(cx);
-    let wrap_elapsed = wrap_started.elapsed();
+    let (wrap_draw, wrap_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    });
 
-    crate::ui::markdown::reset_perf_probe();
-    let unwrap_started = Instant::now();
     let wrap = cx
         .debug_bounds(wrap_selector)
         .expect("wrap control after enabling wrapping");
-    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
-    let (unwrap_draw, unwrap_probe) = measured_redraw(cx);
-    let unwrap_elapsed = unwrap_started.elapsed();
+    let (unwrap_draw, unwrap_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    });
 
     cx.update(|_, cx| {
         preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
     });
-    let combined_wrap_started = Instant::now();
     let wrap = cx
         .debug_bounds(wrap_selector)
         .expect("wrap control before combined smooth scenario");
-    cx.simulate_click(wrap.center(), gpui::Modifiers::default());
-    let (combined_wrap_draw, combined_wrap_probe) = measured_redraw(cx);
-    let combined_wrap_elapsed = combined_wrap_started.elapsed();
+    let (combined_wrap_draw, combined_wrap_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(wrap.center(), gpui::Modifiers::default());
+    });
 
     let body = cx
         .debug_bounds("reasoning-body-0")
@@ -125,12 +123,14 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         "a long reasoning card containing code must keep its scrollbar host flush"
     );
     reset_reasoning_smooth_invalidations();
-    cx.simulate_event(ScrollWheelEvent {
-        position: body.center(),
-        delta: ScrollDelta::Lines(point(0., -3.)),
-        ..Default::default()
+    let mut smooth_draws = measure_draws(cx, |cx| {
+        cx.simulate_event(ScrollWheelEvent {
+            position: body.center(),
+            delta: ScrollDelta::Lines(point(0., -3.)),
+            ..Default::default()
+        });
     });
-    let mut smooth_draws = Vec::new();
+    let mut smooth_steps = 0;
     let mut smooth_probes = Vec::new();
     for _ in 0..64 {
         let remaining = cx.update(|_, cx| {
@@ -141,13 +141,22 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         if remaining == px(0.) {
             break;
         }
-        let (draw, probe) = measured_redraw(cx);
-        smooth_draws.push(draw);
-        smooth_probes.push(probe);
+        let draws = measure_draws(cx, |cx| {
+            assert!(
+                cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+                "queued reasoning motion must have a scheduled frame"
+            );
+        });
+        assert!(!draws.is_empty(), "each reasoning easing step must draw");
+        smooth_steps += 1;
+        smooth_draws.extend(draws);
+        // Structural counts come from a separate settled frame; this extra
+        // draw does not advance easing and is excluded from the timings.
+        smooth_probes.push(settled_frame_probe(cx));
     }
     assert!(
-        !smooth_draws.is_empty(),
-        "long reasoning must schedule smooth-scroll frames"
+        smooth_steps > 0,
+        "long reasoning must schedule smooth-scroll steps"
     );
     assert!(
         cx.update(|_, cx| {
@@ -158,10 +167,10 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         }),
         "smooth scrolling must converge within the fixture's frame budget"
     );
+    smooth_draws.extend(measure_draws(cx, settle_frame_callbacks));
     let smooth_invalidations = reasoning_smooth_invalidations();
     assert_eq!(
-        smooth_invalidations,
-        smooth_draws.len(),
+        smooth_invalidations, smooth_steps,
         "each easing step must invalidate the view exactly once"
     );
     assert!(
@@ -170,7 +179,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     );
     let smooth_p50 = duration_percentile(&smooth_draws, 50);
     let smooth_p95 = duration_percentile(&smooth_draws, 95);
-    let smooth_max = smooth_draws.iter().copied().max().unwrap_or_default();
+    let smooth_max = smooth_draws.iter().copied().max().expect("smooth draws");
     let smooth_probe = smooth_probes
         .iter()
         .copied()
@@ -179,17 +188,19 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
 
     eprintln!(
         "LONG_CONTENT_PERF expand_draw={expand_draw:?} \
-         expand={expand_probe:?} reopen_total={reopen_elapsed:?} reopen_draw={reopen_draw:?} \
-         reopen={reopen_probe:?} wrap_total={wrap_elapsed:?} wrap_draw={wrap_draw:?} \
-         wrap={wrap_probe:?} unwrap_total={unwrap_elapsed:?} unwrap_draw={unwrap_draw:?} \
-         unwrap={unwrap_probe:?} combined_wrap_total={combined_wrap_elapsed:?} \
+         expand={expand_probe:?} reopen_draw={reopen_draw:?} \
+         reopen={reopen_probe:?} wrap_draw={wrap_draw:?} \
+         wrap={wrap_probe:?} unwrap_draw={unwrap_draw:?} unwrap={unwrap_probe:?} \
          combined_wrap_draw={combined_wrap_draw:?} combined_wrap={combined_wrap_probe:?} \
-         smooth_frames={} smooth_p50={smooth_p50:?} smooth_p95={smooth_p95:?} \
+         smooth_steps={smooth_steps} smooth_draws={} \
+         smooth_p50={smooth_p50:?} smooth_p95={smooth_p95:?} \
          smooth_max={smooth_max:?} smooth={smooth_probe:?} \
          smooth_invalidations={smooth_invalidations}",
         smooth_draws.len()
     );
 
+    // Each probe describes one settled frame, independently of how many
+    // actual frames the interaction needed to finish.
     let failures = [
         ("reasoning expansion", expand_probe),
         ("reasoning reopen", reopen_probe),
@@ -199,7 +210,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         ("smooth-scroll frame", smooth_probe),
     ]
     .into_iter()
-    .filter(|(_, probe)| probe.code_text_elements > MAX_CODE_TEXT_ELEMENTS_PER_INTERACTION)
+    .filter(|(_, probe)| probe.code_text_elements > MAX_CODE_TEXT_ELEMENTS_PER_SETTLED_FRAME)
     .map(|(operation, probe)| {
         format!(
             "{operation} materialized {} code-text elements",
@@ -223,12 +234,12 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         ("smooth-scroll frame", smooth_probe),
     ] {
         assert!(
-            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_INTERACTION,
+            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_SETTLED_FRAME,
             "{operation} rebuilt {} text views",
             probe.text_view_builds
         );
         assert!(
-            probe.code_block_renders <= MAX_CODE_BLOCK_RENDERS_PER_INTERACTION,
+            probe.code_block_renders <= MAX_CODE_BLOCK_RENDERS_PER_SETTLED_FRAME,
             "{operation} reran {} code block renderers",
             probe.code_block_renders
         );
@@ -244,12 +255,8 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
     );
 
     if !cfg!(debug_assertions) {
-        // Row-model re-freeze: the total span now includes the deferred
-        // inner-list relayout that the P1 mirror performed while streaming,
-        // and it varies with machine load (90–200 ms observed). The
-        // user-visible contract is the painted frame, which stays an order of
-        // magnitude under the old 50 ms total; the probe counters above bound
-        // the build work.
+        // Each interaction value is the slowest actual draw, including
+        // frames caused by deferred layout convergence.
         assert!(
             expand_draw <= Duration::from_millis(50),
             "release reasoning expansion frame must stay below the frozen 50 ms guard: {expand_draw:?}"
@@ -260,7 +267,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         );
         assert!(
             wrap_draw <= Duration::from_micros(12_900),
-            "release wrap draw must stay at least 30% below the 18.45 ms baseline: {wrap_draw:?}"
+            "release wrap draw must stay below 12.9 ms: {wrap_draw:?}"
         );
         assert!(
             unwrap_draw <= Duration::from_micros(12_900),
@@ -272,26 +279,23 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
         );
         assert!(
             smooth_p95 <= Duration::from_micros(12_600),
-            "release smooth draw p95 must stay at least 30% below the 18.03 ms baseline: {smooth_p95:?}"
+            "release smooth draw p95 must stay below 12.6 ms: {smooth_p95:?}"
         );
     }
 }
 
-/// The production-shaped combined case keeps the long code in the assistant
-/// answer, not inside reasoning: one visible transcript row therefore owns a
-/// retained reasoning viewport and a continuous, very tall code block. Outer
-/// list easing must not bring back per-line work on every frame.
+/// Long assistant code follows a retained reasoning viewport. Outer list
+/// easing must keep layout work bounded inside each visible row.
 #[gpui::test]
 fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
     cx: &mut TestAppContext,
 ) {
     const CODE_LINES: usize = 640;
-    // Row model: one interaction re-renders every visible row, and each row
-    // owns one text view (user plain text, reasoning viewport, answer prose).
-    const MAX_TEXT_VIEW_BUILDS_PER_INTERACTION: usize = 3;
-    const MAX_SMOOTH_FRAMES: usize = 24;
+    // Each visible row owns one text view: user text, reasoning, or prose.
+    const MAX_TEXT_VIEW_BUILDS_PER_SETTLED_FRAME: usize = 3;
+    const MAX_SMOOTH_STEPS: usize = 24;
 
-    init_app(cx);
+    init_performance_app(cx);
     let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(760.), px(560.)));
 
@@ -363,8 +367,8 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
             chat.view
                 .list_state
                 .set_follow_mode(gpui::FollowMode::Normal);
-            // Row model: anchor the list on the assistant turn's reasoning
-            // row so the trigger and the long answer below stay visible.
+            // Anchor on reasoning so its trigger and the answer below it
+            // participate in the same viewport.
             chat.view.list_state.scroll_to(ListOffset {
                 item_ix: 6,
                 offset_in_item: px(0.),
@@ -397,9 +401,7 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
     let wrap_selector = selector("wrap");
     let block_selector = selector("block");
 
-    // The budgeted reasoning viewport is taller than the old seven-line card,
-    // so the long answer row starts below the fold: reveal it once before the
-    // wrap interactions so its code block (and wrap control) renders.
+    // Reveal the answer before measuring its wrap controls.
     cx.update(|_, cx| {
         chat.read(cx).view.list_state.scroll_to_reveal_item(7);
     });
@@ -408,19 +410,17 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
 
     let measure_toggle = |cx: &mut gpui::VisualTestContext| {
         let wrap = cx.debug_bounds(wrap_selector).expect("answer wrap control");
-        crate::ui::markdown::reset_perf_probe();
-        let started = Instant::now();
-        cx.simulate_click(wrap.center(), Modifiers::default());
-        let (draw, probe) = measured_redraw(cx);
-        (started.elapsed(), draw, probe)
+        measured_interaction(cx, |cx| {
+            cx.simulate_click(wrap.center(), Modifiers::default());
+        })
     };
 
-    let (_, nowrap_to_wrap_draw, nowrap_to_wrap) = measure_toggle(cx);
-    let (_, wrap_to_nowrap_draw, wrap_to_nowrap) = measure_toggle(cx);
+    let (nowrap_to_wrap_draw, nowrap_to_wrap) = measure_toggle(cx);
+    let (wrap_to_nowrap_draw, wrap_to_nowrap) = measure_toggle(cx);
     cx.update(|_, cx| {
         preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = true);
     });
-    let (_, combined_wrap_draw, combined_wrap) = measure_toggle(cx);
+    let (combined_wrap_draw, combined_wrap) = measure_toggle(cx);
 
     cx.update(|_, cx| {
         chat.read(cx).view.list_state.scroll_to_reveal_item(7);
@@ -434,39 +434,46 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
     // sits at the viewport top and the body fills the rest of the window, so
     // aim inside the visible part, clear of the floating composer.
     let wheel_point = point(block.left() + px(20.), px(300.));
-    cx.simulate_event(ScrollWheelEvent {
-        position: wheel_point,
-        delta: ScrollDelta::Lines(point(0., -3.)),
-        ..Default::default()
+    let mut smooth_draws = measure_draws(cx, |cx| {
+        cx.simulate_event(ScrollWheelEvent {
+            position: wheel_point,
+            delta: ScrollDelta::Lines(point(0., -3.)),
+            ..Default::default()
+        });
     });
     assert!(
         cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining) > px(0.),
         "outer transcript input must queue easing in the combined fixture"
     );
 
-    let mut smooth_draws = Vec::new();
+    let mut smooth_steps = 0;
     let mut smooth_probes = Vec::new();
     for _ in 0..64 {
         if cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining) == px(0.) {
             break;
         }
-        assert!(
-            cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
-            "queued transcript motion must have a scheduled frame"
-        );
-        let (draw, probe) = measured_redraw(cx);
-        smooth_draws.push(draw);
-        smooth_probes.push(probe);
+        let draws = measure_draws(cx, |cx| {
+            assert!(
+                cx.update(|window, cx| window.simulate_next_frame(cx)) > 0,
+                "queued transcript motion must have a scheduled frame"
+            );
+        });
+        assert!(!draws.is_empty(), "each transcript easing step must draw");
+        smooth_steps += 1;
+        smooth_draws.extend(draws);
+        // Probe one settled frame without advancing another easing step.
+        smooth_probes.push(settled_frame_probe(cx));
     }
     assert!(
-        !smooth_draws.is_empty() && smooth_draws.len() <= MAX_SMOOTH_FRAMES,
-        "transcript easing must converge with bounded invalidations"
+        smooth_steps > 0 && smooth_steps <= MAX_SMOOTH_STEPS,
+        "transcript easing must converge within {MAX_SMOOTH_STEPS} steps"
     );
     assert_eq!(
         cx.update(|_, cx| chat.read(cx).view.smooth_scroll.remaining),
         px(0.),
         "transcript easing must converge"
     );
+    smooth_draws.extend(measure_draws(cx, settle_frame_callbacks));
     let after_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     assert!(
         after_scroll.item_ix > before_scroll.item_ix
@@ -479,13 +486,13 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
         .copied()
         .max_by_key(|probe| probe.code_text_elements)
         .unwrap_or_default();
+    // These counters describe separate settled frames, not the sum of the
+    // event and convergence draws captured by the timing helpers.
     for (operation, probe) in [
         ("answer wrap", nowrap_to_wrap),
         ("answer unwrap", wrap_to_nowrap),
         ("combined answer wrap", combined_wrap),
-        // Row model: an eased frame that crosses a row boundary materializes
-        // the next row in the same frame, so two code-text elements can be
-        // built in one frame during the scroll. Wrap toggles still build one.
+        // Crossing a row boundary can expose two code blocks together.
         ("combined transcript frame", smooth_probe),
     ] {
         let bound = if operation == "combined transcript frame" {
@@ -498,44 +505,38 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
             "{operation} built {} code-text elements (bound {bound})",
             probe.code_text_elements
         );
-        // Row model: same reasoning as the code-text bound above — a frame
-        // crossing a row boundary can render the next row's block too.
-        let render_bound = if operation == "combined transcript frame" {
-            2
-        } else {
-            1
-        };
         assert!(
-            probe.code_block_renders <= render_bound,
-            "{operation} rendered {} code blocks (bound {render_bound})",
+            probe.code_block_renders <= bound,
+            "{operation} rendered {} code blocks (bound {bound})",
             probe.code_block_renders
         );
         assert!(
-            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_INTERACTION,
+            probe.text_view_builds <= MAX_TEXT_VIEW_BUILDS_PER_SETTLED_FRAME,
             "{operation} rebuilt {} text views",
             probe.text_view_builds
         );
     }
 
+    let smooth_p50 = duration_percentile(&smooth_draws, 50);
     let smooth_p95 = duration_percentile(&smooth_draws, 95);
+    let smooth_max = smooth_draws.iter().copied().max().expect("smooth draws");
     eprintln!(
         "OUTER_LONG_CONTENT_PERF wrap_draw={nowrap_to_wrap_draw:?} \
          unwrap_draw={wrap_to_nowrap_draw:?} combined_wrap_draw={combined_wrap_draw:?} \
-         smooth_frames={} smooth_p95={smooth_p95:?}",
+         smooth_steps={smooth_steps} smooth_draws={} \
+         smooth_p50={smooth_p50:?} smooth_p95={smooth_p95:?} smooth_max={smooth_max:?}",
         smooth_draws.len()
     );
 }
 
-/// AC8 under the row model: a 4000-line code result plus an inline formula in
-/// one tool-activity row. The result body is lazy — no Markdown entity before
-/// the first expand — the expand builds exactly one continuous code-text
-/// element for the budgeted viewport, and the formula renders from that same
-/// body. Re-collapse releases the entity again.
+/// A lazy tool result combines 4000 code lines with an inline formula. Its
+/// expanded viewport renders one continuous code-text element, and folding
+/// the row releases the result body.
 #[gpui::test]
 fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut TestAppContext) {
     const CODE_LINES: usize = 4000;
 
-    init_app(cx);
+    init_performance_app(cx);
     let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(760.), px(560.)));
 
@@ -596,8 +597,7 @@ fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut Test
     });
     redraw_settled(cx);
 
-    // The paired result exists but nothing was built while the row stayed
-    // folded (AC4, perf fixture variant).
+    // A folded activity retains the result data without creating its body.
     crate::ui::markdown::reset_perf_probe();
     cx.update(|_, cx| {
         let activity = last_activity_renderer(chat.read(cx)).expect("activity row");
@@ -612,28 +612,20 @@ fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut Test
         "a folded activity row builds no code text"
     );
 
-    // Expand: bounded work covering the 4000-line block. The first expand
-    // builds two bodies — the fenced-JSON arguments section and the result —
-    // so the structural bound is per *body*, never per source line. The
-    // probe covers exactly one settled draw: frame counts otherwise vary
-    // with scheduler load and would couple the bound to painted-frame count.
-    // No frame-time guard here: the lazy first build legitimately pays the
-    // one-time parse and highlight of the full 4000-line source; the
-    // bounded-build probe is the pass/fail signal (the re-disclosure draw
-    // guards live in the reasoning fixtures above).
-    cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            assert!(toggle_activity_row(this, cx), "the activity row toggles");
-        });
+    // Expansion creates argument and result bodies. Time all actual draws,
+    // then count their code elements in one separate settled frame.
+    let row_id = chat.read_with(cx, |chat, _| {
+        rows_of_kind(chat, RowKind::ToolActivity)
+            .last()
+            .expect("activity row")
+            .id()
     });
-    cx.run_until_parked();
-    let expand_started = Instant::now();
-    let expand_probe = cx.update(|window, cx| {
-        crate::ui::markdown::reset_perf_probe();
-        let _ = window.draw(cx);
-        crate::ui::markdown::perf_probe()
+    let header_selector: &'static str =
+        Box::leak(format!("{}-header", row_id.debug_name()).into_boxed_str());
+    let header = cx.debug_bounds(header_selector).expect("activity header");
+    let (expand_draw, expand_probe) = measured_interaction(cx, |cx| {
+        cx.simulate_click(header.center(), Modifiers::default());
     });
-    let expand_draw = expand_started.elapsed();
 
     let owner_id = cx.update(|_, cx| {
         last_activity_renderer(chat.read(cx))
@@ -669,12 +661,28 @@ fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut Test
         expand_probe.text_view_builds
     );
 
-    // Re-collapse releases the entity again.
-    cx.update(|_, cx| {
-        chat.update(cx, |this, cx| {
-            assert!(toggle_activity_row(this, cx));
+    // Tail following can clip the header after expansion; reveal it before
+    // clicking to release the result body.
+    chat.read_with(cx, |chat, _| {
+        let item_ix = chat
+            .view
+            .projection
+            .row_index(row_id)
+            .expect("activity row");
+        chat.view.list_state.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: px(0.),
         });
     });
+    redraw_settled(cx);
+    let header = cx.debug_bounds(header_selector).expect("activity header");
+    assert!(chat.read_with(cx, |chat, _| {
+        chat.view
+            .list_state
+            .viewport_bounds()
+            .contains(&header.center())
+    }));
+    cx.simulate_click(header.center(), Modifiers::default());
     cx.run_until_parked();
     cx.update(|_, cx| {
         let activity = last_activity_renderer(chat.read(cx)).expect("activity row");
@@ -685,11 +693,8 @@ fn long_tool_result_with_code_and_math_expands_under_the_row_model(cx: &mut Test
     });
 }
 
-/// AC1 (P4): a far-beyond-threshold prose row renders through the fork's
-/// windowed block layout, and its first frame and scroll-only p95 stay inside
-/// the frame budget. The structural half of AC1 (laid-out blocks ≤ visible +
-/// overdraw) is enforced by the fork's own windowed unit tests; this guard
-/// covers the Nostra wiring end to end.
+/// Initial content and newly exposed blocks must fit the frame budget while
+/// remaining selectable through the transcript's outer scroll owner.
 #[gpui::test]
 fn long_windowed_prose_first_frame_and_scroll_stay_in_budget(cx: &mut TestAppContext) {
     // Parsing six megabytes of Markdown in a debug build costs minutes for no
@@ -700,72 +705,98 @@ fn long_windowed_prose_first_frame_and_scroll_stay_in_budget(cx: &mut TestAppCon
     } else {
         100_000
     };
+    const SCROLL_TARGET: &str = "WINDOWED_SCROLL_TARGET";
+    const TAIL_TARGET: &str = "WINDOWED_TAIL_TARGET";
 
-    init_app(cx);
+    init_performance_app(cx);
     let (chat, cx) = add_chat_window(cx);
     cx.simulate_resize(gpui::size(px(760.), px(560.)));
-
-    // Mixed prose: paragraph pairs with a heading every 50 lines, so the
-    // document carries ~LINES/2 blocks — 25× the 300-block gate.
-    let mut source = String::with_capacity(LINES * 96);
-    let mut line = 0;
-    while line < LINES {
-        if line % 50 == 0 {
-            source.push_str(&format!("## Section {}\n\n", line / 50));
-            line += 1;
-            continue;
-        }
-        source.push_str(&format!(
-            "Windowed paragraph {line} carries enough body text to exercise real layout, \
-             with inline markup like `code` and **emphasis**.\n\n"
-        ));
-        line += 2;
-    }
-
     cx.update(|_, cx| {
-        preferences::update_in_memory(cx, |prefs| prefs.smooth_chat_scrolling = false);
-        chat.update(cx, |chat, cx| {
-            test_support::push_canonical(
-                chat,
-                LlmMessage {
-                    role: crate::llm::Role::Assistant,
-                    content: vec![ContentBlock::Text {
-                        text: source,
-                        provider_metadata: ProviderMetadata::default(),
-                    }],
-                    provider_metadata: ProviderMetadata::default(),
-                },
-                cx,
-            );
+        preferences::update_in_memory(cx, |prefs| {
+            prefs.smooth_chat_scrolling = false;
+            prefs.code_block_wrap = false;
+            prefs.code_block_line_numbers = false;
         });
     });
-    cx.run_until_parked();
-    cx.update(|_, cx| {
+    settle_frame_callbacks(cx);
+
+    // One block per pair of source lines, with two short selectable markers.
+    let mut source = String::with_capacity(LINES * 96);
+    let mut target_offset = 0;
+    for line in (0..LINES).step_by(2) {
+        if line == 120 {
+            target_offset = source.len();
+            source.push_str(&format!("```text\n{SCROLL_TARGET}\n```\n\n"));
+        } else if line % 50 == 0 {
+            source.push_str(&format!("## Section {}\n\n", line / 50));
+        } else {
+            source.push_str(&format!(
+                "Windowed paragraph {line} carries enough body text to exercise real layout, \
+                 with inline markup like `code` and **emphasis**.\n\n"
+            ));
+        }
+    }
+    let tail_offset = source.len();
+    source.push_str(&format!("```text\n{TAIL_TARGET}\n```\n"));
+
+    let initial_draws = measure_draws(cx, |cx| {
+        cx.update(|_, cx| {
+            chat.update(cx, |chat, cx| {
+                test_support::push_canonical(
+                    chat,
+                    LlmMessage {
+                        role: crate::llm::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: source,
+                            provider_metadata: ProviderMetadata::default(),
+                        }],
+                        provider_metadata: ProviderMetadata::default(),
+                    },
+                    cx,
+                );
+            });
+        });
+        settle_frame_callbacks(cx);
+    });
+    let initial_max = initial_draws
+        .iter()
+        .copied()
+        .max()
+        .expect("initial content must produce a frame");
+    let (owner_id, visible_bottom) = cx.update(|window, cx| {
+        let chat = chat.read(cx);
         assert!(
             renderer_for_row(
-                chat.read(cx),
-                rows_of_kind(chat.read(cx), RowKind::AssistantProse)
+                chat,
+                rows_of_kind(chat, RowKind::AssistantProse)
                     .first()
                     .expect("the long prose row"),
             )
             .expect("prose renderer")
-            .is_windowed(cx),
-            "a 100k-line row must render through the windowed block layout"
+            .requests_windowed_layout(),
+            "the long prose row must request windowed block layout"
         );
+        (
+            last_prose_id(chat),
+            window.viewport_size().height - chat.composer_height,
+        )
     });
+    let target_selector: &'static str =
+        Box::leak(format!("markdown-code-line-{owner_id}-{target_offset}-0").into_boxed_str());
+    let tail_selector: &'static str =
+        Box::leak(format!("markdown-code-line-{owner_id}-{tail_offset}-0").into_boxed_str());
+    let visible = |bounds: &gpui::Bounds<gpui::Pixels>| {
+        bounds.top() >= px(0.) && bounds.bottom() <= visible_bottom
+    };
+    let tail = cx
+        .debug_bounds(tail_selector)
+        .filter(visible)
+        .expect("initial tail-follow must display actual tail text");
+    assert_code_line_copy(cx, tail, TAIL_TARGET);
 
-    // First painted frame: only the visible band may lay out, never the
-    // whole document.
-    let first_frame = cx.update(|window, cx| {
-        let started = Instant::now();
-        let _ = window.draw(cx);
-        started.elapsed()
-    });
-    redraw_settled(cx);
-    // The transcript follows the tail on push; anchor at the top so the 48
-    // gestures traverse fresh document instead of pushing against the end.
+    // Start the wheel traversal above a target outside the initial overdraw.
     cx.update(|_, cx| {
-        chat.update(cx, |chat, _| {
+        chat.update(cx, |chat, cx| {
             chat.view
                 .list_state
                 .set_follow_mode(gpui::FollowMode::Normal);
@@ -773,24 +804,45 @@ fn long_windowed_prose_first_frame_and_scroll_stay_in_budget(cx: &mut TestAppCon
                 item_ix: 0,
                 offset_in_item: px(0.),
             });
+            cx.notify();
         });
     });
-    redraw_settled(cx);
+    settle_frame_callbacks(cx);
+    assert!(
+        cx.debug_bounds(target_selector).is_none(),
+        "the wheel target must begin outside the materialized band"
+    );
     let before_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
 
-    // Scroll-only frames: repeated wheel gestures over the windowed row, one
-    // redraw per gesture with easing off. The point sits mid-viewport, clear
-    // of the composer.
     let wheel_point = point(px(380.), px(280.));
     let mut scroll_draws = Vec::new();
+    let mut copied_target = false;
     for _ in 0..48 {
-        cx.simulate_event(ScrollWheelEvent {
-            position: wheel_point,
-            delta: ScrollDelta::Lines(point(0., -9.)),
-            ..Default::default()
+        let mut target_in_event_frame = false;
+        let draws = measure_draws(cx, |cx| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: wheel_point,
+                delta: ScrollDelta::Lines(point(0., -9.)),
+                ..Default::default()
+            });
+            target_in_event_frame = cx
+                .debug_bounds(target_selector)
+                .is_some_and(|b| visible(&b));
+            settle_frame_callbacks(cx);
         });
-        let (draw, _) = measured_redraw(cx);
-        scroll_draws.push(draw);
+        assert!(
+            !draws.is_empty(),
+            "a wheel gesture must produce a measured frame"
+        );
+        scroll_draws.extend(draws);
+        if !copied_target && target_in_event_frame {
+            let target = cx
+                .debug_bounds(target_selector)
+                .filter(visible)
+                .expect("the exposed target must remain visible after convergence");
+            assert_code_line_copy(cx, target, SCROLL_TARGET);
+            copied_target = true;
+        }
     }
     let after_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
     assert!(
@@ -799,27 +851,47 @@ fn long_windowed_prose_first_frame_and_scroll_stay_in_budget(cx: &mut TestAppCon
         "the wheel gestures must actually advance the transcript or the \
          scroll timings above prove nothing"
     );
+    assert!(
+        copied_target,
+        "scrolling must expose and select the target text"
+    );
     let scroll_p95 = duration_percentile(&scroll_draws, 95);
 
     eprintln!(
-        "WINDOWED_PROSE_PERF lines={LINES} first_frame={first_frame:?} \
+        "WINDOWED_PROSE_PERF lines={LINES} initial_frames={} initial_max={initial_max:?} \
          scroll_frames={} scroll_p95={scroll_p95:?} scroll_max={:?}",
+        initial_draws.len(),
         scroll_draws.len(),
         scroll_draws.iter().copied().max().unwrap_or_default(),
     );
 
     if !cfg!(debug_assertions) {
-        // Frame budget: 60 fps is 16.7 ms. The windowed first frame paints
-        // only the visible band (observed single-digit ms); the scroll p95
-        // mirrors the frozen steady-frame guards. Both carry headroom for
-        // machine variance while staying inside the budget.
         assert!(
-            first_frame <= Duration::from_millis(16),
-            "release windowed first frame must stay inside the frame budget: {first_frame:?}"
+            initial_max <= Duration::from_millis(16),
+            "every initial content frame must stay inside the 16 ms budget: {initial_max:?}"
         );
         assert!(
             scroll_p95 <= Duration::from_millis(16),
             "release windowed scroll-only p95 must stay inside the frame budget: {scroll_p95:?}"
         );
     }
+}
+
+fn assert_code_line_copy(
+    cx: &mut gpui::VisualTestContext,
+    bounds: gpui::Bounds<gpui::Pixels>,
+    expected: &str,
+) {
+    let start = point(bounds.left() + px(1.), bounds.center().y);
+    let end = point(bounds.right() - px(1.), bounds.center().y);
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(end, Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+    cx.dispatch_action(gpui_component::input::Copy);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some(expected.to_string()),
+        "the visible code text must participate in drag selection"
+    );
+    cx.update(gpui_base::TextSelection::clear);
 }

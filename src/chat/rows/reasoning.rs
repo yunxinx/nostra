@@ -164,6 +164,16 @@ impl ReasoningRenderer {
         self.body = Some(body);
     }
 
+    fn natural_height_body(&self) -> Option<&MarkdownBody> {
+        if matches!(self.phase, ReasoningPhase::Finished { .. })
+            && self.disclosure == ReasoningDisclosure::Full
+        {
+            self.body.as_ref()
+        } else {
+            None
+        }
+    }
+
     /// Scroll the body to its end when tail follow is armed and the user has
     /// not moved away from the end. Belt-and-braces next to
     /// `FollowMode::Tail`, which already keeps growing content pinned.
@@ -460,14 +470,15 @@ impl RowRenderer for ReasoningRenderer {
         })
     }
 
-    fn is_windowed(&self, cx: &App) -> bool {
-        // Only the Full disclosure renders a natural-height body; the preview
-        // and the budgeted viewport are scrollable, where the fork ignores
-        // the windowed flag.
-        self.disclosure == ReasoningDisclosure::Full
-            && self.body.as_ref().is_some_and(|body| {
-                typography::windowed_body(self.display.len(), body.block_count(cx))
-            })
+    fn visit_layout_dependencies(&self, visit: &mut dyn FnMut(&MarkdownBody)) {
+        if let Some(body) = self.natural_height_body() {
+            visit(body);
+        }
+    }
+
+    fn requests_windowed_layout(&self) -> bool {
+        self.natural_height_body()
+            .is_some_and(|body| typography::windowed_body(self.display.len(), body.block_count()))
     }
 
     #[cfg(test)]
@@ -500,7 +511,11 @@ impl ReasoningRenderer {
         // same way the transcript listener does, so the eased replay never
         // skips. It is negative as soon as content sits above the viewport —
         // exactly when the top fade belongs.
-        let anchor = body.scroll_state(cx).scroll_px_offset_for_scrollbar();
+        let anchor = self
+            .scroll
+            .as_ref()
+            .map(|scroll| scroll.scroll_px_offset_for_scrollbar())
+            .unwrap_or_default();
         let show_fade = anchor.y < Pixels::ZERO;
 
         let row_id = ctx.row_id;
@@ -624,7 +639,11 @@ impl ReasoningRenderer {
         let copy_value: CopyValue = Rc::new(move |_, cx| dispatch_copy.clipboard_value(row_id, cx));
 
         let dispatch_scroll = ctx.dispatch.clone();
-        let anchor = body.scroll_state(cx).scroll_px_offset_for_scrollbar();
+        let anchor = self
+            .scroll
+            .as_ref()
+            .map(|scroll| scroll.scroll_px_offset_for_scrollbar())
+            .unwrap_or_default();
         let on_scroll = Rc::new(
             move |event: &ScrollWheelEvent, window: &mut Window, cx: &mut App| {
                 dispatch_scroll.send(
@@ -750,8 +769,8 @@ impl ReasoningRenderer {
                 )
             })
             .when(full, |this| {
-                // Natural height, no inner scrollbar; long sources route
-                // through the fork's windowed block layout (P4 PRD R5).
+                // Natural height, no inner scrollbar; long sources use
+                // windowed block measurement.
                 this.child(
                     div()
                         .w_full()
@@ -761,9 +780,10 @@ impl ReasoningRenderer {
                         .text_sm()
                         .text_color(text_color)
                         .debug_selector(move || block_selector("body", content_index))
-                        .child(body.text_view(typography::reasoning(cx)).windowed(
-                            typography::windowed_body(self.display.len(), body.block_count(cx)),
-                        )),
+                        .child(
+                            body.text_view(typography::reasoning(cx))
+                                .windowed(self.requests_windowed_layout()),
+                        ),
                 )
             })
             .into_any_element()
