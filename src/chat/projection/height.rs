@@ -162,16 +162,22 @@ impl RowHeight {
         let text_lines = |chars: usize, chars_per_line: f32| -> u32 {
             (((chars as f32) / chars_per_line.max(1.)).ceil() as u32).max(1)
         };
+        let body_lines = |chars: usize| {
+            text_lines(
+                chars,
+                super::super::rows::typography::ESTIMATE_CHARS_PER_LINE,
+            )
+        };
         match kind {
             // One row of text inside the bubble padding.
             RowKind::UserBubble => line * text_lines(source_len, 56.) as f32 + px(12.),
             RowKind::AssistantProse => {
                 let blocks = block_hint.max(1) as f32;
-                line * text_lines(source_len, 62.) as f32 + px(8.) * (blocks - 1.).clamp(0., 20.)
+                line * body_lines(source_len) as f32 + px(8.) * (blocks - 1.).clamp(0., 20.)
             }
-            // Trigger chip plus the seven-line visible budget.
+            // Trigger row plus the streaming preview's visible lines.
             RowKind::Reasoning => {
-                line + px(8.) + line * text_lines(source_len.min(4 * 1024), 62.) as f32
+                line + px(8.) + line * body_lines(source_len.min(4 * 1024)) as f32
             }
             RowKind::ToolActivity => line + px(6.),
             RowKind::ToolActivityGroup => line + px(6.),

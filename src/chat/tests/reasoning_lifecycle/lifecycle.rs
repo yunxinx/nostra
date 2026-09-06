@@ -61,7 +61,7 @@ fn reasoning_finished_collapses_the_card(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "Here is the answer.", cx);
         });
     });
@@ -267,4 +267,156 @@ fn reasoning_after_prose_creates_a_second_ordered_card(cx: &mut TestAppContext) 
         gpui::size(px(900.), px(700.)),
         |_, _| chat.clone().into_any_element(),
     );
+}
+
+/// R10: the finish event carries the coalescer's enqueue-time duration. The
+/// transcript banks it on the part and the trigger label renders it — the
+/// renderer owns no timer.
+#[gpui::test]
+fn a_streamed_finish_banks_the_measured_duration_on_the_trace(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            test_support::finish_reasoning(
+                this,
+                0,
+                "reasoning-0",
+                None,
+                Some(Duration::from_millis(72_000)),
+                cx,
+            );
+        });
+    });
+
+    cx.update(|_, cx| {
+        let this = chat.read(cx);
+        let PartSource::Reasoning { reasoning, .. } = &last_turn(this, cx).parts[0].source else {
+            panic!("reasoning part");
+        };
+        assert_eq!(
+            reasoning.duration_ms,
+            Some(72_000),
+            "the finish path banks the duration on the part content"
+        );
+        let renderer = reasoning_part(this).expect("trace");
+        assert_eq!(
+            renderer.elapsed(),
+            Some(Duration::from_millis(72_000)),
+            "the renderer reads the banked duration, not its own clock"
+        );
+        assert!(
+            renderer.label_for_test().contains("1 m 12 s"),
+            "the label interpolates the adaptive duration format, got {:?}",
+            renderer.label_for_test()
+        );
+    });
+}
+
+/// R7: the terminal message carries the gateway-banked duration, and the
+/// terminal reconciliation keeps showing it (the streamed part's value makes
+/// way for the authoritative one).
+#[gpui::test]
+fn the_terminal_message_keeps_a_banked_duration_on_the_trace(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
+            test_support::finish_reasoning(
+                this,
+                0,
+                "reasoning-0",
+                None,
+                Some(Duration::from_millis(72_000)),
+                cx,
+            );
+            test_support::finish_reply(
+                this,
+                Some(IndexedMessage::from_message(LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![
+                        ContentBlock::Reasoning {
+                            reasoning: crate::llm::ReasoningContent {
+                                display: "thinking".into(),
+                                replay: None,
+                                duration_ms: Some(31_000),
+                            },
+                        },
+                        ContentBlock::Text {
+                            text: "answer".into(),
+                            provider_metadata: ProviderMetadata::default(),
+                        },
+                    ],
+                    provider_metadata: ProviderMetadata::default(),
+                })),
+                None,
+                cx,
+            );
+        });
+    });
+
+    cx.update(|_, cx| {
+        let this = chat.read(cx);
+        let renderer = reasoning_part(this).expect("trace");
+        assert_eq!(
+            renderer.elapsed(),
+            Some(Duration::from_millis(31_000)),
+            "the authoritative message's duration replaces the streamed one"
+        );
+        assert!(
+            renderer.label_for_test().contains("31 s"),
+            "got {:?}",
+            renderer.label_for_test()
+        );
+    });
+}
+
+/// R7: a restored session materializes its reasoning from the persisted
+/// message (`Turn::from_llm` → `Part::from_block`), so the banked duration on
+/// that message is what the trigger shows — no live timer involved.
+#[gpui::test]
+fn a_restored_trace_shows_its_persisted_duration(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            test_support::push_canonical(
+                chat,
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: "a restored thought".into(),
+                            replay: None,
+                            duration_ms: Some(7_385_000),
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+    });
+
+    cx.update(|_, cx| {
+        let this = chat.read(cx);
+        let renderer = reasoning_part(this).expect("restored trace");
+        assert_eq!(
+            renderer.elapsed(),
+            Some(Duration::from_millis(7_385_000)),
+            "the duration comes from the persisted part content"
+        );
+        assert!(
+            renderer.label_for_test().contains("2 h 3 m"),
+            "the adaptive format renders hours, got {:?}",
+            renderer.label_for_test()
+        );
+    });
 }

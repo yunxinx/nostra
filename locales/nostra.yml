@@ -175,8 +175,8 @@ chat:
       zh-CN: 自动换行
   reasoning:
     finished:
-      en: "Thought for %{duration}s"
-      zh-CN: "已思考 %{duration} 秒"
+      en: "Thought for %{duration}"
+      zh-CN: "思考 %{duration}"
     completed:
       en: Thought
       zh-CN: 已思考
@@ -189,12 +189,6 @@ chat:
     copy:
       en: Copy reasoning
       zh-CN: 复制思考过程
-    expand_all:
-      en: Expand full text
-      zh-CN: 全文展开
-    collapse_all:
-      en: Collapse full text
-      zh-CN: 收起全文
   error:
     runtime_unavailable:
       en: Unable to open a conversation right now. Please try again.
@@ -374,6 +368,12 @@ settings:
   smooth_chat_scrolling_desc:
     en: Ease discrete mouse-wheel scrolling in the conversation area; precise touchpad scrolling is unchanged.
     zh-CN: 让对话区域的离散鼠标滚轮滚动更平滑；触控板的精确滚动不受影响。
+  jump_to_latest_button:
+    en: Back-to-latest button
+    zh-CN: 「回到最新」按钮
+  jump_to_latest_button_desc:
+    en: Show the button above the message input that jumps back to the latest messages; tail-following itself is unchanged.
+    zh-CN: 显示消息输入框上方跳转回最新消息的按钮；关闭后跟随尾部的行为本身不变。
   code_wrap:
     en: Code block wrapping
     zh-CN: 代码块自动换行

@@ -55,6 +55,7 @@ pub(super) fn render(
         ),
         user_message_markdown_row(preferences, preference_handle, cx),
         smooth_chat_scrolling_row(preferences, preference_handle, cx),
+        jump_to_latest_button_row(preferences, preference_handle, cx),
         code_wrap_row(preferences, preference_handle, cx),
         code_line_numbers_row(preferences, preference_handle, cx),
     ];
@@ -105,6 +106,28 @@ fn smooth_chat_scrolling_row(
             .checked(preferences.smooth_chat_scrolling)
             .on_click(move |checked, _, cx| {
                 crate::chat::set_smooth_scrolling(*checked, &preference_handle, cx)
+            })
+            .into_any_element(),
+        preferences.hide_settings_info_buttons,
+        cx,
+    )
+}
+
+fn jump_to_latest_button_row(
+    preferences: &Preferences,
+    preference_handle: &PreferenceHandle,
+    cx: &App,
+) -> AnyElement {
+    let preference_handle = preference_handle.clone();
+    ui::row(
+        "jump-to-latest-button",
+        t!("settings.jump_to_latest_button").to_string(),
+        Some(t!("settings.jump_to_latest_button_desc").to_string()),
+        Switch::new("jump-to-latest-button-switch")
+            .small()
+            .checked(preferences.jump_to_latest_button)
+            .on_click(move |checked, _, cx| {
+                crate::chat::set_jump_button(*checked, &preference_handle, cx)
             })
             .into_any_element(),
         preferences.hide_settings_info_buttons,
@@ -365,6 +388,8 @@ mod tests {
                 "settings.user_message_markdown_desc",
                 "settings.smooth_chat_scrolling",
                 "settings.smooth_chat_scrolling_desc",
+                "settings.jump_to_latest_button",
+                "settings.jump_to_latest_button_desc",
                 "settings.code_wrap",
                 "settings.code_wrap_desc",
                 "settings.code_line_numbers",

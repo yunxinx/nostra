@@ -15,7 +15,7 @@
 //! header to fold.
 //!
 //! Results larger than [`typography::RESULT_BUDGET_BYTES`] render inside the
-//! reasoning row's budgeted, internally scrollable viewport, replaying wheel
+//! reasoning row's clamped, internally scrollable viewport, replaying wheel
 //! input through [`RowAction::ReplayNestedScroll`].
 
 use std::time::Instant;
@@ -693,8 +693,7 @@ impl ToolActivityRenderer {
             ];
         }
         let line_height = window.line_height();
-        let budget_height = (line_height * typography::BUDGET_MIN_LINES)
-            .max(ctx.viewport_height * typography::BUDGET_VIEWPORT_RATIO);
+        let budget_height = typography::reasoning_cap(line_height, ctx.viewport_height);
         let row_id = ctx.row_id;
         let ui_id = self.ui_id;
         // Painted-frame anchor for the eased replay (same contract as the

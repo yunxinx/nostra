@@ -80,6 +80,7 @@ fn rows_follow_part_order_with_error_and_actions(cx: &mut gpui::TestAppContext) 
                         reasoning: ReasoningContent {
                             display: "thinking".into(),
                             replay: None,
+                            duration_ms: None,
                         },
                     },
                     ContentBlock::Text {

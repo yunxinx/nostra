@@ -9,10 +9,10 @@ fn separate_reasoning_rows_keep_independent_state(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "answer", cx);
             test_support::append_reasoning(this, 2, "reasoning-1".into(), "second", cx);
-            test_support::finish_reasoning(this, 2, "reasoning-1", None, cx);
+            test_support::finish_reasoning(this, 2, "reasoning-1", None, None, cx);
 
             assert_eq!(
                 reasoning_states(this, cx),
@@ -45,10 +45,10 @@ fn separate_reasoning_rows_toggle_and_copy_independently(cx: &mut TestAppContext
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "answer", cx);
             test_support::append_reasoning(this, 2, "reasoning-1".into(), "second", cx);
-            test_support::finish_reasoning(this, 2, "reasoning-1", None, cx);
+            test_support::finish_reasoning(this, 2, "reasoning-1", None, None, cx);
         });
     });
 
@@ -84,8 +84,8 @@ fn separate_reasoning_rows_toggle_and_copy_independently(cx: &mut TestAppContext
 
     let copy_and_read =
         |selector: &'static str, trigger: &'static str, cx: &mut gpui::VisualTestContext| {
-            // Budgeted viewports are taller than the old seven-line cards;
-            // bring the trigger row back into the window before interacting.
+            // Expanded viewports are taller than the collapsed trigger row;
+            // bring the trigger back into the window before interacting.
             chat.update(cx, |this, _| {
                 this.view.list_state.scroll_to(ListOffset::default());
             });
@@ -120,7 +120,7 @@ fn a_finished_reasoning_id_cannot_be_reused(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "first", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "late", cx);
         });
     });
@@ -152,7 +152,7 @@ fn replay_only_reasoning_is_closed_without_allocating_a_card(cx: &mut TestAppCon
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::start_reasoning(this, 0, "reasoning-0".into(), cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", Some(replay.clone()), cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", Some(replay.clone()), None, cx);
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "late", cx);
         });
     });
@@ -180,7 +180,7 @@ fn terminal_snapshot_preserves_separate_reasoning_rows(cx: &mut TestAppContext) 
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "partial first", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "partial answer", cx);
             test_support::append_reasoning(this, 2, "reasoning-1".into(), "partial second", cx);
             let first = reasoning_part_mut(this).expect("first reasoning card");
@@ -194,6 +194,7 @@ fn terminal_snapshot_preserves_separate_reasoning_rows(cx: &mut TestAppContext) 
                             reasoning: crate::llm::ReasoningContent {
                                 display: "first".into(),
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                         ContentBlock::Text {
@@ -204,6 +205,7 @@ fn terminal_snapshot_preserves_separate_reasoning_rows(cx: &mut TestAppContext) 
                             reasoning: crate::llm::ReasoningContent {
                                 display: "second".into(),
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                     ],
@@ -247,7 +249,7 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
         chat.update(cx, |this, cx| {
             test_support::start_tool_call(this, 0, 0, "call-0".into(), "lookup".into(), cx);
             test_support::append_reasoning(this, 1, "reasoning-0".into(), "partial", cx);
-            test_support::finish_reasoning(this, 1, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 1, "reasoning-0", None, None, cx);
             let part_id = last_turn(this, cx)
                 .parts
                 .iter()
@@ -276,6 +278,7 @@ fn terminal_filter_preserves_reasoning_identity_by_content_index(cx: &mut TestAp
                             reasoning: crate::llm::ReasoningContent {
                                 display: "authoritative".into(),
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                     }],
@@ -373,6 +376,7 @@ fn late_reasoning_snapshot_preserves_card_state_and_identity(cx: &mut TestAppCon
                                 ..Default::default()
                             }),
                         }),
+                        duration_ms: None,
                     },
                 }],
                 cx,

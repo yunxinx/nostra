@@ -345,8 +345,9 @@ impl Transcript {
                 content_index,
                 id,
                 replay,
+                duration,
             } => self
-                .finish_reasoning_block(*content_index, id, replay.clone(), cx)
+                .finish_reasoning_block(*content_index, id, replay.clone(), *duration, cx)
                 .into_iter()
                 .collect(),
             ConversationStreamEvent::ReasoningSnapshotUpdated {
@@ -463,6 +464,7 @@ impl Transcript {
         content_index: usize,
         stream_id: &str,
         replay: Option<ProviderMetadata>,
+        duration: Option<std::time::Duration>,
         cx: &mut Context<Self>,
     ) -> Option<TranscriptUpdate> {
         let (turn_id, part_id) = {
@@ -473,6 +475,14 @@ impl Transcript {
                 .find(|part| kind.matches(part, content_index, stream_id))?;
             if let Some(replay) = replay {
                 kind.set_replay(&mut part.source, replay);
+            }
+            // R7: bank the measured thinking time on the block itself so the
+            // renderer reads it from the part, the terminal reconciliation
+            // keeps it, and a later snapshot cannot lose it.
+            if let Some(duration) = duration
+                && let PartSource::Reasoning { reasoning, .. } = &mut part.source
+            {
+                reasoning.duration_ms = Some(duration.as_millis() as u64);
             }
             part.finished = true;
             (last.turn_id, part.part_id)
@@ -524,7 +534,7 @@ impl Transcript {
         replay: Option<ProviderMetadata>,
         cx: &mut Context<Self>,
     ) -> Option<TranscriptUpdate> {
-        self.finish_stream_part(StreamKind::Prose, content_index, id, replay, cx)
+        self.finish_stream_part(StreamKind::Prose, content_index, id, replay, None, cx)
     }
 
     fn start_reasoning(
@@ -541,6 +551,7 @@ impl Transcript {
                 reasoning: ReasoningContent {
                     display: String::new(),
                     replay: None,
+                    duration_ms: None,
                 },
                 stream_id: id.clone(),
             },
@@ -563,9 +574,17 @@ impl Transcript {
         content_index: usize,
         id: &str,
         replay: Option<ProviderMetadata>,
+        duration: Option<std::time::Duration>,
         cx: &mut Context<Self>,
     ) -> Option<TranscriptUpdate> {
-        self.finish_stream_part(StreamKind::Reasoning, content_index, id, replay, cx)
+        self.finish_stream_part(
+            StreamKind::Reasoning,
+            content_index,
+            id,
+            replay,
+            duration,
+            cx,
+        )
     }
 
     fn update_reasoning_snapshot(
@@ -585,7 +604,12 @@ impl Transcript {
                 return None;
             }
             if let PartSource::Reasoning { reasoning, .. } = &mut part.source {
+                // The snapshot carries display/replay, never timing: keep the
+                // duration the stream already banked (the snapshot's own value
+                // would win if one ever appears).
+                let duration_ms = snapshot.duration_ms.or(reasoning.duration_ms);
                 *reasoning = snapshot;
+                reasoning.duration_ms = duration_ms;
             }
             (last.turn_id, part.part_id)
         };
@@ -729,6 +753,7 @@ impl StreamKind {
                 reasoning: ReasoningContent {
                     display: String::new(),
                     replay: None,
+                    duration_ms: None,
                 },
                 stream_id,
             },

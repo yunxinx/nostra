@@ -57,6 +57,7 @@ use self::transcript::Role;
 use self::transcript::TranscriptSource as _;
 use self::transcript::{Transcript, TranscriptEvent, TranscriptSnapshot, TranscriptUpdate};
 pub(crate) use self::view::scrolling::SmoothScrollState;
+pub(crate) use self::view::scrolling::set_jump_button;
 pub(crate) use self::view::scrolling::set_smooth_scrolling;
 #[cfg(test)]
 pub(crate) use self::view::scrolling::{
@@ -917,6 +918,7 @@ pub(crate) mod test_support {
         content_index: usize,
         id: &str,
         replay: Option<ProviderMetadata>,
+        duration: Option<std::time::Duration>,
         cx: &mut Context<ChatView>,
     ) {
         apply_stream(
@@ -925,6 +927,7 @@ pub(crate) mod test_support {
                 content_index,
                 id: id.to_string(),
                 replay,
+                duration,
             }],
             cx,
         );

@@ -1,42 +1,46 @@
 //! Row renderer for one reasoning ("chain of thought") part.
 //!
 //! Two-phase form (PRD R1). While the part streams, the row is a fixed-height
-//! tail-following preview: [`typography::PREVIEW_LINES`] lines of body text on
-//! a left rail, no frame, no fill, with a top fade into the pane background
-//! once content has scrolled above the viewport. The outer height never
-//! changes during the stream, so the prose below the row is laid out once and
-//! stays put (AC1), and the preview itself is a scrollable `TextView` from the
-//! first delta — there is no Natural ↔ Virtualized scroll migration anywhere
-//! in this renderer.
+//! tail-following preview: [`typography::PREVIEW_LINES`] lines of body text in
+//! an outlined card, with a top fade into the pane background once content has
+//! scrolled above the viewport. The outer height never changes during the
+//! stream, so the prose below the row is laid out once and stays put (AC1),
+//! and the preview itself is a scrollable `TextView` from the first delta —
+//! there is no Natural ↔ Virtualized scroll migration anywhere in this
+//! renderer.
 //!
-//! When the stream ends the row folds to a trigger line ("Thought for Ns" /
-//! the localized fallback) with a copy action. Expanding gives a viewport
-//! bounded by `max(BUDGET_MIN_LINES lines, viewport × 45%)`; a secondary
-//! toggle switches to natural full height with no inner scrollbar. Auto
-//! collapse yields to the user the first time they work either toggle
+//! When the stream ends the row folds to a trigger row ("Thought for Ns" /
+//! the localized fallback) with a copy action. Expanding gives a body at
+//! `min(natural height, cap)` where the cap is
+//! `max(BUDGET_MIN_LINES lines, viewport × 45%)` (PRD R3): short traces render
+//! at their own height, longer ones scroll inside a viewport of exactly the
+//! cap. The natural height converges through the painted-body measurement
+//! ([`RowAction::BodyMeasured`]) plus the body's layout observers. Auto
+//! collapse yields to the user the first time they work the toggle
 //! (`user_controlled`).
 //!
-//! Wheel input inside the preview or the budgeted viewport is forwarded to
+//! The trigger's "Thought for Ns" duration comes from the part content
+//! (`ReasoningContent::duration_ms`): the coalescer stamps it at event
+//! arrival (R10) and the gateway banks it on the persisted assistant message
+//! (R7), so a restored session shows the real thinking time. The renderer
+//! owns no timer of its own.
+//!
+//! Wheel input inside the preview or the clamped viewport is forwarded to
 //! the view through [`RowAction::ReplayNestedScroll`], which owns the easing
 //! constants, the painted-frame anchor restore, the window-activation check,
 //! and the nested scroll boundary; the renderer owns only the follow flag and
 //! the queued distance ([`NestedScrollReplay`]).
 
-use std::{
-    rc::Rc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, time::Duration};
 
 use gpui::{
-    AnyElement, App, ElementId, FollowMode, InteractiveElement as _, IntoElement, ListState,
-    ParentElement as _, Pixels, ScrollWheelEvent, SharedString, Styled as _, Window, div,
-    linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
+    AnyElement, App, ElementId, FollowMode, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ListState, ParentElement as _, Pixels, Role, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Window, div, linear_color_stop, linear_gradient,
+    prelude::FluentBuilder as _,
 };
 use gpui_component::{
-    ActiveTheme as _, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    clipboard::Clipboard,
-    h_flex, v_flex,
+    ActiveTheme as _, ElementExt as _, Icon, IconName, clipboard::Clipboard, h_flex, v_flex,
 };
 use rust_i18n::t;
 
@@ -53,7 +57,37 @@ use super::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReasoningPhase {
     Streaming,
-    Finished { elapsed: Option<Duration> },
+    /// The banked stream duration, read from the part content
+    /// (`ReasoningContent::duration_ms`), never measured here.
+    Finished {
+        elapsed: Option<Duration>,
+    },
+}
+
+/// "N s" under a minute, "M m S s" under an hour, "H h M m" beyond — whole
+/// seconds, ASCII digits, trailing units dropped when their value is zero
+/// (PRD R7). A burst-backfilled block whose duration is ~0 renders as "0 s".
+pub(crate) fn format_reasoning_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    if seconds < 60 {
+        format!("{seconds} s")
+    } else if seconds < 3600 {
+        let minutes = seconds / 60;
+        let remainder = seconds % 60;
+        if remainder == 0 {
+            format!("{minutes} m")
+        } else {
+            format!("{minutes} m {remainder} s")
+        }
+    } else {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {minutes} m")
+        }
+    }
 }
 
 /// A copy button hidden until the pointer enters `hover_group`.
@@ -102,13 +136,16 @@ pub(crate) struct ReasoningRenderer {
     /// Whether streaming updates may pin the preview to its tail. Upward
     /// wheel input disarms it; a downward gesture at the end re-arms it.
     follow: bool,
-    /// Start of this block's stream, cleared exactly once when the phase
-    /// turns `Finished`.
-    started_at: Option<Instant>,
     smooth: SmoothScrollState,
     owner_id: u64,
     presentation: Option<MarkdownPresentation>,
     materialized: bool,
+    /// Painted height of the expanded body in its natural-height form, as
+    /// reported through [`RowAction::BodyMeasured`]. While it stays at or
+    /// below the cap the body renders at natural height; the first report
+    /// above the cap switches the form to the clamped viewport. `None` until
+    /// the natural form has painted once.
+    natural_height: Option<Pixels>,
 }
 
 impl ReasoningRenderer {
@@ -123,11 +160,11 @@ impl ReasoningRenderer {
             disclosure: ReasoningDisclosure::Collapsed,
             user_controlled: false,
             follow: true,
-            started_at: None,
             smooth: SmoothScrollState::default(),
             owner_id: 0,
             presentation: None,
             materialized: false,
+            natural_height: None,
         }
     }
 
@@ -164,14 +201,51 @@ impl ReasoningRenderer {
         self.body = Some(body);
     }
 
+    /// The body whose layout the expanded row depends on — the
+    /// natural-height measurement dependency. Both expanded forms (natural
+    /// and clamped) declare it: parse and layout completion gate the row's
+    /// `Settled` confidence either way.
     fn natural_height_body(&self) -> Option<&MarkdownBody> {
         if matches!(self.phase, ReasoningPhase::Finished { .. })
-            && self.disclosure == ReasoningDisclosure::Full
+            && self.disclosure == ReasoningDisclosure::Expanded
         {
             self.body.as_ref()
         } else {
             None
         }
+    }
+
+    /// Whether the expanded body renders inside the clamped, internally
+    /// scrollable viewport rather than at natural height.
+    ///
+    /// Three inputs decide, all conservative in the same direction — never
+    /// lay out more than the cap in one frame, never clamp content that
+    /// plausibly fits:
+    ///
+    /// - sources past the windowed thresholds are always clamped: the windowed
+    ///   block layout cannot combine with an internal-scroll viewport, and the
+    ///   clamped viewport bounds its own per-frame layout work;
+    /// - a painted natural height above the cap clamps exactly;
+    /// - before the first paint, a source-length estimate over twice the cap
+    ///   avoids one full-height layout frame for long traces; the 2× slack
+    ///   keeps the coarse characters-per-line heuristic from clamping content
+    ///   that actually fits.
+    fn expanded_uses_clamped_viewport(
+        &self,
+        body: &MarkdownBody,
+        cap: Pixels,
+        line_height: Pixels,
+    ) -> bool {
+        if typography::windowed_body(self.display.len(), body.block_count()) {
+            return true;
+        }
+        if self.natural_height.is_some_and(|height| height > cap) {
+            return true;
+        }
+        let estimated_lines = (self.display.len() as f32 / typography::ESTIMATE_CHARS_PER_LINE)
+            .ceil()
+            .max(1.);
+        estimated_lines * line_height > cap * 2.
     }
 
     /// Scroll the body to its end when tail follow is armed and the user has
@@ -191,9 +265,24 @@ impl ReasoningRenderer {
         }
     }
 
-    fn turn_finished(&mut self) {
-        if let ReasoningPhase::Streaming = self.phase {
-            let elapsed = self.started_at.take().map(|started| started.elapsed());
+    /// The banked stream duration carried by `ctx`'s part content, or `None`
+    /// for a block this client never saw stream (e.g. replay-only reasoning).
+    fn banked_duration(ctx: &MaterializeContext) -> Option<Duration> {
+        let part = ctx.part?;
+        let PartSource::Reasoning { reasoning, .. } = &part.source else {
+            return None;
+        };
+        reasoning.duration_ms.map(Duration::from_millis)
+    }
+
+    /// Fold to the finished phase with `elapsed` as the banked duration. The
+    /// value is set unconditionally: a terminal reconciliation may arrive
+    /// after the stream's own finish event and carries the authoritative
+    /// duration.
+    fn turn_finished(&mut self, elapsed: Option<Duration>) {
+        if let ReasoningPhase::Finished { elapsed: current } = &mut self.phase {
+            *current = elapsed;
+        } else {
             self.phase = ReasoningPhase::Finished { elapsed };
         }
         if !self.user_controlled {
@@ -210,12 +299,9 @@ impl ReasoningRenderer {
         let Some(elapsed) = elapsed else {
             return t!("chat.reasoning.completed").to_string();
         };
-        // One decimal, floored at 0.1s: a sub-100ms trace is real but reads as
-        // "0 seconds", which looks like a bug rather than a fast model.
-        let seconds = elapsed.as_secs_f64().max(0.1);
         t!(
             "chat.reasoning.finished",
-            duration = format!("{seconds:.1}")
+            duration = format_reasoning_duration(elapsed)
         )
         .to_string()
     }
@@ -233,10 +319,10 @@ impl ReasoningRenderer {
     #[cfg(test)]
     pub(crate) fn toggle_for_test(&mut self) {
         self.user_controlled = true;
-        self.disclosure = if self.disclosure == ReasoningDisclosure::Budgeted {
+        self.disclosure = if self.disclosure == ReasoningDisclosure::Expanded {
             ReasoningDisclosure::Collapsed
         } else {
-            ReasoningDisclosure::Budgeted
+            ReasoningDisclosure::Expanded
         };
     }
 
@@ -246,6 +332,11 @@ impl ReasoningRenderer {
             ReasoningPhase::Streaming => None,
             ReasoningPhase::Finished { elapsed } => elapsed,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn label_for_test(&self) -> String {
+        self.label()
     }
 
     #[cfg(test)]
@@ -288,7 +379,7 @@ impl ReasoningRenderer {
     }
 
     /// How far the body's own viewport can scroll, i.e. how much content the
-    /// height budget is hiding. Non-zero means the budget engaged.
+    /// height cap is hiding. Non-zero means the cap engaged.
     #[cfg(test)]
     pub(crate) fn scroll_max_offset(&self) -> gpui::Pixels {
         self.scroll_max().y
@@ -304,6 +395,14 @@ impl ReasoningRenderer {
     pub(crate) fn is_scrollable(&self) -> bool {
         self.scroll.is_some()
     }
+
+    /// The painted natural height of the expanded body, once its natural
+    /// form has painted. A trace pre-clamped from its source length never
+    /// paints natural, so this stays `None` there.
+    #[cfg(test)]
+    pub(crate) fn natural_height_for_test(&self) -> Option<gpui::Pixels> {
+        self.natural_height
+    }
 }
 
 impl RowRenderer for ReasoningRenderer {
@@ -317,29 +416,32 @@ impl RowRenderer for ReasoningRenderer {
         self.ui_id = ctx.row_id.part.as_u64();
         if let Some(part) = ctx.part {
             self.content_index = part.content_index;
-            if let PartSource::Reasoning { reasoning, .. } = &part.source {
-                // A live insert seeds empty: stream batches publish Insert
-                // then Append after the model already carries the delta, and
-                // the following Append replays the accumulated source (P1
-                // empty-seed rule). A late materialization (cold restore
-                // mid-stream, first layout) re-reads the accumulated content
-                // so no prefix is lost.
-                self.display = if part.finished || !ctx.append_replays_part {
-                    reasoning.display.clone()
+            // A live insert seeds empty: stream batches publish Insert
+            // then Append after the model already carries the delta, and
+            // the following Append replays the accumulated source (P1
+            // empty-seed rule). A late materialization (cold restore
+            // mid-stream, first layout) re-reads the accumulated content
+            // so no prefix is lost.
+            let duration = if let PartSource::Reasoning { reasoning, .. } = &part.source {
+                if part.finished || !ctx.append_replays_part {
+                    self.display = reasoning.display.clone();
                 } else {
-                    String::new()
-                };
-            }
+                    self.display = String::new();
+                }
+                reasoning.duration_ms.map(Duration::from_millis)
+            } else {
+                None
+            };
             if part.finished {
-                self.phase = ReasoningPhase::Finished { elapsed: None };
-                self.started_at = None;
+                // Historical content: the duration banked on the persisted
+                // message is the only timing there is (R7).
+                self.phase = ReasoningPhase::Finished { elapsed: duration };
             } else if matches!(self.phase, ReasoningPhase::Finished { .. }) {
                 self.phase = ReasoningPhase::Streaming;
             }
-            if matches!(self.phase, ReasoningPhase::Streaming) && self.started_at.is_none() {
-                self.started_at = Some(Instant::now());
-            }
         }
+        // A fresh body has no painted natural height yet.
+        self.natural_height = None;
         self.build_body(cx);
         self.materialized = true;
     }
@@ -348,6 +450,7 @@ impl RowRenderer for ReasoningRenderer {
         self.body = None;
         self.scroll = None;
         self.smooth.cancel_motion();
+        self.natural_height = None;
         self.materialized = false;
     }
 
@@ -373,7 +476,11 @@ impl RowRenderer for ReasoningRenderer {
                 if let Some(body) = self.body.as_mut() {
                     body.finish(cx);
                 }
-                self.turn_finished();
+                // The transcript already banked the coalescer's duration on
+                // the part before publishing this event, so re-reading the
+                // part is the same read the renderer would have done at
+                // materialize time (R10).
+                self.turn_finished(Self::banked_duration(ctx));
             }
             RowChange::Replace => {
                 // Reuse semantics: keep the markdown entity when the part
@@ -389,6 +496,8 @@ impl RowRenderer for ReasoningRenderer {
                 if let Some(body) = self.body.as_mut() {
                     if self.display != next {
                         body.set_text(&next, cx);
+                        // The replacement's natural height is unknown again.
+                        self.natural_height = None;
                     }
                     if now_finished {
                         body.finish(cx);
@@ -399,7 +508,16 @@ impl RowRenderer for ReasoningRenderer {
                 }
                 self.display = next;
                 if now_finished {
-                    self.turn_finished();
+                    // Terminal reconciliation: the authoritative message
+                    // carries the gateway-banked duration and it wins; a
+                    // message without timing leaves whatever the stream
+                    // already banked on the part.
+                    let banked = Self::banked_duration(ctx);
+                    let elapsed = match self.phase {
+                        ReasoningPhase::Streaming => banked,
+                        ReasoningPhase::Finished { elapsed } => banked.or(elapsed),
+                    };
+                    self.turn_finished(elapsed);
                 }
                 self.follow_tail();
             }
@@ -440,24 +558,13 @@ impl RowRenderer for ReasoningRenderer {
     }
 
     fn toggle_disclosure(&mut self, target: DisclosureTarget, _cx: &mut App) {
-        match target {
-            DisclosureTarget::Reasoning => {
-                self.user_controlled = true;
-                self.disclosure = if self.disclosure == ReasoningDisclosure::Budgeted {
-                    ReasoningDisclosure::Collapsed
-                } else {
-                    ReasoningDisclosure::Budgeted
-                };
-            }
-            DisclosureTarget::ReasoningFull => {
-                self.user_controlled = true;
-                self.disclosure = if self.disclosure == ReasoningDisclosure::Full {
-                    ReasoningDisclosure::Budgeted
-                } else {
-                    ReasoningDisclosure::Full
-                };
-            }
-            _ => {}
+        if target == DisclosureTarget::Reasoning {
+            self.user_controlled = true;
+            self.disclosure = if self.disclosure == ReasoningDisclosure::Expanded {
+                ReasoningDisclosure::Collapsed
+            } else {
+                ReasoningDisclosure::Expanded
+            };
         }
     }
 
@@ -476,9 +583,11 @@ impl RowRenderer for ReasoningRenderer {
         }
     }
 
-    fn requests_windowed_layout(&self) -> bool {
-        self.natural_height_body()
-            .is_some_and(|body| typography::windowed_body(self.display.len(), body.block_count()))
+    fn note_body_height(&mut self, height: Pixels, cap: Pixels) -> bool {
+        let was_clamped = self.natural_height.is_some_and(|previous| previous > cap);
+        let now_clamped = height > cap;
+        self.natural_height = Some(height);
+        now_clamped != was_clamped
     }
 
     #[cfg(test)]
@@ -502,7 +611,7 @@ impl ReasoningRenderer {
     ) -> AnyElement {
         let theme = cx.theme();
         let background = theme.background;
-        let rail = crate::appearance::contrast::pane_outline(theme.border, cx);
+        let card_outline = crate::appearance::contrast::pane_outline(theme.border, cx);
         let text_color =
             crate::appearance::contrast::text_on(theme.group_box_foreground, background, cx);
         let line_height = window.line_height();
@@ -522,11 +631,22 @@ impl ReasoningRenderer {
         let dispatch = ctx.dispatch.clone();
         let content_index = self.content_index;
 
+        // The streaming preview keeps the pre-refactor card: outlined, no
+        // fill, clipped (R9). The horizontal padding lives on the scrollable
+        // TextView itself so its absolutely positioned scrollbar is measured
+        // against the full card width and lands in the right-hand gutter
+        // instead of over the text. Vertical padding is deliberately absent:
+        // the preview is a window on the tail-following stream, and a padded
+        // tail viewport defeats the native nested-scroll replay (the wheel
+        // gesture re-pins to the padding-extended tail instead of moving).
         div()
+            .relative()
             .w_full()
-            .border_l_2()
-            .border_color(rail)
-            .pl_3()
+            .rounded(cx.theme().radius)
+            .border_1()
+            .border_color(card_outline)
+            .overflow_hidden()
+            .debug_selector(move || block_selector("card", content_index))
             .child(
                 div()
                     .id(ElementId::NamedInteger(
@@ -558,7 +678,8 @@ impl ReasoningRenderer {
                             .child(
                                 body.scrollable_text_view(typography::reasoning(cx))
                                     .text_sm()
-                                    .text_color(text_color),
+                                    .text_color(text_color)
+                                    .px_3(),
                             ),
                     )
                     .when(show_fade, |this| {
@@ -591,48 +712,42 @@ impl ReasoningRenderer {
     ) -> AnyElement {
         let theme = cx.theme();
         let background = theme.background;
-        let rail = crate::appearance::contrast::pane_outline(theme.border, cx);
+        let card_outline = crate::appearance::contrast::pane_outline(theme.border, cx);
         let text_color =
             crate::appearance::contrast::text_on(theme.group_box_foreground, background, cx);
+        // The disclosure's secondary tier: derived like the sidebar's quiet
+        // labels — the colour first clears the body-text floor on the pane,
+        // then the strength lowers it below the body tier so it reads as
+        // visibly "faded" in both light and dark themes (R4). Hovering the
+        // trigger lifts the tier back to the floor-cleared base (R8).
+        let header_base =
+            crate::appearance::contrast::text_on(theme.muted_foreground, background, cx);
+        let header_text = crate::appearance::contrast::transcript_muted_text(cx, 0.6);
+        let hover_text = header_base;
         let line_height = window.line_height();
-        let budget_height = (line_height * typography::BUDGET_MIN_LINES)
-            .max(ctx.viewport_height * typography::BUDGET_VIEWPORT_RATIO);
+        let cap = typography::reasoning_cap(line_height, ctx.viewport_height);
         let expanded = self.disclosure != ReasoningDisclosure::Collapsed;
-        let full = self.disclosure == ReasoningDisclosure::Full;
+        let clamped = self.expanded_uses_clamped_viewport(body, cap, line_height);
 
         let ui_id = self.ui_id;
         let content_index = self.content_index;
         let hover_group: SharedString = format!("turn-reasoning-{ui_id}").into();
         let label = self.label();
+        let focus_ring = theme.ring.opacity(0.2);
 
         let dispatch_toggle = ctx.dispatch.clone();
         let row_id = ctx.row_id;
-        let on_toggle = Rc::new(
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                dispatch_toggle.send(
-                    RowAction::ToggleDisclosure {
-                        row_id,
-                        target: DisclosureTarget::Reasoning,
-                    },
-                    window,
-                    cx,
-                );
-            },
-        );
-
-        let dispatch_full = ctx.dispatch.clone();
-        let on_toggle_full = Rc::new(
-            move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-                dispatch_full.send(
-                    RowAction::ToggleDisclosure {
-                        row_id,
-                        target: DisclosureTarget::ReasoningFull,
-                    },
-                    window,
-                    cx,
-                );
-            },
-        );
+        type ToggleFn = Rc<dyn Fn(&mut Window, &mut App)>;
+        let on_toggle: ToggleFn = Rc::new(move |window: &mut Window, cx: &mut App| {
+            dispatch_toggle.send(
+                RowAction::ToggleDisclosure {
+                    row_id,
+                    target: DisclosureTarget::Reasoning,
+                },
+                window,
+                cx,
+            );
+        });
 
         type CopyValue = Rc<dyn Fn(&mut Window, &mut App) -> SharedString>;
         let dispatch_copy = ctx.dispatch.clone();
@@ -660,6 +775,26 @@ impl ReasoningRenderer {
             },
         );
 
+        // A keyed tab-stop focus handle for the trigger row, stable across
+        // list splices through the part's ui id (Custom Clickable Rows).
+        let focus_handle = window
+            .use_keyed_state(
+                ElementId::NamedInteger("turn-reasoning-toggle".into(), ui_id),
+                cx,
+                |_, cx| cx.focus_handle(),
+            )
+            .read(cx)
+            .clone();
+        let toggle_id = ElementId::NamedInteger("turn-reasoning-toggle".into(), ui_id);
+        let aria_label: SharedString = if expanded {
+            t!("chat.reasoning.collapse").to_string()
+        } else {
+            t!("chat.reasoning.expand").to_string()
+        }
+        .into();
+        let on_toggle_key = on_toggle.clone();
+        let on_toggle_click = on_toggle.clone();
+
         v_flex()
             // Hover scope for the copy button, covering the trigger row and
             // the expanded body — hovering either reveals it.
@@ -672,49 +807,59 @@ impl ReasoningRenderer {
                     .gap_1()
                     .items_center()
                     .child(
-                        // The trigger is a flex item on the main axis, so it
-                        // stays at its intrinsic width instead of stretching
-                        // across the column. Ceiling for a label some locale
-                        // makes long enough to reach the column edge — it
-                        // truncates there instead of widening the message.
-                        Button::new(ElementId::NamedInteger(
-                            "turn-reasoning-toggle".into(),
-                            ui_id,
-                        ))
-                        .ghost()
-                        .small()
-                        .max_w_full()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .debug_selector(move || block_selector("trigger", content_index))
-                        .child(div().min_w_0().text_ellipsis().child(label))
-                        .tooltip(if expanded {
-                            t!("chat.reasoning.collapse").to_string()
-                        } else {
-                            t!("chat.reasoning.expand").to_string()
-                        })
-                        .on_click(move |event, window, cx| on_toggle(event, window, cx)),
-                    )
-                    .child(
-                        Button::new(ElementId::NamedInteger(
-                            "turn-reasoning-full-toggle".into(),
-                            ui_id,
-                        ))
-                        .ghost()
-                        .small()
-                        .compact()
-                        .label(if full {
-                            t!("chat.reasoning.collapse_all").to_string()
-                        } else {
-                            t!("chat.reasoning.expand_all").to_string()
-                        })
-                        .tooltip(if full {
-                            t!("chat.reasoning.collapse_all").to_string()
-                        } else {
-                            t!("chat.reasoning.expand_all").to_string()
-                        })
-                        .debug_selector(move || block_selector("full", content_index))
-                        .on_click(move |event, window, cx| on_toggle_full(event, window, cx)),
+                        // The disclosure trigger (R4): a quiet custom
+                        // clickable row — the "Thought for Ns" label with a
+                        // trailing chevron, like the sidebar's section
+                        // headers, in the pane's muted secondary tier —
+                        // instead of a button. `h_flex` is load-bearing: a
+                        // bare `div()` defaults to block layout in this fork
+                        // and stacks its children vertically. The trigger is
+                        // a flex item on the main axis, so it stays at its
+                        // intrinsic width instead of stretching across the
+                        // column; the label truncates if some locale makes it
+                        // long enough to reach the column edge.
+                        h_flex()
+                            .id(toggle_id)
+                            .debug_selector(move || block_selector("trigger", content_index))
+                            .role(Role::Button)
+                            .aria_label(aria_label)
+                            .aria_expanded(expanded)
+                            .track_focus(&focus_handle.tab_stop(true))
+                            .focus_visible(move |this| this.border_1().border_color(focus_ring))
+                            .items_center()
+                            .gap_0p5()
+                            .min_w_0()
+                            .max_w_full()
+                            .overflow_hidden()
+                            .text_sm()
+                            .text_color(header_text)
+                            // The trigger reads as clickable while hovered:
+                            // the quiet tier lifts to its floor-cleared base
+                            // colour — text highlight, not a background tint
+                            // (R8). No padding — the label stays flush with
+                            // the prose column (R4).
+                            .hover(move |this| this.text_color(hover_text))
+                            // Desktop default cursor, per the Custom Clickable
+                            // Rows contract (the arrow every other custom row
+                            // uses, not a link hand).
+                            .cursor_default()
+                            .on_key_down(
+                                move |event: &KeyDownEvent, window: &mut Window, cx: &mut App| {
+                                    if crate::ui::consume_button_key(event, window, cx) {
+                                        on_toggle_key(window, cx);
+                                    }
+                                },
+                            )
+                            .on_click(move |_, window: &mut Window, cx: &mut App| {
+                                on_toggle_click(window, cx)
+                            })
+                            .flex_none()
+                            .child(div().min_w_0().text_ellipsis().child(label))
+                            .child(Icon::new(if expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })),
                     )
                     // Nothing to put on the clipboard until the block's
                     // stream ends: a copy offered mid-stream would freeze a
@@ -729,26 +874,30 @@ impl ReasoningRenderer {
                         ))
                     }),
             )
-            .when(self.disclosure == ReasoningDisclosure::Budgeted, |this| {
-                // `relative` is load-bearing: the scrollable TextView attaches
-                // an absolutely-positioned scrollbar overlay that needs a
-                // positioning context, exactly like the transcript's own
-                // scrollbar host.
+            .when(expanded && clamped, |this| {
+                // The cap engaged: a fixed-height viewport with the body's
+                // own internal scrollbar, inside the outlined card (R9). The
+                // horizontal padding lives on the scrollable TextView so its
+                // scrollbar is measured against the full card width and
+                // lands in the right-hand gutter instead of over the text.
                 this.child(
                     div()
-                        .id(ElementId::NamedInteger(
-                            "turn-reasoning-body".into(),
-                            self.ui_id,
-                        ))
-                        .debug_selector(move || block_selector("body", content_index))
                         .relative()
                         .w_full()
-                        .border_l_2()
-                        .border_color(rail)
-                        .pl_3()
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(card_outline)
+                        .overflow_hidden()
+                        .debug_selector(move || block_selector("card", content_index))
                         .child(
                             div()
-                                .h(budget_height)
+                                .id(ElementId::NamedInteger(
+                                    "turn-reasoning-body".into(),
+                                    self.ui_id,
+                                ))
+                                .debug_selector(move || block_selector("body", content_index))
+                                .w_full()
+                                .h(cap)
                                 .on_scroll_wheel(move |event: &ScrollWheelEvent, window, cx| {
                                     on_scroll(event, window, cx);
                                 })
@@ -762,27 +911,50 @@ impl ReasoningRenderer {
                                         .child(
                                             body.scrollable_text_view(typography::reasoning(cx))
                                                 .text_sm()
-                                                .text_color(text_color),
+                                                .text_color(text_color)
+                                                .px_3()
+                                                .py_2(),
                                         ),
                                 ),
                         ),
                 )
             })
-            .when(full, |this| {
-                // Natural height, no inner scrollbar; long sources use
-                // windowed block measurement.
+            .when(expanded && !clamped, |this| {
+                // Natural height: content at or below the cap renders at its
+                // own height with no inner scrollbar, inside the outlined
+                // card (R9). The wrapper reports its painted height back so
+                // the form can clamp the moment the content outgrows the cap.
+                let dispatch_measure = ctx.dispatch.clone();
                 this.child(
                     div()
+                        .relative()
                         .w_full()
-                        .border_l_2()
-                        .border_color(rail)
-                        .pl_3()
-                        .text_sm()
-                        .text_color(text_color)
-                        .debug_selector(move || block_selector("body", content_index))
+                        .rounded(cx.theme().radius)
+                        .border_1()
+                        .border_color(card_outline)
+                        .overflow_hidden()
+                        .debug_selector(move || block_selector("card", content_index))
                         .child(
-                            body.text_view(typography::reasoning(cx))
-                                .windowed(self.requests_windowed_layout()),
+                            div()
+                                .w_full()
+                                .text_sm()
+                                .text_color(text_color)
+                                .debug_selector(move || block_selector("body", content_index))
+                                .on_prepaint(
+                                    move |bounds: gpui::Bounds<Pixels>,
+                                          window: &mut Window,
+                                          cx: &mut App| {
+                                        dispatch_measure.send(
+                                            RowAction::BodyMeasured {
+                                                row_id,
+                                                height: bounds.size.height,
+                                            },
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )
+                                .child(body.text_view(typography::reasoning(cx)).px_3().py_2()),
                         ),
                 )
             })

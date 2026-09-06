@@ -1,6 +1,7 @@
 //! Runtime ownership for one durable conversation.
 
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use futures::channel::oneshot;
 use gpui::{Context, Entity, EventEmitter, Task};
@@ -275,6 +276,9 @@ pub(crate) enum ConversationStreamEvent {
         content_index: usize,
         id: String,
         replay: Option<ReplayMetadata>,
+        /// How long the reasoning block streamed, stamped at enqueue time by
+        /// the coalescer (arrival-to-arrival, unaffected by drain pacing).
+        duration: Option<Duration>,
     },
     ReasoningSnapshotUpdated {
         content_index: usize,

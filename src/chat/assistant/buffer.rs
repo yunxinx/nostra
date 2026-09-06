@@ -1,5 +1,7 @@
 //! Grapheme-safe buffering and paced stream flush state.
 
+use std::time::Instant;
+
 use super::*;
 
 use std::collections::{HashMap, VecDeque};
@@ -42,6 +44,10 @@ pub(super) enum StreamDelta {
         content_index: usize,
         id: String,
         replay: Option<crate::llm::ReplayMetadata>,
+        /// How long the block streamed, stamped at enqueue time (see
+        /// [`PendingDeltas::push`]). `None` when no start was recorded on
+        /// this buffer.
+        duration: Option<Duration>,
     },
     ReasoningSnapshotUpdated {
         content_index: usize,
@@ -489,10 +495,33 @@ pub(super) struct PendingDeltas {
     paced: bool,
     held_tail_once: bool,
     reveal_boundaries: HashMap<(usize, String), RevealBoundary>,
+    /// Per-block reasoning start times, recorded when the block's start event
+    /// is enqueued and consumed by its finish event. Both stamps therefore
+    /// land at event arrival — before the queue's pacing — so the block's
+    /// duration measures the stream itself, not the drain.
+    reasoning_started_at: HashMap<(usize, String), Instant>,
 }
 
 impl PendingDeltas {
-    pub(super) fn push(&mut self, delta: StreamDelta) -> FlushAction {
+    pub(super) fn push(&mut self, mut delta: StreamDelta) -> FlushAction {
+        match &mut delta {
+            StreamDelta::ReasoningStarted { content_index, id } => {
+                self.reasoning_started_at
+                    .insert((*content_index, id.clone()), Instant::now());
+            }
+            StreamDelta::ReasoningFinished {
+                content_index,
+                id,
+                duration,
+                ..
+            } => {
+                *duration = self
+                    .reasoning_started_at
+                    .remove(&(*content_index, id.clone()))
+                    .map(|started| started.elapsed());
+            }
+            _ => {}
+        }
         let summary = delta.grapheme_summary();
         self.paced |= summary.is_some_and(|summary| summary.count > DIRECT_FOLLOW_CHUNK_GRAPHEMES);
         // Re-segment the new authoritative tail together with the carried

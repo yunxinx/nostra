@@ -230,7 +230,7 @@ fn requested_windowed_layout_does_not_reuse_inactive_completion(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn reasoning_height_dependency_tracks_its_natural_height_disclosure(cx: &mut TestAppContext) {
+fn reasoning_height_dependency_tracks_its_expanded_disclosure(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     cx.update(|cx| {
         for finished in [false, true] {
@@ -242,6 +242,7 @@ fn reasoning_height_dependency_tracks_its_natural_height_disclosure(cx: &mut Tes
                     reasoning: crate::llm::ReasoningContent {
                         display: "x".repeat(super::typography::WINDOWED_SOURCE_BYTES),
                         replay: None,
+                        duration_ms: None,
                     },
                     stream_id: String::new(),
                 },
@@ -254,19 +255,66 @@ fn reasoning_height_dependency_tracks_its_natural_height_disclosure(cx: &mut Tes
             let body_id = renderer.body_entity_id().expect("reasoning body");
             assert!(layout_dependency_ids(&renderer).is_empty());
             assert!(renderer.is_layout_complete());
-            renderer.toggle_disclosure(DisclosureTarget::ReasoningFull, cx);
+            renderer.toggle_disclosure(DisclosureTarget::Reasoning, cx);
             assert_eq!(
                 layout_dependency_ids(&renderer),
                 if finished { vec![body_id] } else { Vec::new() },
-                "streaming remains a fixed-height preview even with Full disclosure"
+                "streaming remains a fixed-height preview even when expanded"
             );
-            assert_eq!(renderer.requests_windowed_layout(), finished);
+            assert!(!renderer.requests_windowed_layout());
             assert_eq!(renderer.is_layout_complete(), !finished);
-            renderer.toggle_disclosure(DisclosureTarget::ReasoningFull, cx);
+            renderer.toggle_disclosure(DisclosureTarget::Reasoning, cx);
             assert!(layout_dependency_ids(&renderer).is_empty());
             assert!(renderer.is_layout_complete());
             assert_eq!(renderer.body_entity_id(), Some(body_id));
         }
+    });
+}
+
+/// The expanded body clamps exactly when its painted natural height crosses
+/// the cap, and the clamp decision latches: a repeated report cannot flip it
+/// back and forth while the deferred remeasure converges.
+#[gpui::test]
+fn reasoning_clamps_once_the_painted_body_exceeds_the_cap(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let presentation = MarkdownPresentation::for_test(cx);
+        let part = Part {
+            part_id: PartId::from_u64_for_test(1),
+            content_index: 0,
+            source: PartSource::Reasoning {
+                reasoning: crate::llm::ReasoningContent {
+                    display: "a modest trace".into(),
+                    replay: None,
+                    duration_ms: None,
+                },
+                stream_id: String::new(),
+            },
+            finished: true,
+        };
+        let mut ctx = activity_ctx(&part, None, &presentation);
+        ctx.row_id = RowId::new(ctx.row_id.turn, part.part_id, RowKind::Reasoning);
+        let mut renderer = super::ReasoningRenderer::new();
+        renderer.materialize(&ctx, cx);
+        renderer.toggle_disclosure(DisclosureTarget::Reasoning, cx);
+
+        let cap = px(300.);
+        assert!(
+            !renderer.note_body_height(px(120.), cap),
+            "content below the cap keeps the natural form"
+        );
+        assert!(
+            renderer.note_body_height(px(400.), cap),
+            "the first report above the cap must flip to the clamped form"
+        );
+        assert!(
+            !renderer.note_body_height(px(400.), cap),
+            "a repeated report must not re-flip the form"
+        );
+        assert!(
+            renderer.note_body_height(px(280.), cap),
+            "a report back below the cap must return the form to natural height"
+        );
     });
 }
 
@@ -697,4 +745,35 @@ fn short_activity_runs_stay_individual(cx: &mut TestAppContext) {
             vec![RowKind::ToolActivity, RowKind::ToolActivity],
         );
     });
+}
+
+/// R7: the trigger duration format adapts across its three tiers, with the
+/// zero-value units omitted and ASCII digits throughout.
+#[test]
+fn reasoning_duration_formats_seconds_minutes_and_hours() {
+    use std::time::Duration;
+
+    use super::reasoning::format_reasoning_duration;
+
+    assert_eq!(format_reasoning_duration(Duration::ZERO), "0 s");
+    assert_eq!(format_reasoning_duration(Duration::from_millis(999)), "0 s");
+    assert_eq!(format_reasoning_duration(Duration::from_secs(59)), "59 s");
+    assert_eq!(format_reasoning_duration(Duration::from_secs(60)), "1 m");
+    assert_eq!(
+        format_reasoning_duration(Duration::from_secs(61)),
+        "1 m 1 s"
+    );
+    assert_eq!(
+        format_reasoning_duration(Duration::from_secs(3_599)),
+        "59 m 59 s"
+    );
+    assert_eq!(format_reasoning_duration(Duration::from_secs(3_600)), "1 h");
+    assert_eq!(
+        format_reasoning_duration(Duration::from_secs(3_661)),
+        "1 h 1 m"
+    );
+    assert_eq!(
+        format_reasoning_duration(Duration::from_millis(7_385_000)),
+        "2 h 3 m"
+    );
 }

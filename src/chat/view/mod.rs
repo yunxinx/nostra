@@ -830,6 +830,44 @@ impl TranscriptView {
         self.projection.record_height(row_id, height, key, settled);
     }
 
+    /// R3: a natural-height body inside the row reported its painted height.
+    /// Route it to the row's renderer with the current cap; when the
+    /// renderer's form flips (an expanded reasoning body clamping to its
+    /// scrollable viewport) the row must be remeasured and re-rendered so the
+    /// list converges on the new height.
+    ///
+    /// The report arrives from an element prepaint inside the list's own
+    /// layout, while the list state is borrowed, so the remeasure that
+    /// follows a flip is deferred to the end of the update cycle.
+    fn note_body_height(&mut self, row_id: RowId, height: Pixels, cx: &mut Context<ChatView>) {
+        let Some(ix) = self.projection.row_index(row_id) else {
+            return;
+        };
+        let cap = crate::chat::rows::typography::reasoning_cap(
+            self.typography.line_height,
+            self.viewport_height,
+        );
+        let flipped = self
+            .slots
+            .get_mut(ix)
+            .is_some_and(|slot| slot.renderer.note_body_height(height, cap));
+        if !flipped {
+            return;
+        }
+        self.projection.invalidate_layout(row_id);
+        self.window_dirty = true;
+        let weak = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = weak.update(cx, |this, cx| {
+                let Some(current) = this.view.projection.row_index(row_id) else {
+                    return;
+                };
+                this.view.remeasure_rows(&[current]);
+                this.view.schedule_sync(cx);
+            });
+        });
+    }
+
     /// Replay state for a row's own scrollable viewport, if it has one.
     pub(in crate::chat) fn nested_scroll_replay(
         &mut self,
@@ -881,6 +919,10 @@ impl TranscriptView {
         cx.notify();
     }
 
+    /// Whether the scroll state would show the jump affordance. This is the
+    /// pure scroll-state half of the render decision; the caller additionally
+    /// gates on the `jump_to_latest_button` preference, which never feeds
+    /// back into the follow-tail state machine.
     pub(in crate::chat) fn show_jump_button(&self) -> bool {
         self.jump_visible
     }
@@ -1116,7 +1158,11 @@ impl ChatView {
         let render_item = cx.processor(move |this, index: usize, window, cx| {
             this.view.render_row(index, window, cx)
         });
-        let show_jump = self.view.show_jump_button();
+        // The jump affordance's *visibility logic* is a pure function of the
+        // scroll state; the preference only gates whether the button is ever
+        // painted. Tail-following itself never changes with the setting.
+        let show_jump =
+            self.preference_snapshot.jump_to_latest_button && self.view.show_jump_button();
         // Record the conversation viewport height for viewport-relative row
         // budgets. The composer height is recorded the same way; a change
         // repaints the list once.
@@ -1346,6 +1392,9 @@ impl ChatView {
                 height,
                 settled,
             } => self.view.record_measured(row_id, height, settled),
+            RowAction::BodyMeasured { row_id, height } => {
+                self.view.note_body_height(row_id, height, cx)
+            }
             RowAction::ToggleDisclosure { row_id, target } => {
                 self.toggle_row_disclosure(row_id, target, window, cx)
             }
@@ -1384,6 +1433,14 @@ impl ChatView {
         let Some(ix) = self.view.projection.row_index(row_id) else {
             return;
         };
+        // R2: a disclosure toggle grows or shrinks the row without the user
+        // scrolling. An active tail-follow would re-anchor the list to its
+        // end on the very layout that changes the row height, pinning the
+        // viewport to the panel's bottom edge instead of letting the panel
+        // expand below the fold. Pausing keeps the `Tail` mode (and its
+        // automatic re-engage at the bottom) while freezing the current
+        // scroll position. No-op when the list is not following.
+        self.view.list_state.pause_following_tail();
         if let Some(slot) = self.view.slots.get_mut(ix) {
             slot.renderer.toggle_disclosure(target, cx);
             slot.observe_layout(row_id, cx);

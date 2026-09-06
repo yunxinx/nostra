@@ -86,13 +86,12 @@ impl RowId {
 }
 
 /// Disclosure form of a reasoning row: a finished trace is either a collapsed
-/// trigger, a viewport bounded by the height budget, or natural full height.
+/// trigger row or an expanded body at `min(natural height, cap)`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ReasoningDisclosure {
     #[default]
     Collapsed,
-    Budgeted,
-    Full,
+    Expanded,
 }
 
 /// Disclosure form of one tool activity row: the body is either folded or
@@ -118,7 +117,7 @@ impl ActivityDisclosure {
 }
 
 /// Per-row disclosure kept on the projection so it survives renderer release
-/// and cold rebuilds. `reasoning` carries the reasoning row's tri-state,
+/// and cold rebuilds. `reasoning` carries the reasoning row's two-state fold,
 /// `activity` the tool activity row's two-stage fold, and `group_open` the
 /// expanded/collapsed state of a tool-activity group row.
 /// `reasoning_user_controlled` records that the user worked a reasoning

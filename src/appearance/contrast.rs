@@ -269,6 +269,16 @@ pub(crate) fn sidebar_muted_text(cx: &App, strength: f32) -> Hsla {
     sidebar_text(cx).opacity(strength)
 }
 
+/// Secondary transcript text — the reasoning disclosure header's chevron and
+/// "Thought for Ns" label. Same hierarchy rule as [`sidebar_muted_text`]:
+/// the colour first clears the body-text floor on the conversation pane,
+/// then the strength lowers it below the body tier. Deriving from the floor
+/// rather than opacifying the raw theme colour keeps the quiet tier tracking
+/// the body text when a palette moves, instead of drifting into the pane.
+pub(crate) fn transcript_muted_text(cx: &App, strength: f32) -> Hsla {
+    text_on(cx.theme().muted_foreground, cx.theme().background, cx).opacity(strength)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,30 +431,57 @@ mod tests {
     }
 
     /// The transcript row pairings with no divider between them: the
-    /// reasoning rail, the tool-activity header against its body, the step
-    /// stack header, and the hover-revealed turn-actions bar. Every fill and
-    /// outline goes through the same derivation the renderers call, so the
-    /// assertion tracks the views instead of restating them.
+    /// reasoning card's outline, the reasoning header's quiet text on the
+    /// pane, the tool-activity header against its body, and the step stack
+    /// header. Every fill and outline
+    /// goes through the same derivation the renderers call, so the assertion
+    /// tracks the views instead of restating them. (The turn-actions bar and
+    /// the reasoning trigger carry no background of their own — the trigger's
+    /// hover is a text-colour lift to its floor-cleared base, covered by the
+    /// header-tier assertions below.)
     #[gpui::test]
     fn transcript_row_surfaces_hold_their_pairings_in_every_theme(cx: &mut TestAppContext) {
         with_every_bundled_theme(cx, |name, cx| {
             let theme = cx.theme();
             let pane = theme.background;
 
-            // The reasoning rail is a bare 2px line against the pane.
-            let rail = pane_outline(theme.border, cx);
-            let rail_reads = ratio(rail, pane);
+            // The reasoning card (streaming preview and expanded body) is an
+            // outlined, unfilled card: the 1px border is what delimits it.
+            let card_outline = pane_outline(theme.border, cx);
+            let outline_reads = ratio(card_outline, pane);
             assert!(
-                rail_reads >= MIN_OUTLINE_CONTRAST,
-                "{name}: the reasoning rail reads at {rail_reads:.3} on the pane"
+                outline_reads >= MIN_OUTLINE_CONTRAST,
+                "{name}: the reasoning card outline reads at {outline_reads:.3} on the pane"
             );
 
-            // Tool-activity and step-stack headers, and the actions bar,
-            // share one recipe: a muted block on the pane, body text on it.
+            // The reasoning disclosure header (the "Thought for Ns" label
+            // with its trailing chevron) is the transcript's quiet tier: the
+            // base colour clears the body-text floor on the pane, and the
+            // strength applied by the renderer keeps it below the body tier.
+            let header_base = text_on(theme.muted_foreground, pane, cx);
+            let base_reads = ratio(header_base, pane);
+            assert!(
+                clears(base_reads, header_base, MIN_BODY_TEXT_CONTRAST),
+                "{name}: the reasoning header base reads at {base_reads:.2} on the pane"
+            );
+            let header_applied = transcript_muted_text(cx, 0.6);
+            // Hover lifts the trigger's text back to the base tier: brighter
+            // than the applied quiet tier (the click affordance).
+            let applied_reads = ratio(opaque(pane, header_applied), pane);
+            assert!(
+                applied_reads < base_reads,
+                "{name}: the applied reasoning header ({applied_reads:.2}) must stay quieter                  than its floor-cleared base ({base_reads:.2})"
+            );
+            assert!(
+                applied_reads > 1.,
+                "{name}: the applied reasoning header must still be visible"
+            );
+
+            // Tool-activity and step-stack headers share one recipe: a muted
+            // block on the pane, body text on it.
             for (label, text_base) in [
                 ("activity header", theme.foreground),
                 ("group header", theme.foreground),
-                ("actions bar", theme.muted_foreground),
             ] {
                 let header = pane_block(theme.muted, cx);
                 let header_reads = ratio(header, pane);

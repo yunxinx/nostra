@@ -1062,6 +1062,67 @@ fn jumping_to_latest_follows_the_tail_and_parks_hover(cx: &mut TestAppContext) {
     );
 }
 
+/// Disabling the "back to latest" preference hides the button without
+/// touching the scroll-state machine: the visibility flag keeps tracking the
+/// tail, so re-enabling the preference brings the button back immediately.
+#[gpui::test]
+fn the_jump_button_preference_gates_only_the_button(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+
+    // Warm the list layout at the final width, then grow the conversation —
+    // the live-session shape in which the affordance exists.
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::tests::fixtures::seed_completed_exchange(chat, cx);
+        });
+    });
+    redraw_settled(cx);
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::tests::fixtures::seed_large_conversation(chat, 200, 0, cx);
+        });
+    });
+    redraw_settled(cx);
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, _| {
+            chat.view
+                .list_state
+                .set_follow_mode(gpui::FollowMode::Normal);
+            chat.view.list_state.scroll_to(ListOffset::default());
+        });
+    });
+    redraw_settled(cx);
+    assert!(cx.update(|_, cx| chat.read(cx).view.show_jump_button()));
+    assert!(
+        cx.debug_bounds("jump-to-latest").is_some(),
+        "the button renders with the default preference"
+    );
+
+    cx.update(|_, cx| {
+        crate::preferences::update_in_memory(cx, |prefs| prefs.jump_to_latest_button = false);
+    });
+    redraw(cx);
+    assert!(
+        cx.update(|_, cx| chat.read(cx).view.show_jump_button()),
+        "the scroll-state visibility keeps tracking the tail"
+    );
+    assert!(
+        cx.debug_bounds("jump-to-latest").is_none(),
+        "the preference hides the button even off the tail"
+    );
+
+    cx.update(|_, cx| {
+        crate::preferences::update_in_memory(cx, |prefs| prefs.jump_to_latest_button = true);
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("jump-to-latest").is_some(),
+        "re-enabling the preference restores the button without scrolling"
+    );
+}
+
 /// AC6 update side: a declared typography change invalidates the old
 /// measurements, drops the effective height back to the refreshed estimate,
 /// and asks the list to re-measure exactly the affected rows.

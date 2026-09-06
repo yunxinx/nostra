@@ -51,6 +51,7 @@ fn long_content_performance_feedback_loop(cx: &mut TestAppContext) {
                         reasoning: crate::llm::ReasoningContent {
                             display: source,
                             replay: None,
+                            duration_ms: None,
                         },
                     }],
                     provider_metadata: ProviderMetadata::default(),
@@ -352,6 +353,7 @@ fn long_content_performance_feedback_loop_for_assistant_code_and_transcript(
                             reasoning: crate::llm::ReasoningContent {
                                 display: reasoning,
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                         ContentBlock::Text {

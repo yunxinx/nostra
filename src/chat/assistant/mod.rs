@@ -213,6 +213,9 @@ fn project_stream_delta(event: GenerationEvent) -> Option<StreamDelta> {
             content_index,
             id,
             replay,
+            // Stamped at enqueue time by `PendingDeltas::push` from the
+            // buffer's own start table.
+            duration: None,
         }),
         GenerationEvent::ReasoningSnapshotUpdated {
             content_index,
@@ -376,10 +379,12 @@ fn semantic_event(delta: StreamDelta) -> ConversationStreamEvent {
             content_index,
             id,
             replay,
+            duration,
         } => ConversationStreamEvent::ReasoningFinished {
             content_index,
             id,
             replay,
+            duration,
         },
         StreamDelta::ReasoningSnapshotUpdated {
             content_index,

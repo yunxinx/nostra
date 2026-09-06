@@ -116,10 +116,8 @@ pub(crate) struct RowRenderContext {
 /// Which foldable surface a [`RowAction::ToggleDisclosure`] targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisclosureTarget {
-    /// The reasoning trigger row: collapsed chip ↔ budgeted viewport.
+    /// The reasoning trigger row: collapsed chip ↔ expanded body.
     Reasoning,
-    /// The reasoning full-text toggle: budgeted viewport ↔ natural height.
-    ReasoningFull,
     /// A tool activity row's body.
     Activity,
     /// A tool activity row's arguments section, inside an open body.
@@ -154,6 +152,11 @@ pub(crate) enum RowAction {
         height: Pixels,
         settled: bool,
     },
+    /// A natural-height body inside the row was painted at `height` (the
+    /// expanded reasoning body in its unclamped form). The view routes it
+    /// back with the renderer's current height cap so a body taller than the
+    /// cap can switch to its clamped, internally scrollable form.
+    BodyMeasured { row_id: RowId, height: Pixels },
     /// The pointer entered (`entered: true`) or left a row of `turn`.
     /// Directional on purpose: gpui re-evaluates every hover element in one
     /// mouse-move, so a bare `Option<TurnId>` collapses "which row left" into
@@ -236,12 +239,24 @@ pub(crate) trait RowRenderer {
     }
 
     /// Viewport replay state for renderers with their own scrollable
-    /// [`TextView`](crate::ui::markdown) (reasoning preview / budgeted
+    /// [`TextView`](crate::ui::markdown) (reasoning preview / clamped
     /// viewport). The view owns the easing constants, the window-activation
     /// check, and the nested scroll boundary; the renderer owns the follow
     /// flag and the queued distance.
     fn nested_scroll_replay(&mut self) -> Option<NestedScrollReplay<'_>> {
         None
+    }
+
+    /// Update-phase notification that a natural-height body this renderer
+    /// rendered was painted at `height`. `cap` is the height above which the
+    /// renderer must clamp instead. Returns whether the renderer's rendered
+    /// form changed, requiring the owning row to be remeasured. Only the
+    /// natural form reports its height, so in practice this flips a
+    /// disclosure at most once: the clamped form has no reporter until the
+    /// content changes and the renderer starts over.
+    fn note_body_height(&mut self, height: Pixels, cap: Pixels) -> bool {
+        let _ = (height, cap);
+        false
     }
 
     /// Visit every body whose natural height contributes to the current row layout.

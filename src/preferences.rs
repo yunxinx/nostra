@@ -70,6 +70,9 @@ pub struct Preferences {
     pub user_message_markdown: bool,
     /// Whether the conversation transcript eases discrete mouse-wheel input.
     pub smooth_chat_scrolling: bool,
+    /// Whether the conversation shows the "back to latest" jump button above
+    /// the composer. Disabling it never changes tail-following itself.
+    pub jump_to_latest_button: bool,
     /// Whether supported windows use the native macOS blurred backdrop.
     pub glass_effect: bool,
     /// Opacity of the theme tint drawn above the native blurred backdrop.
@@ -140,6 +143,7 @@ impl Default for Preferences {
             composer_font: ComposerFont::default(),
             user_message_markdown: false,
             smooth_chat_scrolling: false,
+            jump_to_latest_button: true,
             glass_effect: false,
             glass_tint_opacity: DEFAULT_GLASS_TINT_OPACITY,
             hide_settings_info_buttons: false,
@@ -713,6 +717,17 @@ mod tests {
         );
         assert!(serde_json::from_value::<Preferences>(missing_smooth_chat_scrolling).is_err());
 
+        let mut missing_jump_to_latest_button =
+            serde_json::to_value(Preferences::default()).expect("serialize preferences");
+        assert!(
+            missing_jump_to_latest_button
+                .as_object_mut()
+                .expect("preferences object")
+                .remove("jump_to_latest_button")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<Preferences>(missing_jump_to_latest_button).is_err());
+
         let mut missing_restore_last_chat =
             serde_json::to_value(Preferences::default()).expect("serialize preferences");
         assert!(
@@ -786,6 +801,7 @@ mod tests {
         assert!(!prefs.detailed_logging);
         assert!(!prefs.user_message_markdown);
         assert!(!prefs.smooth_chat_scrolling);
+        assert!(prefs.jump_to_latest_button);
         assert!(!prefs.code_block_wrap);
         assert_eq!(prefs.code_block_wrap_revision, 0);
         assert!(!prefs.code_block_line_numbers);
@@ -922,6 +938,7 @@ mod tests {
         let prefs = Preferences {
             user_message_markdown: true,
             smooth_chat_scrolling: true,
+            jump_to_latest_button: false,
             code_block_wrap: true,
             code_block_wrap_revision: 7,
             code_block_line_numbers: true,
@@ -934,6 +951,7 @@ mod tests {
         assert!(back.code_block_line_numbers);
         assert!(back.user_message_markdown);
         assert!(back.smooth_chat_scrolling);
+        assert!(!back.jump_to_latest_button);
     }
 
     #[test]

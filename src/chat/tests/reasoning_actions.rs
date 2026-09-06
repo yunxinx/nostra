@@ -12,7 +12,7 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "thinking", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "answer", cx);
         });
     });
@@ -57,6 +57,7 @@ fn manual_toggle_survives_the_auto_collapse(cx: &mut TestAppContext) {
                             reasoning: crate::llm::ReasoningContent {
                                 display: "thinking".into(),
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                         ContentBlock::Text {
@@ -96,7 +97,7 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -120,10 +121,70 @@ fn the_collapsed_trigger_hugs_its_label(cx: &mut TestAppContext) {
         trigger.size.width > px(0.),
         "the trigger must still be wide enough to hit"
     );
+    // The label and its trailing chevron share one line: a bare `div()`
+    // defaults to block layout in this fork and stacks them (the trigger
+    // measured 36.5px tall that way). One line of `text_sm` with a 16px
+    // chevron is well under 30px.
+    assert!(
+        trigger.size.height < px(30.),
+        "the trigger stacked its children vertically ({:?})",
+        trigger.size.height
+    );
+}
+
+/// Clicking the trigger also focuses it (the Custom Clickable Rows contract),
+/// so Enter and Space must activate the disclosure from the keyboard — and
+/// Space must not fall through to the transcript's native scrolling.
+#[gpui::test]
+fn the_reasoning_trigger_activates_with_enter_and_space(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    seed_turn(&chat, cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            test_support::append_reasoning(this, 0, "reasoning-0".into(), "a thought", cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
+            test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
+        });
+    });
+    redraw(cx);
+
+    let before_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("the collapsed trigger was drawn");
+    // The click both toggles and focuses the trigger row.
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+    assert!(
+        cx.update(|_, cx| reasoning_part(chat.read(cx)).is_some_and(|r| r.is_expanded())),
+        "the click must expand the trace"
+    );
+
+    cx.simulate_keystrokes("enter");
+    redraw(cx);
+    assert!(
+        cx.update(|_, cx| reasoning_part(chat.read(cx)).is_some_and(|r| !r.is_expanded())),
+        "Enter must collapse the focused trigger"
+    );
+
+    cx.simulate_keystrokes("space");
+    redraw(cx);
+    assert!(
+        cx.update(|_, cx| reasoning_part(chat.read(cx)).is_some_and(|r| r.is_expanded())),
+        "Space must expand the focused trigger"
+    );
+    let after_scroll = cx.update(|_, cx| chat.read(cx).view.list_state.logical_scroll_top());
+    assert_eq!(after_scroll.item_ix, before_scroll.item_ix);
+    assert_eq!(
+        after_scroll.offset_in_item, before_scroll.offset_in_item,
+        "Space activation must not scroll the transcript"
+    );
 }
 
 /// Clicking the copy button puts the turn's complete reasoning on the
-/// clipboard — the accumulated source, not the seven lines the card happens
+/// clipboard — the accumulated source, not the few lines the card happens
 /// to be showing.
 #[gpui::test]
 fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
@@ -143,7 +204,7 @@ fn the_copy_button_copies_the_whole_reasoning(cx: &mut TestAppContext) {
                 expected.push_str(&delta);
                 test_support::append_reasoning(this, 0, "reasoning-0".into(), &delta, cx);
             }
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -235,7 +296,7 @@ fn the_copy_button_appears_only_once_reasoning_has_ended(cx: &mut TestAppContext
     // The stream boundary is what earns the button.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx)
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx)
         });
     });
     draw(cx);
@@ -272,7 +333,7 @@ fn the_message_copy_button_appears_only_once_the_turn_finished_streaming(cx: &mu
     // streaming, so a copy offered now would freeze a partial answer.
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "The answer.", cx);
         });
     });
@@ -308,7 +369,7 @@ fn the_message_copy_button_copies_the_whole_answer(cx: &mut TestAppContext) {
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "a private thought", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "First part.", cx);
             test_support::append_text(this, 2, "text-1".into(), "Second part.", cx);
             // End the stream so the turn becomes copyable: the copy gate
@@ -408,7 +469,7 @@ fn hovering_a_reasoning_row_reveals_the_message_copy_button(cx: &mut TestAppCont
     cx.update(|_, cx| {
         chat.update(cx, |this, cx| {
             test_support::append_reasoning(this, 0, "reasoning-0".into(), "a private thought", cx);
-            test_support::finish_reasoning(this, 0, "reasoning-0", None, cx);
+            test_support::finish_reasoning(this, 0, "reasoning-0", None, None, cx);
             test_support::append_text(this, 1, "text-0".into(), "The visible answer.", cx);
             test_support::finish_text(this, 1, "text-0", None, cx);
         });

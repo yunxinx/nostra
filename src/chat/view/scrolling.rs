@@ -3,6 +3,10 @@
 //! Only line-based wheel deltas are eased; pixel-precise deltas stay on the
 //! native path. Inactive windows cancel queued motion instead of scheduling
 //! frames AppKit would throttle (see `quality-guidelines.md`).
+//!
+//! The transcript-scrolling preference setters (`set_smooth_scrolling`,
+//! `set_jump_button`) live here too: both write through the preference
+//! handle and refresh windows; neither touches the follow-tail state machine.
 
 use gpui::{App, Pixels, Window, px};
 
@@ -82,6 +86,22 @@ pub(crate) fn set_smooth_scrolling(
     }
     crate::preferences::update_with(cx, preference_handle, |prefs| {
         prefs.smooth_chat_scrolling = enabled
+    });
+    cx.refresh_windows();
+}
+
+/// Toggle the "back to latest" jump button. Tail-following itself is a
+/// function of the scroll state and never changes with this preference.
+pub(crate) fn set_jump_button(
+    enabled: bool,
+    preference_handle: &crate::preferences::PreferenceHandle,
+    cx: &mut App,
+) {
+    if preference_handle.snapshot().jump_to_latest_button == enabled {
+        return;
+    }
+    crate::preferences::update_with(cx, preference_handle, |prefs| {
+        prefs.jump_to_latest_button = enabled
     });
     cx.refresh_windows();
 }

@@ -21,21 +21,39 @@ use crate::appearance::contrast;
 /// stream, which keeps the prose below it from moving.
 pub(crate) const PREVIEW_LINES: f32 = 6.;
 
-/// Minimum height of a budgeted reasoning viewport, in lines of body text.
+/// Line-count floor of the expanded reasoning height cap, in lines of body
+/// text. The cap is an upper bound: content at or below it renders at its
+/// natural height, taller content scrolls inside a viewport of exactly the
+/// cap (PRD R3).
 pub(crate) const BUDGET_MIN_LINES: f32 = 12.;
 
-/// Fraction of the conversation viewport a budgeted reasoning viewport may
-/// occupy when that is taller than [`BUDGET_MIN_LINES`].
+/// Fraction of the conversation viewport the expanded reasoning height cap
+/// may occupy when that is taller than [`BUDGET_MIN_LINES`] lines.
 pub(crate) const BUDGET_VIEWPORT_RATIO: f32 = 0.45;
+
+/// Height cap of an expanded reasoning body: the larger of the line-count
+/// floor and the viewport share. Tool-result viewports share the same
+/// budget scale.
+pub(crate) fn reasoning_cap(line_height: Pixels, viewport_height: Pixels) -> Pixels {
+    (line_height * BUDGET_MIN_LINES).max(viewport_height * BUDGET_VIEWPORT_RATIO)
+}
+
+/// Conservative characters per body-text line for height pre-estimates:
+/// shared by the row-height estimator and the reasoning expand pre-check so
+/// both agree on how much text a line holds.
+pub(crate) const ESTIMATE_CHARS_PER_LINE: f32 = 62.;
 
 /// Tool results above this many bytes use the budgeted, internally
 /// scrollable viewport instead of natural height.
 pub(crate) const RESULT_BUDGET_BYTES: usize = 8 * 1024;
 
-/// A natural-height prose or reasoning-full body switches to the fork's
-/// windowed block layout past either threshold: source ≥ 64 KiB,
-/// or ≥ 300 blocks for sources the byte gate would miss (many short
-/// paragraphs cost more to lay out than one block of the same bytes).
+/// A natural-height prose body switches to the fork's windowed block layout
+/// past either threshold: source ≥ 64 KiB, or ≥ 300 blocks for sources the
+/// byte gate would miss (many short paragraphs cost more to lay out than one
+/// block of the same bytes). An expanded reasoning body whose source crosses
+/// these thresholds skips natural height entirely and uses the clamped,
+/// internally scrollable viewport, which bounds per-frame layout work by its
+/// own viewport size.
 pub(crate) const WINDOWED_SOURCE_BYTES: usize = 64 * 1024;
 
 /// Block count at which a natural-height row body renders through the

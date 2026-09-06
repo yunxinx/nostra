@@ -97,6 +97,7 @@ fn terminal_message_replaces_streamed_reasoning_projection(cx: &mut TestAppConte
                         reasoning: crate::llm::ReasoningContent {
                             display: "authoritative terminal reasoning".into(),
                             replay: None,
+                            duration_ms: None,
                         },
                     }],
                     provider_metadata: ProviderMetadata::default(),
@@ -134,6 +135,7 @@ fn terminal_message_can_create_a_reasoning_trace(cx: &mut TestAppContext) {
                         reasoning: crate::llm::ReasoningContent {
                             display: "backfilled reasoning".into(),
                             replay: None,
+                            duration_ms: None,
                         },
                     }],
                     provider_metadata: ProviderMetadata::default(),

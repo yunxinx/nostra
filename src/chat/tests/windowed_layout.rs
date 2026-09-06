@@ -190,11 +190,12 @@ fn prose_crosses_into_the_windowed_path_only_above_the_threshold(cx: &mut TestAp
     );
 }
 
-/// Reasoning's budgeted viewport is scrollable (the fork ignores the
-/// windowed flag there), and its full-text form below the threshold is the
-/// natural path.
+/// Reasoning's expanded body clamps to its scrollable viewport once the
+/// content outgrows the cap; the clamped form is never the windowed block
+/// layout (the fork cannot combine windowed block measurement with an
+/// internal-scroll viewport).
 #[gpui::test]
-fn reasoning_full_text_stays_natural_below_the_threshold(cx: &mut TestAppContext) {
+fn reasoning_expanded_body_clamps_below_the_windowed_threshold(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
 
@@ -212,6 +213,7 @@ fn reasoning_full_text_stays_natural_below_the_threshold(cx: &mut TestAppContext
                         reasoning: crate::llm::ReasoningContent {
                             display: source,
                             replay: None,
+                            duration_ms: None,
                         },
                     }],
                     provider_metadata: ProviderMetadata::default(),
@@ -234,34 +236,22 @@ fn reasoning_full_text_stays_natural_below_the_threshold(cx: &mut TestAppContext
         let renderer = reasoning_part(chat.read(cx)).expect("reasoning renderer");
         assert!(
             !renderer.requests_windowed_layout(),
-            "the budgeted viewport is scrollable; the fork ignores windowed there"
+            "the clamped viewport is scrollable; the fork ignores windowed there"
         );
-    });
-
-    chat.update(cx, |this, _| {
-        this.view.list_state.scroll_to(ListOffset::default());
-    });
-    redraw(&chat, cx);
-    let full_toggle = cx
-        .debug_bounds("reasoning-full-0")
-        .expect("full-text toggle");
-    cx.simulate_click(full_toggle.center(), gpui::Modifiers::default());
-    redraw(&chat, cx);
-
-    cx.update(|_, cx| {
-        let renderer = reasoning_part(chat.read(cx)).expect("reasoning renderer");
         assert!(
-            !renderer.requests_windowed_layout(),
-            "a below-threshold full-text body uses natural layout"
+            renderer.scroll_max_offset() > px(0.),
+            "240 paragraphs exceed the cap, so the viewport must be hiding content"
         );
     });
 }
 
-/// The windowed arm of the reasoning full-text form: above the threshold the
-/// Full disclosure reports windowed, so its row measurement records as not
-/// settled while the block cache converges.
+/// Above the windowed thresholds the expanded body clamps as well: the
+/// windowed block layout cannot combine with the internal-scroll viewport,
+/// and the clamped viewport itself bounds per-frame layout work. Its
+/// measurement settles once the parse is installed, because the row height
+/// no longer depends on windowed block measurement.
 #[gpui::test]
-fn reasoning_full_text_flips_windowed_above_the_threshold(cx: &mut TestAppContext) {
+fn reasoning_expanded_body_clamps_above_the_windowed_threshold(cx: &mut TestAppContext) {
     init_app(cx);
     let (chat, cx) = add_chat_window(cx);
 
@@ -276,6 +266,7 @@ fn reasoning_full_text_flips_windowed_above_the_threshold(cx: &mut TestAppContex
                         reasoning: crate::llm::ReasoningContent {
                             display: source,
                             replay: None,
+                            duration_ms: None,
                         },
                     }],
                     provider_metadata: ProviderMetadata::default(),
@@ -295,37 +286,24 @@ fn reasoning_full_text_flips_windowed_above_the_threshold(cx: &mut TestAppContex
     redraw(&chat, cx);
 
     cx.update(|_, cx| {
-        let renderer = reasoning_part(chat.read(cx)).expect("reasoning renderer");
-        assert!(
-            !renderer.requests_windowed_layout(),
-            "budgeted viewport is scrollable"
-        );
-    });
-
-    chat.update(cx, |this, _| {
-        this.view.list_state.scroll_to(ListOffset::default());
-    });
-    redraw(&chat, cx);
-    let full_toggle = cx
-        .debug_bounds("reasoning-full-0")
-        .expect("full-text toggle");
-    cx.simulate_click(full_toggle.center(), gpui::Modifiers::default());
-    redraw(&chat, cx);
-
-    cx.update(|_, cx| {
         let turn = chat.read(cx);
         let renderer = reasoning_part(turn).expect("reasoning renderer");
         assert!(
-            renderer.requests_windowed_layout(),
-            "a source past 64 KiB must render through the windowed block layout"
+            !renderer.requests_windowed_layout(),
+            "an oversized trace clamps to the scrollable viewport; windowed is \
+             incompatible with the internal scroll"
+        );
+        assert!(
+            renderer.scroll_max_offset() > px(0.),
+            "the cap must hide the oversized content behind the internal scroll"
         );
         let confidence = rows_of_kind(turn, RowKind::Reasoning)
             .first()
             .and_then(|row| row.recorded_confidence());
         assert_eq!(
             confidence,
-            Some(Confidence::Measured),
-            "a windowed row's height still converges; it must not record as settled"
+            Some(Confidence::Settled),
+            "a clamped row's height is the cap; it must settle once the parse completes"
         );
     });
 }

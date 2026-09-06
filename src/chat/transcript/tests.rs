@@ -91,6 +91,7 @@ fn stream_lifecycle_retains_part_ids_on_authoritative_replace(cx: &mut TestAppCo
                         content_index: 0,
                         id: "reasoning-0".into(),
                         replay: None,
+                        duration: None,
                     },
                     ConversationStreamEvent::TextStarted {
                         content_index: 1,
@@ -128,6 +129,7 @@ fn stream_lifecycle_retains_part_ids_on_authoritative_replace(cx: &mut TestAppCo
                                 reasoning: ReasoningContent {
                                     display: "thinking".into(),
                                     replay: None,
+                                    duration_ms: None,
                                 },
                             },
                         },
@@ -353,6 +355,7 @@ fn copyable_text_joins_prose_parts(cx: &mut TestAppContext) {
                             reasoning: ReasoningContent {
                                 display: "hidden".into(),
                                 replay: None,
+                                duration_ms: None,
                             },
                         },
                         ContentBlock::Text {
