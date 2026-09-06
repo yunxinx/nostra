@@ -2,7 +2,9 @@ use std::collections::HashSet;
 
 use crate::llm::{Message, ModelSelection, Usage};
 
-use super::super::{Compaction, ConfigChange, EntryId, Reference, TranscriptReplay, TurnResult};
+use super::super::{
+    Compaction, ConfigChange, EntryId, EntryKindTag, Reference, TranscriptReplay, TurnResult,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedMessage {
@@ -36,6 +38,19 @@ pub enum ResolvedContextItem {
         entry_id: EntryId,
         summary: String,
     },
+}
+
+/// Entry metadata for one node of the resolved active path. `byte_offset` /
+/// `byte_len` are present only when a durable byte index backs the store; an
+/// in-memory store has no bytes and pages by entry identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathEntryRecord {
+    pub entry_id: EntryId,
+    pub parent_id: Option<EntryId>,
+    pub kind: EntryKindTag,
+    pub byte_offset: Option<u64>,
+    pub byte_len: Option<u64>,
+    pub timestamp: i64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

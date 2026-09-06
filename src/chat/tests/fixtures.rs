@@ -117,7 +117,11 @@ pub(in crate::chat) fn seed_paged_conversation(chat: &mut ChatView, cx: &mut Con
         ResolvedStateSource::new(state(&["early question", "early reply"])).load_tail(usize::MAX);
     let tail_page =
         ResolvedStateSource::new(state(&["late question", "late reply"])).load_tail(usize::MAX);
-    let cursor = TranscriptCursor { index: 0 };
+    // The cursor is opaque to the model: it only needs to name an entry that
+    // precedes the loaded tail so `has_earlier` reports one more page.
+    let cursor = TranscriptCursor {
+        entry_id: crate::session::EntryId::new(),
+    };
     let update = chat.transcript.update(cx, |transcript, cx| {
         transcript.load(tail_page, Some(cursor), cx)
     });

@@ -1,5 +1,33 @@
 use super::*;
 
+/// Build a full-load restore bundle from a resolved state, mirroring the
+/// production fallback path (design §3.5 step 3).
+fn restore_bundle_from_state(
+    session_id: &SessionId,
+    state: &ResolvedSessionState,
+) -> crate::chat::persistence::restore::ChatSessionRestore {
+    use crate::chat::persistence::restore::next_turn_seed_from_state;
+    use crate::chat::transcript::{ResolvedStateSource, TranscriptSource as _};
+    crate::chat::persistence::restore::ChatSessionRestore {
+        session_id: session_id.clone(),
+        page: ResolvedStateSource::new(state.clone()).load_tail(usize::MAX),
+        cursor: None,
+        source: None,
+        model: state
+            .latest_config
+            .as_ref()
+            .map(|config| config.model.clone())
+            .or_else(|| {
+                state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| message.model.clone())
+            }),
+        next_turn_seed: next_turn_seed_from_state(state),
+    }
+}
+
 #[gpui::test]
 fn public_turn_flow_emits_binding_and_persists_a_completed_terminal(cx: &mut TestAppContext) {
     init_app(cx);
@@ -126,7 +154,7 @@ fn deletion_queued_behind_the_first_turn_cannot_leave_an_orphan_session(cx: &mut
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
     let catalog = stores.chat_catalog().expect("Chat catalog capability");
-    let (chat, cx) = add_chat_window_with_stores(cx, stores);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
     let controller = cx.update(|_, cx| {
         chat.read_with(cx, |this, app| {
             this.runtime.read(app).session_controller_for_test()
@@ -439,8 +467,11 @@ fn restore_from_session_hydrates_messages_and_advances_turn_id(cx: &mut TestAppC
     assert_eq!(state.messages.len(), 1);
 
     let (other, cx) = add_chat_window_with_stores(cx, stores);
-    let restored = cx
-        .update(|_, cx| other.update(cx, |this, cx| this.restore_session(&session_id, &state, cx)));
+    let restored = cx.update(|_, cx| {
+        other.update(cx, |this, cx| {
+            this.restore_session(&restore_bundle_from_state(&session_id, &state), cx)
+        })
+    });
     assert!(restored.is_ok(), "restore should succeed on an idle view");
     cx.run_until_parked();
     cx.update(|_, cx| {
@@ -479,8 +510,11 @@ fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppC
         latest_config: None,
         latest_compaction: None,
     };
-    let result = cx
-        .update(|_, cx| chat.update(cx, |this, cx| this.restore_session(&session_id, &state, cx)));
+    let result = cx.update(|_, cx| {
+        chat.update(cx, |this, cx| {
+            this.restore_session(&restore_bundle_from_state(&session_id, &state), cx)
+        })
+    });
     assert!(result.is_err(), "restore must reject a streaming view");
 }
 
@@ -488,7 +522,7 @@ fn restore_from_session_rejects_a_view_with_pending_generation(cx: &mut TestAppC
 fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext) {
     init_app(cx);
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
-    let (chat, cx) = add_chat_window_with_stores(cx, stores);
+    let (chat, cx) = add_chat_window_with_stores(cx, stores.clone());
     let selection = ModelSelection {
         profile_id: "profile".into(),
         model_id: "model-a".into(),
@@ -538,19 +572,16 @@ fn chat_view_persists_a_terminal_through_the_controller(cx: &mut TestAppContext)
     drop(controller_guard);
     cx.run_until_parked();
 
+    let restore_store = stores.chat().expect("Chat store capability");
     cx.update(|_, cx| {
-        let state = chat.update(cx, |this, cx| {
+        chat.read_with(cx, |this, _cx| {
             let runtime = this.runtime_snapshot_for_test();
             assert!(!runtime.is_generating());
             assert!(!runtime.has_pending_turn());
-            this.runtime
-                .read(cx)
-                .session_controller_for_test()
-                .lock()
-                .expect("controller lock")
-                .restore(&start.session_id)
-                .expect("restore")
         });
+        let state = restore_store
+            .load_session(&start.session_id, None)
+            .expect("restore");
         assert_eq!(state.messages.len(), 1);
         assert_eq!(state.turn_results.len(), 1);
         assert_eq!(state.turn_results[0].result.status, TurnStatus::Cancelled);
@@ -646,9 +677,8 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
         })
     });
 
-    let shutdown_hold = stores
-        .chat()
-        .expect("Chat store")
+    let restore_store = stores.chat().expect("Chat store capability");
+    let shutdown_hold = restore_store
         .reserve_operation()
         .expect("reserve shutdown test barrier");
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
@@ -676,16 +706,10 @@ fn provider_generation_keeps_shutdown_behind_terminal_persistence(cx: &mut TestA
     // A completed shutdown intentionally closes the shared store boundary.
     // Verify the terminal while the controller is still usable, then exercise
     // the final shutdown barrier independently.
-    cx.update(|_, cx| {
-        let state = chat.update(cx, |this, cx| {
-            this.runtime
-                .read(cx)
-                .session_controller_for_test()
-                .lock()
-                .expect("controller lock")
-                .restore(&session_id)
-                .expect("restore terminal")
-        });
+    let state = restore_store
+        .load_session(&session_id, None)
+        .expect("restore terminal");
+    cx.update(|_, _cx| {
         assert_eq!(state.turn_results.len(), 1);
         assert_eq!(state.turn_results[0].result.status, TurnStatus::Cancelled);
     });

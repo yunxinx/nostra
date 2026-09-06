@@ -31,7 +31,7 @@ pub(crate) use super::test_support;
 use super::transcript::{PartId, PartSource};
 use super::{
     ChatDeleteRequest, ChatView, Role, SMOOTH_SCROLL_FINISH_THRESHOLD,
-    SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD, SmoothScrollState, Turn, is_replayable,
+    SMOOTH_SCROLL_FRAME_FRACTION, STICK_THRESHOLD, SmoothScrollState, Turn,
     reasoning_smooth_invalidations, reset_reasoning_smooth_invalidations,
 };
 use crate::chat::projection::{Row, RowId, RowKind};
@@ -718,6 +718,7 @@ pub(in crate::chat) mod fixtures;
 mod markdown_streaming;
 mod math_interaction;
 mod math_rendering;
+mod paged_open;
 mod performance;
 /// Agent-runnable feedback loop for the user-visible long-content stall.
 ///

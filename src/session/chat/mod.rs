@@ -572,10 +572,16 @@ where
         Ok(())
     }
 
-    pub fn restore(
+    /// Bind the controller to a previously persisted Chat session without
+    /// loading its transcript. The caller owns body loading (the windowed
+    /// transcript open path); this method keeps only the domain, existence,
+    /// pending-turn, and latest-model obligations of the old full restore.
+    /// Read-only: it never writes timestamps or appends a fact.
+    pub fn restore_binding(
         &mut self,
         session_id: &SessionId,
-    ) -> Result<ResolvedSessionState, ChatSessionControllerError> {
+        latest_model: Option<ModelSelection>,
+    ) -> Result<(), ChatSessionControllerError> {
         if self.deleted {
             return Err(ChatSessionControllerError::Deleted);
         }
@@ -589,20 +595,12 @@ where
                 session_id: session_id.clone(),
             });
         }
-        let state = self.store.load_session(session_id, None)?;
-        self.current_model = state
-            .latest_config
-            .as_ref()
-            .map(|config| config.model.clone())
-            .or_else(|| {
-                state
-                    .messages
-                    .iter()
-                    .rev()
-                    .find_map(|message| message.model.clone())
-            });
+        // Existence is proven through the store's read path: a deleted or
+        // missing session keeps the previous binding.
+        self.store.load_session(session_id, None)?;
+        self.current_model = latest_model;
         self.session_id = Some(session_id.clone());
-        Ok(state)
+        Ok(())
     }
 
     /// Permanently delete this controller's durable session, if one exists.
@@ -634,6 +632,18 @@ where
         self.store.flush().map_err(Into::into)
     }
 
+    /// Assemble the request-side history for the bound session from the
+    /// durable source. Called by the persistence coordinator on its own
+    /// thread after the user fact commits, so the provider request never
+    /// depends on how much transcript the UI has paged in.
+    pub fn request_history(&mut self) -> Result<Vec<Message>, ChatSessionControllerError> {
+        let Some(session_id) = self.session_id.clone() else {
+            return Ok(Vec::new());
+        };
+        let state = self.store.load_session(&session_id, None)?;
+        Ok(replayable_history(&state))
+    }
+
     pub fn shutdown(&mut self) -> Result<(), ChatSessionControllerError> {
         self.store.shutdown().map_err(Into::into)
     }
@@ -648,6 +658,32 @@ fn message_has_content(message: &Message) -> bool {
         ContentBlock::ToolCall { .. } => true,
         ContentBlock::ToolResult { tool_result } => !tool_result.content.trim().is_empty(),
     })
+}
+
+/// Project the resolved canonical path into the request-side history.
+///
+/// This is the Chat controller's request-history contract (design §3.7): it
+/// reads the durable source through `load_session` so the assembled request
+/// never depends on how much of the transcript the UI has paged in. Empty
+/// assistant turns are dropped (`is_replayable`) and a trailing empty
+/// assistant turn — a durable begin whose terminal never produced an
+/// assistant snapshot — is trimmed so the provider never sees a stub turn.
+pub fn replayable_history(state: &ResolvedSessionState) -> Vec<Message> {
+    let end = match state.messages.last() {
+        Some(last) if last.message.role == Role::Assistant && last.message.content.is_empty() => {
+            state.messages.len().saturating_sub(1)
+        }
+        _ => state.messages.len(),
+    };
+    state.messages[..end]
+        .iter()
+        .map(|resolved| resolved.message.clone())
+        .filter(is_replayable)
+        .collect()
+}
+
+fn is_replayable(message: &Message) -> bool {
+    message.role != Role::Assistant || !message.content.is_empty()
 }
 
 fn terminal_entries(

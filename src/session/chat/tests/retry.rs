@@ -82,6 +82,26 @@ impl SessionTreeStore for AtomicCreateStore {
     ) -> Result<SessionBranchTreeSnapshot, SessionError> {
         self.inner.load_branch_tree(session_id)
     }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError> {
+        self.inner.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        self.inner.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 impl SessionFlushStore for AtomicCreateStore {
@@ -112,7 +132,10 @@ fn first_turn_uses_the_atomic_session_creation_primitive() {
     controller
         .finish_turn("turn-1", &ChatTurnTerminal::cancelled())
         .expect("finish");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0].entry_id, start.user_entry_id);
 }
@@ -202,6 +225,26 @@ impl SessionTreeStore for FailOnceStore {
     ) -> Result<SessionBranchTreeSnapshot, SessionError> {
         self.inner.load_branch_tree(session_id)
     }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError> {
+        self.inner.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        self.inner.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 impl SessionFlushStore for FailOnceStore {
@@ -243,7 +286,10 @@ fn terminal_append_failure_keeps_the_turn_retryable() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("same terminal should retry");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.turn_results.len(), 1);
 }
@@ -349,6 +395,26 @@ impl SessionTreeStore for CommitThenErrorStore {
     ) -> Result<SessionBranchTreeSnapshot, SessionError> {
         self.inner.load_branch_tree(session_id)
     }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError> {
+        self.inner.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        self.inner.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 impl SessionFlushStore for CommitThenErrorStore {
@@ -379,7 +445,10 @@ fn retry_after_post_commit_create_error_reuses_the_created_session() {
     controller
         .finish_turn("turn-1", &ChatTurnTerminal::cancelled())
         .expect("terminal should persist");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.turn_results.len(), 1);
 }
@@ -414,7 +483,10 @@ fn retry_after_post_commit_user_error_does_not_duplicate_the_user_fact() {
     controller
         .finish_turn("turn-2", &ChatTurnTerminal::cancelled())
         .expect("terminal should persist");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.turn_results.len(), 2);
 }
@@ -447,7 +519,10 @@ fn retry_after_post_commit_terminal_error_does_not_duplicate_terminal_facts() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("retry should discover the committed terminal");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.turn_results.len(), 1);
 }

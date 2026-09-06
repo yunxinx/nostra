@@ -9,8 +9,9 @@ use rust_i18n::t;
 use crate::chat::{
     ChatDeleteRequest, ChatView,
     conversation_runtime::{ConversationRuntimeEvent, ConversationRuntimeUpdate},
+    persistence::restore::{ChatSessionRestore, next_turn_seed_from_state},
     spawn_conversation, title_from_resolved_state,
-    transcript::{TranscriptEvent, TranscriptUpdate},
+    transcript::{ResolvedStateSource, TranscriptEvent, TranscriptSource as _, TranscriptUpdate},
 };
 use crate::llm::ModelSelection;
 use crate::preferences::{self, PreferenceHandle};
@@ -637,25 +638,45 @@ impl ProjectWorkspace {
 
         let title = title_from_resolved_state(&restore.state)
             .unwrap_or_else(|| t!("agent.untitled_session").to_string().into());
-        let restored_model = match spawned.view.update(cx, |chat, cx| {
-            chat.restore_session(&restore.session_id, &restore.state, cx)
-        }) {
-            Ok(model) => model,
-            Err(error) => {
-                crate::logging::error(
-                    "agent.restore",
-                    format_args!(
-                        "failed to restore Agent session {}: {error}",
-                        restore.session_id
-                    ),
-                );
-                spawned.view.update(cx, |view, cx| view.close_scope(cx));
-                self.session_load_state =
-                    AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
-                self.notify_changed(cx);
-                return;
-            }
+        let restored_model = restore
+            .state
+            .latest_config
+            .as_ref()
+            .map(|config| config.model.clone())
+            .or_else(|| {
+                restore
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find_map(|message| message.model.clone())
+            });
+        // Agent restore stays a full load (design §5.6): the whole resolved
+        // state becomes one page with no paged source and the old turn seed.
+        let agent_session_restore = ChatSessionRestore {
+            session_id: restore.session_id.clone(),
+            page: ResolvedStateSource::new(restore.state.clone()).load_tail(usize::MAX),
+            cursor: None,
+            source: None,
+            model: restored_model.clone(),
+            next_turn_seed: next_turn_seed_from_state(&restore.state),
         };
+        if let Err(error) = spawned.view.update(cx, |chat, cx| {
+            chat.restore_session(&agent_session_restore, cx)
+        }) {
+            crate::logging::error(
+                "agent.restore",
+                format_args!(
+                    "failed to restore Agent session {}: {error}",
+                    restore.session_id
+                ),
+            );
+            spawned.view.update(cx, |view, cx| view.close_scope(cx));
+            self.session_load_state =
+                AgentLoadState::Error(t!("chat.error.runtime_unavailable").to_string().into());
+            self.notify_changed(cx);
+            return;
+        }
         let id = self.conversations.allocate_id();
         let subscriptions = self.subscribe_conversation(
             &spawned.parts.runtime,

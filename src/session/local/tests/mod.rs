@@ -242,6 +242,7 @@ where
 mod catalog;
 mod contracts;
 mod durability;
+mod entry_index;
 mod path_safety;
 mod pending;
 mod repair;

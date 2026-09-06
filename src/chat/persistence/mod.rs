@@ -1,5 +1,10 @@
+mod jsonl_source;
 mod lifecycle;
+mod open;
 pub(crate) mod restore;
+
+pub(crate) use jsonl_source::JsonlOffsetSource;
+pub(crate) use open::{ChatOpenError, OpenedChatSession, open_tail_page};
 
 use super::conversation_runtime::{
     ChatSessionControllerHandle, ConversationQuiescence, ConversationRuntime, PendingBeginRequest,
@@ -8,9 +13,18 @@ use super::conversation_runtime::{
 use futures::channel::oneshot;
 use gpui::{AppContext as _, Context};
 
+use crate::llm::Message as LlmMessage;
 use crate::session::{
     ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal, SessionOperationGuard,
 };
+
+/// The durable begin outcome plus the request history assembled on the
+/// persistence thread: the user fact is committed, so a full `load_session`
+/// reflects the canonical path including the new turn.
+pub(super) struct ChatBeginOutcome {
+    pub(super) start: ChatTurnStart,
+    pub(super) history: Vec<LlmMessage>,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum BeginPersistenceError {
@@ -69,7 +83,7 @@ pub(super) struct TurnPersistenceCoordinator {
     result: Option<oneshot::Receiver<Result<(), TerminalPersistenceError>>>,
 }
 
-type BeginPersistenceOutcome = (bool, bool, Result<ChatTurnStart, BeginPersistenceError>);
+type BeginPersistenceOutcome = (bool, bool, Result<ChatBeginOutcome, BeginPersistenceError>);
 
 impl TurnPersistenceCoordinator {
     fn start(
@@ -104,9 +118,20 @@ impl TurnPersistenceCoordinator {
                             })?;
                         terminal_committed = true;
                     }
-                    controller
-                        .begin_turn(request.user_message, request.selection, request.turn_id)
-                        .map_err(BeginPersistenceError::Begin)
+                    let start = controller
+                        .begin_turn(
+                            request.user_message.clone(),
+                            request.selection.clone(),
+                            request.turn_id.clone(),
+                        )
+                        .map_err(BeginPersistenceError::Begin)?;
+                    // Same thread, right after the user fact committed: the
+                    // history is assembled from the durable source, never
+                    // from the UI's paged transcript view (R5).
+                    let history = controller
+                        .request_history()
+                        .map_err(BeginPersistenceError::Begin)?;
+                    Ok(ChatBeginOutcome { start, history })
                 })
             })();
             let begin_succeeded = begin.is_ok();

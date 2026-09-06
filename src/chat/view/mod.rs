@@ -1461,6 +1461,12 @@ impl ChatView {
         let view = &mut self.view;
         let presentation = &self.markdown_presentation;
         view.sync_window(&transcript, presentation, user_message_markdown, cx);
+        // Scrolling toward the top is the other trigger for backward paging
+        // (R7): transcript updates alone would only fire after a page lands.
+        let wants_prepend = view.wants_prepend(&self.transcript_snapshot);
+        if wants_prepend {
+            self.load_before(cx);
+        }
     }
 }
 

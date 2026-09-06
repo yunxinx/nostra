@@ -9,15 +9,16 @@ use rust_i18n::t;
 use crate::chat::{
     ChatDeleteRequest, ChatView,
     conversation_runtime::{ConversationRuntimeEvent, ConversationRuntimeUpdate},
-    spawn_conversation, title_from_resolved_state,
+    persistence::{ChatOpenError, OpenedChatSession, open_tail_page},
+    spawn_conversation,
     transcript::{TranscriptEvent, TranscriptUpdate},
 };
 use crate::llm::ModelSelection;
 use crate::preferences::PreferenceHandle;
 use crate::runtime::RuntimeServices;
 use crate::session::{
-    ChatSessionCatalogController, FavoriteChange, MAX_FAVORITES, ResolvedSessionState,
-    SessionEntryKind, SessionId, SessionLifecycleStore,
+    ChatSessionCatalogController, FavoriteChange, MAX_FAVORITES, SessionEntryKind, SessionId,
+    SessionLifecycleStore,
 };
 use crate::ui::inline_delete_confirmation::InlineDeleteConfirmationHandle;
 
@@ -164,10 +165,11 @@ impl ChatWorkspaceSnapshot {
     }
 }
 
+/// The background open outcome plus the selection epoch it belongs to: the
+/// workspace drops bundles whose request was superseded.
 struct SessionRestore {
     request: SelectionRequest,
-    session_id: SessionId,
-    state: ResolvedSessionState,
+    opened: OpenedChatSession,
 }
 
 pub(super) struct ChatWorkspace {
@@ -411,12 +413,30 @@ impl ChatWorkspace {
             self.select_target(target, window, cx);
             return;
         }
-        let catalog_store = match self.runtime_services.session_services().chat_catalog() {
+        let services = self.runtime_services.session_services().clone();
+        let catalog_store = match services.chat_catalog() {
             Ok(store) => store,
             Err(error) => {
                 crate::logging::error(
                     "chat.restore",
                     format_args!("failed to open the chat session catalog: {error}"),
+                );
+                window.push_notification(
+                    (
+                        NotificationType::Error,
+                        t!("chat.error.runtime_unavailable").to_string(),
+                    ),
+                    cx,
+                );
+                return;
+            }
+        };
+        let session_store = match services.chat() {
+            Ok(store) => store,
+            Err(error) => {
+                crate::logging::error(
+                    "chat.restore",
+                    format_args!("failed to open the chat session store: {error}"),
                 );
                 window.push_notification(
                     (
@@ -437,15 +457,17 @@ impl ChatWorkspace {
                 .background_executor()
                 .spawn(async move {
                     let mut controller = ChatSessionCatalogController::new(catalog_store);
-                    controller.load_initial().and_then(|_| {
-                        controller
-                            .select(&selected_id)
-                            .map(|selected| selected.state)
-                    })
+                    let selected = controller
+                        .load_initial()
+                        .and_then(|_| controller.select(&selected_id))?;
+                    // Page the tail through the entry index; fall back to a
+                    // full load when the index is missing, stale, or unreadable.
+                    let opened = open_tail_page(&session_store, &selected_id, &selected)?;
+                    Ok::<SessionRestore, ChatOpenError>(SessionRestore { request, opened })
                 })
                 .await;
-            let state = match result {
-                Ok(state) => state,
+            let bundle = match result {
+                Ok(bundle) => bundle,
                 Err(error) => {
                     crate::logging::error(
                         "chat.restore",
@@ -465,15 +487,7 @@ impl ChatWorkspace {
             };
             let _ = window_handle.update(cx, |_, window, cx| {
                 workspace.update(cx, |workspace, cx| {
-                    workspace.apply_session_restore(
-                        SessionRestore {
-                            request,
-                            session_id,
-                            state,
-                        },
-                        window,
-                        cx,
-                    );
+                    workspace.apply_session_restore(bundle, window, cx);
                 });
             });
         });
@@ -487,16 +501,28 @@ impl ChatWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.selection_epoch.is_current(restore.request) {
+        let SessionRestore {
+            request,
+            opened:
+                OpenedChatSession {
+                    restore,
+                    title,
+                    selection,
+                },
+        } = restore;
+        let session_id = restore.session_id.clone();
+        if !self.selection_epoch.is_current(request) {
             return;
         }
-        if let Some(target) = self.conversations.opened_target(&restore.session_id) {
+        if let Some(target) = self.conversations.opened_target(&session_id) {
             self.conversations.set_active(target);
-            self.record_active_session(&restore.session_id, cx);
+            self.record_active_session(&session_id, cx);
             self.notify_changed(cx);
             return;
         }
-        let title = title_from_resolved_state(&restore.state)
+        let title = title
+            .as_deref()
+            .map(crate::chat::derive_title)
             .unwrap_or_else(|| t!("chat.default_title").to_string().into());
         let Some(scope) = self.create_scope(window, cx) else {
             return;
@@ -509,29 +535,24 @@ impl ChatWorkspace {
             window,
             cx,
         );
-        let restored_model = match spawned.view.update(cx, |chat, cx| {
-            chat.restore_session(&restore.session_id, &restore.state, cx)
-        }) {
-            Ok(model) => model,
-            Err(error) => {
-                crate::logging::error(
-                    "chat.restore",
-                    format_args!(
-                        "failed to restore chat session {}: {error}",
-                        restore.session_id
-                    ),
-                );
-                spawned.view.update(cx, |chat, cx| chat.close_scope(cx));
-                window.push_notification(
-                    (
-                        NotificationType::Error,
-                        t!("chat.error.runtime_unavailable").to_string(),
-                    ),
-                    cx,
-                );
-                return;
-            }
-        };
+        if let Err(error) = spawned
+            .view
+            .update(cx, |chat, cx| chat.restore_session(&restore, cx))
+        {
+            crate::logging::error(
+                "chat.restore",
+                format_args!("failed to restore chat session {session_id}: {error}"),
+            );
+            spawned.view.update(cx, |chat, cx| chat.close_scope(cx));
+            window.push_notification(
+                (
+                    NotificationType::Error,
+                    t!("chat.error.runtime_unavailable").to_string(),
+                ),
+                cx,
+            );
+            return;
+        }
         let id = self.conversations.allocate_id();
         let subscriptions = self.subscribe_conversation(
             &spawned.parts.runtime,
@@ -540,7 +561,7 @@ impl ChatWorkspace {
             window,
             cx,
         );
-        let selection = seed_conversation_selection(restored_model, cx);
+        let selection = seed_conversation_selection(selection, cx);
         let is_generating = conversation_generating(&spawned.parts.runtime, cx);
         let now = std::time::Instant::now();
         self.conversations.push_and_activate(Conversation {
@@ -557,11 +578,11 @@ impl ChatWorkspace {
             scroll_anchor: None,
             metadata: (),
             title,
-            session_id: Some(restore.session_id.clone()),
+            session_id: Some(session_id.clone()),
             last_active_at: now,
             _subscriptions: subscriptions,
         });
-        self.record_active_session(&restore.session_id, cx);
+        self.record_active_session(&session_id, cx);
         self.notify_changed(cx);
     }
 

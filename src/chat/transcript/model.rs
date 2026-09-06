@@ -60,6 +60,7 @@ impl Role {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) const fn to_llm(self) -> crate::llm::Role {
         match self {
@@ -183,6 +184,7 @@ impl Part {
         Self::new(part_id, content_index, source, finished)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn canonical(&self) -> Option<ContentBlock> {
         match &self.source {
@@ -270,7 +272,7 @@ impl Turn {
     }
 
     #[must_use]
-    pub(super) fn from_llm(message: LlmMessage, turn_id: TurnId, next_part_id: &mut u64) -> Self {
+    pub(crate) fn from_llm(message: LlmMessage, turn_id: TurnId, next_part_id: &mut u64) -> Self {
         let role = Role::from_llm(message.role);
         let parts = message
             .content
@@ -290,6 +292,7 @@ impl Turn {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn to_llm(&self) -> LlmMessage {
         LlmMessage {
@@ -316,7 +319,7 @@ impl Turn {
 }
 
 #[must_use]
-pub(super) fn allocate_turn_id(next: &mut u64) -> TurnId {
+pub(crate) fn allocate_turn_id(next: &mut u64) -> TurnId {
     let id = TurnId(*next);
     *next = next.saturating_add(1);
     id
@@ -327,11 +330,6 @@ pub(super) fn allocate_part_id(next: &mut u64) -> PartId {
     let id = PartId(*next);
     *next = next.saturating_add(1);
     id
-}
-
-#[must_use]
-pub(crate) fn is_replayable(message: &LlmMessage) -> bool {
-    message.role != crate::llm::Role::Assistant || !message.content.is_empty()
 }
 
 pub(super) fn apply_indexed_message(

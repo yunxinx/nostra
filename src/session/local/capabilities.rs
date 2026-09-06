@@ -1,3 +1,10 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
+
 use super::super::ChatMessageRef;
 use super::*;
 
@@ -40,33 +47,37 @@ impl SessionTreeStore for LocalSessionStore {
             // the source again before deciding which projection is safe to
             // publish; an exact batch still pending may also be persisted by
             // recorder shutdown after this method returns.
-            if let Ok(reloaded) = Self::reload_entries(&source_boundary, &handle.path)
-                && let Ok(projection) = SessionProjection::from_entries(&handle.header, &reloaded)
+            if let Ok(loaded) = Self::reload_load(&source_boundary, &handle.path)
+                && let Ok(projection) =
+                    SessionProjection::from_entries(&handle.header, &loaded.entries)
+                && let Ok(entry_rows) = entry_index_rows(&loaded.entries, &loaded.entry_ranges)
             {
-                handle.entries = reloaded;
+                handle.entries = loaded.entries;
                 handle.projection = projection;
                 handle.source_stamp = source_stamp(&handle.path);
-            }
-            let result = if pending_remains {
-                catalog.upsert_projection_with_intents(
-                    &handle.header,
-                    &handle.projection,
-                    &handle.path,
-                    &[],
-                )
-            } else {
-                // Deterministic validation rejection wrote no fact, so this
-                // source-derived projection completes the operation's intent.
-                catalog.upsert_projection_with_intents(
-                    &handle.header,
-                    &handle.projection,
-                    &handle.path,
-                    &handle.projection_intents,
-                )
-            };
-            handle.catalog_dirty = pending_remains || result.is_err();
-            if result.is_ok() && !pending_remains {
-                handle.projection_intents.clear();
+                let result = if pending_remains {
+                    catalog.upsert_projection_with_intents(
+                        &handle.header,
+                        &handle.projection,
+                        &entry_rows,
+                        &handle.path,
+                        &[],
+                    )
+                } else {
+                    // Deterministic validation rejection wrote no fact, so this
+                    // source-derived projection completes the operation's intent.
+                    catalog.upsert_projection_with_intents(
+                        &handle.header,
+                        &handle.projection,
+                        &entry_rows,
+                        &handle.path,
+                        &handle.projection_intents,
+                    )
+                };
+                handle.catalog_dirty = pending_remains || result.is_err();
+                if result.is_ok() && !pending_remains {
+                    handle.projection_intents.clear();
+                }
             }
             return Err(error);
         }
@@ -77,14 +88,17 @@ impl SessionTreeStore for LocalSessionStore {
                 "injected interruption after session leaf publication",
             )));
         }
-        handle.entries =
-            Self::reload_entries(&source_boundary, &handle.path).map_err(session_io_error)?;
+        let loaded = Self::reload_load(&source_boundary, &handle.path).map_err(session_io_error)?;
+        handle.entries = loaded.entries;
         handle.projection = SessionProjection::from_entries(&handle.header, &handle.entries)
             .map_err(session_io_error)?;
         handle.source_stamp = source_stamp(&handle.path);
+        let entry_rows =
+            entry_index_rows(&handle.entries, &loaded.entry_ranges).map_err(session_io_error)?;
         let result = catalog.upsert_projection_with_intents(
             &handle.header,
             &handle.projection,
+            &entry_rows,
             &handle.path,
             &handle.projection_intents,
         );
@@ -127,6 +141,108 @@ impl SessionTreeStore for LocalSessionStore {
         let entries = self.load_entries_for_session(session_id)?;
         session_branch_tree_snapshot(&entries, None)
     }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError> {
+        if session_id.domain() != self.config.domain {
+            return Err(SessionError::DomainMismatch {
+                header: self.config.domain,
+                id: session_id.domain(),
+            });
+        }
+        let rows = self
+            .catalog
+            .entry_index_rows(session_id)
+            .map_err(session_io_error)?;
+        if rows.is_empty() {
+            // Distinguish a deleted session from a missing index projection;
+            // both must fail closed so callers take the full-load fallback.
+            self.catalog
+                .get(session_id)
+                .map_err(session_io_error)?
+                .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+            return Err(SessionError::EntryIndexMissing(session_id.clone()));
+        }
+        let records = rows
+            .into_iter()
+            .map(|row| PathEntryRecord {
+                entry_id: row.entry_id,
+                parent_id: row.parent_id,
+                kind: row.kind,
+                byte_offset: Some(row.byte_offset),
+                byte_len: Some(row.byte_len),
+                timestamp: row.timestamp,
+            })
+            .collect::<Vec<_>>();
+        let source_path = self.authorized_source_path_for_read(session_id)?;
+        resolve_entry_index_path(&records, &source_path, leaf, session_id)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if session_id.domain() != self.config.domain {
+            return Err(SessionError::DomainMismatch {
+                header: self.config.domain,
+                id: session_id.domain(),
+            });
+        }
+        let rows = self
+            .catalog
+            .entry_index_rows_for_entries(session_id, entry_ids)
+            .map_err(session_io_error)?;
+        #[cfg(test)]
+        super::READ_ENTRIES_PROBE.fetch_add(entry_ids.len(), std::sync::atomic::Ordering::Relaxed);
+        let path = self.authorized_source_path_for_read(session_id)?;
+        let mut file = fs::File::open(&path).map_err(SessionError::io)?;
+        let mismatch = |entry_id: &EntryId| SessionError::EntryIndexMismatch {
+            session_id: session_id.clone(),
+            entry_id: entry_id.clone(),
+        };
+        entry_ids
+            .iter()
+            .zip(rows)
+            .map(|(entry_id, row)| {
+                let row = row.ok_or_else(|| mismatch(entry_id))?;
+                // The index is a disposable projection: the deserialized fact
+                // must prove it is exactly the requested entry, otherwise the
+                // offsets are stale and the caller must fall back.
+                let text = read_entry_line(&mut file, row.byte_offset, row.byte_len)
+                    .map_err(|_| mismatch(entry_id))?;
+                let entry: SessionEntry =
+                    serde_json::from_str(&text).map_err(|_| mismatch(entry_id))?;
+                if entry.id != *entry_id {
+                    return Err(mismatch(entry_id));
+                }
+                Ok(entry)
+            })
+            .collect()
+    }
+
+    fn invalidate_entry_index(&mut self, session_id: &SessionId) -> Result<(), SessionError> {
+        if session_id.domain() != self.config.domain {
+            return Err(SessionError::DomainMismatch {
+                header: self.config.domain,
+                id: session_id.domain(),
+            });
+        }
+        // A retained handle keeps the disposable projection the next mutation
+        // would extend incrementally; force that extension to become a full
+        // rebuild instead. A handle that does not exist yet always starts
+        // dirty, so there is nothing to mark.
+        if let Some(handle) = self.handles.get_mut(session_id) {
+            handle.catalog_dirty = true;
+        }
+        Ok(())
+    }
 }
 
 impl SessionFlushStore for LocalSessionStore {
@@ -148,6 +264,31 @@ impl SessionFlushStore for LocalSessionStore {
 }
 
 impl LocalSessionStore {
+    /// Resolve the authorized JSONL source for a read-only entry-index
+    /// operation. An open handle is used only while its file identity still
+    /// matches; otherwise the path is derived from validated session identity
+    /// like every other local read, never from catalog path text alone.
+    fn authorized_source_path_for_read(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PathBuf, SessionError> {
+        if let Some(handle) = self.handles.get(session_id) {
+            source::authorize_existing_source(&self.source_boundary, &handle.path)
+                .map_err(local_store_session_error)?;
+            if source_stamp(&handle.path) == handle.source_stamp {
+                return Ok(handle.path.clone());
+            }
+        }
+        let summary = self
+            .catalog
+            .get(session_id)
+            .map_err(session_io_error)?
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        let path = self.source_path_for_summary(&summary);
+        source::authorize_existing_source(&self.source_boundary, &path)
+            .map_err(local_store_session_error)
+    }
+
     fn flush_locked(&mut self) -> Result<(), SessionError> {
         self.flush_handles_locked("flush")?;
         if self.catalog.needs_repair() {
@@ -477,5 +618,108 @@ impl ChatMessageReferenceStore for LocalSessionStore {
             .find(|entry| entry.id == reference.entry_id)
             .ok_or_else(|| unavailable(reference, ChatMessageUnavailableReason::MessageDeleted))?;
         message_from_entry(reference, &summary, entry)
+    }
+}
+
+/// Resolve the active entry path from catalog index rows without
+/// deserializing message bodies. `records` must be in durable append order.
+/// `Leaf` rows carry no target column, so their small fact line is read from
+/// the source on demand (design: keep the PRD R1 column set unchanged).
+fn resolve_entry_index_path(
+    records: &[PathEntryRecord],
+    source_path: &Path,
+    requested_leaf: Option<&EntryId>,
+    session_id: &SessionId,
+) -> Result<Vec<PathEntryRecord>, SessionError> {
+    let by_id: HashMap<&EntryId, &PathEntryRecord> = records
+        .iter()
+        .map(|record| (&record.entry_id, record))
+        .collect();
+    let effective_leaf = match requested_leaf {
+        Some(leaf_id) => leaf_id.clone(),
+        None => {
+            let last = records
+                .last()
+                .ok_or_else(|| SessionError::EntryIndexMissing(session_id.clone()))?;
+            match last.kind {
+                EntryKindTag::Leaf => leaf_target_at(source_path, last, session_id)?
+                    .unwrap_or_else(|| last.entry_id.clone()),
+                _ => last.entry_id.clone(),
+            }
+        }
+    };
+    let leaf_id = match by_id.get(&effective_leaf) {
+        Some(record) if record.kind == EntryKindTag::Leaf => {
+            leaf_target_at(source_path, record, session_id)?.unwrap_or(effective_leaf)
+        }
+        Some(_) => effective_leaf,
+        None => return Err(SessionError::LeafNotFound(effective_leaf)),
+    };
+    let mut path = Vec::new();
+    let mut current = Some(leaf_id);
+    let mut seen = HashSet::new();
+    while let Some(id) = current {
+        if !seen.insert(id.clone()) {
+            return Err(SessionError::CycleDetected);
+        }
+        let record = by_id
+            .get(&id)
+            .copied()
+            .ok_or_else(|| SessionError::LeafNotFound(id.clone()))?;
+        current = record.parent_id.clone();
+        path.push(record.clone());
+    }
+    path.reverse();
+    match path.first() {
+        Some(first) if first.kind == EntryKindTag::Header => Ok(path),
+        _ => Err(SessionError::MissingHeader),
+    }
+}
+
+/// Read one exact JSONL line by byte range. Reading through `take` keeps the
+/// allocation bounded by the bytes that actually exist, so a corrupt catalog
+/// length can never request an unbounded buffer.
+fn read_entry_line(
+    file: &mut fs::File,
+    byte_offset: u64,
+    byte_len: u64,
+) -> Result<String, SessionError> {
+    file.seek(SeekFrom::Start(byte_offset))
+        .map_err(SessionError::io)?;
+    let mut text = String::new();
+    file.take(byte_len)
+        .read_to_string(&mut text)
+        .map_err(SessionError::io)?;
+    if text.len() as u64 != byte_len {
+        return Err(SessionError::io(std::io::Error::other(
+            "session entry index range is not fully readable",
+        )));
+    }
+    Ok(text)
+}
+
+/// Resolve `Leaf.target_id` for one index row through a targeted read of the
+/// original fact line. Any mismatch between the line and the index is a typed
+/// index error, so the caller falls back instead of trusting the projection.
+fn leaf_target_at(
+    source_path: &Path,
+    record: &PathEntryRecord,
+    session_id: &SessionId,
+) -> Result<Option<EntryId>, SessionError> {
+    let mut file = fs::File::open(source_path).map_err(SessionError::io)?;
+    let mismatch = || SessionError::EntryIndexMismatch {
+        session_id: session_id.clone(),
+        entry_id: record.entry_id.clone(),
+    };
+    let text = read_entry_line(
+        &mut file,
+        record.byte_offset.unwrap_or(0),
+        record.byte_len.unwrap_or(0),
+    )
+    .map_err(|_| mismatch())?;
+    let entry: SessionEntry = serde_json::from_str(&text).map_err(|_| mismatch())?;
+    match entry.kind {
+        SessionEntryKind::Leaf(leaf) if entry.id == record.entry_id => Ok(leaf.target_id),
+        _ => Err(mismatch()),
     }
 }

@@ -1,5 +1,8 @@
 use super::*;
 
+/// The replayability predicate moved to the session layer with the request
+/// history (design §3.7): it projects durable `llm::Message` facts, so the
+/// assertion lives here through the session-side pure function.
 #[test]
 fn empty_assistant_placeholders_are_not_replayed() {
     let empty_assistant = LlmMessage {
@@ -16,8 +19,27 @@ fn empty_assistant_placeholders_are_not_replayed() {
         provider_metadata: ProviderMetadata::default(),
     };
 
-    assert!(!is_replayable(&empty_assistant));
-    assert!(is_replayable(&user));
+    let state_of = |message: &LlmMessage| crate::session::ResolvedSessionState {
+        leaf_id: crate::session::EntryId::new(),
+        path: Vec::new(),
+        context: Vec::new(),
+        messages: vec![crate::session::ResolvedMessage {
+            entry_id: crate::session::EntryId::new(),
+            message: message.clone(),
+            turn_id: None,
+            model: None,
+            usage: crate::llm::Usage::default(),
+        }],
+        transcript_replays: Vec::new(),
+        turn_results: Vec::new(),
+        latest_config: None,
+        latest_compaction: None,
+    };
+    assert!(crate::session::replayable_history(&state_of(&empty_assistant)).is_empty());
+    assert_eq!(
+        crate::session::replayable_history(&state_of(&user)),
+        vec![user]
+    );
 }
 
 /// A failed turn must render its upstream error card through a real view

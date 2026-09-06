@@ -124,7 +124,12 @@ impl LocalSessionStore {
                 unresolved_session_ids.insert(session_id);
                 continue;
             }
-            match CatalogRepairProjection::from_entries(header, &loaded.entries, path.clone()) {
+            match CatalogRepairProjection::from_entries(
+                header,
+                &loaded.entries,
+                &loaded.entry_ranges,
+                path.clone(),
+            ) {
                 Ok(projection) => projections.push(projection),
                 Err(error) => {
                     unresolved_session_ids.insert(session_id);

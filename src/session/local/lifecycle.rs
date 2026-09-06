@@ -45,7 +45,7 @@ impl SessionLifecycleStore for LocalSessionStore {
         let temporary = source::create_session_stage(&self.staging_boundary)
             .map_err(local_store_session_error)?;
         let (file, temporary_path) = temporary.into_parts();
-        let (mut staged, initial_entries) = JsonlWriter::create_on_file(
+        let (mut staged, initial_entries, initial_ranges) = JsonlWriter::create_on_file(
             temporary_path.to_path_buf(),
             file,
             header.clone(),
@@ -127,9 +127,15 @@ impl SessionLifecycleStore for LocalSessionStore {
             .ok_or_else(|| SessionError::SessionNotFound(header.session_id.clone()))?
             .projection_intents
             .clone();
-        let result =
-            self.catalog
-                .upsert_projection_with_intents(&header, &projection, &path, &intents);
+        let entry_rows =
+            entry_index_rows(&initial_entries, &initial_ranges).map_err(session_io_error)?;
+        let result = self.catalog.upsert_projection_with_intents(
+            &header,
+            &projection,
+            &entry_rows,
+            &path,
+            &intents,
+        );
         if result.is_ok()
             && let Some(handle) = self.handles.get_mut(&header.session_id)
         {
@@ -171,8 +177,8 @@ impl SessionLifecycleStore for LocalSessionStore {
         // The recorder validates the entire request, including any exact
         // pending tail, before retrying or writing bytes. Deterministic graph
         // errors therefore return here without poisoning its retry queue.
-        let appended = match handle.recorder.append_batch(entries) {
-            Ok(appended) => appended,
+        let recorded = match handle.recorder.append_batch(entries) {
+            Ok(recorded) => recorded,
             Err(error) => {
                 // Retrying an older pending batch can commit it before the
                 // current batch fails. Re-read the source on this exceptional
@@ -180,11 +186,12 @@ impl SessionLifecycleStore for LocalSessionStore {
                 // already durable.
                 let pending_remains = handle.recorder.has_pending();
                 handle.catalog_dirty = true;
-                if let Ok(reloaded) = Self::reload_entries(&source_boundary, &handle.path)
+                if let Ok(loaded) = Self::reload_load(&source_boundary, &handle.path)
                     && let Ok(projection) =
-                        SessionProjection::from_entries(&handle.header, &reloaded)
+                        SessionProjection::from_entries(&handle.header, &loaded.entries)
+                    && let Ok(entry_rows) = entry_index_rows(&loaded.entries, &loaded.entry_ranges)
                 {
-                    handle.entries = reloaded;
+                    handle.entries = loaded.entries;
                     handle.projection = projection;
                     handle.source_stamp = source_stamp(&handle.path);
                     let result = if pending_remains {
@@ -196,6 +203,7 @@ impl SessionLifecycleStore for LocalSessionStore {
                         catalog.upsert_projection_with_intents(
                             &handle.header,
                             &handle.projection,
+                            &entry_rows,
                             &handle.path,
                             &[],
                         )
@@ -203,6 +211,7 @@ impl SessionLifecycleStore for LocalSessionStore {
                         catalog.upsert_projection_with_intents(
                             &handle.header,
                             &handle.projection,
+                            &entry_rows,
                             &handle.path,
                             &handle.projection_intents,
                         )
@@ -215,6 +224,8 @@ impl SessionLifecycleStore for LocalSessionStore {
                 return Err(error);
             }
         };
+        let appended = recorded.entries;
+        let appended_ranges = recorded.ranges;
         let current_batch_start = appended.len().checked_sub(requested_count).ok_or_else(|| {
             SessionError::io(std::io::Error::other(
                 "session recorder returned fewer entries than requested",
@@ -248,27 +259,41 @@ impl SessionLifecycleStore for LocalSessionStore {
         }
 
         let catalog_result = if projection_was_dirty || has_leaf_change {
-            match SessionProjection::from_entries(&handle.header, &handle.entries) {
-                Ok(projection) => {
-                    handle.projection = projection;
-                    catalog.upsert_projection_with_intents(
+            // A full rebuild replaces the whole entry index from one scan of
+            // the durable source, so scanned offsets and the projection never
+            // disagree after a leaf change or a dirty handle.
+            let loaded = Self::reload_load(&source_boundary, &handle.path)
+                .map_err(local_store_session_error)?;
+            let (projection, entry_rows) =
+                SessionProjection::from_entries(&handle.header, &loaded.entries)
+                    .and_then(|projection| {
+                        entry_index_rows(&loaded.entries, &loaded.entry_ranges)
+                            .map(|entry_rows| (projection, entry_rows))
+                    })
+                    .map_err(session_io_error)?;
+            handle.projection = projection;
+            catalog.upsert_projection_with_intents(
+                &handle.header,
+                &handle.projection,
+                &entry_rows,
+                &handle.path,
+                &handle.projection_intents,
+            )
+        } else {
+            // Incremental appends write only the entry rows the recorder's
+            // writer actually put on disk for this batch.
+            match handle.projection.append_entries(&appended) {
+                Ok(appended_messages) => match entry_index_rows(&appended, &appended_ranges) {
+                    Ok(entry_rows) => catalog.append_projection_with_intents(
                         &handle.header,
                         &handle.projection,
+                        &appended_messages,
+                        &entry_rows,
                         &handle.path,
                         &handle.projection_intents,
-                    )
-                }
-                Err(error) => Err(error),
-            }
-        } else {
-            match handle.projection.append_entries(&appended) {
-                Ok(appended_messages) => catalog.append_projection_with_intents(
-                    &handle.header,
-                    &handle.projection,
-                    &appended_messages,
-                    &handle.path,
-                    &handle.projection_intents,
-                ),
+                    ),
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             }
         };

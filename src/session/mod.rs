@@ -25,19 +25,19 @@ pub use catalog::{
 };
 pub use chat::{
     ChatSessionController, ChatSessionControllerError, ChatTurnStart, ChatTurnTerminal,
-    ConversationDescriptor,
+    ConversationDescriptor, replayable_history,
 };
 pub use chat_catalog::{
     ChatSessionCatalogController, ChatSessionCatalogError, SelectedChatSession,
 };
 pub use domain::{
     BranchSummary, CURRENT_FORMAT_VERSION, ChatMessageRef, ChatSessionRef, Compaction,
-    ConfigChange, EntryId, FavoriteChange, Leaf, MessageEntry, ProjectIdentity, Reference,
-    SafeError, SafeErrorCategory, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
-    SessionId, TranscriptReplay, TurnResult, TurnStatus,
+    ConfigChange, EntryId, EntryKindTag, FavoriteChange, Leaf, MessageEntry, ProjectIdentity,
+    Reference, SafeError, SafeErrorCategory, SessionDomain, SessionEntry, SessionEntryKind,
+    SessionHeader, SessionId, TranscriptReplay, TurnResult, TurnStatus,
 };
 pub use error::{DiagnosticKind, JsonlDiagnostic, SessionError};
-pub use jsonl::{JsonlLoad, JsonlLoader, JsonlWriter};
+pub use jsonl::{EntryByteRange, JsonlLoad, JsonlLoader, JsonlWriter};
 pub use local::{LocalSessionStore, LocalStoreConfig, LocalStoreError};
 pub use memory::{
     InMemorySessionStore, ProjectSessionStore, SessionCatalogStore, SessionFlushStore,
@@ -54,13 +54,15 @@ pub use service::{
     SharedChatReferenceStore, SharedSessionCatalog, SharedSessionStore,
 };
 pub use tree::{
-    ResolvedContextItem, ResolvedMessage, ResolvedSessionState, ResolvedTranscriptReplay,
-    ResolvedTurnResult, SessionBranchPreview, SessionBranchSummary, SessionBranchTreeNode,
-    SessionBranchTreeSnapshot, SessionTreeBranchChoice, SessionTreeRow, SessionTreeRowKind,
-    SessionTreeSnapshot, resolve_session, session_branch_preview, session_branch_tree_snapshot,
-    session_tree_snapshot, validate_session_entries,
+    PathEntryRecord, ResolvedContextItem, ResolvedMessage, ResolvedSessionState,
+    ResolvedTranscriptReplay, ResolvedTurnResult, SessionBranchPreview, SessionBranchSummary,
+    SessionBranchTreeNode, SessionBranchTreeSnapshot, SessionTreeBranchChoice, SessionTreeRow,
+    SessionTreeRowKind, SessionTreeSnapshot, resolve_session, session_branch_preview,
+    session_branch_tree_snapshot, session_tree_snapshot, validate_session_entries,
 };
 
+#[cfg(test)]
+pub(crate) use local::READ_ENTRIES_PROBE;
 pub(crate) use recorder::JsonlRecorder;
 pub(crate) use service::SessionOperationGuard;
 pub(crate) use tree::AppendValidationState;

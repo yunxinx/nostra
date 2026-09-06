@@ -416,6 +416,80 @@ pub enum SessionEntryKind {
     Leaf(Leaf),
 }
 
+/// Discriminant of [`SessionEntryKind`] without its payload. The catalog
+/// `entries` index stores this as the serde tag name so metadata-only path
+/// resolution never deserializes message bodies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntryKindTag {
+    Header,
+    Message,
+    TurnResult,
+    ConfigChange,
+    FavoriteChange,
+    Compaction,
+    BranchSummary,
+    TranscriptReplay,
+    Reference,
+    Leaf,
+}
+
+impl EntryKindTag {
+    /// The serde tag name used by `SessionEntryKind` in JSONL facts and the
+    /// catalog `entries.kind` column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Header => "header",
+            Self::Message => "message",
+            Self::TurnResult => "turn_result",
+            Self::ConfigChange => "config_change",
+            Self::FavoriteChange => "favorite_change",
+            Self::Compaction => "compaction",
+            Self::BranchSummary => "branch_summary",
+            Self::TranscriptReplay => "transcript_replay",
+            Self::Reference => "reference",
+            Self::Leaf => "leaf",
+        }
+    }
+
+    /// Parse a tag stored by a catalog projection row. An unknown name is a
+    /// disposable-index mismatch, not a fact-stream error.
+    #[must_use]
+    pub fn parse_tag(value: &str) -> Option<Self> {
+        match value {
+            "header" => Some(Self::Header),
+            "message" => Some(Self::Message),
+            "turn_result" => Some(Self::TurnResult),
+            "config_change" => Some(Self::ConfigChange),
+            "favorite_change" => Some(Self::FavoriteChange),
+            "compaction" => Some(Self::Compaction),
+            "branch_summary" => Some(Self::BranchSummary),
+            "transcript_replay" => Some(Self::TranscriptReplay),
+            "reference" => Some(Self::Reference),
+            "leaf" => Some(Self::Leaf),
+            _ => None,
+        }
+    }
+}
+
+impl SessionEntryKind {
+    #[must_use]
+    pub const fn tag(&self) -> EntryKindTag {
+        match self {
+            Self::Header(_) => EntryKindTag::Header,
+            Self::Message(_) => EntryKindTag::Message,
+            Self::TurnResult(_) => EntryKindTag::TurnResult,
+            Self::ConfigChange(_) => EntryKindTag::ConfigChange,
+            Self::FavoriteChange(_) => EntryKindTag::FavoriteChange,
+            Self::Compaction(_) => EntryKindTag::Compaction,
+            Self::BranchSummary(_) => EntryKindTag::BranchSummary,
+            Self::TranscriptReplay(_) => EntryKindTag::TranscriptReplay,
+            Self::Reference(_) => EntryKindTag::Reference,
+            Self::Leaf(_) => EntryKindTag::Leaf,
+        }
+    }
+}
+
 /// Session-level favorite flag. Last write in the file wins; it is not
 /// branch-scoped.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

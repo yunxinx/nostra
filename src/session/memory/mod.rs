@@ -10,7 +10,7 @@ use super::catalog::project_session_summary;
 use super::{
     AppendValidationState, CatalogError, CatalogPage, CatalogQuery, ChatMessageRead,
     ChatMessageReferenceStore, ChatMessageSearchCursor, ChatMessageSearchPage,
-    ChatMessageSearchQuery, ChatReferenceError, EntryId, ResolvedSessionState,
+    ChatMessageSearchQuery, ChatReferenceError, EntryId, PathEntryRecord, ResolvedSessionState,
     SessionBranchPreview, SessionBranchTreeSnapshot, SessionDomain, SessionEntry, SessionEntryKind,
     SessionError, SessionHeader, SessionId, SessionSummary, SessionTreeSnapshot,
     reference::{
@@ -76,6 +76,27 @@ pub trait SessionTreeStore {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionBranchTreeSnapshot, SessionError>;
+    /// Resolve the active path as ordered entry metadata, without
+    /// deserializing or returning message bodies. This is the read-only
+    /// seam the windowed transcript loader uses to page backwards.
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError>;
+    /// Read specific entries by id. The implementation must verify the
+    /// returned facts are exactly the requested ids; a mismatch is a typed
+    /// index error so callers can fall back to a full load.
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError>;
+    /// File a repair intent for one session's disposable entry-index
+    /// projection after a read proved it stale or unreadable. The next
+    /// mutation or flush replaces the index from the durable source; a store
+    /// whose index is derived from its facts (memory) accepts and ignores it.
+    fn invalidate_entry_index(&mut self, session_id: &SessionId) -> Result<(), SessionError>;
 }
 
 pub trait SessionFlushStore {
@@ -450,6 +471,72 @@ impl SessionTreeStore for InMemorySessionStore {
             .get(session_id)
             .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
         session_branch_tree_snapshot(&session.entries, session.leaf.as_ref())
+    }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&EntryId>,
+    ) -> Result<Vec<PathEntryRecord>, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        let state = resolve_session(&session.entries, leaf.or(session.leaf.as_ref()))?;
+        let mut by_id = HashMap::with_capacity(session.entries.len());
+        for entry in &session.entries {
+            by_id.insert(entry.id.clone(), entry);
+        }
+        state
+            .path
+            .iter()
+            .map(|entry_id| {
+                let entry = by_id
+                    .get(entry_id)
+                    .ok_or_else(|| SessionError::DanglingParent(entry_id.clone()))?;
+                Ok(PathEntryRecord {
+                    entry_id: entry.id.clone(),
+                    parent_id: entry.parent_id.clone(),
+                    kind: entry.kind.tag(),
+                    // The in-memory store has no durable bytes; paging over
+                    // entries is identity-based, never offset-based.
+                    byte_offset: None,
+                    byte_len: None,
+                    timestamp: entry.timestamp,
+                })
+            })
+            .collect()
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<SessionEntry>, SessionError> {
+        let session = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
+        entry_ids
+            .iter()
+            .map(|entry_id| {
+                session
+                    .entries
+                    .iter()
+                    .find(|entry| entry.id == *entry_id)
+                    .cloned()
+                    .ok_or_else(|| SessionError::EntryIndexMismatch {
+                        session_id: session_id.clone(),
+                        entry_id: entry_id.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        // The in-memory index is a projection of the facts it is derived
+        // from; it can never diverge, so the repair intent is a no-op.
+        Ok(())
     }
 }
 

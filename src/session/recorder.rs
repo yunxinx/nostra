@@ -15,17 +15,35 @@ use std::{
     time::Duration,
 };
 
-use super::{EntryId, JsonlWriter, SessionEntry, SessionEntryKind, SessionError};
+use super::{EntryByteRange, EntryId, JsonlWriter, SessionEntry, SessionEntryKind, SessionError};
 
 const COMMAND_CAPACITY: usize = 64;
 const DROP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Response<T> = SyncSender<Result<T, SessionError>>;
 
+/// A durable recorder result: the exact entries that reached JSONL and the
+/// byte ranges the writer actually wrote for them. Ranges always come from
+/// real on-disk bytes (a successful write or reconciliation), never from a
+/// regenerated batch.
+pub(crate) struct RecordedBatch {
+    pub(crate) entries: Vec<SessionEntry>,
+    pub(crate) ranges: Vec<EntryByteRange>,
+}
+
+impl RecordedBatch {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            ranges: Vec::new(),
+        }
+    }
+}
+
 enum RecorderCommand {
     Append {
         kinds: Vec<SessionEntryKind>,
-        response: Response<Vec<SessionEntry>>,
+        response: Response<RecordedBatch>,
     },
     Flush {
         response: Response<()>,
@@ -88,7 +106,7 @@ impl JsonlRecorder {
     pub(crate) fn append_batch(
         &self,
         kinds: Vec<SessionEntryKind>,
-    ) -> Result<Vec<SessionEntry>, SessionError> {
+    ) -> Result<RecordedBatch, SessionError> {
         let (response, receiver) = self.command_response();
         self.sender
             .send(RecorderCommand::Append { kinds, response })
@@ -97,10 +115,10 @@ impl JsonlRecorder {
     }
 
     pub(crate) fn set_leaf(&self, target: Option<&EntryId>) -> Result<EntryId, SessionError> {
-        let mut entries = self.append_batch(vec![SessionEntryKind::Leaf(super::Leaf {
+        let mut recorded = self.append_batch(vec![SessionEntryKind::Leaf(super::Leaf {
             target_id: target.cloned(),
         })])?;
-        entries.pop().map(|entry| entry.id).ok_or_else(|| {
+        recorded.entries.pop().map(|entry| entry.id).ok_or_else(|| {
             SessionError::io(std::io::Error::other(
                 "session recorder returned no Leaf entry",
             ))
@@ -225,7 +243,7 @@ fn run_worker(
                     }
                 };
                 let recovered = match persist_pending(&mut writer, &mut pending, &pending_state) {
-                    Ok(entries) => entries,
+                    Ok(recorded) => recorded,
                     Err(error) => {
                         // The current request was validated and assigned stable
                         // identity against the pending tail before the retry.
@@ -248,7 +266,7 @@ fn run_worker(
                         continue;
                     }
                     let result = match writer.append_entries(&prepared) {
-                        Ok(()) => {
+                        Ok(ranges) => {
                             #[cfg(test)]
                             if fail_next_append_after_write {
                                 fail_next_append_after_write = false;
@@ -260,9 +278,14 @@ fn run_worker(
                                     ))));
                                 continue;
                             }
-                            let mut all = recovered;
-                            all.extend(prepared);
-                            Ok(all)
+                            let mut entries = recovered.entries;
+                            entries.extend(prepared);
+                            let mut all_ranges = recovered.ranges;
+                            all_ranges.extend(ranges);
+                            Ok(RecordedBatch {
+                                entries,
+                                ranges: all_ranges,
+                            })
                         }
                         Err(error) => {
                             pending = prepared;
@@ -312,16 +335,19 @@ fn persist_pending(
     writer: &mut JsonlWriter,
     pending: &mut Vec<SessionEntry>,
     pending_state: &AtomicBool,
-) -> Result<Vec<SessionEntry>, SessionError> {
+) -> Result<RecordedBatch, SessionError> {
     if pending.is_empty() {
         pending_state.store(false, Ordering::Release);
-        return Ok(Vec::new());
+        return Ok(RecordedBatch::empty());
     }
     let batch = std::mem::take(pending);
     match writer.reconcile_entries(&batch) {
-        Ok(()) => {
+        Ok(ranges) => {
             pending_state.store(false, Ordering::Release);
-            Ok(batch)
+            Ok(RecordedBatch {
+                entries: batch,
+                ranges,
+            })
         }
         Err(error) => {
             *pending = batch;

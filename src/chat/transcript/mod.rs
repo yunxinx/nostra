@@ -18,13 +18,13 @@ use crate::llm::{
 use super::conversation_runtime::ConversationStreamEvent;
 
 pub(crate) use self::model::{
-    Part, PartId, PartKind, PartSource, Role, Turn, TurnId, is_replayable,
+    Part, PartId, PartKind, PartSource, Role, Turn, TurnId, allocate_turn_id,
 };
 pub(crate) use self::source::{
     ResolvedStateSource, TranscriptCursor, TranscriptPage, TranscriptSource,
 };
 
-use self::model::{allocate_part_id, allocate_turn_id, apply_indexed_message};
+use self::model::{allocate_part_id, apply_indexed_message};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PartChange {
@@ -52,9 +52,6 @@ pub(crate) enum TranscriptEvent {
         turn_id: TurnId,
     },
     /// A page of earlier turns was prepended by the windowed loader.
-    /// Constructed by the test-driven `prepend` seam until the P5 storage
-    /// cursor lands; production transcripts load the full tail.
-    #[allow(dead_code)]
     PagePrepended {
         turn_ids: Vec<TurnId>,
     },
@@ -157,23 +154,11 @@ impl Transcript {
         }
     }
 
+    /// The backward-paging cursor, naming the earliest message turn the model
+    /// currently holds. `None` means the path start has been reached.
     #[must_use]
-    pub(crate) fn replayable_history(&self) -> Vec<LlmMessage> {
-        let end = match self.turns.last() {
-            Some(turn)
-                if turn.role == Role::Assistant
-                    && turn.parts.is_empty()
-                    && turn.error.is_none() =>
-            {
-                self.turns.len().saturating_sub(1)
-            }
-            _ => self.turns.len(),
-        };
-        self.turns[..end]
-            .iter()
-            .map(Turn::to_llm)
-            .filter(is_replayable)
-            .collect()
+    pub(crate) fn source_cursor(&self) -> Option<TranscriptCursor> {
+        self.source_cursor.clone()
     }
 
     #[must_use]
@@ -204,8 +189,6 @@ impl Transcript {
 
     /// Prepend one page of earlier turns (P2 windowed loading). Ids are
     /// allocated fresh so they stay monotonic against the tail already held.
-    /// Driven by the test source until the P5 storage cursor lands.
-    #[allow(dead_code)]
     pub(crate) fn prepend(
         &mut self,
         page: TranscriptPage,
@@ -216,9 +199,9 @@ impl Transcript {
         let mut turns = adopted;
         turns.append(&mut self.turns);
         self.turns = turns;
-        if page.cursor_before.is_some() {
-            self.source_cursor = page.cursor_before;
-        }
+        // `None` means the page reached the path start, so no earlier page
+        // remains; an exhausted or failed page keeps its cursor otherwise.
+        self.source_cursor = page.cursor_before;
         self.publish(TranscriptEvent::PagePrepended { turn_ids }, cx)
     }
 

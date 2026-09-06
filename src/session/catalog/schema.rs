@@ -237,6 +237,74 @@ const MESSAGE_NODE_FOREIGN_KEYS: &[ForeignKeySchema] = &[ForeignKeySchema {
     match_name: "NONE",
 }];
 
+const ENTRIES_COLUMNS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "session_id",
+        declaration: "session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 1,
+    },
+    ColumnSchema {
+        name: "entry_id",
+        declaration: "entry_id TEXT NOT NULL",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 2,
+    },
+    ColumnSchema {
+        name: "parent_id",
+        declaration: "parent_id TEXT",
+        data_type: "TEXT",
+        not_null: false,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ColumnSchema {
+        name: "kind",
+        declaration: "kind TEXT NOT NULL",
+        data_type: "TEXT",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ColumnSchema {
+        name: "byte_offset",
+        declaration: "byte_offset INTEGER NOT NULL",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ColumnSchema {
+        name: "byte_len",
+        declaration: "byte_len INTEGER NOT NULL",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+    ColumnSchema {
+        name: "timestamp",
+        declaration: "timestamp INTEGER NOT NULL",
+        data_type: "INTEGER",
+        not_null: true,
+        default_value: None,
+        primary_key_position: 0,
+    },
+];
+
+const ENTRIES_FOREIGN_KEYS: &[ForeignKeySchema] = &[ForeignKeySchema {
+    table: "sessions",
+    from: "session_id",
+    to: "session_id",
+    on_update: "NO ACTION",
+    on_delete: "CASCADE",
+    match_name: "NONE",
+}];
+
 const REPAIR_STATE_COLUMNS: &[ColumnSchema] = &[
     ColumnSchema {
         name: "key",
@@ -303,6 +371,12 @@ const MESSAGE_NODES_TABLE: TableSchema = TableSchema {
     constraints: &["PRIMARY KEY(session_id, entry_id)"],
     foreign_keys: MESSAGE_NODE_FOREIGN_KEYS,
 };
+const ENTRIES_TABLE: TableSchema = TableSchema {
+    name: "entries",
+    columns: ENTRIES_COLUMNS,
+    constraints: &["PRIMARY KEY(session_id, entry_id)"],
+    foreign_keys: ENTRIES_FOREIGN_KEYS,
+};
 const REPAIR_STATE_TABLE: TableSchema = TableSchema {
     name: "repair_state",
     columns: REPAIR_STATE_COLUMNS,
@@ -316,10 +390,16 @@ const PROJECTS_TABLE: TableSchema = TableSchema {
     foreign_keys: &[],
 };
 
-const CHAT_TABLES: &[TableSchema] = &[SESSIONS_TABLE, MESSAGE_NODES_TABLE, REPAIR_STATE_TABLE];
+const CHAT_TABLES: &[TableSchema] = &[
+    SESSIONS_TABLE,
+    MESSAGE_NODES_TABLE,
+    ENTRIES_TABLE,
+    REPAIR_STATE_TABLE,
+];
 const AGENT_TABLES: &[TableSchema] = &[
     SESSIONS_TABLE,
     MESSAGE_NODES_TABLE,
+    ENTRIES_TABLE,
     REPAIR_STATE_TABLE,
     PROJECTS_TABLE,
 ];
@@ -380,6 +460,16 @@ const MESSAGE_SEARCH_COLUMNS: &[IndexColumnSchema] = &[
         descending: false,
     },
 ];
+const ENTRIES_SESSION_OFFSET_COLUMNS: &[IndexColumnSchema] = &[
+    IndexColumnSchema {
+        name: "session_id",
+        descending: false,
+    },
+    IndexColumnSchema {
+        name: "byte_offset",
+        descending: false,
+    },
+];
 
 const CATALOG_INDEXES: &[IndexSchema] = &[
     IndexSchema {
@@ -407,6 +497,13 @@ const CATALOG_INDEXES: &[IndexSchema] = &[
         name: "message_nodes_search",
         table: "message_nodes",
         columns: MESSAGE_SEARCH_COLUMNS,
+        unique: false,
+        partial: false,
+    },
+    IndexSchema {
+        name: "entries_session_offset",
+        table: "entries",
+        columns: ENTRIES_SESSION_OFFSET_COLUMNS,
         unique: false,
         partial: false,
     },

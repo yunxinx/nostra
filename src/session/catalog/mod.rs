@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::Metadata,
     path::{Path, PathBuf},
     str::FromStr,
@@ -15,14 +16,17 @@ use rusqlite::{
     types::Type,
 };
 
-use super::{EntryId, ProjectIdentity, SessionDomain, SessionHeader, SessionId};
+use super::{EntryId, EntryKindTag, ProjectIdentity, SessionDomain, SessionHeader, SessionId};
 
 mod projection;
 mod recovery;
 mod schema;
 mod types;
 
-pub(crate) use projection::{CatalogRepairProjection, SessionProjection, project_session_summary};
+pub(crate) use projection::{
+    CatalogRepairProjection, EntryIndexRow, SessionProjection, entry_index_rows,
+    project_session_summary,
+};
 use projection::{
     MessageNodeProjection, rebuild_projects_in_transaction, refresh_project_in_transaction,
     role_from_name, summary_from_row, write_projection_in_transaction,
@@ -34,7 +38,7 @@ pub use types::{
 };
 pub(crate) use types::{MessageNodeRow, ProjectionIntent};
 
-pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 8;
+pub(crate) const CATALOG_SCHEMA_VERSION: i64 = 9;
 pub(crate) const DEFAULT_PAGE_SIZE: usize = 30;
 /// Product cap on favorites.  The favorite group is not paginated — it is a
 /// pinned shortlist, and one query has to return all of it — so the cap is
@@ -184,15 +188,15 @@ impl Catalog {
         &mut self,
         header: &SessionHeader,
         projection: &SessionProjection,
+        entry_rows: &[EntryIndexRow],
         jsonl_path: &Path,
         intents: &[ProjectionIntent],
     ) -> Result<(), CatalogError> {
         self.write_projection(
             header,
             projection,
-            &projection.messages,
+            &ProjectionContent::full(projection, entry_rows),
             jsonl_path,
-            true,
             intents,
         )
     }
@@ -202,15 +206,15 @@ impl Catalog {
         header: &SessionHeader,
         projection: &SessionProjection,
         appended_messages: &[MessageNodeProjection],
+        entry_rows: &[EntryIndexRow],
         jsonl_path: &Path,
         intents: &[ProjectionIntent],
     ) -> Result<(), CatalogError> {
         self.write_projection(
             header,
             projection,
-            appended_messages,
+            &ProjectionContent::incremental(appended_messages, entry_rows),
             jsonl_path,
-            false,
             intents,
         )
     }
@@ -219,24 +223,21 @@ impl Catalog {
         &mut self,
         header: &SessionHeader,
         projection: &SessionProjection,
-        messages: &[MessageNodeProjection],
+        content: &ProjectionContent<'_>,
         jsonl_path: &Path,
-        replace_messages: bool,
         intents: &[ProjectionIntent],
     ) -> Result<(), CatalogError> {
         let force_full = self.reopen_if_replaced()?;
-        let result = self.write_projection_once(
-            header,
-            projection,
-            if force_full {
-                &projection.messages
-            } else {
-                messages
-            },
-            jsonl_path,
-            force_full || replace_messages,
-            intents,
-        );
+        // A replaced catalog file is re-armed as repair-required before this
+        // write, so entry rows for a forced full rewrite of an incremental
+        // append may be partial: the pending repair scan rebuilds the whole
+        // table from the JSONL source.
+        let selected = if force_full {
+            &ProjectionContent::full(projection, content.entry_rows)
+        } else {
+            content
+        };
+        let result = self.write_projection_once(header, projection, selected, jsonl_path, intents);
         if let Err(error) = result {
             // A write-ahead intent may belong to an inode that was replaced
             // during this operation. Best-effort re-arm the current catalog,
@@ -249,9 +250,8 @@ impl Catalog {
             if let Err(error) = self.write_projection_once(
                 header,
                 projection,
-                &projection.messages,
+                &ProjectionContent::full(projection, content.entry_rows),
                 jsonl_path,
-                true,
                 intents,
             ) {
                 let _ = self.mark_repair_required();
@@ -263,7 +263,7 @@ impl Catalog {
         }
         self.refresh_needs_repair()?;
         #[cfg(test)]
-        if force_full || replace_messages || replaced_after_write {
+        if force_full || replaced_after_write || content.replace_messages {
             self.full_projection_writes = self.full_projection_writes.saturating_add(1);
         } else {
             self.incremental_projection_writes =
@@ -276,9 +276,8 @@ impl Catalog {
         &mut self,
         header: &SessionHeader,
         projection: &SessionProjection,
-        messages: &[MessageNodeProjection],
+        content: &ProjectionContent<'_>,
         jsonl_path: &Path,
-        replace_messages: bool,
         intents: &[ProjectionIntent],
     ) -> Result<(), CatalogError> {
         let tx = self.connection.transaction()?;
@@ -286,9 +285,10 @@ impl Catalog {
             &tx,
             header,
             projection,
-            messages,
+            content.messages,
+            content.entry_rows,
             jsonl_path,
-            replace_messages,
+            content.replace_messages,
         )?;
         if let Some(project) = &header.project {
             refresh_project_in_transaction(&tx, &project.project_id)?;
@@ -305,6 +305,61 @@ impl Catalog {
         ))?;
         let rows = statement.query_map(params![self.domain.prefix()], summary_from_row)?;
         rows.map(|row| row.map_err(CatalogError::from)).collect()
+    }
+
+    /// Read every entry-index row of one session in durable append order
+    /// (`byte_offset` ascending). The caller resolves the active path from
+    /// this metadata without deserializing message bodies.
+    pub(crate) fn entry_index_rows(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Vec<EntryIndexRow>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT entry_id, parent_id, kind, byte_offset, byte_len, timestamp
+             FROM entries WHERE session_id = ?1 ORDER BY byte_offset",
+        )?;
+        let rows =
+            statement.query_map(params![session_id.to_string()], entry_index_row_from_sql)?;
+        rows.map(|row| row.map_err(CatalogError::from)).collect()
+    }
+
+    /// Look up entry-index rows for specific entry ids. The result aligns with
+    /// the requested order; a missing id yields `None` so the caller can
+    /// report a typed index mismatch instead of silently skipping content.
+    pub(crate) fn entry_index_rows_for_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[EntryId],
+    ) -> Result<Vec<Option<EntryIndexRow>>, CatalogError> {
+        if entry_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT entry_id, parent_id, kind, byte_offset, byte_len, timestamp
+             FROM entries WHERE session_id = ?1 AND entry_id IN (",
+        );
+        let mut values: Vec<Box<dyn ToSql>> = vec![Box::new(session_id.to_string())];
+        for (index, entry_id) in entry_ids.iter().enumerate() {
+            if index > 0 {
+                sql.push(',');
+            }
+            sql.push_str(&format!("?{}", index + 2));
+            values.push(Box::new(entry_id.to_string()));
+        }
+        sql.push(')');
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            entry_index_row_from_sql,
+        )?;
+        let found = rows
+            .map(|row| row.map_err(CatalogError::from))
+            .collect::<Result<Vec<EntryIndexRow>, _>>()?;
+        let by_id = found
+            .into_iter()
+            .map(|row| (row.entry_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        Ok(entry_ids.iter().map(|id| by_id.get(id).cloned()).collect())
     }
 
     pub(crate) fn projection_intent_session_ids(&self) -> Result<Vec<SessionId>, CatalogError> {
@@ -356,7 +411,8 @@ impl Catalog {
                 &tx,
                 &repaired.header,
                 &repaired.projection,
-                &repaired.projection.messages,
+                repaired.projection.messages.as_slice(),
+                repaired.entry_rows.as_slice(),
                 &repaired.jsonl_path,
                 true,
             )?;
@@ -719,6 +775,31 @@ static INITIALIZE_INTERRUPTION: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new
 #[cfg(test)]
 static REPLACEMENT_INITIALIZATION_FAILURE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
+fn entry_index_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntryIndexRow> {
+    let entry_id = EntryId::from_str(&row.get::<_, String>(0)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+    })?;
+    let parent_id = row
+        .get::<_, Option<String>>(1)?
+        .map(|value| {
+            EntryId::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(1, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?;
+    let kind = EntryKindTag::parse_tag(&row.get::<_, String>(2)?).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(2, Type::Text, "unknown entry kind tag".into())
+    })?;
+    Ok(EntryIndexRow {
+        entry_id,
+        parent_id,
+        kind,
+        byte_offset: row.get::<_, i64>(3)?.max(0) as u64,
+        byte_len: row.get::<_, i64>(4)?.max(0) as u64,
+        timestamp: row.get(5)?,
+    })
+}
+
 fn query_needs_repair(connection: &Connection) -> Result<bool, CatalogError> {
     Ok(connection.query_row(
         "SELECT EXISTS(
@@ -755,6 +836,35 @@ fn clear_projection_intents_for_session_in_transaction(
         ],
     )?;
     Ok(())
+}
+
+/// The message-node and entry-index rows one projection transaction writes,
+/// plus whether the transaction replaces all rows for the session. A full
+/// write uses the projection's complete message set; an incremental append
+/// supplies only the new batch, and entry rows follow the same rule so
+/// offsets never mix the two sources.
+struct ProjectionContent<'a> {
+    messages: &'a [MessageNodeProjection],
+    entry_rows: &'a [EntryIndexRow],
+    replace_messages: bool,
+}
+
+impl<'a> ProjectionContent<'a> {
+    fn full(projection: &'a SessionProjection, entry_rows: &'a [EntryIndexRow]) -> Self {
+        Self {
+            messages: &projection.messages,
+            entry_rows,
+            replace_messages: true,
+        }
+    }
+
+    fn incremental(messages: &'a [MessageNodeProjection], entry_rows: &'a [EntryIndexRow]) -> Self {
+        Self {
+            messages,
+            entry_rows,
+            replace_messages: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

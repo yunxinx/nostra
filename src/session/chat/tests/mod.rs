@@ -3,8 +3,8 @@ use std::{fs, time::Duration};
 use super::*;
 use crate::llm::{FinishReason, IndexedMessage, Protocol, UsageProvenance};
 use crate::session::{
-    InMemorySessionStore, LocalSessionStore, LocalStoreConfig, SessionBranchPreview,
-    SessionBranchTreeSnapshot, SessionTreeSnapshot,
+    InMemorySessionStore, LocalSessionStore, LocalStoreConfig, PathEntryRecord,
+    SessionBranchPreview, SessionBranchTreeSnapshot, SessionEntry, SessionTreeSnapshot,
 };
 use crate::session::{
     SessionFlushStore, SessionLifecycleStore, SessionReadStore, SessionTreeStore,
@@ -98,7 +98,8 @@ fn exercise_completed<S: SessionStore>(store: S) {
         .expect("completed turn should persist");
     assert!(controller.pending_turn_id().is_none());
     let state = controller
-        .restore(&start.session_id)
+        .store
+        .load_session(&start.session_id, None)
         .expect("completed session should restore");
     assert_eq!(state.messages.len(), 2);
     assert_eq!(state.messages[0].entry_id, start.user_entry_id);
@@ -116,4 +117,5 @@ fn exercise_completed<S: SessionStore>(store: S) {
 }
 
 mod contracts;
+mod replay;
 mod retry;

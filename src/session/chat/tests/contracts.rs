@@ -122,7 +122,8 @@ fn project_controller_creates_and_restores_a_project_scoped_session() {
     assert_eq!(page.sessions[0].project.as_ref(), Some(&project));
 
     let restored = controller
-        .restore(&start.session_id)
+        .store
+        .load_session(&start.session_id, None)
         .expect("restore project session");
     assert_eq!(restored.messages.len(), 1);
 }
@@ -182,7 +183,8 @@ fn failed_generation_drops_partial_assistant_and_redacts_upstream_body() {
         .expect("failed terminal should persist user and result");
     controller.flush().expect("flush should complete");
     let state = controller
-        .restore(&start.session_id)
+        .store
+        .load_session(&start.session_id, None)
         .expect("failed session should restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(
@@ -224,7 +226,10 @@ fn cancelled_generation_drops_partial_assistant() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("cancelled terminal should persist");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.turn_results[0].result.status, TurnStatus::Cancelled);
 }
@@ -259,7 +264,10 @@ fn request_failure_and_invalid_terminal_states_are_explicit() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("an exact durable terminal retry is idempotent");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.turn_results[0].result.status, TurnStatus::Failed);
 }
@@ -277,7 +285,10 @@ fn exercise_terminal_without_assistant<S: SessionStore>(store: S, terminal: Chat
     controller
         .finish_turn("turn-1", &terminal)
         .expect("terminal should persist");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.messages[0].entry_id, start.user_entry_id);
     assert_eq!(state.turn_results.len(), 1);
@@ -335,7 +346,10 @@ fn completed_without_assistant_snapshot_keeps_only_terminal_result() {
     controller
         .finish_turn("turn-1", &terminal)
         .expect("terminal should persist");
-    let state = controller.restore(&start.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&start.session_id, None)
+        .expect("restore");
     assert_eq!(state.messages.len(), 1);
     assert_eq!(state.turn_results.len(), 1);
     assert_eq!(state.turn_results[0].result.status, TurnStatus::Completed);
@@ -399,9 +413,12 @@ fn local_store_restarts_and_read_only_restore_keeps_timestamp() {
         (start.session_id, before)
     };
 
-    let mut restored =
+    let restored =
         ChatSessionController::new(LocalSessionStore::open(config.clone()).expect("reopen store"));
-    let state = restored.restore(&session_id).expect("restart restore");
+    let state = restored
+        .store
+        .load_session(&session_id, None)
+        .expect("restart restore");
     let after = restored
         .store
         .get_summary(&session_id)
@@ -465,7 +482,10 @@ fn changing_model_is_restored_as_the_latest_config() {
         .finish_turn("turn-2", &ChatTurnTerminal::cancelled())
         .expect("second terminal");
 
-    let state = controller.restore(&first.session_id).expect("restore");
+    let state = controller
+        .store
+        .load_session(&first.session_id, None)
+        .expect("restore");
     assert_eq!(
         state.latest_config.as_ref().map(|config| &config.model),
         Some(&model("model-b"))

@@ -11,14 +11,15 @@ use crate::llm::{ModelSelection, Role};
 use super::super::reference::searchable_text_from_message;
 use super::super::tree::{message_preview, resolve_session};
 use super::super::{
-    EntryId, ProjectIdentity, SessionDomain, SessionEntry, SessionEntryKind, SessionHeader,
-    SessionId,
+    EntryByteRange, EntryId, EntryKindTag, ProjectIdentity, SessionDomain, SessionEntry,
+    SessionEntryKind, SessionHeader, SessionId,
 };
 use super::{CatalogError, SessionSummary};
 
 pub(crate) struct CatalogRepairProjection {
     pub(super) header: SessionHeader,
     pub(super) projection: SessionProjection,
+    pub(super) entry_rows: Vec<EntryIndexRow>,
     pub(super) jsonl_path: PathBuf,
 }
 
@@ -26,12 +27,15 @@ impl CatalogRepairProjection {
     pub(crate) fn from_entries(
         header: SessionHeader,
         entries: &[SessionEntry],
+        entry_ranges: &[EntryByteRange],
         jsonl_path: PathBuf,
     ) -> Result<Self, CatalogError> {
         let projection = SessionProjection::from_entries(&header, entries)?;
+        let entry_rows = entry_index_rows(entries, entry_ranges)?;
         Ok(Self {
             header,
             projection,
+            entry_rows,
             jsonl_path,
         })
     }
@@ -45,11 +49,60 @@ impl CatalogRepairProjection {
     }
 }
 
+/// One row of the disposable `entries` byte-offset index. Offsets only come
+/// from a full loader scan or the writer's own durable write results.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EntryIndexRow {
+    pub(crate) entry_id: EntryId,
+    pub(crate) parent_id: Option<EntryId>,
+    pub(crate) kind: EntryKindTag,
+    pub(crate) byte_offset: u64,
+    pub(crate) byte_len: u64,
+    pub(crate) timestamp: i64,
+}
+
+/// Project entry rows from a scanned source. The two slices must be parallel
+/// and name the same ids; a mismatch is a projection error, never an inferred
+/// offset.
+pub(crate) fn entry_index_rows(
+    entries: &[SessionEntry],
+    entry_ranges: &[EntryByteRange],
+) -> Result<Vec<EntryIndexRow>, CatalogError> {
+    if entries.len() != entry_ranges.len() {
+        return Err(CatalogError::Corrupt(format!(
+            "entry range count {} does not match entry count {}",
+            entry_ranges.len(),
+            entries.len()
+        )));
+    }
+    entries
+        .iter()
+        .zip(entry_ranges)
+        .map(|(entry, range)| {
+            if entry.id != range.entry_id {
+                return Err(CatalogError::Corrupt(format!(
+                    "entry range id {} does not match entry {}",
+                    range.entry_id, entry.id
+                )));
+            }
+            Ok(EntryIndexRow {
+                entry_id: entry.id.clone(),
+                parent_id: entry.parent_id.clone(),
+                kind: entry.kind.tag(),
+                byte_offset: range.byte_offset,
+                byte_len: range.byte_len,
+                timestamp: entry.timestamp,
+            })
+        })
+        .collect()
+}
+
 pub(super) fn write_projection_in_transaction(
     tx: &Transaction<'_>,
     header: &SessionHeader,
     projection: &SessionProjection,
     messages: &[MessageNodeProjection],
+    entry_rows: &[EntryIndexRow],
     jsonl_path: &Path,
     replace_messages: bool,
 ) -> Result<(), CatalogError> {
@@ -102,6 +155,10 @@ pub(super) fn write_projection_in_transaction(
             "DELETE FROM message_nodes WHERE session_id = ?1",
             params![header.session_id.to_string()],
         )?;
+        tx.execute(
+            "DELETE FROM entries WHERE session_id = ?1",
+            params![header.session_id.to_string()],
+        )?;
     }
     for node in messages {
         tx.execute(
@@ -125,6 +182,28 @@ pub(super) fn write_projection_in_transaction(
                 node.preview.as_deref(),
                 node.searchable_text.as_str(),
                 node.searchable_folded.as_str(),
+            ],
+        )?;
+    }
+    for row in entry_rows {
+        tx.execute(
+            "INSERT INTO entries (
+                session_id, entry_id, parent_id, kind, byte_offset, byte_len, timestamp
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(session_id, entry_id) DO UPDATE SET
+                parent_id = excluded.parent_id,
+                kind = excluded.kind,
+                byte_offset = excluded.byte_offset,
+                byte_len = excluded.byte_len,
+                timestamp = excluded.timestamp",
+            params![
+                header.session_id.to_string(),
+                row.entry_id.to_string(),
+                row.parent_id.as_ref().map(ToString::to_string),
+                row.kind.as_str(),
+                row.byte_offset.min(i64::MAX as u64) as i64,
+                row.byte_len.min(i64::MAX as u64) as i64,
+                row.timestamp,
             ],
         )?;
     }

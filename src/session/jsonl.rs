@@ -16,10 +16,22 @@ use super::{
     SessionEntryKind, SessionError, SessionHeader, validate_session_entries,
 };
 
+/// Durable byte location of one JSONL entry line, including its trailing
+/// newline. Offsets always come from real on-disk bytes: either the writer's
+/// own successful write or a full loader scan. They are never inferred.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntryByteRange {
+    pub entry_id: EntryId,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+}
+
 /// Parsed session facts and non-fatal diagnostics emitted by the loader.
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsonlLoad {
     pub entries: Vec<SessionEntry>,
+    /// Byte ranges parallel to `entries`, for the catalog entry index.
+    pub entry_ranges: Vec<EntryByteRange>,
     pub diagnostics: Vec<JsonlDiagnostic>,
     pub truncated_tail: bool,
     pub valid_bytes: u64,
@@ -54,6 +66,7 @@ impl JsonlLoader {
         let file = File::open(path).map_err(SessionError::io)?;
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
+        let mut entry_ranges = Vec::new();
         let mut diagnostics = Vec::new();
         let mut seen = HashSet::new();
         let mut line_number = 1;
@@ -105,6 +118,11 @@ impl JsonlLoader {
                     if !seen.insert(entry.id.clone()) {
                         return Err(SessionError::DuplicateId(entry.id));
                     }
+                    entry_ranges.push(EntryByteRange {
+                        entry_id: entry.id.clone(),
+                        byte_offset: line_start,
+                        byte_len: read as u64,
+                    });
                     entries.push(entry);
                     valid_bytes = consumed_bytes;
                     ends_with_newline = has_newline;
@@ -138,6 +156,7 @@ impl JsonlLoader {
         }
         Ok(JsonlLoad {
             entries,
+            entry_ranges,
             diagnostics,
             truncated_tail,
             valid_bytes,
@@ -172,7 +191,7 @@ impl JsonlWriter {
             .write(true)
             .open(&path)
             .map_err(SessionError::io)?;
-        Self::create_on_file(path, file, header, Vec::new()).map(|(writer, _)| writer)
+        Self::create_on_file(path, file, header, Vec::new()).map(|(writer, _, _)| writer)
     }
 
     pub(crate) fn create_on_file(
@@ -180,7 +199,7 @@ impl JsonlWriter {
         file: File,
         header: SessionHeader,
         initial: Vec<SessionEntryKind>,
-    ) -> Result<(Self, Vec<SessionEntry>), SessionError> {
+    ) -> Result<(Self, Vec<SessionEntry>, Vec<EntryByteRange>), SessionError> {
         header.validate()?;
         let domain = header.domain;
         let header_entry = SessionEntry::header(header);
@@ -191,12 +210,12 @@ impl JsonlWriter {
             leaf: header_entry.id.clone(),
             domain,
         };
-        writer.write_entries(std::slice::from_ref(&header_entry))?;
+        let mut ranges = writer.write_entries(std::slice::from_ref(&header_entry))?;
         let mut entries = vec![header_entry];
         let initial = writer.prepare_batch_entries(initial)?;
-        writer.append_entries(&initial)?;
+        ranges.extend(writer.append_entries(&initial)?);
         entries.extend(initial);
-        Ok((writer, entries))
+        Ok((writer, entries, ranges))
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, SessionError> {
@@ -324,23 +343,26 @@ impl JsonlWriter {
         }))
     }
 
-    pub fn append_entries(&mut self, entries: &[SessionEntry]) -> Result<(), SessionError> {
+    pub fn append_entries(
+        &mut self,
+        entries: &[SessionEntry],
+    ) -> Result<Vec<EntryByteRange>, SessionError> {
         if entries.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        self.write_entries(entries)?;
+        let ranges = self.write_entries(entries)?;
         if let Some(last) = entries.last() {
             self.leaf = leaf_after_entry(last);
         }
-        Ok(())
+        Ok(ranges)
     }
 
     pub(crate) fn reconcile_entries(
         &mut self,
         expected: &[SessionEntry],
-    ) -> Result<(), SessionError> {
+    ) -> Result<Vec<EntryByteRange>, SessionError> {
         if expected.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let path = self.path.clone();
@@ -376,7 +398,12 @@ impl JsonlWriter {
                     expected[matched].id.clone(),
                 ))
             } else {
-                reopened.append_entries(&expected[matched..])
+                // The matched prefix is already durable at its scanned
+                // offsets; only the missing suffix is written now, so every
+                // returned range reflects real on-disk bytes.
+                let mut ranges = loaded.entry_ranges[start..start + matched].to_vec();
+                ranges.extend(reopened.append_entries(&expected[matched..])?);
+                Ok(ranges)
             }
         } else if let Some(conflict) = expected
             .iter()
@@ -387,12 +414,12 @@ impl JsonlWriter {
             reopened.append_entries(expected)
         };
 
-        if result.is_ok() {
+        if let Ok(ranges) = result {
             // A prior write may have returned an error after making the exact
             // bytes readable but before proving them stable. Even when no
             // suffix is missing, reconciliation must cross a fresh sync_all
             // barrier before the recorder is allowed to forget this batch.
-            result = reopened.flush();
+            result = reopened.flush().map(|_| ranges);
         }
         *self = reopened;
         result
@@ -414,16 +441,31 @@ impl JsonlWriter {
         self.file.sync_all().map_err(SessionError::io)
     }
 
-    fn write_entries(&mut self, entries: &[SessionEntry]) -> Result<(), SessionError> {
+    fn write_entries(
+        &mut self,
+        entries: &[SessionEntry],
+    ) -> Result<Vec<EntryByteRange>, SessionError> {
         let validated = self
             .validation
             .validate_entries(entries.iter(), self.domain)?;
+        // The current durable file length is the offset of the first new
+        // line. Ranges therefore describe the exact bytes this write puts on
+        // disk, which is what the catalog entry index stores.
+        let mut offset = self.file.metadata().map_err(SessionError::io)?.len();
         let mut encoded = Vec::new();
+        let mut ranges = Vec::with_capacity(entries.len());
         for entry in entries {
             let line = serde_json::to_string(entry).map_err(|source| SessionError::Serialize {
                 entry_id: entry.id.clone(),
                 source,
             })?;
+            let byte_len = line.len() as u64 + 1;
+            ranges.push(EntryByteRange {
+                entry_id: entry.id.clone(),
+                byte_offset: offset,
+                byte_len,
+            });
+            offset = offset.saturating_add(byte_len);
             encoded.extend_from_slice(line.as_bytes());
             encoded.push(b'\n');
         }
@@ -434,7 +476,7 @@ impl JsonlWriter {
         self.file.write_all(&encoded).map_err(SessionError::io)?;
         self.flush()?;
         self.validation.commit(validated);
-        Ok(())
+        Ok(ranges)
     }
 }
 

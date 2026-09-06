@@ -319,6 +319,10 @@ pub(crate) struct ConversationRuntime {
     pub(super) reply_task: Option<ReplyTask>,
     pub(super) quiescence: ConversationQuiescence,
     pub(super) transcript: Entity<Transcript>,
+    /// Paged transcript source retained from the last restore. `None` for a
+    /// fresh draft or the full-load fallback; warm/cold view transitions keep
+    /// it because the source's path-snapshot prefix is immutable.
+    pub(super) transcript_source: Option<Arc<super::persistence::JsonlOffsetSource>>,
     #[cfg(test)]
     pub(super) next_reply_drop_flag: Option<std::rc::Rc<std::cell::Cell<bool>>>,
 }
@@ -366,6 +370,7 @@ impl ConversationRuntime {
             reply_task: None,
             quiescence: ConversationQuiescence::default(),
             transcript,
+            transcript_source: None,
             #[cfg(test)]
             next_reply_drop_flag: None,
         }
@@ -391,6 +396,14 @@ impl ConversationRuntime {
     #[must_use]
     pub fn references(&self) -> Option<SharedChatReferenceStore> {
         self.conversation.references()
+    }
+
+    /// The paged transcript source retained from the last restore, for the
+    /// view's backward-paging loader. The returned clone is send-safe: the
+    /// source only holds the shared read handle and immutable metadata.
+    #[must_use]
+    pub(crate) fn transcript_source(&self) -> Option<Arc<super::persistence::JsonlOffsetSource>> {
+        self.transcript_source.clone()
     }
 
     #[must_use]

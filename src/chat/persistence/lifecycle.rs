@@ -107,11 +107,11 @@ impl ConversationRuntime {
             self.pending_turn_id = None;
         }
         if request.request_generation != self.request_generation {
-            if let Ok(start) = &result {
+            if let Ok(begin) = &result {
                 self.pending_terminal =
                     Some((request.turn_id.clone(), ChatTurnTerminal::cancelled()));
                 self.pending_turn_id = None;
-                self.session_id = Some(start.session_id.clone());
+                self.session_id = Some(begin.start.session_id.clone());
             }
             self.terminal_persistence = None;
             self.generating = false;
@@ -122,8 +122,8 @@ impl ConversationRuntime {
             self.publish_state(cx);
             return;
         }
-        let start = match result {
-            Ok(start) if self.terminal_persistence.is_some() => start,
+        let begin = match result {
+            Ok(begin) if self.terminal_persistence.is_some() => begin,
             Ok(_) => {
                 self.publish_state(cx);
                 return;
@@ -151,21 +151,24 @@ impl ConversationRuntime {
 
         self.generating = true;
         self.pending_turn_id = Some(request.turn_id.clone());
-        self.session_id = Some(start.session_id.clone());
+        self.session_id = Some(begin.start.session_id.clone());
         self.next_turn_id = self.next_turn_id.saturating_add(1);
         self.transcript.update(cx, |transcript, cx| {
             transcript.begin_turn(request.user_message.clone(), cx);
         });
-        let history = self.transcript.read(cx).replayable_history();
+        // The history was assembled on the persistence thread from the full
+        // durable source after the user fact committed (R5); it deliberately
+        // does not read the transcript entity the UI pages into.
+        let history = begin.history;
         let selection = request.selection.clone();
         let turn_id = request.turn_id.clone();
         let generation = request.request_generation;
-        let session_id = start.session_id.clone();
+        let session_id = begin.start.session_id.clone();
         self.publish_state(cx);
         self.publish_event(
             ConversationRuntimeEvent::TurnStarted(Box::new(StartedConversationTurn {
                 request,
-                session_id: start.session_id,
+                session_id: begin.start.session_id,
             })),
             cx,
         );

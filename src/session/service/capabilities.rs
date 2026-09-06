@@ -246,6 +246,31 @@ impl SessionTreeStore for SharedSessionStore {
         self.ensure_domain(session_id.domain())?;
         self.core.lock()?.load_branch_tree(session_id)
     }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&super::super::EntryId>,
+    ) -> Result<Vec<super::super::PathEntryRecord>, SessionError> {
+        self.ensure_domain(session_id.domain())?;
+        self.core.lock()?.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[super::super::EntryId],
+    ) -> Result<Vec<super::super::SessionEntry>, SessionError> {
+        self.ensure_domain(session_id.domain())?;
+        self.core.lock()?.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, session_id: &SessionId) -> Result<(), SessionError> {
+        self.ensure_domain(session_id.domain())?;
+        self.core
+            .lock_mutation(self.permit.as_ref())?
+            .invalidate_entry_index(session_id)
+    }
 }
 
 impl SessionFlushStore for SharedSessionStore {
@@ -319,6 +344,78 @@ impl SessionCatalogStore for SharedSessionCatalog {
     ) -> Result<Option<SessionSummary>, CatalogError> {
         self.ensure_catalog_domain(session_id.domain())?;
         self.core.lock_catalog()?.get_session_summary(session_id)
+    }
+}
+
+impl SessionTreeStore for SharedSessionCatalog {
+    /// The catalog facade is read-only: it resolves entry metadata for lazy
+    /// selection but never grants leaf or projection-mutation authority.
+    fn set_leaf(
+        &mut self,
+        _session_id: &SessionId,
+        _leaf: Option<&super::super::EntryId>,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::ReadOnlyCapability)
+    }
+
+    fn load_session_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core.lock()?.load_session_tree(session_id)
+    }
+
+    fn load_session_tree_for_leaf(
+        &self,
+        session_id: &SessionId,
+        leaf: &super::super::EntryId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core
+            .lock()?
+            .load_session_tree_for_leaf(session_id, leaf)
+    }
+
+    fn load_branch_preview(
+        &self,
+        session_id: &SessionId,
+        branch_root: &super::super::EntryId,
+    ) -> Result<SessionBranchPreview, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core
+            .lock()?
+            .load_branch_preview(session_id, branch_root)
+    }
+
+    fn load_branch_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core.lock()?.load_branch_tree(session_id)
+    }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&super::super::EntryId>,
+    ) -> Result<Vec<super::super::PathEntryRecord>, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core.lock()?.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[super::super::EntryId],
+    ) -> Result<Vec<super::super::SessionEntry>, SessionError> {
+        self.ensure_session_domain(session_id.domain())?;
+        self.core.lock()?.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        Err(SessionError::ReadOnlyCapability)
     }
 }
 
@@ -396,5 +493,80 @@ impl ProjectSessionStore for SharedAgentProjectStore {
         query: super::super::ProjectCatalogQuery,
     ) -> Result<super::super::ProjectCatalogPage, CatalogError> {
         self.0.lock_catalog()?.list_projects(query)
+    }
+}
+
+impl SharedSessionStore {
+    /// Downgrade this mutable capability to a send-safe `Arc` handle with
+    /// only the read-side entry-index methods of `SessionTreeStore`. The
+    /// windowed transcript loader holds it across threads without gaining
+    /// append, leaf, or flush authority.
+    #[must_use]
+    pub fn tree_read_handle(self) -> Arc<dyn SessionTreeStore + Send + Sync> {
+        Arc::new(SharedTreeReadHandle(self))
+    }
+}
+
+struct SharedTreeReadHandle(SharedSessionStore);
+
+impl SessionTreeStore for SharedTreeReadHandle {
+    fn set_leaf(
+        &mut self,
+        _session_id: &SessionId,
+        _leaf: Option<&super::super::EntryId>,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::ReadOnlyCapability)
+    }
+
+    fn load_session_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        self.0.load_session_tree(session_id)
+    }
+
+    fn load_session_tree_for_leaf(
+        &self,
+        session_id: &SessionId,
+        leaf: &super::super::EntryId,
+    ) -> Result<SessionTreeSnapshot, SessionError> {
+        self.0.load_session_tree_for_leaf(session_id, leaf)
+    }
+
+    fn load_branch_preview(
+        &self,
+        session_id: &SessionId,
+        branch_root: &super::super::EntryId,
+    ) -> Result<SessionBranchPreview, SessionError> {
+        self.0.load_branch_preview(session_id, branch_root)
+    }
+
+    fn load_branch_tree(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionBranchTreeSnapshot, SessionError> {
+        self.0.load_branch_tree(session_id)
+    }
+
+    fn load_entry_index(
+        &self,
+        session_id: &SessionId,
+        leaf: Option<&super::super::EntryId>,
+    ) -> Result<Vec<super::super::PathEntryRecord>, SessionError> {
+        self.0.load_entry_index(session_id, leaf)
+    }
+
+    fn read_entries(
+        &self,
+        session_id: &SessionId,
+        entry_ids: &[super::super::EntryId],
+    ) -> Result<Vec<super::super::SessionEntry>, SessionError> {
+        self.0.read_entries(session_id, entry_ids)
+    }
+
+    fn invalidate_entry_index(&mut self, _session_id: &SessionId) -> Result<(), SessionError> {
+        // A read handle has no projection-mutation authority; the caller must
+        // file repair intents through the mutable shared store.
+        Err(SessionError::ReadOnlyCapability)
     }
 }

@@ -138,12 +138,21 @@ pub enum SessionError {
     InvalidCompactionTarget(EntryId),
     #[error("branch summary references invalid source entry `{0}`")]
     InvalidBranchTarget(EntryId),
+    #[error("session `{0}` has no durable entry index rows")]
+    EntryIndexMissing(SessionId),
+    #[error("session entry index for `{session_id}` does not match entry `{entry_id}`")]
+    EntryIndexMismatch {
+        session_id: SessionId,
+        entry_id: EntryId,
+    },
     #[error("chat message reference must point to a chat session")]
     ReferenceSourceNotChat,
     #[error("chat message references are only valid in agent sessions")]
     ReferenceOutsideAgent,
     #[error("session entry kind is not allowed in this position")]
     InvalidEntryKind,
+    #[error("this session capability is read-only and cannot mutate the store")]
+    ReadOnlyCapability,
     #[error("invalid transcript replay entry: {0}")]
     InvalidTranscriptReplay(String),
     #[error("session store lock is poisoned after an interrupted operation")]

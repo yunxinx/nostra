@@ -14,15 +14,15 @@ use crate::paths;
 
 use super::{
     CatalogError, ChatMessageRead, ChatMessageReferenceStore, ChatMessageSearchCursor,
-    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, EntryId, JsonlLoader,
-    JsonlRecorder, ProjectCatalogPage, ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore,
-    ResolvedSessionState, SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore,
-    SessionDomain, SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader,
-    SessionId, SessionLifecycleStore, SessionReadStore, SessionSummary, SessionTreeSnapshot,
-    SessionTreeStore,
+    ChatMessageSearchPage, ChatMessageSearchQuery, ChatReferenceError, EntryId, EntryKindTag,
+    JsonlLoad, JsonlLoader, JsonlRecorder, PathEntryRecord, ProjectCatalogPage,
+    ProjectCatalogQuery, ProjectIdentity, ProjectSessionStore, ResolvedSessionState,
+    SessionBranchPreview, SessionBranchTreeSnapshot, SessionCatalogStore, SessionDomain,
+    SessionEntry, SessionEntryKind, SessionError, SessionFlushStore, SessionHeader, SessionId,
+    SessionLifecycleStore, SessionReadStore, SessionSummary, SessionTreeSnapshot, SessionTreeStore,
     catalog::{
         Catalog, CatalogPage, CatalogQuery, CatalogRepairProjection, ProjectionIntent,
-        RepairReport, SessionProjection,
+        RepairReport, SessionProjection, entry_index_rows,
     },
     reference::{
         ChatMessageUnavailableReason, message_from_entry, preview_from_node, unavailable,
@@ -180,6 +180,13 @@ struct LocalStoreTestFaults {
     after_leaf_commit: bool,
     after_delete_commit: bool,
 }
+
+/// Test probe counting message facts deserialized through the offset-index
+/// read path (`read_entries`). The paged open path asserts on it to prove an
+/// open never deserializes the whole transcript.
+#[cfg(test)]
+pub(crate) static READ_ENTRIES_PROBE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 impl LocalSessionStore {
     pub fn open(config: LocalStoreConfig) -> Result<Self, LocalStoreError> {
@@ -432,12 +439,19 @@ impl LocalSessionStore {
         Ok(())
     }
 
+    fn reload_load(
+        source_boundary: &source::SourceBoundary,
+        path: &Path,
+    ) -> Result<JsonlLoad, LocalStoreError> {
+        source::authorize_existing_source(source_boundary, path)?;
+        Ok(JsonlLoader::load(path)?)
+    }
+
     fn reload_entries(
         source_boundary: &source::SourceBoundary,
         path: &Path,
     ) -> Result<Vec<SessionEntry>, LocalStoreError> {
-        source::authorize_existing_source(source_boundary, path)?;
-        Ok(JsonlLoader::load(path)?.entries)
+        Ok(Self::reload_load(source_boundary, path)?.entries)
     }
 
     fn load_header_and_entries_for_session(
@@ -495,14 +509,18 @@ impl LocalSessionStore {
             .get_mut(session_id)
             .ok_or_else(|| SessionError::SessionNotFound(session_id.clone()))?;
         handle.recorder.flush()?;
-        handle.entries = Self::reload_entries(&source_boundary, &handle.path)
-            .map_err(local_store_session_error)?;
+        let loaded =
+            Self::reload_load(&source_boundary, &handle.path).map_err(local_store_session_error)?;
+        handle.entries = loaded.entries;
         handle.projection = SessionProjection::from_entries(&handle.header, &handle.entries)
             .map_err(session_io_error)?;
         handle.source_stamp = source_stamp(&handle.path);
+        let entry_rows =
+            entry_index_rows(&handle.entries, &loaded.entry_ranges).map_err(session_io_error)?;
         let result = catalog.upsert_projection_with_intents(
             &handle.header,
             &handle.projection,
+            &entry_rows,
             &handle.path,
             &handle.projection_intents,
         );

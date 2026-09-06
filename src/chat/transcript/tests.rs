@@ -6,8 +6,8 @@ use crate::llm::{
 };
 
 use super::{
-    PartChange, PartKind, PartSource, ResolvedStateSource, Role, Transcript, TranscriptEvent,
-    TranscriptSource as _, copyable_text, derive_title, is_replayable,
+    PartChange, PartKind, PartSource, ResolvedStateSource, Role, Transcript, TranscriptCursor,
+    TranscriptEvent, TranscriptSource as _, copyable_text, derive_title,
 };
 use crate::chat::conversation_runtime::ConversationStreamEvent;
 use crate::session::{EntryId, ResolvedMessage, ResolvedSessionState, Usage};
@@ -62,31 +62,10 @@ fn begin_turn_appends_user_and_empty_assistant(cx: &mut TestAppContext) {
             assert!(
                 matches!(update.event(), TranscriptEvent::TailAppended { turn_ids } if turn_ids.len() == 2)
             );
-            let history = transcript.replayable_history();
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0], user_text("hello runtime"));
             assert_eq!(
                 transcript.title().as_deref(),
                 Some("hello runtime")
             );
-        });
-    });
-}
-
-#[gpui::test]
-fn empty_assistant_placeholders_are_not_replayed(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        let transcript = cx.new(Transcript::new);
-        transcript.update(cx, |transcript, cx| {
-            transcript.begin_turn(user_text("hi"), cx);
-            let history = transcript.replayable_history();
-            assert_eq!(history.len(), 1);
-            assert!(is_replayable(&history[0]));
-            assert!(!is_replayable(&LlmMessage {
-                role: LlmRole::Assistant,
-                content: Vec::new(),
-                provider_metadata: ProviderMetadata::default(),
-            }));
         });
     });
 }
@@ -177,16 +156,14 @@ fn stream_lifecycle_retains_part_ids_on_authoritative_replace(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-fn tool_role_is_retained_in_history(cx: &mut TestAppContext) {
+fn tool_role_is_retained_in_the_transcript(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let transcript = cx.new(Transcript::new);
         transcript.update(cx, |transcript, cx| {
             transcript.push_canonical_turn(user_text("lookup"), cx);
             transcript.push_canonical_turn(assistant_text("calling"), cx);
             transcript.push_canonical_turn(tool_result("call-0", "ok"), cx);
-            let history = transcript.replayable_history();
-            assert_eq!(history.len(), 3);
-            assert_eq!(history[2].role, LlmRole::Tool);
+            assert_eq!(transcript.turns().len(), 3);
             assert_eq!(transcript.turns()[2].role, Role::Tool);
         });
     });
@@ -227,7 +204,6 @@ fn load_reset_rebuilds_from_resolved_state(cx: &mut TestAppContext) {
             assert!(matches!(update.event(), TranscriptEvent::Reset));
             assert_eq!(transcript.turns().len(), 2);
             assert_eq!(transcript.title().as_deref(), Some("restored title"));
-            assert_eq!(transcript.replayable_history().len(), 2);
             assert!(!update.snapshot().has_earlier());
         });
     });
@@ -274,6 +250,88 @@ fn load_tail_reports_earlier_pages_when_truncated(cx: &mut TestAppContext) {
                 transcript.turns()[0].parts[0].source.prose_text(),
                 Some("newer")
             );
+        });
+    });
+}
+
+#[gpui::test]
+fn load_before_pages_backwards_until_the_path_start(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let transcript = cx.new(Transcript::new);
+        let entry_ids: Vec<EntryId> = (0..5).map(|_| EntryId::new()).collect();
+        let state = ResolvedSessionState {
+            leaf_id: EntryId::new(),
+            path: Vec::new(),
+            context: Vec::new(),
+            messages: entry_ids
+                .iter()
+                .enumerate()
+                .map(|(index, entry_id)| ResolvedMessage {
+                    entry_id: entry_id.clone(),
+                    message: if index % 2 == 0 {
+                        user_text(&format!("message {index}"))
+                    } else {
+                        assistant_text(&format!("message {index}"))
+                    },
+                    turn_id: Some(format!("turn-{}", index + 1)),
+                    model: None,
+                    usage: Usage::default(),
+                })
+                .collect(),
+            transcript_replays: Vec::new(),
+            turn_results: Vec::new(),
+            latest_config: None,
+            latest_compaction: None,
+        };
+        let source = ResolvedStateSource::new(state);
+        assert_eq!(source.total_hint(), Some(5));
+
+        let tail = source.load_tail(2);
+        assert_eq!(tail.turns.len(), 2);
+        let cursor = tail
+            .cursor_before
+            .clone()
+            .expect("tail reports earlier page");
+        assert_eq!(cursor.entry_id, entry_ids[3]);
+
+        let middle = source.load_before(&cursor, 2);
+        assert_eq!(middle.turns.len(), 2);
+        assert_eq!(
+            middle
+                .cursor_before
+                .as_ref()
+                .expect("middle reports earlier page")
+                .entry_id,
+            entry_ids[1]
+        );
+
+        let first = source.load_before(middle.cursor_before.as_ref().expect("cursor"), 2);
+        assert_eq!(first.turns.len(), 1);
+        assert_eq!(first.cursor_before, None);
+
+        let stale = TranscriptCursor {
+            entry_id: EntryId::new(),
+        };
+        let empty = source.load_before(&stale, 2);
+        assert!(empty.turns.is_empty());
+        assert_eq!(empty.cursor_before, Some(stale));
+
+        transcript.update(cx, |transcript, cx| {
+            transcript.load(tail, None, cx);
+            let update = transcript.prepend(middle, cx);
+            assert!(matches!(
+                update.event(),
+                TranscriptEvent::PagePrepended { turn_ids } if turn_ids.len() == 2
+            ));
+            assert_eq!(transcript.turns().len(), 4);
+            assert!(transcript.snapshot().has_earlier());
+            let update = transcript.prepend(first, cx);
+            assert!(matches!(
+                update.event(),
+                TranscriptEvent::PagePrepended { turn_ids } if turn_ids.len() == 1
+            ));
+            assert_eq!(transcript.turns().len(), 5);
+            assert!(!transcript.snapshot().has_earlier());
         });
     });
 }

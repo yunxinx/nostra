@@ -8,7 +8,7 @@
 
 mod assistant;
 pub(crate) mod conversation_runtime;
-mod persistence;
+pub(crate) mod persistence;
 pub(crate) mod projection;
 pub(crate) mod rows;
 pub(crate) mod transcript;
@@ -25,7 +25,7 @@ use std::{
 
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Context, Entity, ListOffset, Pixels, SharedString,
-    Subscription, Window, px,
+    Subscription, Task, Window, px,
 };
 use gpui_component::input::{InputEvent, RopeExt as _};
 use rust_i18n::t;
@@ -33,7 +33,7 @@ use rust_i18n::t;
 use crate::llm::{GenerationService, ModelSelection};
 use crate::providers;
 use crate::runtime::RuntimeServices;
-use crate::session::{ConversationContext, SessionId};
+use crate::session::ConversationContext;
 use crate::ui::{
     markdown::{MarkdownExtensionSnapshot, MarkdownPresentation},
     reference_picker::{ChatReferenceComposer, ComposerEvent, ComposerStatus},
@@ -54,6 +54,7 @@ use self::conversation_runtime::{ConversationRuntime, ConversationRuntimeSnapsho
 use self::projection::{RowId, RowProjection, TypographySnapshot};
 #[cfg(test)]
 use self::transcript::Role;
+use self::transcript::TranscriptSource as _;
 use self::transcript::{Transcript, TranscriptEvent, TranscriptSnapshot, TranscriptUpdate};
 pub(crate) use self::view::scrolling::SmoothScrollState;
 pub(crate) use self::view::scrolling::set_smooth_scrolling;
@@ -66,8 +67,6 @@ pub(crate) use self::view::scrolling::{
 pub(crate) use self::persistence::restore::ChatRestoreError;
 #[cfg(test)]
 pub(crate) use self::transcript::Turn;
-#[cfg(test)]
-pub(crate) use self::transcript::is_replayable;
 pub(crate) use self::transcript::{derive_title, title_from_resolved_state};
 
 pub(in crate::chat) const CONTENT_MAX_WIDTH: Pixels = px(760.);
@@ -239,6 +238,17 @@ pub struct ChatView {
     selection: Option<ModelSelection>,
     selection_available: bool,
     composer_revision: u64,
+    /// Generation of the current restore binding; backward-paging tasks
+    /// validate it before applying their page so a superseded restore can
+    /// never prepend into the new conversation.
+    prepend_generation: u64,
+    /// In-flight backward page load (dedupes concurrent triggers; dropping
+    /// the task cancels it).
+    _prepend_task: Option<Task<()>>,
+    /// Set when a backward page load failed or returned nothing: stops the
+    /// trigger loop from re-issuing the same unreachable page. Reset by the
+    /// next restore (generation bump).
+    prepend_stalled: bool,
     _subscriptions: Vec<Subscription>,
     #[cfg(test)]
     prepend_pages: Vec<crate::chat::transcript::TranscriptPage>,
@@ -444,6 +454,9 @@ impl ChatView {
             selection,
             selection_available,
             composer_revision: 0,
+            prepend_generation: 0,
+            _prepend_task: None,
+            prepend_stalled: false,
             _subscriptions: vec![
                 composer_subscription,
                 subscription,
@@ -592,29 +605,59 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Load one earlier page behind the current window (R7). In this phase
-    /// the resolved-state source returns everything, so the queue only has
-    /// entries under test; production transcripts report `has_earlier` false.
+    /// Load one earlier page behind the current window (R7). The page comes
+    /// from the runtime's retained paged source: one background read, applied
+    /// on the main thread only while this restore generation is still current.
     pub(in crate::chat) fn load_before(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.transcript_snapshot.has_earlier() {
+        if !self.transcript_snapshot.has_earlier() || self.prepend_stalled {
             return false;
         }
         #[cfg(test)]
-        {
-            let Some(page) = self.prepend_pages.pop() else {
-                return false;
-            };
+        if let Some(page) = self.prepend_pages.pop() {
+            // Deterministic view-layer seam: the queued page replaces the
+            // background read so structural tests do not depend on a store.
             let update = self
                 .transcript
                 .update(cx, |transcript, cx| transcript.prepend(page, cx));
             self.handle_transcript_update(&update, cx);
-            true
+            return true;
         }
-        #[cfg(not(test))]
-        {
-            let _ = cx;
-            false
+        if self._prepend_task.is_some() {
+            return false;
         }
+        let Some(source) = self.runtime.read(cx).transcript_source() else {
+            return false;
+        };
+        let Some(cursor) = self.transcript.read(cx).source_cursor() else {
+            return false;
+        };
+        let generation = self.prepend_generation;
+        let read = cx.background_executor().spawn(async move {
+            source.load_before(&cursor, self::persistence::restore::PREPEND_PAGE_TURNS)
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let page = read.await;
+            let _ = this.update(cx, |this, cx| {
+                if this.prepend_generation != generation {
+                    // A new restore superseded this page; drop it.
+                    return;
+                }
+                this._prepend_task = None;
+                if page.turns.is_empty() {
+                    // The source failed closed (or the cursor left the
+                    // snapshot's path): keep the cursor, stop retrying, and
+                    // let the next restore retry from a fresh snapshot.
+                    this.prepend_stalled = true;
+                    return;
+                }
+                let update = this
+                    .transcript
+                    .update(cx, |transcript, cx| transcript.prepend(page, cx));
+                this.handle_transcript_update(&update, cx);
+            });
+        });
+        self._prepend_task = Some(task);
+        true
     }
 
     pub(crate) fn copy_source_for(&self, row_id: RowId, cx: &App) -> Option<SharedString> {
@@ -649,19 +692,25 @@ impl ChatView {
 
     pub(crate) fn restore_session(
         &mut self,
-        session_id: &SessionId,
-        state: &crate::session::ResolvedSessionState,
+        restore: &self::persistence::restore::ChatSessionRestore,
         cx: &mut Context<Self>,
-    ) -> Result<Option<ModelSelection>, ChatRestoreError> {
+    ) -> Result<(), ChatRestoreError> {
         let (result, snapshot) = self.runtime.update(cx, |runtime, cx| {
-            let result = runtime.restore_session(session_id, state, cx);
+            let result = runtime.restore_session(restore, cx);
             (result, runtime.snapshot())
         });
         self.apply_runtime_snapshot(snapshot);
         // Turns arrive through the deferred `TranscriptEvent::Reset`. Advancing
         // `transcript_snapshot` here would make the view skip that event.
-        if let Ok(Some(selection)) = &result {
-            self.update_selection(selection.clone());
+        // A new restore invalidates any in-flight backward page and re-arms
+        // the loader.
+        self.prepend_generation = self.prepend_generation.saturating_add(1);
+        self._prepend_task = None;
+        self.prepend_stalled = false;
+        if result.is_ok()
+            && let Some(model) = &restore.model
+        {
+            self.update_selection(model.clone());
         }
         cx.notify();
         result
@@ -754,6 +803,7 @@ pub(crate) mod test_support {
     use self::conversation_runtime::ConversationRequestGeneration;
     use super::*;
     use crate::session::ChatTurnStart;
+    use crate::session::SessionId;
 
     fn apply_transcript_updates(
         chat: &mut ChatView,
