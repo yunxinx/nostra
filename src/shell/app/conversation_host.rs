@@ -32,13 +32,14 @@ impl ConversationId {
     }
 }
 
-/// Catalog last-model, or a restored session model. `Conversation` owns this
-/// value and syncs it to the view; do not seed from `ChatView::selection`.
+/// Session-restore model, rescued draft selection, or `None` for the catalog
+/// last-model default. `Conversation` owns the value and syncs it to the
+/// view; do not seed from `ChatView::selection`.
 pub(super) fn seed_conversation_selection(
-    restored: Option<ModelSelection>,
+    preferred: Option<ModelSelection>,
     cx: &mut App,
 ) -> Option<ModelSelection> {
-    restored.or_else(|| providers::last_selection_from(&providers::ensure_global(cx).snapshot()))
+    preferred.or_else(|| providers::last_selection_from(&providers::ensure_global(cx).snapshot()))
 }
 
 pub(super) fn conversation_generating(runtime: &Entity<ConversationRuntime>, cx: &App) -> bool {

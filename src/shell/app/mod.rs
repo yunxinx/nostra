@@ -468,28 +468,6 @@ impl ChatApp {
     }
 
     #[cfg(test)]
-    fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.model_picker
-            .update(cx, |picker, cx| picker.dismiss(window, cx));
-        let target = self
-            .chat_workspace()
-            .read(cx)
-            .conversations
-            .conversations()
-            .get(index)
-            .map(|conversation| conversation.id);
-        if let Some(target) = target {
-            self.dispatch_workspace_command(
-                CHAT_WORKSPACE_ID,
-                WorkspaceCommand::SelectConversation(target),
-                Some(window),
-                cx,
-            );
-        }
-        self.sync_workspace_snapshot(cx);
-    }
-
-    #[cfg(test)]
     fn select_target(
         &mut self,
         target: ConversationId,

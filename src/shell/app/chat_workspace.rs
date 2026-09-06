@@ -190,6 +190,15 @@ pub(super) struct ChatWorkspace {
     pub(super) collapsed_history_sections: HashSet<HistorySectionKind>,
     pub(super) delete_confirmation: InlineDeleteConfirmationHandle,
     parked_pointer: Option<ParkedPointer>,
+    /// Unsent composer text carried across conversation switches. Captured
+    /// from the outgoing conversation and installed on the incoming one, so
+    /// the input is a single app-level buffer in memory (never persisted).
+    pending_input: String,
+    /// Model selection rescued from the last discarded message-less draft.
+    /// Seeds the next new draft ahead of the catalog default, so a draft's
+    /// model choice follows into the next conversation without touching the
+    /// global catalog.
+    rescued_draft_selection: Option<ModelSelection>,
     pub(super) runtime_services: RuntimeServices,
     pub(super) preference_handle: PreferenceHandle,
     pub(super) snapshot: ChatWorkspaceSnapshot,
@@ -218,6 +227,8 @@ impl ChatWorkspace {
             collapsed_history_sections: HashSet::new(),
             delete_confirmation: InlineDeleteConfirmationHandle::default(),
             parked_pointer: None,
+            pending_input: String::new(),
+            rescued_draft_selection: None,
             runtime_services: services,
             preference_handle,
             snapshot: ChatWorkspaceSnapshot::empty(),
@@ -293,6 +304,9 @@ impl ChatWorkspace {
             window,
             cx,
         );
+        // Depart before installing the replacement: a failure above must
+        // leave the current conversation untouched.
+        self.depart_active_conversation(window, cx);
         let id = self.conversations.allocate_id();
         let subscriptions = self.subscribe_conversation(
             &spawned.parts.runtime,
@@ -301,7 +315,7 @@ impl ChatWorkspace {
             window,
             cx,
         );
-        let selection = seed_conversation_selection(None, cx);
+        let selection = seed_conversation_selection(self.rescued_draft_selection.clone(), cx);
         let is_generating = conversation_generating(&spawned.parts.runtime, cx);
         let now = std::time::Instant::now();
         self.conversations.push_and_activate(Conversation {
@@ -322,7 +336,49 @@ impl ChatWorkspace {
             last_active_at: now,
             _subscriptions: subscriptions,
         });
+        self.install_pending_input(window, cx);
         self.notify_changed(cx);
+    }
+
+    /// Capture the unsent input of the conversation being left, and drop that
+    /// conversation entirely when it is a message-less draft: a draft that
+    /// never persisted a turn has no durable identity to keep, so switching
+    /// away releases its runtime, view, and composer together. A draft whose
+    /// first send is still in flight (generation or persistence) is kept: the
+    /// session bind lands through the normal runtime events.
+    fn depart_active_conversation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.conversations.active() else {
+            return;
+        };
+        let Some(conversation) = self.conversations.conversation(target) else {
+            return;
+        };
+        // Read the input before any removal: the composer entity is the
+        // source of truth and is dropped with the conversation.
+        self.pending_input = conversation.composer.read(cx).composer_text(cx);
+        let discard = conversation.session_id.is_none() && !conversation.has_in_flight_work(cx);
+        if discard {
+            self.rescued_draft_selection = conversation.selection.clone();
+            self.remove_conversation(target, window, cx);
+        }
+    }
+
+    /// Install the carried input on the conversation that just became active.
+    /// An empty buffer clears whatever stale text that conversation's composer
+    /// still holds; reference chips are per-conversation state and are not
+    /// carried with the text.
+    fn install_pending_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.conversations.active() else {
+            return;
+        };
+        let Some(conversation) = self.conversations.conversation(target) else {
+            return;
+        };
+        let composer = conversation.composer.clone();
+        let text = self.pending_input.clone();
+        composer.update(cx, |composer, cx| {
+            composer.set_composer_text(&text, window, cx);
+        });
     }
 
     pub(super) fn select_target(
@@ -332,9 +388,20 @@ impl ChatWorkspace {
         cx: &mut Context<Self>,
     ) {
         self.invalidate_selection_request();
-        if self.conversations.select_target(target) {
+        if self.conversations.active() == Some(target) {
+            return;
+        }
+        self.depart_active_conversation(window, cx);
+        // Discarding the outgoing draft lets its list neighbor become active
+        // on its own; when that neighbor is the requested target, the host
+        // `select_target` would report no change and skip the switch
+        // sequence, so the carried input would never land. Run the sequence
+        // in that case too.
+        let neighbor_is_target = self.conversations.active() == Some(target);
+        if neighbor_is_target || self.conversations.select_target(target) {
             self.conversations.touch(target);
             self.warm_if_cold(target, window, cx);
+            self.install_pending_input(window, cx);
             self.cool_idle_conversations(cx);
             self.notify_changed(cx);
         }
@@ -515,8 +582,14 @@ impl ChatWorkspace {
             return;
         }
         if let Some(target) = self.conversations.opened_target(&session_id) {
+            // Depart only when this branch actually switches the active
+            // conversation; the unopened path below departs after the
+            // restored view is fully built, so a failed restore leaves the
+            // current conversation untouched.
+            self.depart_active_conversation(window, cx);
             self.conversations.set_active(target);
             self.record_active_session(&session_id, cx);
+            self.install_pending_input(window, cx);
             self.notify_changed(cx);
             return;
         }
@@ -553,6 +626,9 @@ impl ChatWorkspace {
             );
             return;
         }
+        // Depart only after the restored view is fully built: a failed restore
+        // must leave the current conversation in place.
+        self.depart_active_conversation(window, cx);
         let id = self.conversations.allocate_id();
         let subscriptions = self.subscribe_conversation(
             &spawned.parts.runtime,
@@ -583,6 +659,7 @@ impl ChatWorkspace {
             _subscriptions: subscriptions,
         });
         self.record_active_session(&session_id, cx);
+        self.install_pending_input(window, cx);
         self.notify_changed(cx);
     }
 
@@ -689,8 +766,19 @@ impl ChatWorkspace {
             return false;
         };
         conversation.selection = Some(selection.clone());
+        let is_draft = conversation.session_id.is_none();
         if let Some(view) = &conversation.view {
-            view.update(cx, |chat, cx| chat.select_model(selection, cx));
+            if is_draft {
+                // A draft has no durable session to append a config change to,
+                // and its model choice must not reach the global catalog:
+                // it only seeds the next new conversation.
+                view.update(cx, |chat, cx| chat.set_selection(selection, cx));
+            } else {
+                // A bound session records the choice durably and updates the
+                // catalog default, which supersedes any rescued draft choice.
+                self.rescued_draft_selection = None;
+                view.update(cx, |chat, cx| chat.select_model(selection, cx));
+            }
         }
         true
     }

@@ -205,7 +205,7 @@ mod tests {
         let now = local_millis(2026, 3, 4, 15);
         let sections = history_sections(
             now,
-            ["draft"],
+            ["bound"],
             ["starred"],
             ["today-chat", "older"],
             |title: &&str| match *title {
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(
             sections[1].rows,
             vec![
-                HistoryRow::Pending("draft"),
+                HistoryRow::Pending("bound"),
                 HistoryRow::Catalog("today-chat")
             ]
         );

@@ -494,35 +494,114 @@ fn conversation_entities_dropped(released: &ReleasedConversation) -> bool {
         && released.composer.upgrade().is_none()
 }
 
+/// Spawn a draft and persist its first turn, binding the conversation to a
+/// durable session. Only bound conversations survive being switched away
+/// from, so multi-conversation fixtures are built from persisted ones.
+/// Callers must run each spawn in its own update so the session bind lands
+/// before the next switch.
+fn spawn_persisted_conversation(
+    app: &Entity<ChatApp>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> ConversationId {
+    app.update(cx, |this, cx| {
+        this.spawn_draft(window, cx);
+        let view = this
+            .chat_snapshot()
+            .active_view()
+            .expect("a fresh conversation is warm");
+        view.update(cx, test_support::persist_session);
+        this.chat_snapshot().active().expect("active conversation")
+    })
+}
+
+fn active_composer_text(app: &Entity<ChatApp>, cx: &mut gpui::VisualTestContext) -> String {
+    app.read_with(cx, |this, cx| {
+        this.chat_snapshot()
+            .active_view()
+            .expect("the active conversation is warm")
+            .read_with(cx, |chat, cx| chat.composer_text_for_test(cx))
+    })
+}
+
+fn active_conversation_selection(
+    app: &Entity<ChatApp>,
+    cx: &mut gpui::VisualTestContext,
+) -> Option<crate::llm::ModelSelection> {
+    app.read_with(cx, |this, cx| {
+        let workspace = this.chat_workspace().read(cx);
+        let active = workspace
+            .conversations
+            .active()
+            .expect("active conversation");
+        workspace
+            .conversations
+            .conversation(active)
+            .expect("conversation")
+            .selection
+            .clone()
+    })
+}
+
+/// A selectable provider whose endpoint refuses connections instantly, so a
+/// submitted turn can begin without waiting on the network.
+fn refused_profile(id: &str, model_id: &str) -> crate::llm::ProviderProfile {
+    crate::llm::ProviderProfile {
+        id: id.into(),
+        name: "Refused provider".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: crate::llm::SecretString::default(),
+        protocol: crate::llm::Protocol::Responses,
+        compatibility: crate::llm::CompatibilityProfile::default(),
+        models: vec![crate::llm::ModelConfig {
+            id: model_id.into(),
+            model_id: model_id.into(),
+            display_name: None,
+        }],
+    }
+}
+
 #[gpui::test]
 fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
 
-    let first_removed = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            for _ in 1..20 {
-                this.spawn_draft(window, cx);
-            }
-            assert_eq!(this.chat_snapshot().conversations().len(), 20);
+    // Deleting a bound conversation completes asynchronously (the runtime
+    // closes its scope once quiescent, then the deferred removal lands), so
+    // each deletion needs a park before the next one.
+    fn delete_until_one_remains(
+        cx: &mut gpui::VisualTestContext,
+        app: &Entity<ChatApp>,
+    ) -> Vec<ReleasedConversation> {
+        let mut removed = Vec::new();
+        while app.read_with(cx, |this, _| this.chat_snapshot().conversations().len()) > 1 {
+            removed.push(cx.update(|window, cx| {
+                app.update(cx, |this, cx| release_first_conversation(this, window, cx))
+            }));
+            cx.run_until_parked();
+            redraw(cx);
+        }
+        removed
+    }
 
-            let mut removed = Vec::new();
-            while this.chat_snapshot().conversations().len() > 1 {
-                removed.push(release_first_conversation(this, window, cx));
-            }
-            assert_eq!(this.chat_snapshot().conversations().len(), 1);
-            assert!(this.chat_snapshot().active().is_some());
-            assert_eq!(
-                this.chat_snapshot()
-                    .conversations()
-                    .iter()
-                    .filter(|_| true)
-                    .count(),
-                1
-            );
-            removed
-        })
-    });
+    fn spawn_twenty(cx: &mut gpui::VisualTestContext, app: &Entity<ChatApp>) {
+        for _ in 0..20 {
+            cx.update(|window, cx| {
+                spawn_persisted_conversation(app, window, cx);
+            });
+        }
+    }
+
+    spawn_twenty(cx, &app);
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().conversations().len()),
+        20
+    );
+
+    let first_removed = delete_until_one_remains(cx, &app);
+    assert_eq!(first_removed.len(), 19);
+    assert!(app.read_with(cx, |this, _| this.chat_snapshot().conversations().len()) == 1);
+    assert!(app.read_with(cx, |this, _| this.chat_snapshot().active().is_some()));
     cx.run_until_parked();
     assert!(first_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
@@ -537,21 +616,8 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
         });
     });
 
-    let second_removed = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            for _ in 1..20 {
-                this.spawn_draft(window, cx);
-            }
-            let mut removed = Vec::new();
-            while this.chat_snapshot().conversations().len() > 1 {
-                removed.push(release_first_conversation(this, window, cx));
-            }
-            assert_eq!(this.chat_snapshot().conversations().len(), 1);
-            assert!(this.chat_snapshot().active().is_some());
-            removed
-        })
-    });
-    cx.run_until_parked();
+    spawn_twenty(cx, &app);
+    let second_removed = delete_until_one_remains(cx, &app);
     assert!(second_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
@@ -565,21 +631,8 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
         });
     });
 
-    let third_removed = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            for _ in 1..20 {
-                this.spawn_draft(window, cx);
-            }
-            let mut removed = Vec::new();
-            while this.chat_snapshot().conversations().len() > 1 {
-                removed.push(release_first_conversation(this, window, cx));
-            }
-            assert_eq!(this.chat_snapshot().conversations().len(), 1);
-            assert!(this.chat_snapshot().active().is_some());
-            removed
-        })
-    });
-    cx.run_until_parked();
+    spawn_twenty(cx, &app);
+    let third_removed = delete_until_one_remains(cx, &app);
     assert!(third_removed.iter().all(conversation_entities_dropped));
     cx.update(|_, cx| {
         app.read_with(cx, |this, cx| {
@@ -596,37 +649,58 @@ fn deleting_conversations_releases_views_and_owned_subscriptions(cx: &mut TestAp
 
 #[gpui::test]
 fn active_and_last_conversation_deletion_choose_deterministically(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            spawn_persisted_conversation(&app, window, cx);
+        });
+    }
+    let (middle, next, first) = app.read_with(cx, |this, _| {
+        let conversations = this.chat_snapshot().conversations();
+        (
+            conversations[1].id(),
+            conversations[2].id(),
+            conversations[0].id(),
+        )
+    });
+
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            let middle = this.chat_snapshot().conversations()[1].id();
-            let next = this.chat_snapshot().conversations()[2].id();
-            this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.select_target(middle, window, cx)
-            });
+            this.select_target(middle, window, cx);
             this.delete_conversation(middle, window, cx);
-            assert_eq!(this.chat_snapshot().active(), Some(next));
-
-            let before = this.chat_snapshot().active().expect("active conversation");
-            let non_active = this.chat_snapshot().conversations()[0].id();
-            this.delete_conversation(non_active, window, cx);
-            assert_eq!(this.chat_snapshot().active(), Some(before));
-
-            let only = this
-                .chat_snapshot()
-                .active_view()
-                .expect("active view")
-                .downgrade();
-            let only_id = this.chat_snapshot().active().expect("active conversation");
-            this.delete_conversation(only_id, window, cx);
-            assert!(this.chat_snapshot().conversations().is_empty());
-            assert!(this.chat_snapshot().active().is_none());
-            drop(only);
         });
     });
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().active()),
+        Some(next)
+    );
+
+    let before = app.read_with(cx, |this, _| this.chat_snapshot().active().expect("active"));
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| this.delete_conversation(first, window, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().active()),
+        Some(before)
+    );
+
+    let only = app
+        .read_with(cx, |this, _| this.chat_snapshot().active_view())
+        .expect("active view")
+        .downgrade();
+    let only_id = app.read_with(cx, |this, _| this.chat_snapshot().active().expect("active"));
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| this.delete_conversation(only_id, window, cx));
+    });
+    cx.run_until_parked();
+    app.read_with(cx, |this, _| {
+        assert!(this.chat_snapshot().conversations().is_empty());
+        assert!(this.chat_snapshot().active().is_none());
+    });
+    drop(only);
 }
 
 #[gpui::test]
@@ -669,21 +743,25 @@ fn deleting_a_streaming_conversation_cancels_its_task_without_resurrection(
 
 #[gpui::test]
 fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let (target, selected) = cx.update(|window, cx| {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            spawn_persisted_conversation(&app, window, cx);
+        });
+    }
+    let (target, selected) = app.read_with(cx, |this, _| {
+        let conversations = this.chat_snapshot().conversations();
+        (conversations[0].id(), conversations[2].id())
+    });
+    cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            let target = this.chat_snapshot().conversations()[0].id();
-            let selected = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(target, window, cx);
                 workspace.begin_delete_confirmation(ChatTarget::Conversation(target), window, cx);
             });
-            this.select(2, window, cx);
-            (target, selected)
-        })
+            this.select_target(selected, window, cx);
+        });
     });
 
     cx.update(|window, cx| {
@@ -699,6 +777,7 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
         });
     });
     cx.run_until_parked();
+    redraw(cx);
 
     app.read_with(cx, |this, _| {
         assert_eq!(this.chat_snapshot().conversations().len(), 2);
@@ -714,42 +793,54 @@ fn delete_confirmation_keeps_the_original_target_after_switching(cx: &mut TestAp
 
 #[gpui::test]
 fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let (target, selected) = cx.update(|window, cx| {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            spawn_persisted_conversation(&app, window, cx);
+        });
+    }
+    let (target, selected) = app.read_with(cx, |this, _| {
+        let conversations = this.chat_snapshot().conversations();
+        (conversations[0].id(), conversations[2].id())
+    });
+    cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
-            let target = this.chat_snapshot().conversations()[0].id();
-            let selected = this.chat_snapshot().conversations()[2].id();
             this.chat_workspace().update(cx, |workspace, cx| {
                 workspace.select_target(target, window, cx)
             });
-            (target, selected)
-        })
+        });
     });
+    cx.run_until_parked();
     redraw(cx);
-    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
-    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let session_id = app.read_with(cx, |this, _| {
+        this.chat_snapshot()
+            .conversation(target)
+            .expect("target conversation")
+            .session_id()
+            .expect("persisted session")
+    });
+    let row = Box::leak(format!("history-row-{session_id}").into_boxed_str());
+    let actions = Box::leak(format!("history-actions-{session_id}").into_boxed_str());
     hover(cx, row);
     click(cx, actions);
     redraw(cx);
     assert_eq!(
         app.read_with(cx, |this, _| { this.chat_snapshot().confirming().cloned() }),
-        Some(ChatTarget::Conversation(target))
+        Some(ChatTarget::Session(session_id.clone()))
     );
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.select(2, window, cx);
+            this.select_target(selected, window, cx);
         });
     });
     redraw(cx);
 
-    let confirm = Box::leak(
-        format!("conversation-delete-confirm-{}-confirm", target.as_u64()).into_boxed_str(),
-    );
+    let confirm =
+        Box::leak(format!("history-delete-confirm-{session_id}-confirm").into_boxed_str());
     click(cx, confirm);
+    cx.run_until_parked();
 
     app.read_with(cx, |this, _| {
         assert_eq!(this.chat_snapshot().conversations().len(), 2);
@@ -766,27 +857,37 @@ fn inline_confirm_target_survives_selection_switch(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let target = cx.update(|window, cx| {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let target = cx.update(|window, cx| spawn_persisted_conversation(&app, window, cx));
+    cx.update(|_, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            let view = this.chat_snapshot().conversations()[0]
-                .view()
+            let view = this
+                .chat_workspace()
+                .read(cx)
+                .conversations
+                .conversation(target)
+                .and_then(|conversation| conversation.view.clone())
                 .expect("a fresh conversation is warm");
-            let target = this.chat_snapshot().conversations()[0].id();
             view.update(cx, test_support::mark_generating);
-            this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.select_target(target, window, cx)
-            });
-            target
-        })
+        });
     });
+    cx.run_until_parked();
     redraw(cx);
+    let session_id = app.read_with(cx, |this, cx| {
+        this.chat_workspace()
+            .read(cx)
+            .conversations
+            .conversation(target)
+            .expect("conversation")
+            .session_id
+            .clone()
+            .expect("persisted session")
+    });
 
-    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
-    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
-    let generating =
-        Box::leak(format!("conversation-generating-{}", target.as_u64()).into_boxed_str());
+    let row = Box::leak(format!("history-row-{session_id}").into_boxed_str());
+    let actions = Box::leak(format!("history-actions-{session_id}").into_boxed_str());
+    let generating = Box::leak(format!("history-generating-{session_id}").into_boxed_str());
     assert!(
         cx.debug_bounds(generating).is_some(),
         "a selected generating row shows its spinner"
@@ -810,7 +911,7 @@ fn a_generating_row_arms_its_delete_trigger_only_while_hovered(cx: &mut TestAppC
     click(cx, actions);
     assert_eq!(
         app.read_with(cx, |this, _| this.chat_snapshot().confirming().cloned()),
-        Some(ChatTarget::Conversation(target))
+        Some(ChatTarget::Session(session_id.clone()))
     );
     assert!(
         cx.debug_bounds(actions).is_some(),
@@ -1398,9 +1499,9 @@ fn account_work_mode_submenu_switches_and_records_the_selected_workspace(cx: &mu
     });
 }
 
-/// First send binds the draft. The catalog summary arrives on a later frame;
-/// the bound view must stay on the host list until that real summary exists,
-/// otherwise every remaining row shifts twice.
+/// First send binds the draft. The unbound draft itself never appears in the
+/// history list; the bound view stays on the host list until a real catalog
+/// summary exists, otherwise every remaining row shifts twice.
 #[gpui::test]
 fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestAppContext) {
     let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
@@ -1419,14 +1520,17 @@ fn binding_a_draft_keeps_it_in_the_history_list_on_the_same_frame(cx: &mut TestA
     let bound = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            let view = this
+            let draft = this
                 .chat_snapshot()
                 .conversations()
                 .iter()
                 .find(|conversation| conversation.session_id().is_none())
-                .expect("fresh draft")
-                .view()
-                .expect("a fresh conversation is warm");
+                .expect("fresh draft");
+            assert!(
+                !is_pending_history_conversation(None, this.chat_snapshot().history()),
+                "an unbound draft never appears in the history list"
+            );
+            let view = draft.view().expect("a fresh conversation is warm");
             view.update(cx, test_support::persist_session)
         })
     });
@@ -1488,14 +1592,509 @@ fn new_chat_creates_a_draft_without_a_session_id(cx: &mut TestAppContext) {
     });
 }
 
+/// A bound-but-uncataloged row is the only host row left: clicking it must
+/// route through the window the row was painted in, or the selection
+/// dispatch silently does nothing.
 #[gpui::test]
-fn section_header_toggles_only_from_its_label(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    cx.update(|window, cx| {
+fn clicking_a_host_row_selects_that_conversation(cx: &mut TestAppContext) {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores.clone()));
+    let bound = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
+            let view = this
+                .chat_snapshot()
+                .active_view()
+                .expect("a fresh conversation is warm");
+            let session_id = view.update(cx, test_support::persist_session);
+            // Drop the durable record before the background summary refresh
+            // runs: the refresh then finds no summary and never upserts a
+            // catalog row, so the bound conversation stays on the host list
+            // and the row is stable across clicks.
+            let mut store = stores.chat().expect("Chat lifecycle store");
+            store
+                .delete_session(&session_id)
+                .expect("remove the durable record");
+            this.chat_snapshot().active().expect("active conversation")
+        })
+    });
+    cx.run_until_parked();
+    let draft = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            this.chat_snapshot()
+                .active()
+                .expect("the new draft is active")
+        })
+    });
+    // The draft is the list tail, so the bound conversation is the neighbor
+    // the removal path activates; the clicked row must still receive the
+    // carried input.
+    let buffer_text = "typed in the draft before the click";
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            let composer = {
+                let workspace = this.chat_workspace().read(cx);
+                workspace
+                    .conversations
+                    .conversation(draft)
+                    .expect("draft conversation")
+                    .composer
+                    .clone()
+            };
+            composer.update(cx, |composer, cx| {
+                composer.set_composer_text(buffer_text, window, cx);
+            });
         });
     });
+    redraw(cx);
+    let row = Box::leak(format!("conversation-row-{}", bound.as_u64()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(row).is_some(),
+        "the bound conversation stays on the host list until its catalog summary lands"
+    );
+    click(cx, row);
+
+    app.read_with(cx, |this, _| {
+        assert_eq!(
+            this.chat_snapshot().active(),
+            Some(bound),
+            "clicking the host row must switch the active conversation"
+        );
+        assert!(
+            this.chat_snapshot()
+                .conversations()
+                .iter()
+                .all(|conversation| conversation.id() != draft),
+            "switching away releases the message-less draft"
+        );
+    });
+    assert_eq!(
+        active_composer_text(&app, cx),
+        buffer_text,
+        "the carried input lands on the conversation that was activated while the draft was discarded"
+    );
+}
+
+#[gpui::test]
+fn new_chat_leaves_no_sidebar_row_until_the_first_message_lands(cx: &mut TestAppContext) {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let target = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+            this.chat_snapshot()
+                .active()
+                .expect("the new draft is active")
+        })
+    });
+    redraw(cx);
+
+    let draft_row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(draft_row).is_none(),
+        "a new chat creates no sidebar row"
+    );
+
+    let session_id = cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            let view = this.chat_snapshot().active_view().expect("warm view");
+            view.update(cx, test_support::persist_session)
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+
+    let catalog_row = Box::leak(format!("history-row-{session_id}").into_boxed_str());
+    assert!(
+        cx.debug_bounds(catalog_row).is_some(),
+        "the first persisted message adds the catalog row"
+    );
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.chat_snapshot().active(), Some(target));
+        assert_eq!(this.chat_snapshot().active_session_id(), Some(session_id));
+    });
+}
+
+/// A message-less draft is released when the user switches to a persisted
+/// session, and a later new chat rebuilds a fresh draft with nothing left
+/// behind.
+#[gpui::test]
+fn switching_away_releases_a_message_less_draft(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_id = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+
+    let released = cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.spawn_draft(window, cx);
+            let conversation = &this.chat_workspace().read(cx).conversations.conversations()[0];
+            ReleasedConversation {
+                view: conversation
+                    .view
+                    .as_ref()
+                    .expect("warm before the switch")
+                    .downgrade(),
+                runtime: conversation.runtime.downgrade(),
+                transcript: conversation.transcript.downgrade(),
+                composer: conversation.composer.downgrade(),
+            }
+        })
+    });
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    assert!(
+        conversation_entities_dropped(&released),
+        "switching to a persisted session releases the message-less draft"
+    );
+    app.read_with(cx, |this, _| {
+        assert_eq!(this.chat_snapshot().conversations().len(), 1);
+        assert_eq!(this.chat_snapshot().active_session_id(), Some(session_id));
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+        });
+    });
+    app.read_with(cx, |this, _| {
+        let snapshot = this.chat_snapshot();
+        assert_eq!(snapshot.conversations().len(), 2);
+        let active = snapshot.active().expect("the rebuilt draft is active");
+        assert!(
+            snapshot
+                .conversation(active)
+                .expect("active")
+                .session_id()
+                .is_none()
+        );
+    });
+}
+
+/// The input is one app-level buffer: whatever is typed but not sent follows
+/// every switch (new chat, persisted session, another persisted session, back
+/// to a new chat) and is finally submitted with the conversation that is
+/// active, which clears the input.
+#[gpui::test]
+fn the_input_buffer_follows_every_conversation_switch(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_a = seed_persisted_conversation(&stores, None);
+    let session_b = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+
+    // A selectable model so the buffered text can be submitted at the end.
+    let selection = crate::llm::ModelSelection {
+        profile_id: "buffer-profile".into(),
+        model_id: "buffer-model".into(),
+    };
+    cx.update(|_, cx| {
+        let handle = app.read_with(cx, |this, cx| {
+            this.chat_workspace()
+                .read(cx)
+                .runtime_services
+                .provider_catalog()
+                .clone()
+        });
+        crate::providers::update_with_in_memory(cx, &handle, |document| {
+            document
+                .profiles
+                .push(refused_profile("buffer-profile", "buffer-model"));
+            document.last_model_selection = Some(selection.clone());
+        });
+    });
+
+    let buffer_text = "carried across every switch";
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+            let composer = {
+                let workspace = this.chat_workspace().read(cx);
+                let target = workspace.conversations.active().expect("draft");
+                workspace
+                    .conversations
+                    .conversation(target)
+                    .expect("draft conversation")
+                    .composer
+                    .clone()
+            };
+            composer.update(cx, |composer, cx| {
+                composer.set_composer_text(buffer_text, window, cx);
+            });
+        });
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_a.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_composer_text(&app, cx),
+        buffer_text,
+        "the buffer lands on the first restored session"
+    );
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_b.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_composer_text(&app, cx),
+        buffer_text,
+        "the buffer follows into the second restored session"
+    );
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+        });
+    });
+    assert_eq!(
+        active_composer_text(&app, cx),
+        buffer_text,
+        "the buffer follows into a new draft"
+    );
+    let draft_target = app.read_with(cx, |this, _| {
+        this.chat_snapshot().active().expect("the draft is active")
+    });
+
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            let composer = {
+                let workspace = this.chat_workspace().read(cx);
+                workspace
+                    .conversations
+                    .conversation(draft_target)
+                    .expect("draft conversation")
+                    .composer
+                    .clone()
+            };
+            composer.update(cx, |_, cx| {
+                cx.emit(crate::ui::reference_picker::ComposerEvent::Submit(
+                    buffer_text.to_string(),
+                ))
+            });
+        });
+    });
+    cx.run_until_parked();
+
+    app.read_with(cx, |this, cx| {
+        let session_id = this
+            .chat_snapshot()
+            .active_session_id()
+            .expect("the submitted turn binds a session");
+        assert!(
+            this.chat_snapshot().history().contains_session(&session_id),
+            "the submitted turn adds the catalog row"
+        );
+        let view = this.chat_snapshot().active_view().expect("warm view");
+        view.read_with(cx, |chat, cx| {
+            assert_eq!(
+                chat.composer_text_for_test(cx),
+                "",
+                "submitting clears the input"
+            );
+        });
+    });
+}
+
+/// Restoring an unopened session discards the outgoing message-less draft,
+/// which briefly activates its list neighbor before the restored conversation
+/// is installed. The neighbor's own composer may still hold an older value,
+/// so the restore must carry the text that was read from the draft, not the
+/// neighbor's stale copy.
+#[gpui::test]
+fn restoring_a_session_carries_the_input_read_before_the_draft_was_discarded(
+    cx: &mut TestAppContext,
+) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_a = seed_persisted_conversation(&stores, None);
+    let session_b = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+
+    // Open session A and leave stale text in its composer.
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_a.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            let composer = {
+                let workspace = this.chat_workspace().read(cx);
+                let target = workspace.conversations.active().expect("session A");
+                workspace
+                    .conversations
+                    .conversation(target)
+                    .expect("conversation A")
+                    .composer
+                    .clone()
+            };
+            composer.update(cx, |composer, cx| {
+                composer.set_composer_text("stale text in A", window, cx);
+            });
+            this.new_chat(window, cx);
+        });
+    });
+
+    // The draft holds newer text; it becomes the neighbor's job to hand the
+    // buffer over when the restore discards it.
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            let composer = {
+                let workspace = this.chat_workspace().read(cx);
+                let target = workspace.conversations.active().expect("draft");
+                workspace
+                    .conversations
+                    .conversation(target)
+                    .expect("draft conversation")
+                    .composer
+                    .clone()
+            };
+            composer.update(cx, |composer, cx| {
+                composer.set_composer_text("typed in the draft", window, cx);
+            });
+        });
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_b.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_composer_text(&app, cx),
+        "typed in the draft",
+        "the restore installs the text read from the discarded draft, not the neighbor's stale copy"
+    );
+    app.read_with(cx, |this, _| {
+        assert_eq!(
+            this.chat_snapshot().active_session_id(),
+            Some(session_b),
+            "the restored session is active"
+        );
+    });
+}
+
+#[gpui::test]
+fn a_drafts_model_choice_seeds_the_next_new_conversation(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    let session_id = seed_persisted_conversation(&stores, None);
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let restored_selection = active_conversation_selection(&app, cx);
+    let global_before = cx.update(|_, cx| crate::providers::last_selection(cx));
+
+    let draft_choice = crate::llm::ModelSelection {
+        profile_id: "draft-profile".into(),
+        model_id: "draft-model".into(),
+    };
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_model(draft_choice.clone(), cx);
+            });
+        });
+    });
+    assert_eq!(
+        active_conversation_selection(&app, cx),
+        Some(draft_choice.clone()),
+        "the draft records its own model choice"
+    );
+    assert_eq!(
+        cx.update(|_, cx| crate::providers::last_selection(cx)),
+        global_before,
+        "a draft's model change never writes the global catalog"
+    );
+
+    // The persisted session keeps its own model across every draft action.
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        active_conversation_selection(&app, cx),
+        restored_selection,
+        "the persisted session keeps its own model"
+    );
+
+    // The next new conversation seeds the discarded draft's choice.
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+        });
+    });
+    assert_eq!(
+        active_conversation_selection(&app, cx),
+        Some(draft_choice.clone()),
+        "the discarded draft's choice seeds the next new conversation"
+    );
+
+    // Changing a bound session's model supersedes the rescued draft choice.
+    let session_choice = crate::llm::ModelSelection {
+        profile_id: "session-profile".into(),
+        model_id: "session-model".into(),
+    };
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.select_session(session_id.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        app.update(cx, |this, cx| {
+            this.chat_workspace().update(cx, |workspace, cx| {
+                workspace.select_model(session_choice.clone(), cx);
+            });
+        });
+    });
+    assert_eq!(
+        cx.update(|_, cx| crate::providers::last_selection(cx)),
+        Some(session_choice.clone()),
+        "a bound session's model change updates the global default"
+    );
+    cx.update(|window, cx| {
+        app.update(cx, |this, cx| {
+            this.new_chat(window, cx);
+        });
+    });
+    assert_eq!(
+        active_conversation_selection(&app, cx),
+        Some(session_choice),
+        "the newest choice, not the stale rescued one, seeds the next draft"
+    );
+}
+
+#[gpui::test]
+fn section_header_toggles_only_from_its_label(cx: &mut TestAppContext) {
+    let stores =
+        SessionStores::with_stores(InMemorySessionStore::new(), InMemorySessionStore::new());
+    seed_persisted_conversation(&stores, None);
+    let (_app, cx) = add_app_window_with_stores(cx, Some(stores));
+    cx.run_until_parked();
     redraw(cx);
 
     let surface = cx
@@ -1513,18 +2112,24 @@ fn section_header_toggles_only_from_its_label(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn row_actions_stay_centered_and_never_reflow_the_title(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let target = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].id()
-        })
-    });
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let target = cx.update(|window, cx| spawn_persisted_conversation(&app, window, cx));
+    cx.run_until_parked();
     redraw(cx);
+    let session_id = app.read_with(cx, |this, cx| {
+        this.chat_workspace()
+            .read(cx)
+            .conversations
+            .conversation(target)
+            .expect("conversation")
+            .session_id
+            .clone()
+            .expect("persisted session")
+    });
 
-    let row_selector = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
-    let action_selector =
-        Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let row_selector = Box::leak(format!("history-row-{session_id}").into_boxed_str());
+    let action_selector = Box::leak(format!("history-actions-{session_id}").into_boxed_str());
     let idle = cx.debug_bounds(action_selector).expect("row actions");
 
     hover(cx, row_selector);
@@ -1710,17 +2315,24 @@ fn a_row_that_slides_under_a_still_pointer_does_not_take_hover(cx: &mut TestAppC
 
 #[gpui::test]
 fn arming_a_delete_does_not_resize_its_trigger(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let target = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].id()
-        })
-    });
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let session_id = cx.update(|window, cx| spawn_persisted_conversation(&app, window, cx));
+    cx.run_until_parked();
     redraw(cx);
+    let session_id = app.read_with(cx, |this, cx| {
+        this.chat_workspace()
+            .read(cx)
+            .conversations
+            .conversation(session_id)
+            .expect("conversation")
+            .session_id
+            .clone()
+            .expect("persisted session")
+    });
 
-    let row = Box::leak(format!("conversation-row-{}", target.as_u64()).into_boxed_str());
-    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let row = Box::leak(format!("history-row-{session_id}").into_boxed_str());
+    let actions = Box::leak(format!("history-actions-{session_id}").into_boxed_str());
     hover(cx, row);
     let idle = cx.debug_bounds(actions).expect("row actions");
     click(cx, actions);
@@ -1734,27 +2346,33 @@ fn arming_a_delete_does_not_resize_its_trigger(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn history_section_header_collapses_pending_rows(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    let target = cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
-            this.chat_snapshot().conversations()[0].id()
-        })
-    });
+fn history_section_header_collapses_its_rows(cx: &mut TestAppContext) {
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    let target = cx.update(|window, cx| spawn_persisted_conversation(&app, window, cx));
+    cx.run_until_parked();
     redraw(cx);
+    let session_id = app.read_with(cx, |this, cx| {
+        this.chat_workspace()
+            .read(cx)
+            .conversations
+            .conversation(target)
+            .expect("conversation")
+            .session_id
+            .clone()
+            .expect("persisted session")
+    });
+
     let header = "history-section-header-sidebar.group_today";
-    let actions = Box::leak(format!("conversation-actions-{}", target.as_u64()).into_boxed_str());
+    let actions = Box::leak(format!("history-actions-{session_id}").into_boxed_str());
     assert!(cx.debug_bounds(header).is_some());
     assert!(cx.debug_bounds(actions).is_some());
     click(cx, header);
-    redraw(cx);
     assert!(
         cx.debug_bounds(actions).is_none(),
-        "collapsing Today unmounts the pending row"
+        "collapsing Today unmounts that group's rows"
     );
     click(cx, header);
-    redraw(cx);
     assert!(cx.debug_bounds(actions).is_some());
 }
 
@@ -1765,23 +2383,26 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
     let (first, _second) = cx.update(|window, cx| {
         app.update(cx, |this, cx| {
             this.spawn_draft(window, cx);
-            this.spawn_draft(window, cx);
             let first = this.chat_snapshot().conversations()[0]
                 .view()
                 .expect("a fresh conversation is warm");
             let first_id = this.chat_snapshot().conversations()[0].id();
-            let second_id = this.chat_snapshot().conversations()[1].id();
             first.update(cx, |chat, cx| {
                 test_support::start_pending_reply(chat, Rc::clone(&dropped), cx)
             });
-            this.chat_workspace().update(cx, |workspace, cx| {
-                workspace.select_target(second_id, window, cx)
-            });
+            // The first send is in flight, so the draft must survive being
+            // switched away from.
+            this.spawn_draft(window, cx);
+            let second_id = this.chat_snapshot().active().expect("second draft active");
             (first_id, second_id)
         })
     });
     cx.run_until_parked();
     assert!(!dropped.get(), "first stream must still be running");
+    assert_eq!(
+        app.read_with(cx, |this, _| this.chat_snapshot().conversations().len()),
+        2
+    );
 
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
@@ -1796,7 +2417,11 @@ fn switching_active_target_does_not_cancel_other_streams(cx: &mut TestAppContext
 
     app.read_with(cx, |this, _| {
         assert_eq!(this.chat_snapshot().active(), Some(first));
-        assert_eq!(this.chat_snapshot().conversations().len(), 2);
+        assert_eq!(
+            this.chat_snapshot().conversations().len(),
+            1,
+            "the idle message-less draft is dropped when switching away from it"
+        );
     });
 }
 
@@ -1855,7 +2480,11 @@ fn select_session_reuses_an_already_opened_view(cx: &mut TestAppContext) {
             Some(opened_target),
             "reuse without spawning a new view"
         );
-        assert_eq!(this.chat_snapshot().conversations().len(), 2);
+        assert_eq!(
+            this.chat_snapshot().conversations().len(),
+            1,
+            "reselecting the opened session drops the message-less draft"
+        );
     });
 }
 
@@ -1934,14 +2563,13 @@ fn selecting_a_project_draft_invalidates_an_older_session_restore(cx: &mut TestA
 /// reacting to streaming events after the cold transition.
 #[gpui::test]
 fn idle_timer_cools_stale_views_and_republishes_the_snapshot(cx: &mut TestAppContext) {
-    let (app, cx) = add_app_window(cx);
-    cx.update(|window, cx| {
-        app.update(cx, |this, cx| {
-            for _ in 0..4 {
-                this.spawn_draft(window, cx);
-            }
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    for _ in 0..4 {
+        cx.update(|window, cx| {
+            spawn_persisted_conversation(&app, window, cx);
         });
-    });
+    }
 
     // Age the two oldest conversations past the idle threshold. Warm set =
     // active + the three most recent, so only conversations[0] is a cooling
@@ -1995,10 +2623,14 @@ fn cold_conversation_keeps_streaming_and_restores_on_reselect(cx: &mut TestAppCo
     }
 
     let draft_text = "draft kept across cold";
-    let (app, cx) = add_app_window(cx);
+    let stores = SessionStores::with_chat_store(InMemorySessionStore::new());
+    let (app, cx) = add_app_window_with_stores(cx, Some(stores));
+    cx.update(|window, cx| {
+        spawn_persisted_conversation(&app, window, cx);
+    });
+    cx.run_until_parked();
     cx.update(|window, cx| {
         app.update(cx, |this, cx| {
-            this.spawn_draft(window, cx);
             this.spawn_draft(window, cx);
         });
     });

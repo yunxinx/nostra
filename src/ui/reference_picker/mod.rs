@@ -23,7 +23,7 @@ use std::{
 use chrono::{Datelike as _, TimeZone as _};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AppContext as _, ClickEvent, Context, Entity, EventEmitter, InteractiveElement as _,
+    App, AppContext as _, ClickEvent, Context, Entity, EventEmitter, InteractiveElement as _,
     IntoElement, KeyDownEvent, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, Task, Window, div, px,
 };
@@ -580,6 +580,26 @@ impl ChatReferenceComposer {
         self.confirm_error = None;
         self.close_completion_popup();
         cx.notify();
+    }
+
+    /// The unsent input text.
+    pub(crate) fn composer_text(&self, cx: &App) -> String {
+        self.input.read(cx).value().to_string()
+    }
+
+    /// Replace the unsent input text; an empty string clears it. The write
+    /// goes through the event-emitting replacement so input-driven state
+    /// (send availability, height tracking) follows the new value. Reference
+    /// chips belong to the conversation that confirmed them and are not
+    /// carried with the text.
+    pub(crate) fn set_composer_text(
+        &self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input
+            .update(cx, |state, cx| state.replace_all(text, window, cx));
     }
 
     /// True while the completion popup should render.

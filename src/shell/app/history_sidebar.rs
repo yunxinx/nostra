@@ -1,12 +1,12 @@
 //! Chat history catalog sidebar state, background loading, and rendering.
 //!
 //! The sidebar treats the catalog snapshot as the sole source of persisted
-//! rows. Host-owned rows (unbound drafts, and bound views whose catalog
-//! summary has not landed yet) appear above that snapshot. "Opened",
-//! "generating", and "active" are visual annotations derived from workspace
-//! state, never row identity. Every catalog read runs on the background
-//! executor; render only reads the snapshot. Do not insert a placeholder
-//! `SessionSummary` to bridge the bind → catalog gap.
+//! rows. Host-owned rows are bound conversations whose catalog summary has
+//! not landed yet; unbound drafts have no row at all. "Opened", "generating",
+//! and "active" are visual annotations derived from workspace state, never
+//! row identity. Every catalog read runs on the background executor; render
+//! only reads the snapshot. Do not insert a placeholder `SessionSummary` to
+//! bridge the bind → catalog gap.
 
 use std::{collections::HashSet, rc::Rc};
 
@@ -45,7 +45,7 @@ use super::history_groups::{HistoryRow, history_sections};
 use super::workspace_host::WorkspaceCommand;
 use crate::runtime::CHAT_WORKSPACE_ID;
 
-/// Row height for both draft and catalog rows, matching the previous
+/// Row height for both host and catalog rows, matching the previous
 /// conversation row so the sidebar density is unchanged.
 const HISTORY_ROW_HEIGHT: Pixels = px(32.);
 /// Height of a section header band.  Smaller than a row so the header reads as
@@ -835,12 +835,12 @@ impl ChatApp {
             sidebar_target,
             {
                 let app = app.clone();
-                move |_, _, cx| {
+                move |_, window, cx| {
                     app.update(cx, |app, cx| {
                         app.dispatch_workspace_command(
                             CHAT_WORKSPACE_ID,
                             WorkspaceCommand::SelectConversation(target),
-                            None,
+                            Some(window),
                             cx,
                         );
                     })
@@ -855,7 +855,7 @@ impl ChatApp {
                             app.dispatch_workspace_command(
                                 CHAT_WORKSPACE_ID,
                                 WorkspaceCommand::SelectConversation(target),
-                                None,
+                                Some(window),
                                 cx,
                             );
                         })
@@ -961,7 +961,7 @@ impl ChatApp {
         )
     }
 
-    /// Shared row renderer for draft and catalog rows.  The row itself is the
+    /// Shared row renderer for host and catalog rows.  The row itself is the
     /// activation control and declares the hover group its own trailing chrome
     /// binds to, so revealing the actions costs no state and cannot go stale.
     /// The title always spans the row; the actions float above its trailing
@@ -1304,13 +1304,13 @@ fn history_actions_fade(can_favorite: bool) -> (Pixels, f32) {
     (width, HISTORY_ACTION_FADE_RAMP.as_f32() / width.as_f32())
 }
 
-/// Unbound drafts, and bound views that are not yet in the catalog snapshot.
-/// Catalog rows are only real `SessionSummary` records.
+/// Bound conversations that are not yet in the catalog snapshot. Unbound
+/// drafts and catalog rows are never host rows.
 pub(super) fn is_pending_history_conversation(
     session_id: Option<&SessionId>,
     history: &ChatHistorySidebar,
 ) -> bool {
-    session_id.is_none_or(|id| !history.contains_session(id))
+    session_id.is_some_and(|id| !history.contains_session(id))
 }
 
 fn chat_history_generating_selector(target: &ChatTarget) -> String {
@@ -1529,12 +1529,15 @@ mod pending_history_rows {
     }
 
     #[test]
-    fn unbound_and_uncataloged_rows_stay_on_the_host_list() {
+    fn only_bound_uncataloged_rows_stay_on_the_host_list() {
         let cataloged = SessionId::new(SessionDomain::Chat);
         let bound = SessionId::new(SessionDomain::Chat);
         let mut history = super::ChatHistorySidebar::new();
         history.upsert(summary(cataloged.clone()));
-        assert!(is_pending_history_conversation(None, &history));
+        assert!(
+            !is_pending_history_conversation(None, &history),
+            "an unbound draft never appears in the history list"
+        );
         assert!(is_pending_history_conversation(Some(&bound), &history));
         assert!(!is_pending_history_conversation(Some(&cataloged), &history));
     }
