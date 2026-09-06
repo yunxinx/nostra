@@ -107,6 +107,7 @@ fn reasoning_details_round_trip_through_terminal_metadata() {
             reasoning: crate::llm::ReasoningContent {
                 display: "think".into(),
                 replay: Some(terminal.provider_metadata.clone()),
+                duration_ms: None,
             },
         }],
         provider_metadata: ProviderMetadata::default(),
@@ -153,6 +154,7 @@ fn reasoning_text_round_trips_through_the_actual_wire_field() {
                 reasoning: crate::llm::ReasoningContent {
                     display: "think".into(),
                     replay: Some(replay),
+                    duration_ms: None,
                 },
             }],
             provider_metadata: ProviderMetadata::default(),

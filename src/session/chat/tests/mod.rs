@@ -78,6 +78,9 @@ fn exercise_completed<S: SessionStore>(store: S) {
                 reasoning: crate::llm::ReasoningContent {
                     display: "thinking".into(),
                     replay: None,
+                    // R7: the banked thinking time rides the assistant
+                    // message into the JSONL facts and back.
+                    duration_ms: Some(1_500),
                 },
             },
             ContentBlock::Text {

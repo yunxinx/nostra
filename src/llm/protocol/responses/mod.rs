@@ -118,6 +118,13 @@ impl ResponsesSession {
                 Value::Bool(self.compatibility.responses_store),
             ),
         ]);
+        // Streamed reasoning summaries: without this parameter most providers
+        // deliver the whole reasoning item only in the terminal output, so the
+        // chain of thought cannot stream. `effort` is deliberately omitted —
+        // the model's own default applies.
+        if self.compatibility.responses_reasoning_summary {
+            body.insert("reasoning".into(), json!({ "summary": "auto" }));
+        }
         if self.compatibility.responses_include_encrypted_reasoning {
             body.insert("include".into(), json!(["reasoning.encrypted_content"]));
         }

@@ -390,6 +390,7 @@ fn assistant_history_preserves_canonical_block_order() {
                             ..Default::default()
                         }),
                     }),
+                    duration_ms: None,
                 },
             },
             ContentBlock::Text {
@@ -439,6 +440,7 @@ fn assistant_history_generates_an_id_for_every_text_item() {
                 reasoning: crate::llm::ReasoningContent {
                     display: "thought".into(),
                     replay: None,
+                    duration_ms: None,
                 },
             },
             ContentBlock::Text {
@@ -629,5 +631,46 @@ fn ignores_unknown_non_structural_events_but_rejects_structural_ones() {
         session
             .ingest(r#"{"type":"response.reasoning_unknown.delta","output_index":0}"#)
             .is_err()
+    );
+}
+
+/// R10: reasoning models only stream `reasoning_summary_text.delta` when the
+/// request asks for summaries, so the default request carries
+/// `reasoning: {"summary": "auto"}` — and no `effort`, which must follow the
+/// model's own default. The compatibility switch removes the parameter for
+/// gateways that reject it.
+#[test]
+fn reasoning_summary_is_requested_by_default_and_removable() {
+    let request = crate::llm::GenerateRequest {
+        model: "gpt".into(),
+        ..Default::default()
+    };
+
+    let body = ResponsesSession::new(CompatibilityProfile::default())
+        .encode_request(&request)
+        .expect("default request encodes");
+    let reasoning = body
+        .get("reasoning")
+        .and_then(Value::as_object)
+        .expect("default request asks for reasoning summaries");
+    assert_eq!(
+        reasoning.get("summary"),
+        Some(&Value::String("auto".into()))
+    );
+    assert!(
+        reasoning.get("effort").is_none(),
+        "effort must stay with the model default"
+    );
+
+    let disabled = CompatibilityProfile {
+        responses_reasoning_summary: false,
+        ..CompatibilityProfile::default()
+    };
+    let body = ResponsesSession::new(disabled)
+        .encode_request(&request)
+        .expect("request without reasoning summaries encodes");
+    assert!(
+        body.get("reasoning").is_none(),
+        "the switch must remove the whole reasoning parameter"
     );
 }

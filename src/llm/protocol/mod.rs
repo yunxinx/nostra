@@ -252,6 +252,11 @@ pub struct CompatibilityProfile {
     pub responses_instructions: ResponsesInstructionsPolicy,
     pub responses_store: bool,
     pub responses_include_encrypted_reasoning: bool,
+    /// Ask Responses reasoning models for streamed summaries
+    /// (`reasoning: {"summary": "auto"}`). Without it most providers only
+    /// surface the finished reasoning in the terminal output item, so the UI
+    /// cannot stream the chain of thought.
+    pub responses_reasoning_summary: bool,
 }
 
 impl Default for CompatibilityProfile {
@@ -266,6 +271,7 @@ impl Default for CompatibilityProfile {
             responses_instructions: ResponsesInstructionsPolicy::TopLevel,
             responses_store: false,
             responses_include_encrypted_reasoning: true,
+            responses_reasoning_summary: true,
         }
     }
 }

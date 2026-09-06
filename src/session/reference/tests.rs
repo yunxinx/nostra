@@ -38,6 +38,7 @@ fn sensitive_message(text: &str) -> SessionEntryKind {
                                 ..Default::default()
                             }),
                         }),
+                        duration_ms: None,
                     },
                 },
             ],
@@ -273,6 +274,7 @@ fn borrowed_reference_budget_matches_the_owned_redacted_shape() {
                 reasoning: crate::llm::ReasoningContent {
                     display: "reasoning".into(),
                     replay: None,
+                    duration_ms: None,
                 },
             },
             ContentBlock::ToolCall {

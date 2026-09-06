@@ -559,3 +559,78 @@ fn request_context_retains_conversation_and_turn_ids() {
     assert_eq!(context.conversation_id, "conversation-1");
     assert_eq!(context.turn_id, "turn-2");
 }
+
+/// R7: the assembler banks each reasoning block's duration from its own
+/// start/finish arrival times, so the assembled assistant message — the one
+/// that reaches the session JSONL — carries the real thinking time. A later
+/// authoritative snapshot replaces display/replay but never the timing.
+#[test]
+fn assembler_banks_reasoning_duration_on_the_message() {
+    let mut assembler = MessageAssembler::default();
+    for event in [
+        GenerationEvent::ReasoningStarted {
+            content_index: 0,
+            id: "reasoning".into(),
+        },
+        GenerationEvent::ReasoningDelta {
+            content_index: 0,
+            id: "reasoning".into(),
+            delta: "thinking".into(),
+        },
+    ] {
+        assembler.observe(&event).expect("valid event");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    assembler
+        .observe(&GenerationEvent::ReasoningFinished {
+            content_index: 0,
+            id: "reasoning".into(),
+            replay: None,
+        })
+        .expect("finish");
+    let banked = {
+        let message = assembler.message();
+        let [
+            IndexedContentBlock {
+                block: ContentBlock::Reasoning { reasoning },
+                ..
+            },
+        ] = message.content.as_slice()
+        else {
+            panic!("one reasoning block");
+        };
+        assert_eq!(reasoning.display, "thinking");
+        reasoning.duration_ms
+    };
+    assert!(
+        banked >= Some(20),
+        "the banked duration reflects the arrival gap, got {banked:?}"
+    );
+
+    assembler
+        .observe(&GenerationEvent::ReasoningSnapshotUpdated {
+            content_index: 0,
+            id: "reasoning".into(),
+            reasoning: crate::llm::ReasoningContent {
+                display: "authoritative".into(),
+                replay: None,
+                duration_ms: None,
+            },
+        })
+        .expect("snapshot");
+    let message = assembler.message();
+    let [
+        IndexedContentBlock {
+            block: ContentBlock::Reasoning { reasoning },
+            ..
+        },
+    ] = message.content.as_slice()
+    else {
+        panic!("one reasoning block");
+    };
+    assert_eq!(reasoning.display, "authoritative");
+    assert_eq!(
+        reasoning.duration_ms, banked,
+        "a snapshot never disturbs the banked timing"
+    );
+}

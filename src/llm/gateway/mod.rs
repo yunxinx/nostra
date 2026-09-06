@@ -181,6 +181,10 @@ enum AssembledBlock {
         display: String,
         replay: Option<crate::llm::ReplayMetadata>,
         finished: bool,
+        /// Arrival time of the block's start event. Consumed into
+        /// `duration_ms` when the finish event arrives.
+        started_at: Option<Instant>,
+        duration_ms: Option<u64>,
     },
     Tool {
         index: usize,
@@ -194,6 +198,15 @@ struct MessageAssembler {
     // terminal backfill, so a missing earlier Responses output can be inserted
     // without changing canonical order.
     blocks: BTreeMap<usize, AssembledBlock>,
+}
+
+/// Mutable borrow of one assembled reasoning block's fields.
+struct AssembledReasoning<'a> {
+    display: &'a mut String,
+    replay: &'a mut Option<crate::llm::ReplayMetadata>,
+    finished: &'a mut bool,
+    started_at: &'a mut Option<Instant>,
+    duration_ms: &'a mut Option<u64>,
 }
 
 impl MessageAssembler {
@@ -244,23 +257,30 @@ impl MessageAssembler {
                 id,
                 delta,
             } => {
-                let (display, _, finished) = self.reasoning(*content_index, id)?;
-                if *finished {
+                let block = self.reasoning(*content_index, id)?;
+                if *block.finished {
                     return Err(GatewayError::protocol(
                         "reasoning delta arrived after content completion",
                     ));
                 }
-                display.push_str(delta);
+                block.display.push_str(delta);
             }
             GenerationEvent::ReasoningFinished {
                 content_index,
                 id,
                 replay,
             } => {
-                let (_, current_replay, finished) = self.reasoning(*content_index, id)?;
-                *finished = true;
+                let block = self.reasoning(*content_index, id)?;
+                *block.finished = true;
+                // R7: the block's duration is the arrival gap between its own
+                // start and finish events. Stamping it here is what puts the
+                // real thinking time into the persisted assistant message —
+                // a UI-side timer would be skewed by display pacing.
+                if let Some(started_at) = block.started_at.take() {
+                    *block.duration_ms = Some(started_at.elapsed().as_millis() as u64);
+                }
                 if replay.is_some() {
-                    *current_replay = replay.clone();
+                    *block.replay = replay.clone();
                 }
             }
             GenerationEvent::ReasoningSnapshotUpdated {
@@ -268,14 +288,14 @@ impl MessageAssembler {
                 id,
                 reasoning,
             } => {
-                let (display, replay, finished) = self.reasoning(*content_index, id)?;
-                if !*finished {
+                let block = self.reasoning(*content_index, id)?;
+                if !*block.finished {
                     return Err(GatewayError::protocol(
                         "reasoning snapshot arrived before content completion",
                     ));
                 }
-                display.clone_from(&reasoning.display);
-                replay.clone_from(&reasoning.replay);
+                block.display.clone_from(&reasoning.display);
+                block.replay.clone_from(&reasoning.replay);
             }
             GenerationEvent::ToolCallStarted {
                 content_index,
@@ -380,6 +400,8 @@ impl MessageAssembler {
                     display: String::new(),
                     replay: None,
                     finished: false,
+                    started_at: Some(Instant::now()),
+                    duration_ms: None,
                 });
                 Ok(())
             }
@@ -396,21 +418,22 @@ impl MessageAssembler {
         &mut self,
         content_index: usize,
         id: &str,
-    ) -> Result<
-        (
-            &mut String,
-            &mut Option<crate::llm::ReplayMetadata>,
-            &mut bool,
-        ),
-        GatewayError,
-    > {
+    ) -> Result<AssembledReasoning<'_>, GatewayError> {
         match self.blocks.get_mut(&content_index) {
             Some(AssembledBlock::Reasoning {
                 id: current,
                 display,
                 replay,
                 finished,
-            }) if current == id => Ok((display, replay, finished)),
+                started_at,
+                duration_ms,
+            }) if current == id => Ok(AssembledReasoning {
+                display,
+                replay,
+                finished,
+                started_at,
+                duration_ms,
+            }),
             _ => Err(GatewayError::protocol(
                 "reasoning event did not match a started content block",
             )),
@@ -432,13 +455,17 @@ impl MessageAssembler {
                     })
                 }
                 AssembledBlock::Reasoning {
-                    display, replay, ..
+                    display,
+                    replay,
+                    duration_ms,
+                    ..
                 } if !display.is_empty() || replay.is_some() => Some(IndexedContentBlock {
                     content_index: *content_index,
                     block: ContentBlock::Reasoning {
                         reasoning: ReasoningContent {
                             display: display.clone(),
                             replay: replay.clone(),
+                            duration_ms: *duration_ms,
                         },
                     },
                 }),

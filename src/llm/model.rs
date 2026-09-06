@@ -72,6 +72,11 @@ pub struct ReasoningContent {
     pub display: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replay: Option<ReplayMetadata>,
+    /// How long the model spent on this reasoning block, measured from the
+    /// first block event's arrival to its finish (R7). Persisted with the
+    /// assistant message so a restored session still shows the real duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -243,6 +248,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn reasoning_duration_round_trips_and_stays_absent_when_unset() {
+        let with_duration = ReasoningContent {
+            display: "thinking".into(),
+            replay: None,
+            duration_ms: Some(12_345),
+        };
+        let value = serde_json::to_value(&with_duration).expect("serialize");
+        assert_eq!(
+            value,
+            json!({"display": "thinking", "duration_ms": 12345}),
+            "the duration is carried by the block's own JSON"
+        );
+        let back: ReasoningContent = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back, with_duration);
+
+        let without_duration = ReasoningContent {
+            display: "thinking".into(),
+            replay: None,
+            duration_ms: None,
+        };
+        let value = serde_json::to_value(&without_duration).expect("serialize");
+        assert_eq!(
+            value,
+            json!({"display": "thinking"}),
+            "an absent duration must not serialize a null"
+        );
+        let back: ReasoningContent =
+            serde_json::from_value(json!({"display": "thinking"})).expect("deserialize");
+        assert_eq!(back, without_duration);
+    }
 
     #[test]
     fn replay_metadata_never_exposes_opaque_values_in_debug_output() {

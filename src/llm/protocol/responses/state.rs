@@ -350,6 +350,7 @@ impl ResponsesSession {
         ReasoningContent {
             display,
             replay: self.reasoning_provider_metadata(index),
+            duration_ms: None,
         }
     }
 
