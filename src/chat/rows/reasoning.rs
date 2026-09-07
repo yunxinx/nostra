@@ -14,7 +14,10 @@
 //! `min(natural height, cap)` where the cap is
 //! `max(BUDGET_MIN_LINES lines, viewport × 45%)` (PRD R3): short traces render
 //! at their own height, longer ones scroll inside a viewport of exactly the
-//! cap. The natural height converges through the painted-body measurement
+//! cap. The clamped viewport fades whichever of its edges still hides
+//! content — top only at the bottom, bottom only at the top, both in
+//! between — read from the shared internal scroll state at render time.
+//! The natural height converges through the painted-body measurement
 //! ([`RowAction::BodyMeasured`]) plus the body's layout observers. Auto
 //! collapse yields to the user the first time they work the toggle
 //! (`user_controlled`).
@@ -37,7 +40,7 @@ use gpui::{
     AnyElement, App, ElementId, FollowMode, InteractiveElement as _, IntoElement, KeyDownEvent,
     ListState, ParentElement as _, Pixels, Role, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, linear_color_stop, linear_gradient,
-    prelude::FluentBuilder as _,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, ElementExt as _, Icon, IconName, clipboard::Clipboard, h_flex, v_flex,
@@ -116,6 +119,36 @@ fn hidden_until_hover_copy(
 /// row without accidentally matching another reasoning row in the same turn.
 fn block_selector(kind: &str, content_index: usize) -> String {
     format!("reasoning-{kind}-{content_index}")
+}
+
+/// An internal-scroll offset within this distance of an edge counts as
+/// parked at that edge, so sub-pixel jitter at a scroll boundary cannot
+/// flicker a fade on and off.
+const FADE_EDGE_EPSILON: Pixels = px(1.);
+
+/// One line of directional fade over the pane background: opaque at the
+/// viewport's `top` or `bottom` edge, transparent one line-height in. The
+/// overlay carries no id, listener, or occlusion, so it never joins a
+/// hitbox and pointer events pass through to the content beneath.
+fn fade_overlay(
+    background: gpui::Hsla,
+    line_height: Pixels,
+    top: bool,
+    debug_selector: impl FnOnce() -> String,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .when(top, |this| this.top_0())
+        .when(!top, |this| this.bottom_0())
+        .left_0()
+        .right_0()
+        .h(line_height)
+        .bg(linear_gradient(
+            if top { 180. } else { 0. },
+            linear_color_stop(background, 0.),
+            linear_color_stop(background.opacity(0.), 1.),
+        ))
+        .debug_selector(debug_selector)
 }
 
 pub(crate) struct ReasoningRenderer {
@@ -683,21 +716,15 @@ impl ReasoningRenderer {
                             ),
                     )
                     .when(show_fade, |this| {
-                        this.child(
-                            // The fade is one line tall and fades the pane
-                            // background out over the oldest visible text.
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(line_height)
-                                .bg(linear_gradient(
-                                    180.,
-                                    linear_color_stop(background, 0.),
-                                    linear_color_stop(background.opacity(0.), 1.),
-                                )),
-                        )
+                        this.child(fade_overlay(
+                            background,
+                            line_height,
+                            // The preview always follows the stream's tail,
+                            // so only content scrolled above the viewport can
+                            // ever be hidden: one fade, at the top edge.
+                            true,
+                            move || block_selector("fade-top", content_index),
+                        ))
                     }),
             )
             .into_any_element()
@@ -759,6 +786,23 @@ impl ReasoningRenderer {
             .as_ref()
             .map(|scroll| scroll.scroll_px_offset_for_scrollbar())
             .unwrap_or_default();
+        // The clamped viewport fades each edge over the content the cap is
+        // hiding: a fade belongs at an edge exactly while the internal scroll
+        // can still move toward it. Both reads come from the same shared list
+        // state the TextView renders, so any scroll-driven row re-render
+        // re-derives the pair. A viewport with nothing to hide (max offset
+        // zero) fails both comparisons and shows no fade.
+        let (show_top_fade, show_bottom_fade) = match self.scroll.as_ref() {
+            Some(scroll) => {
+                let offset = scroll.scroll_px_offset_for_scrollbar().y;
+                let max_offset = scroll.max_offset_for_scrollbar().y;
+                (
+                    offset < -FADE_EDGE_EPSILON,
+                    offset > -max_offset + FADE_EDGE_EPSILON,
+                )
+            }
+            None => (false, false),
+        };
         let on_scroll = Rc::new(
             move |event: &ScrollWheelEvent, window: &mut Window, cx: &mut App| {
                 dispatch_scroll.send(
@@ -880,6 +924,9 @@ impl ReasoningRenderer {
                 // horizontal padding lives on the scrollable TextView so its
                 // scrollbar is measured against the full card width and
                 // lands in the right-hand gutter instead of over the text.
+                // The fades paint after the viewport as the body's last
+                // children, covering the text the cap is hiding at each
+                // edge.
                 this.child(
                     div()
                         .relative()
@@ -915,7 +962,23 @@ impl ReasoningRenderer {
                                                 .px_3()
                                                 .py_2(),
                                         ),
-                                ),
+                                )
+                                .when(show_top_fade, |this| {
+                                    this.child(fade_overlay(
+                                        background,
+                                        line_height,
+                                        true,
+                                        move || block_selector("fade-top", content_index),
+                                    ))
+                                })
+                                .when(show_bottom_fade, |this| {
+                                    this.child(fade_overlay(
+                                        background,
+                                        line_height,
+                                        false,
+                                        move || block_selector("fade-bottom", content_index),
+                                    ))
+                                }),
                         ),
                 )
             })

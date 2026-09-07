@@ -1123,6 +1123,106 @@ fn the_jump_button_preference_gates_only_the_button(cx: &mut TestAppContext) {
     );
 }
 
+/// The jump affordance must paint above the list's own surfaces: this fork
+/// has no z-index, so intersecting primitives stack by paint order, and the
+/// button has to be a later sibling of the list container or opaque row
+/// content (code block backgrounds, the scrollbar layer) draws over it.
+/// Asserted against the painted scene — the highest-order quad at the
+/// button's center is the button's own surface, above the code block
+/// underneath — plus a real click restoring the tail.
+#[gpui::test]
+fn the_jump_button_paints_above_list_content(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(640.), px(480.)));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::tests::fixtures::seed_completed_exchange(chat, cx);
+        });
+    });
+    redraw_settled(cx);
+    // One code block taller than the viewport: scrolled to the top, its
+    // opaque surface fills the area the button floats over.
+    let code = (0..120)
+        .map(|line| format!("let folded_{line} = compute_{line}({line});"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            crate::chat::tests::test_support::push_canonical(
+                chat,
+                crate::llm::Message {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![crate::llm::ContentBlock::Text {
+                        text: format!("```rust\n{code}\n```"),
+                        provider_metadata: crate::llm::ProviderMetadata::default(),
+                    }],
+                    provider_metadata: crate::llm::ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+    });
+    redraw_settled(cx);
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, _| {
+            chat.view
+                .list_state
+                .set_follow_mode(gpui::FollowMode::Normal);
+            chat.view.list_state.scroll_to(ListOffset::default());
+        });
+    });
+    redraw_settled(cx);
+    assert!(cx.update(|_, cx| chat.read(cx).view.show_jump_button()));
+
+    let button = cx
+        .debug_bounds("jump-to-latest")
+        .expect("the jump button is in the tree");
+    let scale = cx.update(|window, _| window.scale_factor());
+    let scaled = |value: Pixels| gpui::ScaledPixels(f32::from(value) * scale);
+    let center = point(scaled(button.center().x), scaled(button.center().y));
+    let expected = gpui::Bounds {
+        origin: point(scaled(button.origin.x), scaled(button.origin.y)),
+        size: gpui::size(scaled(button.size.width), scaled(button.size.height)),
+    };
+    let quads = cx.update(|window, _| window.painted_quads());
+    let at_center: Vec<&gpui::Quad> = quads
+        .iter()
+        .filter(|quad| quad.bounds.contains(&center))
+        .collect();
+    assert!(
+        at_center.iter().any(|quad| quad.bounds != expected),
+        "list content must underlap the button for the layering to matter"
+    );
+    let topmost = at_center
+        .iter()
+        .max_by_key(|quad| quad.order)
+        .expect("quads at the button's center");
+    assert_eq!(
+        topmost.bounds, expected,
+        "the button's own surface must be the topmost painted quad at its center"
+    );
+
+    // The reordered button keeps its click behavior: a real click restores
+    // tail following and lands on the tail.
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    redraw(cx);
+    let (following, visible, at_end) = cx.update(|_, cx| {
+        let chat = chat.read(cx);
+        (
+            chat.view.list_state.is_following_tail(),
+            chat.view.show_jump_button(),
+            chat.view.list_state.is_scrolled_to_end(),
+        )
+    });
+    assert!(following, "the click still restores tail following");
+    assert!(!visible, "the click hides the button");
+    assert_eq!(at_end, Some(true), "the click lands on the tail");
+}
+
 /// AC6 update side: a declared typography change invalidates the old
 /// measurements, drops the effective height back to the refreshed estimate,
 /// and asks the list to re-measure exactly the affected rows.

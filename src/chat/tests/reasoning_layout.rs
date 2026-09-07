@@ -709,6 +709,63 @@ fn an_oversized_expanded_reasoning_stays_layout_bounded(cx: &mut TestAppContext)
     );
 }
 
+/// Collapsed and natural-height forms render no fades: without the internal
+/// scroll viewport there is no scroll position to derive an edge fade from.
+#[gpui::test]
+fn short_reasoning_renders_no_fades_in_any_form(cx: &mut TestAppContext) {
+    init_app(cx);
+    let (chat, cx) = add_chat_window(cx);
+    cx.simulate_resize(gpui::size(px(900.), px(700.)));
+
+    cx.update(|_, cx| {
+        chat.update(cx, |chat, cx| {
+            test_support::push_canonical(
+                chat,
+                LlmMessage {
+                    role: crate::llm::Role::Assistant,
+                    content: vec![ContentBlock::Reasoning {
+                        reasoning: crate::llm::ReasoningContent {
+                            display: "one\ntwo\nthree\nfour".into(),
+                            replay: None,
+                            duration_ms: None,
+                        },
+                    }],
+                    provider_metadata: ProviderMetadata::default(),
+                },
+                cx,
+            );
+        });
+    });
+    redraw(cx);
+    assert!(
+        cx.debug_bounds("reasoning-body-0").is_none(),
+        "the trace starts collapsed"
+    );
+    assert!(
+        cx.debug_bounds("reasoning-fade-top-0").is_none()
+            && cx.debug_bounds("reasoning-fade-bottom-0").is_none(),
+        "the collapsed trigger renders no fades"
+    );
+
+    let trigger = cx
+        .debug_bounds("reasoning-trigger-0")
+        .expect("collapsed short reasoning trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    redraw(cx);
+    redraw(cx);
+
+    assert!(
+        cx.debug_bounds("reasoning-body-0").is_some()
+            && cx.debug_bounds("reasoning-viewport-0").is_none(),
+        "the short trace expands to its natural height, not the clamped viewport"
+    );
+    assert!(
+        cx.debug_bounds("reasoning-fade-top-0").is_none()
+            && cx.debug_bounds("reasoning-fade-bottom-0").is_none(),
+        "the natural-height form renders no fades"
+    );
+}
+
 /// Reasoning code blocks resolve the active palette in their custom renderer,
 /// so a theme change must not churn the streaming markdown entity.
 #[gpui::test]

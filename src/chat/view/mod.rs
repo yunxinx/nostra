@@ -1171,29 +1171,6 @@ impl ChatView {
         div()
             .relative()
             .size_full()
-            .when(show_jump, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .bottom(composer_height + px(12.))
-                        .flex()
-                        .justify_center()
-                        .child(
-                            div().debug_selector(|| "jump-to-latest".into()).child(
-                                Button::new("jump-to-latest")
-                                    .outline()
-                                    .small()
-                                    .icon(IconName::ArrowDown)
-                                    .label(t!("chat.jump_to_latest").to_string())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.view.jump_to_latest(window, cx);
-                                    })),
-                            ),
-                        ),
-                )
-            })
             .child(
                 div()
                     .relative()
@@ -1234,6 +1211,34 @@ impl ChatView {
                     )
                     .vertical_scrollbar(&self.view.list_state),
             )
+            // The jump affordance paints after the list container: this fork
+            // has no z-index, so intersecting primitives stack by paint
+            // order, and the list's opaque surfaces (code block backgrounds,
+            // the scrollbar layer) would otherwise draw over the button. The
+            // button is absolutely positioned, so moving it behind the
+            // container changes neither its place nor its hitbox.
+            .when(show_jump, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(composer_height + px(12.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            Button::new("jump-to-latest")
+                                .debug_selector(|| "jump-to-latest".into())
+                                .outline()
+                                .small()
+                                .icon(IconName::ArrowDown)
+                                .label(t!("chat.jump_to_latest").to_string())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.view.jump_to_latest(window, cx);
+                                })),
+                        ),
+                )
+            })
     }
 
     pub(super) fn handle_message_scroll_wheel(
